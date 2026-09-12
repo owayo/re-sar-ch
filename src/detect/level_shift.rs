@@ -190,7 +190,7 @@ pub fn detect(
         // 分割候補を順に評価する
         let mut candidates: Vec<Split> = Vec::new();
         for at in w..=segment.len() - w {
-            // **欠測を挟む比較は評価しない。** 変化した時刻を指せない
+            // **欠測を挟む比較は評価しない。** 境目を指す意味が無くなる
             if !is_contiguous(&segment[at - w..at + w]) {
                 continue;
             }
@@ -640,14 +640,17 @@ mod tests {
         assert!((persistence_share - 1.0).abs() < 1e-9);
     }
 
-    /// 段差の時刻を指せる (変化後の窓が裏付けになる)。
+    /// 水準が違う 2 つの時間帯の**境目**を指す (裏付けは後窓)。
+    ///
+    /// 「その瞬間に変わった」ではない (モジュール doc を参照)。
+    /// 指すのは採用した前後窓の分割時刻である。
     #[test]
-    fn the_detection_points_at_the_time_of_the_change() {
+    fn the_detection_points_at_the_boundary_between_the_two_windows() {
         let mut v = vec![90.0; 12];
         v.extend(vec![20.0; 12]);
         let (found, _) = run(cpu_idle(&vals(&v)));
         assert_eq!(found.len(), 1);
-        // 13 点目 (索引 12) から変化した
+        // 13 点目 (索引 12) から水準が違う
         assert_eq!(found[0].support.start_ust, T0 + 12 * STEP_SECS);
     }
 

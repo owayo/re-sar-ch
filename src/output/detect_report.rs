@@ -157,24 +157,22 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
 
 fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode) -> io::Result<()> {
     let ep = &e.episode;
+    // **2 つの範囲を区別して出す。** 根拠が及ぶ範囲だけを出すと
+    // 「その期間まるごとが 1 つの事象で、内側のエピソードはその一部」と
+    // 読まれてしまう。エピソードは検出の**始まり**のまとまりである。
     writeln!(
         out,
-        "エピソード {}  {} → {}",
+        "エピソード {}  検出の始まり {} 〜 {}",
         ep.index + 1,
+        epoch(ep.support.start_ust),
+        epoch(ep.last_onset_ust)
+    )?;
+    writeln!(
+        out,
+        "              根拠が及ぶ範囲 {} → {} (他のエピソードと重なることがある)",
         epoch(ep.support.start_ust),
         epoch(ep.support.end_ust)
     )?;
-    // **エピソードは検出の始まりでまとめている。** 時間範囲の終端は
-    // 含まれる検出のうち最も長いものの終端なので、両方を出さないと
-    // 「いつ始まったことのまとまりか」が読めない。
-    if ep.last_onset_ust > ep.support.start_ust {
-        writeln!(
-            out,
-            "  (検出の始まりは {} 〜 {} に集まっている)",
-            epoch(ep.support.start_ust),
-            epoch(ep.last_onset_ust)
-        )?;
-    }
     writeln!(out, "  {} {}", e.priority.mark(), e.headline)?;
     // **優先度は検出単位。** 見出しの検出について書いていることを明示する
     // (別の検出の持続性で上がったのではない)。
@@ -481,6 +479,13 @@ fn write_background<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     writeln!(
         out,
         "背景の所見 (入力のほぼ全体を占め、いつ起きたかの手がかりを持たない)"
+    )?;
+    // **「重要でない」と読まれないようにする。** 時刻を絞る材料にならない
+    // ことだけを言っている。優先度はエピソードと同じ規則で付けてある。
+    writeln!(
+        out,
+        "  (重要でないという意味ではない。入力のどこを切っても成立するので、\
+         いつ何が起きたかを絞る材料にならないという意味である)"
     )?;
     for b in &a.background {
         let f = &b.finding;
@@ -869,7 +874,7 @@ mod tests {
         write_ndjson(&mut buf, std::slice::from_ref(&a)).expect("NDJSON");
         let text = String::from_utf8(buf).expect("UTF-8");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2 + a.episodes.len());
+        assert_eq!(lines.len(), 2 + a.episodes.len() + a.background.len());
         let head: serde_json::Value = serde_json::from_str(lines[0]).expect("パース");
         assert_eq!(head["record"], "detect_header");
         assert_eq!(head["segment"], 0, "どの起動区間の行か分かること");

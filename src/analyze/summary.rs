@@ -39,7 +39,7 @@ use crate::error::Result;
 use crate::format::file::SaFile;
 use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
 use crate::model::{ActivityId, Aggregation, Availability, CounterBits, Unit, ValueKind};
-use crate::series::compute::{ComputeContext, column_value, tick_total};
+use crate::series::compute::{ComputeContext, column_value_strict, tick_total};
 use crate::series::delta::{Delta, DeltaContext, compute_delta};
 use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
@@ -659,7 +659,8 @@ impl NativeSummaryBuilder {
             let ctx = ComputeContext {
                 itv_cs: timing.itv_cs,
                 tick_total: match (normalize_by_ticks, prev_item) {
-                    (true, Some(p)) => Some(tick_total(p, item)),
+                    // guest / guest_nice を分母に入れないため、列を特定する plan が必要
+                    (true, Some(p)) => Some(tick_total(plan, p, item)),
                     (true, None) => None,
                     (false, _) => None,
                 },
@@ -705,7 +706,12 @@ impl NativeSummaryBuilder {
                         // activity 固有の補正をここで再実装すると、
                         // 同じ指標が出力形式ごとに違う値になる。
                         let prev_for_compute = prev_item.unwrap_or(&EMPTY_ITEM);
-                        match column_value(
+                        // **厳密モードを使う。**
+                        // 互換出力は本家の代替規則で欠落を埋める (旧世代の
+                        // `%memused` を `frmkb` から出す等) が、集計でそれをやると
+                        // 「その世代のファイルには無い値」が有効な観測として
+                        // 平均や p95 に混ざる。欠落は欠落として除外する。
+                        match column_value_strict(
                             snap.id,
                             column,
                             &meta,

@@ -2401,7 +2401,7 @@ impl SarBlock {
                     // 集約行 (SMP)。`prev_primary` / `curr` は既に
                     // offline 補正込みで合算済みで、分母もその合算に使った
                     // CPU の tick 合計 (`deltot_jiffies`) になる。
-                    ctx = agg.context(itv_cs);
+                    ctx = agg.context(ctx);
                     self.cell_values(plan, prev_primary, curr, &ctx)
                 } else {
                     if compute::cpu_is_offline(plan, curr) {
@@ -2660,7 +2660,7 @@ impl SarBlock {
         };
         let itv = interval_cs(self.first_uptime.unwrap_or(0), self.last_uptime);
         let rows = self.average_rows(itv);
-        if self.opts.minmax {
+        if self.opts.minmax && has_xstats(self.view.id) {
             self.write_minmax_average(out, label, &rows)?;
             self.displayed = 0;
             return Ok(());
@@ -2759,11 +2759,10 @@ impl SarBlock {
                 Some(agg) => (&agg.prev, &agg.curr),
                 None => (&state.first, &state.last),
             };
-            let mut ctx = match aggregated {
-                Some(agg) => agg.context(itv),
-                None => ComputeContext::new(itv),
-            };
-            if aggregated.is_none() {
+            let mut ctx = ComputeContext::new(itv);
+            if let Some(agg) = aggregated {
+                ctx = agg.context(ctx);
+            } else {
                 ctx.aggregate_item = state.index == 0;
                 if self.view.id == ActivityId::CPU {
                     let total = compute::per_cpu_interval(plan, first, last).1;
@@ -2912,6 +2911,15 @@ fn ratio_inputs(id: ActivityId) -> &'static [usize] {
         ActivityId::HUGE => &[huge_col::KBHUGTOTAL],
         _ => &[],
     }
+}
+
+/// `-x` の極値ブロックを持つ activity か。
+///
+/// 43 activity のうち `A_PWR_USB` だけはヘッダ条件に `DISPLAY_MINMAX` が
+/// 現れない (03 §9.3 の H 群)。最後に観測したデバイス一覧を再掲するだけで、
+/// 極値を出す `print_*_xstats()` が無いためである。
+fn has_xstats(id: ActivityId) -> bool {
+    id != ActivityId::PWR_USB
 }
 
 /// `-z` がアイテム行を省略する activity か (03 §2.7)。
@@ -4106,6 +4114,15 @@ mod tests {
             ActivityId::PWR_FAN,
         ] {
             assert!(!zero_omit_applies(id), "{id} は -z の対象外");
+        }
+        // `-x` の極値を持たないのは A_PWR_USB だけ (03 §9.3 の H 群)
+        assert!(!has_xstats(ActivityId::PWR_USB));
+        for id in crate::model::KNOWN_ACTIVITIES {
+            assert_eq!(
+                has_xstats(*id),
+                *id != ActivityId::PWR_USB,
+                "{id} の -x 対応"
+            );
         }
 
         let opts = SarTextOptions {

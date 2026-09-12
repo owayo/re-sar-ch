@@ -162,6 +162,22 @@ enum Repro {
 /// `sadf -H` の 1 行目を落とすための語 (本家テストの `grep -v 0x2175` と同じ)。
 const SADF_H_GREP_V: &str = "0x2175";
 
+/// `docs/format/04-test-data.md` §5.1 のフェーズ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// ヘッダ解析のみ (`sadf -H` 相当)。
+    Header,
+    /// 生値デコード (`sadf -r -O debug` 相当)。
+    RawValues,
+    /// `sar` テキスト出力。
+    SarText,
+}
+
+/// 同梱バイナリ由来の golden (全件)。
+///
+/// コマンドラインは本家テストのものをそのまま記録してある。
+/// 環境変数の固定 (`LC_ALL=C` / `TZ=GMT`) は再現性のために必須 (§7.3)。
+/// reSARch 側はプロセスを起動しないので、`TZ=GMT` は [`TimeStyle::Utc`] で表す。
 const GOLDEN_CASES: &[GoldenCase] = &[
     GoldenCase {
         upstream_test: "00655",

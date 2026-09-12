@@ -108,6 +108,17 @@ reSARch is a **reader**. Live collection (`sadc`) is out of scope.
 The generation of the file being read and the output format being reproduced are separate
 settings: a v10 file can be rendered in v12 `sar` style, and vice versa.
 
+Options that are parsed but not yet acted upon are rejected at run time with a reason:
+
+| Option | Status |
+|---|---|
+| `sar -o` / `--sadc` | Collection is out of scope — rejected explicitly |
+| `sadf -c` / `-g` / `-l` | Conversion, SVG and PCP output are not implemented |
+| `sar -i`, positional `interval` / `count` | Not implemented (every record is emitted) |
+| `sar -x` `Minimum:` / `Maximum:` rows | Not implemented (only the label switch is honoured) |
+| `--int=` | Not implemented (`A_IRQ` uses a matrix layout) |
+| `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
+
 ## Design notes
 
 Things that turned out to matter, documented in [`docs/design.md`](docs/design.md):

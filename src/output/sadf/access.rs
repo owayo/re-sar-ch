@@ -98,7 +98,8 @@ impl<'a> ActivityPair<'a> {
         };
         // A_CPU の割合はグローバル itv ではなく、その CPU の tick 合計で正規化する
         if self.id == ActivityId::CPU && ctx.has_prev {
-            ctx.tick_total = Some(tick_total(prev, curr));
+            // guest / guest_nice を分母に入れないため、列を特定する plan が必要
+            ctx.tick_total = Some(tick_total(self.plan, prev, curr));
         }
 
         Some(ItemPair {

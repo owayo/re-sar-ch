@@ -435,10 +435,15 @@ pub fn compare(expected: &str, actual: &str, masks: &[Mask]) -> Comparison {
 
     for (ei, ai) in align(&exp, &act) {
         match (ei, ai) {
-            (Some(i), Some(j)) => {
-                // 揃った行 (内容は一致している)。溜めていた塊を先に処理する
+            (Some(i), Some(j)) if exp[i] == act[j] => {
+                // 揃って内容も一致した行。溜めていた塊を先に処理する
                 flush(&mut cmp, &mut only_exp, &mut only_act);
-                debug_assert_eq!(exp[i], act[j]);
+            }
+            // 対応づけはできたが内容が違う組 (規模が大きすぎて素朴な対応づけに
+            // 落ちた場合に起きる)。塊として扱い、マスクを試す。
+            (Some(i), Some(j)) => {
+                only_exp.push(i);
+                only_act.push(j);
             }
             (Some(i), None) => only_exp.push(i),
             (None, Some(j)) => only_act.push(j),

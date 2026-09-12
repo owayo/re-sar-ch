@@ -449,17 +449,34 @@ pub enum MissingKind {
 /// 足りない分を 0 埋めした構造体で計算するため、
 /// discard 統計を持たない旧 `A_IO` の `dtps` / `bdscd` は `0.00` と表示される。
 /// 一方 `MissingInSample` や不連続は本家でも値が出ない (行そのものが無い)。
+///
+/// 「値の欠落」ではない理由 (識別子列 / 行列型 / 未実装) は `None` を返す。
+/// これらは 0 でも欠測でもなく、**呼び出し方の問題**なので
+/// 欠落として集計に数えてはいけない。
 #[inline]
-pub fn missing_kind(issue: ComputeIssue) -> MissingKind {
+pub fn missing_kind(issue: ComputeIssue) -> Option<MissingKind> {
     match issue {
         // その世代のファイルにフィールドが無いだけ = 本家は 0 埋めして計算する
-        ComputeIssue::UnsupportedBySource => MissingKind::ZeroFilled,
-        ComputeIssue::MissingInSample
-        | ComputeIssue::Discontinuous(_)
-        | ComputeIssue::NotNumeric
-        | ComputeIssue::NeedsItemGroup
-        | ComputeIssue::NotImplemented => MissingKind::Absent,
+        ComputeIssue::UnsupportedBySource => Some(MissingKind::ZeroFilled),
+        // このサンプルでは値が読めなかった / 差分が取れない = 本家なら行が無い
+        ComputeIssue::MissingInSample | ComputeIssue::Discontinuous(_) => Some(MissingKind::Absent),
+        // 値の欠落ではない (数値でない列 / item 群が必要 / 未実装)
+        ComputeIssue::NotNumeric | ComputeIssue::NeedsItemGroup | ComputeIssue::NotImplemented => {
+            None
+        }
     }
+}
+
+/// この列がこのファイルに存在するか (指摘 5)。
+///
+/// [`MissingPolicy::Compat`] は本家に合わせて欠落を 0 に埋めるので、
+/// 返ってきた `0.0` が「観測した 0」なのか「ゼロ補完」なのかは値から判らない。
+/// 由来が必要な呼び出し側 (欠落を注記したい独自出力など) はこれで確かめる。
+///
+/// 偽になるのは「その世代のファイルにフィールドが無い」場合だけで、
+/// サンプル単位の欠測 ([`ComputeIssue::MissingInSample`]) は判定できない。
+pub fn column_is_present(plan: &DecodePlan, column: usize) -> bool {
+    matches!(plan.column_fields.get(column), Some(Some(_)))
 }
 
 // ============================================================================
@@ -793,7 +810,8 @@ pub fn rate_scale(id: ActivityId, column: usize) -> f64 {
             _ => 1.0,
         },
         // PSI の累積 µs 列は本家が `Δµs / (100 × itv)` を出す (03 §1.5.3)。
-        // 生のレート `Δ/itv×100` からは 1/10000 で一致する。
+        // 生のレート `Δ/itv×100` からは 1/10000 で一致する
+        // (区間値は [`psi_pressure`] が直接その式で計算する)。
         // この係数があるので、集計は PSI も他のカウンタと同じ経路で扱える。
         ActivityId::PSI_CPU | ActivityId::PSI_IO | ActivityId::PSI_MEM if is_psi_total(column) => {
             1.0e-4
@@ -903,6 +921,11 @@ fn special_direct(
 ///
 /// 本家は `((double) curr - prev) / (100 * itv)` と **f64 で減算**している
 /// (`S_VALUE` の符号なし減算ではない)。計算順序もそのまま合わせる。
+///
+/// **同じ係数が [`rate_scale`] にもある。** 区間値はここで直接 `100 × itv` で
+/// 割るが、期間集計は生のレート `Δ/itv×100` に `1e-4` を掛けて同じ値に到達する。
+/// 2 箇所に分かれているのは本家の式の形をそのまま残すためで、
+/// 両者が一致することは `single_interval_aggregate_matches_instant_value` が固定する。
 fn psi_pressure(
     plan: &DecodePlan,
     prev: &ItemSnapshot,
@@ -1742,15 +1765,17 @@ impl CpuInterval {
 
     /// この CPU の計算文脈。
     ///
-    /// 分母 (`tick_total`) と集約フラグを設定済みの [`ComputeContext`] を返す。
-    /// 呼び出し側が `tick_total` を自分で詰める必要はない。
-    pub fn context(&self, itv_cs: u64) -> ComputeContext {
+    /// `base` の `itv_cs` / `continuous` / `has_prev` はそのまま引き継ぎ、
+    /// 分母 (`tick_total`) と集約フラグだけを上書きする。
+    ///
+    /// **連続性を勝手に真にしない。** RESTART 直後や item が入れ替わった区間で
+    /// `continuous` を偽装すると、全ゼロの前値から 100% が出る。
+    /// 呼び出し側はその区間の連続性を持っているので、それを渡してもらう。
+    pub fn context(&self, base: ComputeContext) -> ComputeContext {
         ComputeContext {
-            itv_cs,
             tick_total: Some(self.tick_total),
-            continuous: true,
-            has_prev: true,
             aggregate_item: self.role == CpuRole::Aggregate,
+            ..base
         }
     }
 
@@ -1844,13 +1869,11 @@ impl CpuAggregate {
     /// 分母は「オンラインだった CPU の tick 合計」なので、
     /// `%user + … + %idle` は常に 100% になる (オフライン時間は分母に入らない)。
     /// `CPU all が tickless になることはない`前提で 1 以上に補正する (03 §1.4.5)。
-    pub fn context(&self, itv_cs: u64) -> ComputeContext {
+    pub fn context(&self, base: ComputeContext) -> ComputeContext {
         ComputeContext {
-            itv_cs,
             tick_total: Some(self.tick_total.max(1)),
-            continuous: true,
-            has_prev: true,
             aggregate_item: true,
+            ..base
         }
     }
 
@@ -1978,17 +2001,41 @@ pub fn weighted_mhz(
     prev_slots: &[ItemSnapshot],
     curr_slots: &[ItemSnapshot],
 ) -> Computed {
+    let n = prev_slots.len().min(curr_slots.len());
+    weighted_mhz_core(plan, n, |k| &prev_slots[k], |k| &curr_slots[k])
+}
+
+/// [`weighted_mhz`] の**参照スライス**版。
+///
+/// 行が連続していない行列 (`A_IRQ` のように stride で走査するもの) でも
+/// clone を作らずに渡せる。
+fn weighted_mhz_refs(
+    plan: &DecodePlan,
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
+) -> Computed {
+    let n = prev_slots.len().min(curr_slots.len());
+    weighted_mhz_core(plan, n, |k| prev_slots[k], |k| curr_slots[k])
+}
+
+/// `wghMHz` の本体。スロットの取り出し方だけを呼び出し側から受け取る。
+fn weighted_mhz_core<'a>(
+    plan: &DecodePlan,
+    slots: usize,
+    prev_at: impl Fn(usize) -> &'a ItemSnapshot,
+    curr_at: impl Fn(usize) -> &'a ItemSnapshot,
+) -> Computed {
     let mut tisfreq: u64 = 0;
     let mut tis: u64 = 0;
-    let n = prev_slots.len().min(curr_slots.len());
-    for k in 0..n {
-        let freq = raw_column(plan, &curr_slots[k], freq_col::FREQ_KHZ)?;
+    for k in 0..slots {
+        let curr = curr_at(k);
+        let freq = raw_column(plan, curr, freq_col::FREQ_KHZ)?;
         // 未使用スロットで打ち切り
         if freq == 0 {
             break;
         }
-        let c = raw_column(plan, &curr_slots[k], freq_col::TIME_IN_STATE)?;
-        let p = raw_column(plan, &prev_slots[k], freq_col::TIME_IN_STATE)?;
+        let c = raw_column(plan, curr, freq_col::TIME_IN_STATE)?;
+        let p = raw_column(plan, prev_at(k), freq_col::TIME_IN_STATE)?;
         let d = c.wrapping_sub(p);
         tisfreq = tisfreq.wrapping_add((freq / 1000).wrapping_mul(d));
         tis = tis.wrapping_add(d);
@@ -2013,8 +2060,15 @@ pub fn weighted_mhz(
 
 /// 行列型 activity の 1 行分の値 (指摘 3)。
 ///
-/// `prev_slots` / `curr_slots` はその行 (= CPU / 割り込み) に属する
-/// 連続する `nr2` 個の item。要素の並びは `行 * nr2 + 列`。
+/// `prev_slots` / `curr_slots` はその論理行に属する item の**参照**を
+/// 出力に現れる順に並べたもの。参照で受けるのは、行の並びが activity で違うため。
+///
+/// - `A_PWR_FREQ`: 保存形も論理行も「CPU ごとに連続する `nr2` スロット」
+///   (`行 * nr2 + 列` の連続スライス)
+/// - `A_IRQ`: 保存形は 行 = CPU / 列 = 割り込みだが、出力の 1 行は
+///   「1 割り込み × 全 CPU」なので **stride 走査**した非連続の並びになる
+///
+/// どちらも参照を並べるだけで渡せるので、clone は要らない。
 ///
 /// 戻り値の長さは activity によって変わる。
 ///
@@ -2034,8 +2088,8 @@ pub fn matrix_row_values(
     id: ActivityId,
     column: usize,
     plan: &DecodePlan,
-    prev_slots: &[ItemSnapshot],
-    curr_slots: &[ItemSnapshot],
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
     ctx: &ComputeContext,
 ) -> Vec<Computed> {
     matrix_row_values_with(
@@ -2054,8 +2108,8 @@ pub fn matrix_row_values_strict(
     id: ActivityId,
     column: usize,
     plan: &DecodePlan,
-    prev_slots: &[ItemSnapshot],
-    curr_slots: &[ItemSnapshot],
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
     ctx: &ComputeContext,
 ) -> Vec<Computed> {
     matrix_row_values_with(
@@ -2074,14 +2128,14 @@ fn matrix_row_values_with(
     id: ActivityId,
     column: usize,
     plan: &DecodePlan,
-    prev_slots: &[ItemSnapshot],
-    curr_slots: &[ItemSnapshot],
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
     ctx: &ComputeContext,
     policy: MissingPolicy,
 ) -> Vec<Computed> {
     // `wghMHz` は行全体で 1 値。スロットごとには意味を持たない
     if id == ActivityId::PWR_FREQ && column == freq_col::WGH_MHZ {
-        return vec![weighted_mhz(plan, prev_slots, curr_slots)];
+        return vec![weighted_mhz_refs(plan, prev_slots, curr_slots)];
     }
 
     let Some(def) = crate::layout::registry::lookup(id) else {
@@ -2096,14 +2150,15 @@ fn matrix_row_values_with(
         .iter()
         .enumerate()
         .map(|(n, curr)| {
-            let prev = prev_slots.get(n).unwrap_or(&empty);
+            let matched = prev_slots.get(n).copied();
             let mut slot_ctx = *ctx;
             // 前サンプルに対応スロットが無い = 差分が取れない
-            if prev_slots.get(n).is_none() {
+            if matched.is_none() {
                 slot_ctx.has_prev = false;
             }
             // `A_IRQ` の先頭スロットは「全 CPU 合計」列で逆行クランプが効く
             slot_ctx.aggregate_item = n == 0;
+            let prev = matched.unwrap_or(&empty);
             column_value_with(id, column, meta, plan, prev, curr, &slot_ctx, policy)
         })
         .collect()
@@ -2195,13 +2250,6 @@ pub fn rate_sample(
     let curr_v = raw_column(plan, curr, column)?;
     let prev_v = raw_column(plan, prev, column)?;
 
-    let bits = counter_bits(plan, column);
-    let (delta, wrapped) = match compute_delta(prev_v, curr_v, bits, DeltaContext::default()) {
-        Delta::Valid(d) => (d, false),
-        Delta::Wrapped(d) => (d, true),
-        Delta::Unavailable(disc) => return Err(ComputeIssue::Discontinuous(disc)),
-    };
-
     let denominator = match ctx.tick_total {
         // tick 合計 0 = その CPU は動いていない。0% と報告しない
         Some(0) => {
@@ -2216,6 +2264,27 @@ pub fn rate_sample(
             ));
         }
         None => ctx.itv_cs,
+    };
+
+    // 逆行クランプは**サンプル単位**で効く (03 §1.4.4 / §id=3 / §id=6 / §5.1)。
+    // 本家が「減っていたら 0」と決めている列は、その区間の寄与を 0 として
+    // 次の区間へ進む。区間を跨いで端点差分を取ると値が変わる
+    // (Δ = -5, +10 のとき サンプル毎クランプは 10、端点差分は 5)。
+    // ここを `column_value` と同じ判定にすることで
+    // 「1 区間の集計 == その区間の瞬時値」が逆行区間でも成り立つ。
+    if curr_v < prev_v && clamps_decrease(id, column, ctx) {
+        return Ok(RateSample {
+            delta: 0,
+            denominator,
+            wrapped: false,
+        });
+    }
+
+    let bits = counter_bits(plan, column);
+    let (delta, wrapped) = match compute_delta(prev_v, curr_v, bits, DeltaContext::default()) {
+        Delta::Valid(d) => (d, false),
+        Delta::Wrapped(d) => (d, true),
+        Delta::Unavailable(disc) => return Err(ComputeIssue::Discontinuous(disc)),
     };
 
     Ok(RateSample {
@@ -3900,7 +3969,7 @@ mod tests {
         );
         assert_eq!(iv.role(), CpuRole::Single);
         assert_eq!(iv.tickless_value(cpu_col::IDLE), None);
-        let ctx = iv.context(100);
+        let ctx = iv.context(ComputeContext::new(100));
         assert_eq!(ctx.tick_total, Some(1_000));
         assert!(!ctx.aggregate_item);
         assert_eq!(
@@ -3936,7 +4005,7 @@ mod tests {
             agg.tick_total, 1,
             "「CPU all が tickless になることはない」"
         );
-        assert!(agg.context(100).aggregate_item);
+        assert!(agg.context(ComputeContext::new(100)).aggregate_item);
     }
 
     /// 集約 (`all` 行) は CPU ごとに補正してから合算する (指摘 1 / 03 §1.4.3)。
@@ -3962,7 +4031,7 @@ mod tests {
         // guest を含んでいても分母は 8 フィールドぶんのまま
         assert_eq!(agg.tick_total, 2_000);
         assert!(!agg.is_offline(1));
-        let ctx = agg.context(1_000);
+        let ctx = agg.context(ComputeContext::new(1_000));
         assert!(ctx.aggregate_item);
         assert_eq!(ctx.tick_total, Some(2_000));
         assert_eq!(
@@ -4247,8 +4316,8 @@ mod tests {
             ActivityId::PWR_FREQ,
             freq_col::WGH_MHZ,
             &plan,
-            &[p0, p1],
-            &[c0, c1],
+            &[&p0, &p1],
+            &[&c0, &c1],
             &ctx,
         );
         assert_eq!(got.len(), 1, "行全体で 1 値");
@@ -4274,8 +4343,8 @@ mod tests {
             ActivityId::IRQ,
             irq_col::COUNT,
             &plan,
-            &[p_all, p_cpu0.clone()],
-            &[c_all, c_cpu0.clone()],
+            &[&p_all, &p_cpu0],
+            &[&c_all, &c_cpu0],
             &ctx,
         );
         assert_eq!(got, vec![Ok(300.0), Ok(100.0)]);
@@ -4290,8 +4359,8 @@ mod tests {
             ActivityId::IRQ,
             irq_col::COUNT,
             &plan,
-            &[high.clone(), high],
-            &[low.clone(), low],
+            &[&high, &high],
+            &[&low, &low],
             &ctx,
         );
         assert_eq!(
@@ -4446,21 +4515,30 @@ mod tests {
     fn missing_kind_separates_zero_filled_from_absent() {
         assert_eq!(
             missing_kind(ComputeIssue::UnsupportedBySource),
-            MissingKind::ZeroFilled,
+            Some(MissingKind::ZeroFilled),
             "その世代にフィールドが無いだけ = 本家は 0 埋めする"
         );
         for issue in [
             ComputeIssue::MissingInSample,
             ComputeIssue::Discontinuous(Discontinuity::FirstSample),
             ComputeIssue::Discontinuous(Discontinuity::Restart),
+            ComputeIssue::Discontinuous(Discontinuity::AmbiguousDecrease),
+        ] {
+            assert_eq!(
+                missing_kind(issue),
+                Some(MissingKind::Absent),
+                "ゼロ補完してはいけない: {issue:?}"
+            );
+        }
+        for issue in [
             ComputeIssue::NotNumeric,
             ComputeIssue::NeedsItemGroup,
             ComputeIssue::NotImplemented,
         ] {
             assert_eq!(
                 missing_kind(issue),
-                MissingKind::Absent,
-                "ゼロ補完してはいけない: {issue:?}"
+                None,
+                "値の欠落ではない (呼び出し方の問題): {issue:?}"
             );
         }
     }

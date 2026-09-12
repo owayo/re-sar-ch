@@ -74,6 +74,9 @@ pub fn write_text<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     }
 
     writeln!(out)?;
+    write_background(out, a)?;
+
+    writeln!(out)?;
     write_coverage(out, &a.coverage)?;
 
     writeln!(out)?;
@@ -109,11 +112,35 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "比較基準: {}  採取間隔の代表値: {}  エピソード結合: {} 秒以内",
+        "比較基準: {}  採取間隔の代表値: {}  エピソード結合: 始まりが {} 秒以内 (広がりの上限 {})",
         a.baseline_basis.label(),
         a.interval_p90_secs
             .map_or("不明".to_string(), |i| format!("{i} 秒")),
-        a.episode_gap_secs
+        a.episode_gap_secs,
+        if a.episode_onset_span_cap_secs == u64::MAX {
+            "なし".to_string()
+        } else {
+            format!("{} 秒", a.episode_onset_span_cap_secs)
+        }
+    )?;
+    let s = &a.report_scope;
+    writeln!(
+        out,
+        "報告範囲: {} → {}  最低優先度: {}  背景の所見に回す割合: 入力の {}% 以上",
+        s.from.label(),
+        s.to.label(),
+        s.min_priority.label(),
+        a.standing_span_percent
+    )?;
+    writeln!(
+        out,
+        "件数: 入力全体の検出 {} 件 / 報告範囲の検出 {} 件 / 背景の所見 {} 件 / \
+         エピソード {} 件 (優先度で除外 {} 件)",
+        s.detections_in_input,
+        s.detections_in_report_window,
+        s.background_findings,
+        s.episodes_before_priority_filter,
+        s.episodes_excluded_by_priority
     )?;
     writeln!(
         out,
@@ -137,21 +164,40 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode) -> io::Result<()> {
         epoch(ep.support.start_ust),
         epoch(ep.support.end_ust)
     )?;
+    // **エピソードは検出の始まりでまとめている。** 時間範囲の終端は
+    // 含まれる検出のうち最も長いものの終端なので、両方を出さないと
+    // 「いつ始まったことのまとまりか」が読めない。
+    if ep.last_onset_ust > ep.support.start_ust {
+        writeln!(
+            out,
+            "  (検出の始まりは {} 〜 {} に集まっている)",
+            epoch(ep.support.start_ust),
+            epoch(ep.last_onset_ust)
+        )?;
+    }
     writeln!(out, "  {} {}", e.priority.mark(), e.headline)?;
+    // **優先度は検出単位。** 見出しの検出について書いていることを明示する
+    // (別の検出の持続性で上がったのではない)。
     writeln!(
         out,
-        "     優先度: {} (下地 {})",
+        "     優先度: {} (下地 {}) — この見出しの検出について",
         e.priority.label(),
         e.base_priority.label()
     )?;
     for r in &e.priority_reasons {
         writeln!(out, "       - {r}")?;
     }
+    if let Some(longest) = &e.longest_running_headline {
+        writeln!(out, "     最も長く続いた検出: {longest}")?;
+    }
     let s = &e.sufficiency;
+    writeln!(out, "     根拠の充足度: {}", e.sufficiency_spread.label())?;
     writeln!(
         out,
-        "     根拠の充足度: {} (基準 {} 採取 / 検出 {} 採取 / 欠測 {} / 不連続 {})",
-        s.level.label(),
+        "       内訳 ({}): {} 採取 / 要 {} 採取 — 基準 {} 採取 / 検出 {} 採取 / 欠測 {} / 不連続 {}",
+        s.basis.label(),
+        s.material_samples,
+        s.required_samples,
         s.baseline_samples,
         s.detected_samples,
         s.missing_samples,
@@ -170,6 +216,13 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode) -> io::Result<()> {
             out,
             "       (同じ系列に {} つの観点が当たった。3 経路は相関するので独立な裏付けの数ではない)",
             ep.max_viewpoints_on_one_series
+        )?;
+    }
+    if !e.corroborating_series.is_empty() {
+        writeln!(
+            out,
+            "       水準変化と別の観点が同じ時刻で当たった系列: {} (優先度は上げていない)",
+            e.corroborating_series.join(", ")
         )?;
     }
 
@@ -325,6 +378,20 @@ fn write_detection<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
                 "         閾値 MAD の {ratio_threshold} 倍以上、かつ絶対差 {min_absolute_deviation:.2} 以上 (実測 {peak_absolute_deviation:.2})"
             )?;
         }
+        // **倍数を書かない。** 散らばりが測れないので基準になる倍数が無い。
+        DecisionBasis::AbsoluteDeparture {
+            dispersion,
+            min_absolute_deviation,
+            peak_absolute_deviation,
+            ..
+        } => {
+            writeln!(
+                out,
+                "         絶対差 {min_absolute_deviation:.2} 以上 (実測 {peak_absolute_deviation:.2})。\
+                 倍数では判断していない ({})",
+                dispersion.label()
+            )?;
+        }
         DecisionBasis::LevelShift {
             min_shift,
             pooled_mad,
@@ -392,6 +459,64 @@ fn write_baseline<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
     Ok(())
 }
 
+/// 背景の所見を書き出す。
+///
+/// **エピソードと同じ画面に出す。** 「一日中スワップが使われている」を
+/// 別枠にした理由 (いつの手がかりを持たない) と、そのぶん
+/// エピソードから外れていることを読み手へ伝えるため。
+fn write_background<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
+    let excluded = a.report_scope.background_excluded_by_priority;
+    if a.background.is_empty() {
+        writeln!(
+            out,
+            "背景の所見なし (入力のほぼ全体を占める検出は無かった{})",
+            if excluded > 0 {
+                format!("。優先度の下限で {excluded} 件を除外")
+            } else {
+                String::new()
+            }
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "背景の所見 (入力のほぼ全体を占め、いつ起きたかの手がかりを持たない)"
+    )?;
+    for b in &a.background {
+        let f = &b.finding;
+        writeln!(
+            out,
+            "  {} {}{}",
+            f.priority.mark(),
+            f.headline,
+            b.share_of_input_percent
+                .map_or(String::new(), |p| format!(" — 入力の {p}% を占める"))
+        )?;
+        writeln!(
+            out,
+            "     優先度: {} (下地 {}) — この検出について",
+            f.priority.label(),
+            f.base_priority.label()
+        )?;
+        for r in &f.priority_reasons {
+            writeln!(out, "       - {r}")?;
+        }
+        writeln!(
+            out,
+            "     根拠の充足度: {} ({}: {} 採取 / 要 {} 採取)",
+            f.sufficiency.level.label(),
+            f.sufficiency.basis.label(),
+            f.sufficiency.material_samples,
+            f.sufficiency.required_samples
+        )?;
+        write_detection(out, &b.detection)?;
+    }
+    if excluded > 0 {
+        writeln!(out, "  (優先度の下限で {excluded} 件を除外した)")?;
+    }
+    Ok(())
+}
+
 fn write_coverage<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()> {
     writeln!(out, "評価の網羅度")?;
     writeln!(
@@ -407,7 +532,44 @@ fn write_coverage<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<(
         write_tally(out, route, tally)?;
     }
 
-    write_blocked(out, c)
+    write_blocked(out, c)?;
+    write_basis_leaning(out, c)
+}
+
+/// 比較基準が異変側へ寄っている系列を列挙する。
+///
+/// **エピソードの有無にかかわらず出す。** 検出が立たなかった系列の警告を
+/// text から落とすと、同じ留保が JSON にだけ残り、形式ごとに伝播が変わる。
+/// `%idle` が 4 と 6 を交互に取る系列では中央値 5 が固定条件の内側だが、
+/// 連続 2 回を満たさないので固定条件の検出は無く、逸脱も水準変化も
+/// 絶対差の下限に届かない。それでも「この系列の基準は当てにならない」は伝える。
+fn write_basis_leaning<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()> {
+    let series: Vec<String> = c.basis_leaning().map(|e| e.series.display()).collect();
+    if series.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "  比較基準が異変側へ寄っている疑いがある系列: {} 系列 (検出の有無とは無関係)",
+        series.len()
+    )?;
+    let shown: Vec<&str> = series
+        .iter()
+        .take(MAX_LISTED_SERIES_IN_EPISODE)
+        .map(String::as_str)
+        .collect();
+    let rest = series.len().saturating_sub(shown.len());
+    let tail = if rest > 0 {
+        format!(", 他 {rest} 系列")
+    } else {
+        String::new()
+    };
+    writeln!(out, "    {}{tail}", shown.join(", "))?;
+    writeln!(
+        out,
+        "    (中央値そのものが固定条件の内側にある、または材料の半分以上が条件を満たしている。\
+         この系列の逸脱検出は当てにならない)"
+    )
 }
 
 /// 系列ごとに列挙できる件数の上限。
@@ -505,7 +667,8 @@ pub fn write_json<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Resu
     writeln!(out)
 }
 
-/// 行単位。起動区間ごとにヘッダ 1 行 + エピソード 1 件 = 1 行 + 網羅度 1 行。
+/// 行単位。起動区間ごとにヘッダ 1 行 + エピソード 1 件 = 1 行
+/// + 背景の所見 1 件 = 1 行 + 網羅度 1 行。
 ///
 /// どの行がどの起動区間のものかを `segment` で示す。
 pub fn write_ndjson<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Result<()> {
@@ -520,9 +683,13 @@ pub fn write_ndjson<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Re
             "thresholds": a.thresholds,
             "baseline_basis": a.baseline_basis,
             "episode_gap_secs": a.episode_gap_secs,
+            "episode_onset_span_cap_secs": a.episode_onset_span_cap_secs,
+            "standing_span_percent": a.standing_span_percent,
             "interval_p90_secs": a.interval_p90_secs,
             "source": a.source,
             "period": a.period,
+            // 報告時間帯・最低優先度・除外件数。**行だけを見て絞り込みを復元できるように**
+            "report_scope": a.report_scope,
             "notes": a.notes,
         });
         serde_json::to_writer(&mut *out, &head).map_err(json_err)?;
@@ -534,6 +701,18 @@ pub fn write_ndjson<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Re
                 "record": "episode",
                 "segment": segment,
                 "episode": e,
+            });
+            serde_json::to_writer(&mut *out, &row).map_err(json_err)?;
+            writeln!(out)?;
+        }
+
+        // 背景の所見もエピソードと同じ粒度で 1 件 = 1 行
+        for b in &a.background {
+            let row = serde_json::json!({
+                "schema_version": a.schema_version,
+                "record": "background",
+                "segment": segment,
+                "background": b,
             });
             serde_json::to_writer(&mut *out, &row).map_err(json_err)?;
             writeln!(out)?;
@@ -560,6 +739,14 @@ mod tests {
     use crate::detect::{DetectOptions, detect};
 
     fn assessment(values: &[f64]) -> Assessment {
+        assessment_with_period(values, PeriodBounds::default())
+    }
+
+    /// 期間を明示した所見。
+    ///
+    /// 「入力のほぼ全体を占める」の分母は期間なので、背景の所見を
+    /// 試すテストでは期間を渡す。
+    fn assessment_with_period(values: &[f64], period: PeriodBounds) -> Assessment {
         let ts = single(cpu_idle(&vals(values)));
         let opts = DetectOptions::default();
         let outcome = detect(&ts, &opts);
@@ -569,9 +756,19 @@ mod tests {
                 label: "example".to_string(),
                 ..Default::default()
             },
-            PeriodBounds::default(),
+            period,
             &opts,
         )
+    }
+
+    /// 値の並びをちょうど覆う期間。
+    fn period_of(values: &[f64]) -> PeriodBounds {
+        PeriodBounds {
+            first_ust: Some(T0),
+            last_ust: Some(T0 + values.len() as u64 * STEP_SECS),
+            samples: values.len() as u64,
+            ..Default::default()
+        }
     }
 
     fn render(a: &Assessment) -> String {
@@ -686,5 +883,124 @@ mod tests {
         a.filter_priority(Priority::Investigate);
         let text = render(&a);
         assert!(text.contains("エピソードなし"), "{text}");
+    }
+
+    /// 基準の寄りを、検出が無くても text に出す (Issue #5 ⑲)。
+    ///
+    /// `%idle` が 4 と 6 を交互に取ると中央値 5 は固定条件の内側だが、
+    /// 連続 2 回を満たさないので固定条件の検出は無く、
+    /// 逸脱も水準変化も絶対差の下限に届かない。
+    /// **JSON にだけ警告が残る状態にしてはいけない。**
+    #[test]
+    fn the_coverage_lists_series_whose_basis_leans_even_without_an_episode() {
+        let v: Vec<f64> = (0..30)
+            .map(|i| if i % 2 == 0 { 4.0 } else { 6.0 })
+            .collect();
+        let a = assessment(&v);
+        assert!(a.episodes.is_empty(), "この入力では検出が立たない");
+        assert_eq!(
+            a.coverage.series_with_basis_leaning, 1,
+            "網羅度は基準の寄りを数える"
+        );
+
+        let text = render(&a);
+        assert!(
+            text.contains("比較基準が異変側へ寄っている疑いがある系列"),
+            "{text}"
+        );
+        assert!(text.contains("A_CPU/all/idle"), "{text}");
+
+        // JSON も同じことを持っている (形式間で表現をずらさない)
+        let mut buf: Vec<u8> = Vec::new();
+        write_json(&mut buf, std::slice::from_ref(&a)).expect("JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(buf).expect("UTF-8")).expect("パース");
+        let cov = &parsed["assessments"][0]["coverage"];
+        assert_eq!(cov["series_with_basis_leaning"], 1);
+        let leaning = cov["series"]
+            .as_array()
+            .expect("系列")
+            .iter()
+            .filter(|e| e["basis_may_reflect_the_anomaly"] == true)
+            .count();
+        assert_eq!(leaning, 1);
+    }
+
+    /// 背景の所見を 3 形式すべてに出す (Issue #5 ⑨)。
+    #[test]
+    fn a_background_finding_appears_in_every_format() {
+        // 30 点すべて %idle 2% → 入力全体を覆うので背景の所見
+        let v = vec![2.0; 30];
+        let a = assessment_with_period(&v, period_of(&v));
+        assert_eq!(a.background.len(), 1, "背景の所見が 1 件");
+        assert!(
+            a.episodes.is_empty(),
+            "いつの手がかりが無いものをエピソードにしない"
+        );
+
+        let text = render(&a);
+        assert!(text.contains("背景の所見"), "{text}");
+        assert!(text.contains("入力の 100% を占める"), "{text}");
+        assert!(text.contains("エピソードなし"), "{text}");
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_json(&mut buf, std::slice::from_ref(&a)).expect("JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(buf).expect("UTF-8")).expect("パース");
+        assert_eq!(
+            parsed["assessments"][0]["background"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_ndjson(&mut buf, std::slice::from_ref(&a)).expect("NDJSON");
+        let text = String::from_utf8(buf).expect("UTF-8");
+        let records: Vec<String> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).expect("パース")["record"]
+                    .as_str()
+                    .expect("record")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            records,
+            vec!["detect_header", "background", "coverage"],
+            "背景の所見も 1 件 = 1 行"
+        );
+    }
+
+    /// 報告時間帯と最低優先度を 3 形式すべてに出す (Issue #5 ㉑)。
+    #[test]
+    fn the_report_scope_is_visible_in_every_format() {
+        let mut a = assessment(&[50.0; 20]);
+        a.filter_priority(Priority::Investigate);
+
+        let text = render(&a);
+        assert!(text.contains("報告範囲:"), "{text}");
+        assert!(text.contains("最低優先度: 調査"), "{text}");
+        assert!(text.contains("件数: 入力全体の検出"), "{text}");
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_json(&mut buf, std::slice::from_ref(&a)).expect("JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(buf).expect("UTF-8")).expect("パース");
+        let scope = &parsed["assessments"][0]["report_scope"];
+        assert_eq!(scope["min_priority"], "investigate");
+        assert!(scope["detections_in_input"].is_number());
+        assert!(scope["episodes_excluded_by_priority"].is_number());
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_ndjson(&mut buf, std::slice::from_ref(&a)).expect("NDJSON");
+        let first = String::from_utf8(buf)
+            .expect("UTF-8")
+            .lines()
+            .next()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("パース"))
+            .expect("ヘッダ行");
+        assert_eq!(first["report_scope"]["min_priority"], "investigate");
     }
 }

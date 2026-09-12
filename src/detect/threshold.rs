@@ -145,17 +145,28 @@ mod tests {
         super::detect(&series, entry, &baseline, &opts)
     }
 
-    /// `%idle` が 5% 以下の区間を飽和として拾う。
+    /// `%idle` が 5% 以下で続いた区間を拾う。
+    ///
+    /// **形と優先度はカタログの宣言をそのまま運ぶ。**
+    /// この経路が独自に「飽和」と解釈してはいけない
+    /// (`%idle ≤ 5` が何を意味するかはカタログ側の判断である)。
     #[test]
     fn cpu_idle_exhaustion_is_detected() {
         let mut v = vec![80.0; 20];
         v[10] = 1.0;
         v[11] = 2.0;
         v[12] = 0.5;
-        let (found, status) = run(cpu_idle(&vals(&v)));
+        let t = cpu_idle(&vals(&v));
+        let declared = entry_for(&t)
+            .fixed
+            .iter()
+            .find(|f| f.id == "cpu-idle-exhausted")
+            .expect("カタログの固定条件");
+        let (found, status) = run(t);
         assert_eq!(found.len(), 1);
         let d = &found[0];
-        assert_eq!(d.pattern, Pattern::Saturation);
+        assert_eq!(d.pattern, declared.pattern, "宣言された形を運ぶ");
+        assert_eq!(d.base_priority, declared.priority, "宣言された優先度を運ぶ");
         assert_eq!(d.support.samples, 3);
         assert_eq!(d.route(), DetectRoute::FixedCondition);
         assert!(matches!(status, RouteStatus::Detected { count: 1 }));

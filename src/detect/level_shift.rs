@@ -14,11 +14,47 @@
 //! ([`crate::detect::DetectThresholds::shift_window_min_samples`]) で底を打つ。
 //! 窓が小さいと単発のスパイクが窓の中央値を動かしてしまうため。
 //!
-//! # 判定は 2 条件 + 持続性
+//! **底を打った結果、実際の窓は要求より長くなる。** 既定の 600 秒採取では
+//! `max(ceil(1800/600), 5) = 5` 点で、区間値なら各窓 3000 秒である。
+//! 「窓 1800 秒で判定した」と書くと嘘になるので、実際に使った点数と窓幅を
+//! 根拠 ([`crate::detect::DecisionBasis::LevelShift`] の `window_samples` /
+//! `window_secs`) に載せて出力へ渡す。
+//!
+//! # 欠測を挟んだ前後窓は比べない
+//!
+//! 欠測 (値が得られなかった採取) は連続区間を切らない
+//! ([`crate::detect::PreparedSeries::from_timeline`])。したがって
+//! **欠測を除いた配列の上で窓を切ると、低値 5 点と高値 5 点の間に
+//! 数時間の空白があっても水準変化が成立してしまう**。
+//! それは「この時刻に水準が変わった」と言える材料ではない。
+//! 固定条件・逸脱の経路には [`crate::detect::group_runs`] に時刻の
+//! 接続チェックがあるが、この経路には無かった。
+//!
+//! そこで**前後窓を合わせた区間が実時間で連続していること**を要求し、
+//! 途切れていればその分割候補を評価しない。1 点でも欠測を挟むと
+//! その間に何が起きたか分からないので、許容量は置かない。
+//! どの候補も評価できなければ「検出なし」ではなく**評価不能**として返す。
+//!
+//! # 傾向と段差を区別する
+//!
+//! 各窓を自身の中央値で中心化しても、**窓をまたぐ傾向は残る**。
+//! `runq-sz` が毎回 1 ずつ増えるだけの系列でも、前窓 `[0,1,2,3,4]` /
+//! 後窓 `[5,6,7,8,9]` は差 5・MAD 1・正規化差 3.37・持続率 80% を満たし、
+//! 存在しない段差を「この時刻に変わった」として報告してしまう。
+//! 自己相関のある負荷増加や定時バッチでは常に起こる。
+//!
+//! そこで窓内の傾きから**傾向で説明できる量**を見積もり、引いた残りで判定する
+//! ([`trend_explained_shift`])。傾きは前半・後半の中央値差という記述量で、
+//! 確率でも検定統計量でもない (規律 1)。
+//! **傾向は検出を減らす側にしか使わない** — 粗い推定で段差を大きくできる
+//! 作りにすると、推定誤差が新しい検出を生む。
+//!
+//! # 判定は 3 条件 + 持続性
 //!
 //! | # | 条件 | 理由 |
 //! |---|---|---|
 //! | a | 絶対差が指標ごとの最小有意変化量以上 | 単位を持つ差でないと読み手が判断できない |
+//! | a′ | **傾向を引いた段差**も最小有意変化量以上 | 滑らかな増加から架空の変化点を作らない |
 //! | b | 散らばりが測れたときのみ、正規化差も閾値以上 | 揺れの大きい系列で小さな段差を拾わない |
 //! | c | 後窓の 7 割以上が同方向へ最小変化量以上動いている | 単発の値が窓の中央値を押し出すのを防ぐ |
 //!
@@ -55,6 +91,10 @@ struct Split {
     before_median: f64,
     after_median: f64,
     shift: f64,
+    /// `shift` のうち窓内の傾きで説明できる量。
+    trend: f64,
+    /// 傾向を引いた残りの段差。**判定はこれで行う。**
+    step: f64,
     min_shift: f64,
     pooled_mad: Option<f64>,
     normalized: Option<f64>,
@@ -62,6 +102,20 @@ struct Split {
     /// 順位付けに使う大きさ。正規化できたならそれを、できなければ
     /// 最小変化量で割った絶対差を使う (単位の違う系列を混ぜないため)。
     rank: f64,
+}
+
+/// 実際に使った窓の寸法。
+///
+/// 要求幅 (設定値) と**実際の幅**は違う。点数の下限で底を打つと
+/// 実際の窓は要求より長くなるので、両方を根拠に載せる。
+#[derive(Debug, Clone, Copy)]
+struct WindowPlan {
+    /// 前後それぞれの点数。
+    points: usize,
+    /// 設定が要求した窓幅 (秒)。
+    requested_secs: u64,
+    /// 実際の窓幅 (秒) = 点数 × 採取間隔。
+    effective_secs: u64,
 }
 
 /// 水準変化で検出する。
@@ -93,21 +147,33 @@ pub fn detect(
 
     let th = &opts.thresholds;
     let mut out = Vec::new();
-    let mut any_window = false;
+    // 「前後窓を実時間で連続して取れた候補が 1 つでもあったか」。
+    // 窓が取れても欠測を挟んでいれば評価できていない (規律 7)
+    let mut any_evaluable = false;
 
     for segment in series.iter_segments() {
-        let Some(w) = window_size(segment, th.shift_window_secs, th.shift_window_min_samples)
-        else {
+        let Some(interval) = representative_interval(segment) else {
             continue;
         };
+        let w = window_points(interval, th.shift_window_secs, th.shift_window_min_samples);
         if segment.len() < 2 * w {
             continue;
         }
-        any_window = true;
+        let plan = WindowPlan {
+            points: w,
+            requested_secs: th.shift_window_secs,
+            effective_secs: effective_window_secs(interval, w, series.origin.is_instant()),
+        };
 
         // 分割候補を順に評価する
         let mut candidates: Vec<Split> = Vec::new();
         for at in w..=segment.len() - w {
+            // **欠測を挟む比較は評価しない。** 変化した時刻を指せない
+            if !is_contiguous(&segment[at - w..at + w]) {
+                continue;
+            }
+            any_evaluable = true;
+
             let before = &segment[at - w..at];
             let after = &segment[at..at + w];
             let Some(mut split) = evaluate(before, after, entry) else {
@@ -119,6 +185,10 @@ pub fn detect(
                 continue;
             }
             if split.shift.abs() < split.min_shift {
+                continue;
+            }
+            // 傾向で説明できる差は段差ではない
+            if split.step.abs() < split.min_shift {
                 continue;
             }
             if split.persistence < th.shift_persistence_share {
@@ -137,7 +207,7 @@ pub fn detect(
         for best in collapse(&candidates) {
             let after = &segment[best.at..best.at + w];
             let before = series.support_of(&segment[best.at - w..best.at]);
-            out.push(build(series, entry, baseline, best, before, after));
+            out.push(build(series, entry, baseline, best, plan, before, after));
         }
     }
 
@@ -145,8 +215,13 @@ pub fn detect(
     stamp_thresholds(&mut out, opts);
 
     if out.is_empty() {
-        if !any_window {
-            // 前後窓を取れる連続区間が無い。**「検出なし」ではない。**
+        if !any_evaluable {
+            // 実時間で連続した前後窓が取れなかった。**「検出なし」ではない。**
+            //
+            // 長さが足りない場合と、欠測を挟んでいて連続した窓が取れない場合が
+            // ある。どちらも「取れる窓が無い」だが、理由を分けて出せると
+            // 読み手が次に何をすべきか分かる (Issue #5 の 4 / 5。
+            // `NotEvaluated` の variant 追加は `analyze::assessment` 側の担当)
             return (
                 Vec::new(),
                 RouteStatus::NotEvaluated {
@@ -160,13 +235,36 @@ pub fn detect(
     (out, RouteStatus::Detected { count })
 }
 
-/// 窓のサンプル数。
+/// 窓の点数。
 ///
-/// 採取間隔が取れない (区間長が全て 0) 場合は評価しない。
-fn window_size(segment: &[Observation], window_secs: u64, min_samples: usize) -> Option<usize> {
-    let interval = representative_interval(segment)?;
+/// 要求幅を採取間隔で割り、**点数の下限で底を打つ**。
+/// 底を打った場合は実際の窓幅が要求より長くなるので、
+/// [`WindowPlan::effective_secs`] として根拠に載せる。
+fn window_points(interval: u64, window_secs: u64, min_samples: usize) -> usize {
     let by_time = window_secs.div_ceil(interval.max(1)) as usize;
-    Some(by_time.max(min_samples))
+    by_time.max(min_samples)
+}
+
+/// 実際の窓幅 (秒)。
+///
+/// 区間値は `点数 × 採取間隔` を覆う。瞬時値は**採取と採取の間を
+/// 観測していない**ので、5 点の広がりは 4 間隔ぶんである (規律 5)。
+/// [`super::PreparedSeries::support_of`] が作る範囲と一致させる。
+fn effective_window_secs(interval: u64, points: usize, instant: bool) -> u64 {
+    let spans = if instant {
+        (points as u64).saturating_sub(1)
+    } else {
+        points as u64
+    };
+    interval.saturating_mul(spans)
+}
+
+/// 観測が実時間で連続しているか (欠測を挟んでいないか)。
+///
+/// 欠測点は連続区間を切らないので、1 つの連続区間の中でも観測の間に
+/// 穴が開く。穴を挟んだ前後の窓から「この時刻に水準が変わった」とは言えない。
+fn is_contiguous(window: &[Observation]) -> bool {
+    window.windows(2).all(|p| p[0].end_ust == p[1].start_ust)
 }
 
 /// 連続区間の採取間隔の代表値 (秒)。
@@ -203,14 +301,22 @@ fn evaluate(before: &[Observation], after: &[Observation], entry: &CatalogEntry)
     let min_shift = magnitude_floor(entry.shift, before_median)?;
     let shift = after_median - before_median;
 
+    // 窓をまたぐ傾向は窓ごとの中心化では消えない。引いた残りで判定する
+    let trend = trend_explained_shift(&bv, &av);
+    let step = step_of(shift, trend);
+
     // 各窓を自身の中央値で中心化した残差を束ねる。
     // 段差を含めたまま束ねると尺度が段差自身で膨らむ。
     let mut residuals: Vec<f64> = bv.iter().map(|v| v - before_median).collect();
     residuals.extend(av.iter().map(|v| v - after_median));
     let pooled = mad(&residuals, 0.0).filter(|m| *m > 0.0);
-    let normalized = pooled.map(|m| shift.abs() / (MAD_SCALE * m));
+    // 正規化するのは**段差**。観測差を正規化すると傾向の分まで
+    // 「散らばりの何倍」に数えてしまう
+    let normalized = pooled.map(|m| step.abs() / (MAD_SCALE * m));
 
-    // 持続性: 後窓のうち前窓の水準から同方向へ最小変化量以上離れた割合
+    // 持続性: 後窓のうち前窓の水準から同方向へ最小変化量以上離れた割合。
+    // **これは観測された値についての事実**なので傾向を引かない
+    // (「後窓の値が前窓の水準から離れたままだったか」を数えている)。
     let direction = ShiftDirection::of(shift);
     let moved = av
         .iter()
@@ -224,8 +330,8 @@ fn evaluate(before: &[Observation], after: &[Observation], entry: &CatalogEntry)
     let rank = match normalized {
         Some(n) => n,
         // 正規化できない場合は単位を消すため最小変化量で割る
-        None if min_shift > 0.0 => shift.abs() / min_shift,
-        None => shift.abs(),
+        None if min_shift > 0.0 => step.abs() / min_shift,
+        None => step.abs(),
     };
 
     Some(Split {
@@ -233,12 +339,68 @@ fn evaluate(before: &[Observation], after: &[Observation], entry: &CatalogEntry)
         before_median,
         after_median,
         shift,
+        trend,
+        step,
         min_shift,
         pooled_mad: pooled,
         normalized,
         persistence,
         rank,
     })
+}
+
+/// 観測差のうち、窓内の傾きで説明できる量。
+///
+/// 各窓を前半と後半に割り、中央値の差から 1 サンプルあたりの傾きを取る。
+/// 前後 2 つの窓から得た傾きを平均し、窓の中央値の位置の差 (= 窓の点数) を
+/// 掛けたものが「傾向だけで生じる中央値差」である。
+///
+/// **確率でも検定統計量でもない。** 「この窓では 1 採取あたりこれだけ
+/// 動いていた」という記述量である (規律 1)。中央値の差を使うのは、
+/// 単発のスパイクで傾きが跳ねないようにするため。
+///
+/// 窓が 4 点未満のときは前半・後半に 2 点ずつ取れないので 0 を返す
+/// (傾きを推定しない = 傾向による棄却をしない)。
+fn trend_explained_shift(before: &[f64], after: &[f64]) -> f64 {
+    let w = before.len();
+    if w < 4 || after.len() != w {
+        return 0.0;
+    }
+    let half = w / 2;
+    // 前半の中央値と後半の中央値の位置の差 (サンプル数)
+    let distance = (w - half) as f64;
+    let slope = |v: &[f64]| -> Option<f64> {
+        let lo = median(&v[..half])?;
+        let hi = median(&v[w - half..])?;
+        Some((hi - lo) / distance)
+    };
+    match (slope(before), slope(after)) {
+        (Some(sb), Some(sa)) => (sb + sa) / 2.0 * w as f64,
+        _ => 0.0,
+    }
+}
+
+/// 観測差から傾向で説明できる分を引いた段差。
+///
+/// **傾向は検出を減らす側にしか使わない。** 傾きの推定は窓内の中央値差という
+/// 粗いものなので、それで段差を大きくできる作りにすると推定誤差が新しい検出を
+/// 生む。したがって結果は
+///
+/// - 符号が `shift` と同じ (または 0)
+/// - 大きさが `|shift|` を超えない
+///
+/// を必ず満たす。傾向が逆向きなら観測差をそのまま採り、
+/// 傾向が観測差以上なら「傾向だけで説明できる」として 0 にする。
+fn step_of(shift: f64, trend: f64) -> f64 {
+    if trend * shift <= 0.0 {
+        // 傾向が無い / 逆向き。観測差をそのまま採る (増やさない)
+        shift
+    } else if trend.abs() >= shift.abs() {
+        // 観測差は傾向だけで説明できる
+        0.0
+    } else {
+        shift - trend
+    }
 }
 
 /// 分割候補の優劣。
@@ -281,6 +443,7 @@ fn build(
     entry: &'static CatalogEntry,
     baseline: &Baseline,
     split: Split,
+    plan: WindowPlan,
     before: super::TemporalSupport,
     after: &[Observation],
 ) -> Detection {
@@ -290,12 +453,17 @@ fn build(
         before_median: split.before_median,
         after_median: split.after_median,
         shift: split.shift,
+        trend_explained_shift: split.trend,
+        step_shift: split.step,
         min_shift: split.min_shift,
         pooled_mad: split.pooled_mad,
         normalized_shift: split.normalized,
         normalized_threshold: 0.0,
         persistence_share: split.persistence,
         persistence_threshold: 0.0,
+        window_samples: plan.points as u64,
+        window_requested_secs: plan.requested_secs,
+        window_secs: plan.effective_secs,
         before,
         after: after_support,
     };
@@ -336,9 +504,42 @@ fn stamp_thresholds(detections: &mut [Detection], opts: &DetectOptions) {
 
 #[cfg(test)]
 mod tests {
+    use crate::analyze::metric_catalog::{DeviationInterest, ItemScope};
+    use crate::analyze::timeline::SINGLE_ITEM;
+
     use super::super::testing::*;
     use super::super::*;
     use super::*;
+
+    /// 水準変化の方向宣言だけを差し替えたカタログ項目 (テスト用)。
+    ///
+    /// **逸脱の宣言 (`deviation`) は `Upper` に固定する。**
+    /// この経路が見るのは `shift_direction` であって `deviation` ではない、
+    /// という分離をテストで固定するため (逸脱の宣言を流用していた頃は、
+    /// 処理量の指標で「止まった」を検出前に捨てていた)。
+    ///
+    /// 指標ごとの方向はカタログが決めるので、ここでは
+    /// 「どちらの宣言が来ても経路が壊れないこと」だけを固定する。
+    const fn entry_with_interest(interest: DeviationInterest) -> CatalogEntry {
+        CatalogEntry {
+            activity: ActivityId::QUEUE,
+            column: "runq_sz",
+            scope: ItemScope::Single,
+            kind: ValueKind::Gauge,
+            unit: Unit::None,
+            label: "テスト用の系列",
+            fixed: &[],
+            deviation: DeviationInterest::Upper,
+            shift: ShiftMagnitude::Absolute(4.0),
+            shift_direction: interest,
+            interpretations: &[],
+            not_established: &[],
+        }
+    }
+
+    static BOTH_WAYS: CatalogEntry = entry_with_interest(DeviationInterest::Both);
+    static UPWARD_ONLY: CatalogEntry = entry_with_interest(DeviationInterest::Upper);
+    static NO_INTEREST: CatalogEntry = entry_with_interest(DeviationInterest::None);
 
     fn run(t: crate::analyze::timeline::MetricTimeline) -> (Vec<Detection>, RouteStatus) {
         let entry = entry_for(&t);
@@ -469,13 +670,38 @@ mod tests {
     }
 
     /// 宣言した向きだけを見る。
+    ///
+    /// 見るのは [`CatalogEntry::shift_interest`] であり、**逸脱の宣言
+    /// (`deviation`) ではない**。両者を同じ宣言で済ませていたとき、
+    /// 処理量の指標では「止まった」が判定前に捨てられていた (Issue #5 の 20)。
     #[test]
     fn only_the_declared_direction_is_reported() {
-        // idle は下方向のみ。回復 (上昇) は報告しない
+        // runq-sz は圧力の指標。キューが短くなったのは負荷の緩和であって
+        // 所見ではない (逸脱・水準変化ともに上方向だけを宣言している)
+        let mut v = vec![30.0; 15];
+        v.extend(vec![1.0; 15]);
+        let (found, _) = run(runq(&vals(&v)));
+        assert!(found.is_empty(), "runq-sz の低下は異変ではない: {found:#?}");
+    }
+
+    /// 処理量の指標では**水準の上昇も**報告する。
+    ///
+    /// `%idle` の逸脱は下方向だけを見る (低いほうが外れ値) が、
+    /// 水準変化は両方向を宣言している。上昇は「負荷源の消失」であり、
+    /// 処理が終わったのか障害で止まったのかはこの系列からは断定できない。
+    /// **方向で弾くのではなく、水準が動いた事実として出して解釈を並べる。**
+    #[test]
+    fn a_rise_is_reported_for_metrics_that_declare_both_directions() {
         let mut v = vec![20.0; 15];
         v.extend(vec![90.0; 15]);
         let (found, _) = run(cpu_idle(&vals(&v)));
-        assert!(found.is_empty(), "%idle の回復は異変ではない");
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(
+            found[0].pattern,
+            Pattern::LevelShift {
+                direction: ShiftDirection::Rise
+            }
+        );
     }
 
     /// 窓が取れない短い系列は評価しない。
@@ -504,19 +730,248 @@ mod tests {
             })
             .collect();
         // 10 秒採取で 30 分窓 → 180 点
-        assert_eq!(window_size(&obs, 1800, 5), Some(180));
+        assert_eq!(representative_interval(&obs), Some(10));
+        assert_eq!(window_points(10, 1800, 5), 180);
 
-        let obs10m: Vec<Observation> = (0..20)
-            .map(|i| Observation {
-                start_ust: T0 + i * 600,
-                end_ust: T0 + (i + 1) * 600,
-                elapsed_cs: 60000,
-                value: 1.0,
-                origin: ObservationOrigin::InstantGauge,
-            })
-            .collect();
         // 10 分採取で 30 分窓 → 3 点だが下限 5 で底を打つ
-        assert_eq!(window_size(&obs10m, 1800, 5), Some(5));
+        assert_eq!(window_points(600, 1800, 5), 5);
+    }
+
+    /// 点数の下限で底を打った窓の**実際の幅**を根拠に載せる。
+    ///
+    /// 既定の 600 秒採取では `max(ceil(1800/600), 5) = 5` 点になり、
+    /// 区間値では各窓 3000 秒である。「窓 1800 秒で判定した」と出さないため、
+    /// 要求幅と実際の幅の両方を渡す。
+    #[test]
+    fn the_effective_window_width_is_recorded_next_to_the_requested_one() {
+        let mut v = vec![90.0; 15];
+        v.extend(vec![30.0; 15]);
+        let (found, _) = run(cpu_idle(&vals(&v)));
+        let DecisionBasis::LevelShift {
+            window_samples,
+            window_requested_secs,
+            window_secs,
+            before,
+            after,
+            ..
+        } = found[0].decision.basis
+        else {
+            panic!("水準変化の根拠");
+        };
+        assert_eq!(window_samples, 5, "max(ceil(1800/600), 5) = 5 点");
+        assert_eq!(window_requested_secs, 1800, "要求した幅");
+        assert_eq!(window_secs, 3000, "実際の幅。要求の 1800 秒ではない");
+        // 区間値なので実測の範囲も 5 区間ぶん
+        assert_eq!(before.span_secs(), 3000);
+        assert_eq!(after.span_secs(), 3000);
+    }
+
+    /// 瞬時値の窓幅は「点数 − 1」区間ぶん (採取の間は観測していない)。
+    #[test]
+    fn an_instant_gauge_window_is_one_interval_shorter() {
+        assert_eq!(effective_window_secs(600, 5, false), 3000);
+        assert_eq!(effective_window_secs(600, 5, true), 2400);
+
+        let mut v = vec![1.0; 15];
+        v.extend(vec![100.0; 15]);
+        let (found, _) = run(runq(&vals(&v)));
+        let DecisionBasis::LevelShift {
+            window_secs,
+            before,
+            after,
+            ..
+        } = found[0].decision.basis
+        else {
+            panic!("水準変化の根拠");
+        };
+        assert_eq!(window_secs, 2400);
+        assert_eq!(before.span_secs(), 2400, "実測の範囲と一致する");
+        assert_eq!(after.span_secs(), 2400);
+    }
+
+    /// 欠測を挟んだ前後窓から水準変化を作らない。
+    ///
+    /// 低値 5 点 → 数時間の欠測 → 高値 5 点は、欠測を除いた配列の上では
+    /// 隣接して見える。変化した時刻を特定できる材料ではないので、
+    /// 「検出なし」ではなく**評価不能**にする。
+    #[test]
+    fn a_step_across_a_long_gap_is_not_evaluated() {
+        let mut points = vals(&[90.0; 6]);
+        // 3 時間ぶんの欠測。欠測は連続区間を切らない
+        points.extend(std::iter::repeat_n(P::Missing, 18));
+        points.extend(vals(&[20.0; 6]));
+        let (found, status) = run(cpu_idle(&points));
+        assert!(
+            found.is_empty(),
+            "欠測を挟んだ水準差を報告してはいけない: {found:#?}"
+        );
+        assert!(
+            matches!(
+                status,
+                RouteStatus::NotEvaluated {
+                    reason: NotEvaluated::NoWindowLongEnough
+                }
+            ),
+            "評価不能として返す (検出なしではない): {status:?}"
+        );
+    }
+
+    /// 欠測を含む窓だけを飛ばし、他の候補はそのまま評価する。
+    #[test]
+    fn only_the_candidates_containing_a_gap_are_skipped() {
+        // 段差の手前に 1 点の欠測。段差自身は欠測を含まない窓で拾える
+        let mut points = vals(&[90.0; 3]);
+        points.push(P::Missing);
+        points.extend(vals(&[90.0; 12]));
+        points.extend(vals(&[20.0; 12]));
+        let (found, _) = run(cpu_idle(&points));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].support.start_ust, T0 + 16 * STEP_SECS);
+    }
+
+    /// 滑らかな増加から架空の変化点を作らない。
+    ///
+    /// `runq_sz` が毎回 1 ずつ増えるだけの系列では、前窓 `[0,1,2,3,4]` /
+    /// 後窓 `[5,6,7,8,9]` が差 5 (最小有意変化量 4 以上)・MAD 1・
+    /// 正規化差 3.37 (閾値 3.0 以上)・持続率 80% (閾値 70% 以上) を
+    /// すべて満たす。段差は存在しない。
+    #[test]
+    fn a_smooth_ramp_does_not_produce_a_change_point() {
+        let v: Vec<f64> = (0..40).map(f64::from).collect();
+        let (found, status) = run(runq(&vals(&v)));
+        assert!(
+            found.is_empty(),
+            "傾向を特定時刻の段差として報告してはいけない: {found:#?}"
+        );
+        // 評価はできている (**評価不能ではない**)
+        assert!(matches!(status, RouteStatus::Evaluated), "{status:?}");
+    }
+
+    /// 傾向の上に乗った段差は拾う (上の裏返し)。
+    #[test]
+    fn a_step_on_top_of_a_ramp_is_still_detected() {
+        let mut v: Vec<f64> = (0..20).map(f64::from).collect();
+        v.extend((20..40).map(|i| f64::from(i) + 50.0));
+        let (found, _) = run(runq(&vals(&v)));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let DecisionBasis::LevelShift {
+            shift,
+            trend_explained_shift,
+            step_shift,
+            ..
+        } = found[0].decision.basis
+        else {
+            panic!("水準変化の根拠");
+        };
+        assert!(
+            (trend_explained_shift - 5.0).abs() < 1e-9,
+            "傾き 1 × 窓 5 点: {trend_explained_shift}"
+        );
+        assert!((step_shift - 50.0).abs() < 1e-9, "{step_shift}");
+        assert!((shift - 55.0).abs() < 1e-9, "{shift}");
+        // 瞬時値なので変化後の最初の採取時刻を指す
+        assert_eq!(found[0].support.start_ust, T0 + 21 * STEP_SECS);
+    }
+
+    /// 傾向は検出を減らす側にしか使わない。
+    #[test]
+    fn the_trend_never_enlarges_the_step() {
+        // 傾向が逆向き / 過大でも、段差が観測差より大きくはならない
+        assert!((step_of(10.0, -4.0) - 10.0).abs() < 1e-9);
+        assert!((step_of(10.0, 4.0) - 6.0).abs() < 1e-9);
+        assert_eq!(step_of(10.0, 20.0), 0.0, "傾向だけで説明できる");
+        assert!((step_of(-10.0, 4.0) + 10.0).abs() < 1e-9);
+        assert!((step_of(-10.0, -4.0) + 6.0).abs() < 1e-9);
+    }
+
+    /// 窓が 4 点未満なら傾きを推定しない (傾向による棄却をしない)。
+    #[test]
+    fn a_tiny_window_does_not_estimate_a_trend() {
+        assert_eq!(
+            trend_explained_shift(&[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]),
+            0.0
+        );
+    }
+
+    /// 3 点だけの大変動は持続率に届かない。
+    ///
+    /// 「`MAD = 0` の系列の短い大変動」を水準変化で拾えない理由。
+    /// 受け皿は逸脱経路側 (`robust::absolute_departures`) に置いてある。
+    #[test]
+    fn a_three_sample_burst_does_not_reach_the_persistence_share() {
+        let mut v = vec![0.0; 40];
+        for x in v.iter_mut().skip(20).take(3) {
+            *x = 100.0;
+        }
+        let (found, status) = run(runq(&vals(&v)));
+        assert!(found.is_empty(), "後窓 5 点のうち 3 点では 0.7 に届かない");
+        assert!(matches!(status, RouteStatus::Evaluated), "{status:?}");
+    }
+
+    /// 方向の宣言を差し替えても壊れない。
+    ///
+    /// 指標ごとの方向はカタログが決める (Issue #5 の 20)。
+    /// ここでは**両方向の宣言が来ても経路が通ること**を固定する。
+    #[test]
+    fn the_declared_direction_decides_which_shifts_are_reported() {
+        assert!(accepts(&BOTH_WAYS, ShiftDirection::Rise));
+        assert!(accepts(&BOTH_WAYS, ShiftDirection::Fall));
+        assert!(accepts(&UPWARD_ONLY, ShiftDirection::Rise));
+        assert!(!accepts(&UPWARD_ONLY, ShiftDirection::Fall));
+        // 宣言が無ければ方向で捨てない (水準が動いた事実は出す)
+        assert!(accepts(&NO_INTEREST, ShiftDirection::Rise));
+        assert!(accepts(&NO_INTEREST, ShiftDirection::Fall));
+    }
+
+    /// 下方向の水準変化が経路の端まで通る。
+    ///
+    /// 処理量の指標では**停止も所見**である。両方向の宣言で
+    /// `ShiftDirection::Fall` が出力まで届くことを固定する。
+    #[test]
+    fn a_downward_shift_is_reported_when_both_directions_are_declared() {
+        let mut v = vec![500.0; 15];
+        v.extend(vec![0.0; 15]);
+        let t = timeline(
+            MetricKey::new(ActivityId::QUEUE, SINGLE_ITEM, "runq_sz"),
+            Unit::None,
+            ValueKind::Gauge,
+            &vals(&v),
+        );
+        let series = PreparedSeries::from_timeline(&t);
+        let opts = DetectOptions::default();
+        let baseline = build_baseline(&series, &BOTH_WAYS, series.observations.clone(), &opts);
+        let (found, status) = super::detect(&series, &BOTH_WAYS, &baseline, &opts);
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(
+            found[0].pattern,
+            Pattern::LevelShift {
+                direction: ShiftDirection::Fall
+            }
+        );
+        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+        let DecisionBasis::LevelShift { shift, .. } = found[0].decision.basis else {
+            panic!("水準変化の根拠");
+        };
+        assert!(shift < 0.0, "低下として報告する");
+    }
+
+    /// 上方向だけの宣言では低下を報告しない (上の裏返し)。
+    #[test]
+    fn a_downward_shift_is_dropped_when_only_the_rise_is_declared() {
+        let mut v = vec![500.0; 15];
+        v.extend(vec![0.0; 15]);
+        let t = timeline(
+            MetricKey::new(ActivityId::QUEUE, SINGLE_ITEM, "runq_sz"),
+            Unit::None,
+            ValueKind::Gauge,
+            &vals(&v),
+        );
+        let series = PreparedSeries::from_timeline(&t);
+        let opts = DetectOptions::default();
+        let baseline = build_baseline(&series, &UPWARD_ONLY, series.observations.clone(), &opts);
+        let (found, _) = super::detect(&series, &UPWARD_ONLY, &baseline, &opts);
+        assert!(found.is_empty(), "{found:#?}");
     }
 
     /// 同じ段差を窓ごとに何度も報告しない。

@@ -65,6 +65,22 @@
 //! `sar` のデータは**離散的な採取**である。[`TemporalSupport`] は
 //! 時間範囲と採取回数の**両方**を持ち、[`TemporalSupport::describe_span`] は
 //! 「20 分にわたる 3 回の採取」の形の文を返す。
+//!
+//! 時間範囲の**両端も観測の意味で決める**。瞬時値に前サンプルの時刻を
+//! 含めると、10:10 / 10:20 / 10:30 の 3 回の高値が「30 分にわたる 3 回の採取」
+//! になり、採取時点の広がり (20 分) を 1 採取間隔ぶん長く報告する。
+//! この範囲は headline・報告範囲フィルタ・優先度の昇格判定が共用するので、
+//! 偽ると既定の昇格条件 (1800 秒) へ Gauge だけが 1 採取早く到達する。
+//!
+//! # 保存形式の種別と観測の意味を分ける
+//!
+//! [`crate::model::ValueKind`] は「ディスク上の値が累積カウンタか時点の量か」
+//! という**保存・差分処理上の種別**である。検出で必要なのは
+//! 「**その値が何を代表しているか**」で、両者は一致しない。
+//! カタログの `await` は `ValueKind::Gauge` だが、実体は区間のカウンタ差分から
+//! 計算した値 (`Δticks / ΔI/O 数`) である。
+//! [`ObservationOrigin`] が観測の意味を持ち、時間範囲の両端と
+//! 平均の取り方 ([`MeanBasis`]) をそこから決める。
 
 pub mod episodes;
 pub mod level_shift;
@@ -139,11 +155,28 @@ impl SeriesKey {
 ///
 /// **採取回数と時間範囲を必ず一緒に持つ。** 片方だけを出すと
 /// 「3 回高かった」が「20 分間高止まりした」に化ける。
+///
+/// # 範囲の両端は観測の意味で決まる
+///
+/// 区間値 (Counter の差分から計算したレート・比率) は区間を代表するので、
+/// 範囲は**最初の区間の始点から最後の区間の終点**である。
+/// 瞬時値 ([`ObservationOrigin::InstantGauge`]) は採取時点の値なので、
+/// 範囲は**最初の採取時刻から最後の採取時刻**である
+/// ([`PreparedSeries::support_of`] が origin を見て決める)。
+///
+/// 瞬時値に前サンプルの時刻を含めると、10 分採取で 3 回続いた高値が
+/// 「30 分にわたる 3 回の採取」になる。実際に採取が広がっているのは 20 分で、
+/// 残りの 10 分は**最初の採取より前**の時間である。
+/// この範囲は headline・報告範囲フィルタ・優先度の昇格判定
+/// ([`crate::analyze::assessment`]) が共用するので、偽ると既定の昇格条件
+/// (`persistence_secs` = 1800 秒) へ Gauge だけが 1 採取早く到達する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct TemporalSupport {
-    /// 最初の区間の始点 (エポック秒)。
+    /// 範囲の始点 (エポック秒)。
+    ///
+    /// 区間値では最初の区間の始点、瞬時値では**最初の採取時刻**。
     pub start_ust: u64,
-    /// 最後の区間の終点 (エポック秒)。
+    /// 範囲の終点 (エポック秒)。最後の値を観測した時刻。
     pub end_ust: u64,
     /// 値が得られた採取回数。
     pub samples: u64,
@@ -151,12 +184,18 @@ pub struct TemporalSupport {
     pub missing_samples: u64,
     /// 系列全体で不連続として捨てた区間数。
     pub discontinuities: u64,
-    /// 値が得られた区間の長さの合計 (1/100 秒)。
+    /// 観測された区間の長さの合計 (1/100 秒)。
+    ///
+    /// **瞬時値では 0。** 採取時点の値しか観測していないので、
+    /// 長さを持つ区間を観測していない。
     pub observed_cs: u64,
 }
 
 impl TemporalSupport {
     /// 時間範囲の長さ (秒)。**採取が連続していたことを意味しない。**
+    ///
+    /// 瞬時値では「最初の採取から最後の採取まで」なので、
+    /// 3 回の採取が 10 分間隔なら 20 分である (30 分ではない)。
     pub fn span_secs(&self) -> u64 {
         self.end_ust.saturating_sub(self.start_ust)
     }
@@ -219,23 +258,52 @@ pub fn describe_duration(secs: u64) -> String {
 // 観測
 // ===========================================================================
 
-/// 値の由来。Counter 由来のレートと Gauge の瞬時値を混ぜない。
+/// 観測の意味 — **その値が何を代表しているか**。
+///
+/// [`ValueKind`] (保存・差分処理上の種別) とは別の宣言である。
+/// `ValueKind::Gauge` で保存されていても、カタログの `await` と `%ifutil` は
+/// **区間のカウンタ差分から計算した値**であり、採取時点の量ではない
+/// (`await = Δticks / Δ完了 I/O 数`、`%ifutil` は区間の通信量 ÷ リンク速度。
+/// どちらも `series::compute` が前サンプルとの差分から作る)。
+///
+/// | 由来 | 何を代表するか | 時間範囲の始点 | 複数観測の束ね方 |
+/// |---|---|---|---|
+/// | [`IntervalRate`](ObservationOrigin::IntervalRate) | 区間全体 | 区間の始点 | 区間長で重み付けした平均 |
+/// | [`InstantGauge`](ObservationOrigin::InstantGauge) | その瞬間 | 最初の採取時刻 | 採取ごとの単純平均 |
+/// | [`PerRequestAverage`](ObservationOrigin::PerRequestAverage) | 区間の 1 要求あたり | 区間の始点 | **要求数で重み付けした平均** |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationOrigin {
-    /// 2 サンプル間の差分を経過時間で割ったレート (Counter 由来)。
+    /// 区間を代表する値 (Counter の差分から計算したレート・比率)。
     ///
-    /// 値は区間を代表する。区間の内側でどう変動したかは観測されていない。
+    /// 区間の内側でどう変動したかは観測されていない。
+    /// 区間長を重みにした平均で束ねられる。
     IntervalRate,
     /// その時点の瞬時値 (Gauge 由来)。
     ///
     /// 前後の採取の間の値は観測されていない。
+    /// **区間長は重みにならない** — 採取と採取の間隔が長いことは、
+    /// その値が長く続いたことを意味しない。
     InstantGauge,
+    /// 区間のカウンタ差分から「1 要求あたり」として計算した値 (`await`)。
+    ///
+    /// 区間を代表するが、複数区間を束ねるときの重みは区間長ではなく
+    /// **要求数**である (`Σ(Δticks) / Σ(Δ要求数)`)。
+    /// 要求が 1 件しか無かった区間と 1 万件あった区間を同じ重みで平均すると、
+    /// 静かな区間の外れ値が全体の平均を動かす。
+    PerRequestAverage,
 }
 
 impl ObservationOrigin {
-    /// 列の性質から決める。
-    pub const fn of(kind: ValueKind) -> Self {
+    /// 系列の同定と列の性質から決める。
+    ///
+    /// **[`ValueKind`] だけでは決まらない。** 派生した区間値は
+    /// `ValueKind::Gauge` で保存されるが瞬時値ではないので、
+    /// 系列ごとの例外を [`derived_origin`] が持つ。
+    pub fn of(key: &MetricKey, kind: ValueKind) -> Self {
+        if let Some(origin) = derived_origin(key) {
+            return origin;
+        }
         match kind {
             ValueKind::Counter => ObservationOrigin::IntervalRate,
             // Identity 列は検出対象にしない (カタログのテストで固定してある)
@@ -243,10 +311,76 @@ impl ObservationOrigin {
         }
     }
 
+    /// 採取時点の値か (長さを持つ区間を代表しないか)。
+    pub const fn is_instant(self) -> bool {
+        matches!(self, ObservationOrigin::InstantGauge)
+    }
+
+    /// 複数観測を束ねるときの平均の取り方。
+    pub const fn mean_basis(self) -> MeanBasis {
+        match self {
+            ObservationOrigin::IntervalRate => MeanBasis::TimeWeighted,
+            ObservationOrigin::InstantGauge => MeanBasis::PerSample,
+            ObservationOrigin::PerRequestAverage => MeanBasis::UnweightedPerRequest,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
-            ObservationOrigin::IntervalRate => "区間レート (Counter 由来)",
+            ObservationOrigin::IntervalRate => "区間を代表する値 (差分から計算)",
             ObservationOrigin::InstantGauge => "採取時点の値 (Gauge)",
+            ObservationOrigin::PerRequestAverage => "区間の 1 要求あたりの平均 (差分から計算)",
+        }
+    }
+}
+
+/// 派生した区間値の例外表。
+///
+/// `ValueKind::Gauge` で保存されているが採取時点の量ではない系列を挙げる。
+/// **本来はカタログ ([`crate::analyze::metric_catalog::CatalogEntry`]) が
+/// 系列ごとに観測の意味を宣言すべき情報である。** ここに置いているのは
+/// カタログ側の宣言が入るまでの暫定で、Issue #5 の 3 で追跡している。
+fn derived_origin(key: &MetricKey) -> Option<ObservationOrigin> {
+    match (key.activity, key.column.as_str()) {
+        // await = Σ(Δticks) / Δ完了 I/O 数 (`series::compute` の disk_derived)。
+        // 区間の 1 要求あたりの平均なので、区間長では重み付けできない
+        (ActivityId::DISK, "await") => Some(ObservationOrigin::PerRequestAverage),
+        // %ifutil = 区間の通信量 (バイト毎秒) ÷ リンク速度 (`compute::ifutil`)。
+        // 区間を代表する比率なので時間加重平均でよい
+        (ActivityId::NET_DEV, "ifutil_pct") => Some(ObservationOrigin::IntervalRate),
+        _ => None,
+    }
+}
+
+/// 平均をどう取ったか。**取り方を偽らない。**
+///
+/// [`DecisionEvidence::mean`] の意味がこれで変わる。
+/// 「時間加重平均」と書いた数字が実は単純平均だった、という取り違えを
+/// 型で止める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeanBasis {
+    /// 区間長で重み付けした平均。区間値はこれが正しい。
+    TimeWeighted,
+    /// 採取ごとの単純平均。
+    ///
+    /// 瞬時値は区間長を重みにできない (採取間隔はその値が続いた長さではない)。
+    PerSample,
+    /// 単純平均だが、**本来の重み (要求数) で重み付けしたものではない**。
+    ///
+    /// `await` の複数区間の平均は `Σ(Δticks) / Σ(Δ要求数)` である。
+    /// 検出層には区間ごとの要求数が渡ってきていないので、
+    /// 単純平均で代用していることをここで宣言する。
+    /// 要求の少ない区間の値を過大に評価する側へ寄る。
+    UnweightedPerRequest,
+}
+
+impl MeanBasis {
+    pub const fn label(self) -> &'static str {
+        match self {
+            MeanBasis::TimeWeighted => "区間長で重み付けした平均",
+            MeanBasis::PerSample => "採取ごとの単純平均",
+            MeanBasis::UnweightedPerRequest => "単純平均 (本来必要な要求数の重みが無い)",
         }
     }
 }
@@ -266,8 +400,22 @@ pub struct Observation {
 
 impl Observation {
     /// 区間長 (秒)。
+    ///
+    /// 瞬時値では**前の採取からの間隔**であり、その値が続いた長さではない。
     pub fn interval_secs(&self) -> u64 {
         self.end_ust.saturating_sub(self.start_ust)
+    }
+
+    /// 報告する時刻の始点。
+    ///
+    /// 瞬時値は採取時点の値なので、前サンプルの時刻を範囲へ含めない
+    /// ([`TemporalSupport`] の doc を参照)。
+    pub fn reported_start_ust(&self) -> u64 {
+        if self.origin.is_instant() {
+            self.end_ust
+        } else {
+            self.start_ust
+        }
     }
 }
 
@@ -542,12 +690,48 @@ pub enum DecisionBasis {
         peak_absolute_deviation: f64,
         direction: ShiftDirection,
     },
+    /// 散らばりが測れないまま、**絶対差が大きかった**観測。
+    ///
+    /// [`RobustDeviation`](DecisionBasis::RobustDeviation) と**同じ観点**
+    /// ([`DetectRoute::RobustDeviation`]) の別の状態である。
+    /// `MAD == 0` を ε で割った結果ではない (規律 4 は守る) — 逸脱スコアを
+    /// 出さない代わりに、「散らばりは測れないが、指標ごとの最小有意変化量を
+    /// 超える差があった」という事実だけを報告する。
+    ///
+    /// これが無いと、値がほぼ一定の整数 Gauge で**大きな偽陰性**が出る。
+    /// `runq-sz` が 144 点中 141 点 0 で 3 点だけ 100 の入力では、
+    /// 固定条件が無く (CPU 数に依存するので置けない)、MAD が 0 で逸脱も出せず、
+    /// 後窓の持続率は最大 3/5 で水準変化にも届かないため検出 0 件になる。
+    ///
+    /// **出力では「MAD の N 倍」と書かない。**
+    /// 「散らばりが測れないため絶対差で判断した」と書き分ける。
+    AbsoluteDeparture {
+        /// 比較基準の中央値。
+        reference: f64,
+        /// なぜ正規化しなかったか (散らばりが測れない理由)。
+        dispersion: Dispersion,
+        /// 要求した絶対差の下限 (指標ごとの最小有意変化量)。
+        min_absolute_deviation: f64,
+        /// 最も離れた点の `|x - reference|`。
+        peak_absolute_deviation: f64,
+        direction: ShiftDirection,
+    },
     /// 時間的変化。
     LevelShift {
         before_median: f64,
         after_median: f64,
-        /// `after_median - before_median`。
+        /// `after_median - before_median`。**観測された差**。
         shift: f64,
+        /// `shift` のうち窓内の傾きで説明できる量。
+        ///
+        /// 滑らかな増加では前後窓の中央値差がそのまま傾向で説明できる。
+        /// 段差ではないので、引いた残り (`step_shift`) で判定する。
+        trend_explained_shift: f64,
+        /// 傾向を引いた残りの段差。**判定はこちらで行う。**
+        ///
+        /// 符号は `shift` と同じで、大きさは `|shift|` を超えない
+        /// (傾きの推定誤差で検出を増やさないため)。
+        step_shift: f64,
         /// 絶対差の下限 (この指標の単位)。
         min_shift: f64,
         /// 前後の窓を各々の中央値で中心化した残差を束ねた MAD。
@@ -555,13 +739,25 @@ pub enum DecisionBasis {
         /// **段差を含めたまま束ねると尺度が段差自身で膨らむ**ので、
         /// 窓ごとに中心化してから束ねる。
         pooled_mad: Option<f64>,
-        /// `|shift| / (MAD_SCALE × pooled_mad)`。
+        /// `|step_shift| / (MAD_SCALE × pooled_mad)`。
         /// 散らばりが測れないときは `None` (**ε で割らない**)。
         normalized_shift: Option<f64>,
         normalized_threshold: f64,
         /// 後窓のうち前窓の中央値から同方向へ最小変化量以上離れた割合。
         persistence_share: f64,
         persistence_threshold: f64,
+        /// 前後の窓の点数 (前後で同じ)。
+        window_samples: u64,
+        /// 設定が要求した窓幅 (秒)。**実際の窓幅ではない。**
+        window_requested_secs: u64,
+        /// 実際に使った窓幅 (秒) = 点数 × 採取間隔。
+        ///
+        /// 要求幅が採取間隔で割り切れない場合と、点数の下限
+        /// ([`DetectThresholds::shift_window_min_samples`]) で底を打った場合に
+        /// 要求幅より**長くなる**。既定の 600 秒採取では
+        /// `max(ceil(1800/600), 5) = 5` 点なので、区間値では各窓 3000 秒になる。
+        /// 「窓 1800 秒で判定した」と出さないためにこの値を渡す。
+        window_secs: u64,
         before: TemporalSupport,
         after: TemporalSupport,
     },
@@ -571,7 +767,11 @@ impl DecisionBasis {
     pub const fn route(&self) -> DetectRoute {
         match self {
             DecisionBasis::FixedCondition { .. } => DetectRoute::FixedCondition,
-            DecisionBasis::RobustDeviation { .. } => DetectRoute::RobustDeviation,
+            // 絶対差だけで判断した観測も「参照分布からの逸脱」の観点である。
+            // **経路を 4 つ目にしない** (3 経路の枠組みを崩さない)
+            DecisionBasis::RobustDeviation { .. } | DecisionBasis::AbsoluteDeparture { .. } => {
+                DetectRoute::RobustDeviation
+            }
             DecisionBasis::LevelShift { .. } => DetectRoute::LevelShift,
         }
     }
@@ -594,12 +794,20 @@ pub struct DecisionEvidence {
     pub observations_truncated: bool,
     pub min: f64,
     pub max: f64,
-    /// 時間加重平均。区間長が取れない場合は標本平均。
+    /// 平均。取り方は [`DecisionEvidence::mean_basis`] が宣言する。
     pub mean: f64,
+    /// 平均の取り方。**観測の意味 ([`ObservationOrigin`]) から決まる。**
+    ///
+    /// すべてを時間加重平均にすると、瞬時値では「採取間隔が長い点」が
+    /// 重くなり、`await` では「要求が 1 件しか無かった区間」が
+    /// 要求 1 万件の区間と同じ重みになる。
+    pub mean_basis: MeanBasis,
 }
 
 impl DecisionEvidence {
     /// 観測列から根拠を組み立てる。
+    ///
+    /// 平均の取り方は観測の意味から決める (**一律の時間加重平均にしない**)。
     pub fn new(basis: DecisionBasis, observations: &[Observation]) -> Self {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
@@ -613,12 +821,14 @@ impl DecisionEvidence {
             weight += o.elapsed_cs as f64;
             plain += o.value;
         }
-        let mean = if weight > 0.0 {
-            weighted / weight
-        } else if observations.is_empty() {
-            0.0
-        } else {
-            plain / observations.len() as f64
+        let mean_basis = observations
+            .first()
+            .map_or(MeanBasis::PerSample, |o| o.origin.mean_basis());
+        let mean = match mean_basis {
+            // 区間長が取れない (全て 0) 場合は標本平均へ落とす
+            MeanBasis::TimeWeighted if weight > 0.0 => weighted / weight,
+            _ if observations.is_empty() => 0.0,
+            _ => plain / observations.len() as f64,
         };
         Self {
             route: basis.route(),
@@ -632,6 +842,7 @@ impl DecisionEvidence {
             min: if observations.is_empty() { 0.0 } else { min },
             max: if observations.is_empty() { 0.0 } else { max },
             mean,
+            mean_basis,
         }
     }
 }
@@ -749,7 +960,13 @@ impl ReportWindow {
         self.from.is_none() && self.to.is_none()
     }
 
-    /// 区間 `[start_ust, end_ust]` が報告範囲に重なるか。
+    /// 区間 `[start_ust, end_ust]` が報告範囲に**重なるか**。
+    ///
+    /// **両端が範囲内かではなく、重なりで判定する。**
+    /// 端だけを見ると、報告範囲を**包含する**検出が捨てられる。
+    /// 08:00〜12:00 に及ぶ検出へ `--from 09:00 --to 10:00` を指定すると
+    /// 両端 (08:00 と 12:00) が範囲外なので消え、同じ範囲をエポック秒で
+    /// 指定した場合 (こちらは重なりで判定していた) と結果が食い違う。
     pub fn admits(&self, start_ust: u64, end_ust: u64) -> bool {
         if let Some(s) = self.from.epoch()
             && end_ust < s
@@ -770,18 +987,30 @@ impl ReportWindow {
         if end_ust.saturating_sub(start_ust) >= 86_400 {
             return true;
         }
-        in_time_window(start_ust, lo, hi) || in_time_window(end_ust, lo, hi)
+        // 検出区間が占める「時刻」も日跨ぎし得る弧なので、弧同士の重なりを見る
+        arcs_overlap(start_ust % 86_400, end_ust % 86_400, lo, hi)
     }
 }
 
-/// エポック秒の時刻部分が `[lo, hi]` に入るか (`lo > hi` は日跨ぎ)。
-fn in_time_window(ust: u64, lo: u64, hi: u64) -> bool {
-    let tod = ust % 86_400;
+/// 時刻 `tod` が `[lo, hi]` に入るか (`lo > hi` は日跨ぎ)。
+fn tod_in_window(tod: u64, lo: u64, hi: u64) -> bool {
     if lo <= hi {
         tod >= lo && tod <= hi
     } else {
         tod >= lo || tod <= hi
     }
+}
+
+/// 1 日を円と見たときの 2 つの弧が重なるか。
+///
+/// 弧 `[a1, a2]` と `[b1, b2]` は、どちらか一方の端がもう一方に入っていれば
+/// 重なり、入っていなければ重ならない (どちらかが他方を包含する場合も、
+/// 包含される側の端が相手の中に入る)。**端の一致だけを見ないための判定。**
+fn arcs_overlap(a1: u64, a2: u64, b1: u64, b2: u64) -> bool {
+    tod_in_window(a1, b1, b2)
+        || tod_in_window(a2, b1, b2)
+        || tod_in_window(b1, a1, a2)
+        || tod_in_window(b2, a1, a2)
 }
 
 /// 検出の閾値。
@@ -899,7 +1128,7 @@ pub struct PreparedSeries {
 impl PreparedSeries {
     /// 時系列から整える。
     pub fn from_timeline(t: &MetricTimeline) -> Self {
-        let origin = ObservationOrigin::of(t.kind);
+        let origin = ObservationOrigin::of(&t.key, t.kind);
         let mut observations: Vec<Observation> = Vec::new();
         let mut segments: Vec<(usize, usize)> = Vec::new();
         let mut marks: Vec<u64> = Vec::new();
@@ -1010,18 +1239,27 @@ impl PreparedSeries {
     ///
     /// 欠測・不連続は**系列全体の値**を載せる。検出範囲だけを切り出すと
     /// 「この範囲では欠測が無かった」に見えてしまう。
+    ///
+    /// 範囲の始点は**観測の意味で決める**。瞬時値に前サンプルの時刻を
+    /// 含めると採取の広がりを 1 採取間隔ぶん長く報告する
+    /// ([`TemporalSupport`] の doc を参照)。
     pub fn support_of(&self, observations: &[Observation]) -> TemporalSupport {
         let Some(first) = observations.first() else {
             return TemporalSupport::default();
         };
         let last = observations.last().expect("非空");
         TemporalSupport {
-            start_ust: first.start_ust,
+            start_ust: first.reported_start_ust(),
             end_ust: last.end_ust,
             samples: observations.len() as u64,
             missing_samples: self.missing,
             discontinuities: self.discontinuities,
-            observed_cs: observations.iter().map(|o| o.elapsed_cs).sum(),
+            // 瞬時値は長さを持つ区間を観測していない
+            observed_cs: if self.origin.is_instant() {
+                0
+            } else {
+                observations.iter().map(|o| o.elapsed_cs).sum()
+            },
         }
     }
 }
@@ -1254,7 +1492,9 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
         }
     }
 
-    // 報告範囲で検出を絞る (**基準の材料は絞らない**)
+    // 報告範囲で検出を絞る (**基準の材料は絞らない**)。
+    // 判定は**重なり**である。報告範囲を包含する検出を捨てない
+    // ([`ReportWindow::admits`] の doc を参照)
     out.detections
         .retain(|d| window.admits(d.support.start_ust, d.support.end_ust));
 
@@ -1496,14 +1736,136 @@ mod tests {
 
     #[test]
     fn observation_origin_separates_counter_from_gauge() {
+        let idle = MetricKey::new(ActivityId::CPU, "all", "idle");
         assert_eq!(
-            ObservationOrigin::of(ValueKind::Counter),
+            ObservationOrigin::of(&idle, ValueKind::Counter),
             ObservationOrigin::IntervalRate
         );
+        let runq = MetricKey::new(ActivityId::QUEUE, "-", "runq_sz");
         assert_eq!(
-            ObservationOrigin::of(ValueKind::Gauge),
+            ObservationOrigin::of(&runq, ValueKind::Gauge),
             ObservationOrigin::InstantGauge
         );
+    }
+
+    /// 派生した区間値を「採取時点の値」に分類しない。
+    ///
+    /// `await` は `Δticks / Δ完了 I/O 数`、`%ifutil` は区間の通信量から
+    /// 計算した値で、どちらも `ValueKind::Gauge` で保存されているが
+    /// 採取時点の量ではない (`series::compute` の `disk_derived` / `ifutil`)。
+    #[test]
+    fn a_derived_interval_value_is_not_classified_as_an_instant() {
+        let await_key = MetricKey::new(ActivityId::DISK, "dev8-0", "await");
+        assert_eq!(
+            ObservationOrigin::of(&await_key, ValueKind::Gauge),
+            ObservationOrigin::PerRequestAverage,
+            "await は区間の 1 要求あたりの平均"
+        );
+        let ifutil = MetricKey::new(ActivityId::NET_DEV, "eth0", "ifutil_pct");
+        assert_eq!(
+            ObservationOrigin::of(&ifutil, ValueKind::Gauge),
+            ObservationOrigin::IntervalRate,
+            "%ifutil は区間を代表する比率"
+        );
+        // 本物の瞬時値は瞬時値のまま
+        let ldavg = MetricKey::new(ActivityId::QUEUE, "-", "ldavg_1");
+        assert_eq!(
+            ObservationOrigin::of(&ldavg, ValueKind::Gauge),
+            ObservationOrigin::InstantGauge
+        );
+    }
+
+    /// 平均の取り方は観測の意味で決まる。**一律の時間加重平均にしない。**
+    #[test]
+    fn the_mean_is_weighted_according_to_the_observation_origin() {
+        let basis = || DecisionBasis::FixedCondition {
+            condition_id: "test",
+            comparison: FixedComparison::AtLeast,
+            threshold: 0.0,
+            min_samples: 1,
+            rationale: "テスト",
+        };
+        // 区間長 600 秒の点 (値 10) と 2400 秒の点 (値 20)。
+        // 時間加重平均は 18.0、単純平均は 15.0 になる並び
+        let obs = |origin| {
+            vec![
+                Observation {
+                    start_ust: T0,
+                    end_ust: T0 + 600,
+                    elapsed_cs: 60_000,
+                    value: 10.0,
+                    origin,
+                },
+                Observation {
+                    start_ust: T0 + 600,
+                    end_ust: T0 + 3000,
+                    elapsed_cs: 240_000,
+                    value: 20.0,
+                    origin,
+                },
+            ]
+        };
+
+        let rate = DecisionEvidence::new(basis(), &obs(ObservationOrigin::IntervalRate));
+        assert_eq!(rate.mean_basis, MeanBasis::TimeWeighted);
+        assert!((rate.mean - 18.0).abs() < 1e-9, "{}", rate.mean);
+
+        // 瞬時値では採取間隔が重みにならない (間隔が長いことはその値が
+        // 長く続いたことを意味しない)
+        let gauge = DecisionEvidence::new(basis(), &obs(ObservationOrigin::InstantGauge));
+        assert_eq!(gauge.mean_basis, MeanBasis::PerSample);
+        assert!((gauge.mean - 15.0).abs() < 1e-9, "{}", gauge.mean);
+
+        // await は要求数の重みが必要。重みが無いことを宣言する
+        let per_req = DecisionEvidence::new(basis(), &obs(ObservationOrigin::PerRequestAverage));
+        assert_eq!(per_req.mean_basis, MeanBasis::UnweightedPerRequest);
+        assert!((per_req.mean - 15.0).abs() < 1e-9, "{}", per_req.mean);
+    }
+
+    /// 瞬時値の時間範囲は**採取時点の広がり**である。
+    ///
+    /// 10 分採取で 3 回続いた高値は「20 分にわたる 3 回の採取」であり、
+    /// 30 分ではない。この範囲は優先度の昇格判定
+    /// (`persistence_secs` = 1800 秒) と共用されている。
+    #[test]
+    fn an_instant_gauge_reports_only_the_spread_of_its_samples() {
+        let t = runq(&vals(&[0.0, 0.0, 9.0, 9.0, 9.0, 0.0]));
+        let s = PreparedSeries::from_timeline(&t);
+        let support = s.support_of(&s.observations[2..5]);
+
+        assert_eq!(
+            support.start_ust,
+            T0 + 3 * STEP_SECS,
+            "始点は最初の採取時刻 (前サンプルの時刻ではない)"
+        );
+        assert_eq!(support.end_ust, T0 + 5 * STEP_SECS);
+        assert_eq!(support.span_secs(), 2 * STEP_SECS, "3 回の採取の広がり");
+        assert!(support.describe_span().contains("20 分"));
+        assert!(support.describe_span().contains("3 回の採取"));
+        assert!(
+            support.span_secs() < DetectThresholds::default().persistence_secs,
+            "3 回の採取で昇格条件 (1800 秒) へ到達してはいけない"
+        );
+        assert_eq!(
+            support.observed_cs, 0,
+            "瞬時値は長さを持つ区間を観測していない"
+        );
+    }
+
+    /// 区間値の時間範囲は最初の区間の始点から。
+    #[test]
+    fn an_interval_value_keeps_the_start_of_its_first_interval() {
+        let t = cpu_idle(&vals(&[50.0; 6]));
+        let s = PreparedSeries::from_timeline(&t);
+        let support = s.support_of(&s.observations[2..5]);
+
+        assert_eq!(support.start_ust, T0 + 2 * STEP_SECS);
+        assert_eq!(support.span_secs(), 3 * STEP_SECS, "3 区間ぶん");
+        assert!(
+            support.span_secs() >= DetectThresholds::default().persistence_secs,
+            "区間値は 3 区間で 1800 秒に達する"
+        );
+        assert_eq!(support.observed_cs, 3 * STEP_CS);
     }
 
     #[test]
@@ -1614,6 +1976,86 @@ mod tests {
         // 同じ日の 15:00 は範囲外
         let same_day_1500 = T0 + 15 * 3600;
         assert!(!w.admits(same_day_1500, same_day_1500 + 600));
+    }
+
+    /// 報告範囲を**包含する**検出を捨てない。
+    ///
+    /// 08:00〜12:00 に及ぶ検出へ `--from 09:00 --to 10:00` を指定すると、
+    /// 区間の両端 (08:00 と 12:00) はどちらも範囲外である。
+    /// 端だけを見る判定ではこの検出が消え、**同じ範囲をエポック秒で
+    /// 指定した場合と結果が食い違う**。
+    #[test]
+    fn a_detection_that_contains_the_report_window_is_kept() {
+        let by_time = ReportWindow {
+            from: ReportBound::TimeOfDay {
+                hour: 9,
+                min: 0,
+                sec: 0,
+            },
+            to: ReportBound::TimeOfDay {
+                hour: 10,
+                min: 0,
+                sec: 0,
+            },
+        };
+        let by_epoch = ReportWindow {
+            from: ReportBound::Epoch(T0 + 9 * 3600),
+            to: ReportBound::Epoch(T0 + 10 * 3600),
+        };
+        let start = T0 + 8 * 3600;
+        let end = T0 + 12 * 3600;
+
+        assert!(
+            by_time.admits(start, end),
+            "報告範囲を包含する検出を捨ててはいけない"
+        );
+        assert_eq!(
+            by_time.admits(start, end),
+            by_epoch.admits(start, end),
+            "時刻指定とエポック秒指定で結果が変わってはいけない"
+        );
+        // 重ならない検出は捨てる
+        assert!(!by_time.admits(T0 + 12 * 3600, T0 + 13 * 3600));
+        assert!(!by_time.admits(T0 + 7 * 3600, T0 + 8 * 3600));
+        // 端が 1 点だけ触れる場合は重なりとして扱う
+        assert!(by_time.admits(T0 + 7 * 3600, T0 + 9 * 3600));
+    }
+
+    /// 日跨ぎの検出区間と日跨ぎの報告範囲でも重なりで判定する。
+    #[test]
+    fn overlap_is_detected_across_midnight_on_both_sides() {
+        let overnight = ReportWindow {
+            from: ReportBound::TimeOfDay {
+                hour: 0,
+                min: 30,
+                sec: 0,
+            },
+            to: ReportBound::TimeOfDay {
+                hour: 1,
+                min: 0,
+                sec: 0,
+            },
+        };
+        // 23:00 から翌 03:00 までの検出は 00:30〜01:00 を含む
+        let start = T0 + 23 * 3600;
+        assert!(overnight.admits(start, start + 4 * 3600));
+
+        let window = ReportWindow {
+            from: ReportBound::TimeOfDay {
+                hour: 22,
+                min: 0,
+                sec: 0,
+            },
+            to: ReportBound::TimeOfDay {
+                hour: 2,
+                min: 0,
+                sec: 0,
+            },
+        };
+        // 21:00〜23:00 の検出は 22:00 以降と重なる
+        assert!(window.admits(T0 + 21 * 3600, T0 + 23 * 3600));
+        // 19:00〜20:00 はどこにも重ならない
+        assert!(!window.admits(T0 + 19 * 3600, T0 + 20 * 3600));
     }
 
     /// `--from` が `--to` より後ろなら日跨ぎとして扱う。

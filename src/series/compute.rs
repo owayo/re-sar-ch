@@ -1523,10 +1523,25 @@ fn net_dev_derived(
         ctx.itv_cs,
         counter_bits(plan, net_dev_col::TXKB),
     );
-    // speed は分母。この世代に `speed` が無いと 0 になり、
-    // 本家は `speed == 0` を「不明」として 0.0 を返す (03 §5.2)。
-    // 互換出力ではそれに従うが、独自出力では「不明」を 0% と見せない。
+    // speed は分母 (Mbit/s)。この世代に `speed` が無ければ上の
+    // [`primary_input`] が方針に従って処理するが、**フィールドがあって値が 0**
+    // という場合が別にある。0 は「速度を取得できなかった」の意味で
+    // (仮想デバイス、`ethtool` が速度を返さない NIC)、本家は
+    // `speed == 0` のとき `%ifutil` に `0.00` を出す (03 §5.2)。
     let speed = primary_input(plan, curr, net_dev_col::SPEED, policy)?;
+    // **分母が無いので率は作れない。**
+    //
+    // ここで 0.0 を返すと「利用率 0%」という別の意味の値になり、
+    // 集計・検出では**有効な観測として数えられてしまう**
+    // (固定条件の経路が「評価済み・検出なし」になる)。
+    // 欠落と 0 を混同しない (`docs/design.md` §4)、
+    // 評価できなかったものを「検出なし」にしない (同 §11.2 の規律 7)。
+    //
+    // 互換出力は本家が出す `0.00` を再現しなければならないので、
+    // [`MissingPolicy::Compat`] ではこの分岐に入らず下の式へ進む。
+    if speed == 0 && matches!(policy, MissingPolicy::Strict) {
+        return Err(ComputeIssue::MissingInSample);
+    }
     // duplex は式の選択にしか使わない。本家も未提供時は
     // 0 = C_DUPLEX_UNKNOWN として半二重側の式を使う。
     let duplex_v = raw_or_zero(plan, curr, net_dev_col::DUPLEX)?;
@@ -3907,6 +3922,44 @@ mod tests {
             Err(ComputeIssue::UnsupportedBySource),
             "リンク速度が分からないのに利用率 0% と見せない"
         );
+    }
+
+    /// **指摘 18 の点検**: `speed` フィールドはあるが値が 0 の `%ifutil`。
+    ///
+    /// フィールドの欠落 (上のテスト) とは別の経路である。速度を取得できない
+    /// インターフェース (仮想デバイス、`ethtool` が速度を返さない NIC) では
+    /// フィールドが存在して値が 0 になる。ここで `0.0` を返すと
+    /// **計算結果の 0 が有効な観測になり**、固定条件の経路が
+    /// 「評価済み・検出なし」として数えてしまう (規律 7 の抜け)。
+    #[test]
+    fn ifutil_with_a_zero_speed_value_is_unavailable_outside_compat() {
+        // 現行レイアウト。speed / duplex フィールドは存在する
+        let plan = plan_for(ActivityId::NET_DEV);
+        let col = net_dev_col::IFUTIL_PCT;
+        let meta = &lookup(ActivityId::NET_DEV).unwrap().columns[col];
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, net_dev_col::RXKB, 1_000_000);
+        // speed = 0 (取得できなかった)。フィールド自体は存在する
+        put(&plan, &mut c, net_dev_col::SPEED, 0);
+        let ctx = ComputeContext::new(100);
+
+        assert_eq!(
+            column_value(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx).unwrap(),
+            0.0,
+            "互換出力は本家と同じ 0.00 を出す (03 §5.2)"
+        );
+        assert_eq!(
+            column_value_strict(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx),
+            Err(ComputeIssue::MissingInSample),
+            "分母が無いので率を作れない。0% と見せると評価済みに数えられる"
+        );
+
+        // 速度が取れていれば従来どおり計算する (この分岐で他を壊していない)
+        put(&plan, &mut c, net_dev_col::SPEED, 1_000);
+        let v = column_value_strict(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx)
+            .expect("速度があるので計算できる");
+        assert!(v > 0.0, "{v}");
     }
 
     // ---- Average: (方式 B′) ----

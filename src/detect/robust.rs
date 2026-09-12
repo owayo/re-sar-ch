@@ -10,12 +10,31 @@
 //! 値がほぼ一定の系列では MAD が 0 になる。そこを `1e-9` のような ε で割ると
 //! スコアが天文学的な値になり、無害な 1 ビットの揺れが最重大の検出になる。
 //! `MAD == 0` は [`crate::detect::Dispersion::NotMeasurable`] という
-//! **別の状態**として扱い、この経路は何も出さずに降りる。
-//! その系列は固定条件経路と水準変化経路が見る。
+//! **別の状態**として扱い、逸脱スコアは出さない。
 //!
 //! MAD は偏差の中央値なので、**過半数の値が中央値と一致すれば厳密に 0** になる。
 //! 「0 ではないが極端に小さい」状態は、同値がちょうど半数前後を占めるときに
-//! 起こり得る。そこは [`crate::detect::Dispersion::TooSparse`] で降りる。
+//! 起こり得る。そこは [`crate::detect::Dispersion::TooSparse`] で受ける。
+//!
+//! # 散らばりが測れないときの受け皿 — 絶対差で判断する
+//!
+//! ε で割らない代わりに、**何も言わないで済ませてもいけない**。
+//! `runq-sz` が 144 点中 141 点 0 で 3 点だけ 100 という入力では、
+//!
+//! - 固定条件は無い (CPU 数に依存するので絶対値を置けない)
+//! - MAD が 0 なので逸脱スコアを出せない
+//! - 後窓 5 点のうち高いのは 3 点までなので、水準変化の持続率
+//!   (既定 0.7) に届かない
+//!
+//! となり、**検出 0 件**になる。そこで「散らばりは測れないが、指標ごとの
+//! 最小有意変化量 ([`crate::analyze::metric_catalog::ShiftMagnitude`]) を
+//! 超える差があった」という**別の非正規化状態**
+//! ([`crate::detect::DecisionBasis::AbsoluteDeparture`]) を報告する。
+//!
+//! 基準は `ShiftMagnitude` なので、指標ごとの意味が保たれる
+//! (`runq-sz` は 4 タスクぶんの差で鳴り、0 → 1 の整数揺れでは鳴らない)。
+//! **正規化はしない。** 出力でも「MAD の N 倍」ではなく
+//! 「散らばりが測れないため絶対差で判断した」と書き分ける。
 //!
 //! # スコアを `z` と呼ばない
 //!
@@ -66,14 +85,10 @@ pub fn detect(
         );
     }
 
-    // **散らばりが測れないときは何も出さない。** ε で割らない。
+    // **散らばりが測れないときは逸脱スコアを出さない。** ε で割らない。
+    // 代わりに絶対差で判断できるかを見る (何も言わないで済ませない)。
     let Some((center, mad)) = baseline.usable_mad() else {
-        let reason = match baseline.evidence.dispersion {
-            Dispersion::NotMeasurable => NotEvaluated::DispersionNotMeasurable,
-            Dispersion::TooSparse { .. } => NotEvaluated::DispersionTooSparse,
-            _ => NotEvaluated::TooFewBaselineSamples,
-        };
-        return (Vec::new(), RouteStatus::NotEvaluated { reason });
+        return absolute_departures(series, entry, baseline);
     };
 
     let ratio_threshold = opts.thresholds.deviation_ratio;
@@ -92,17 +107,7 @@ pub fn detect(
     for segment in series.iter_segments() {
         for (a, b) in group_runs(segment, deviates) {
             let hit = &segment[a..b];
-            // 逸脱の向きは区間の中で最も外れた点で決める
-            let peak = hit
-                .iter()
-                .max_by(|x, y| {
-                    (x.value - center)
-                        .abs()
-                        .partial_cmp(&(y.value - center).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .expect("非空");
-            let diff = peak.value - center;
+            let diff = peak_deviation(hit, center);
             let direction = ShiftDirection::of(diff);
             let basis = DecisionBasis::RobustDeviation {
                 median: center,
@@ -113,26 +118,7 @@ pub fn detect(
                 peak_absolute_deviation: diff.abs(),
                 direction,
             };
-            out.push(Detection {
-                detector_version: DETECTOR_VERSION,
-                series: SeriesKey::from_metric(&series.key),
-                metric_label: entry.label,
-                unit: series.unit,
-                kind: series.kind,
-                origin: series.origin,
-                pattern: match direction {
-                    ShiftDirection::Rise => Pattern::Spike,
-                    ShiftDirection::Fall => Pattern::Dip,
-                },
-                support: series.support_of(hit),
-                baseline: baseline.evidence.clone(),
-                decision: DecisionEvidence::new(basis, hit),
-                // 逸脱だけでは「このホストでは珍しい」までしか言えない。
-                // 絶対水準の裏付けが無いので単独では Watch を超えない。
-                base_priority: crate::analyze::assessment::Priority::Watch,
-                possible_interpretations: entry.interpretations,
-                not_established: entry.not_established,
-            });
+            out.push(build(series, entry, baseline, basis, direction, hit));
         }
     }
 
@@ -142,6 +128,120 @@ pub fn detect(
         RouteStatus::Detected { count: out.len() }
     };
     (out, status)
+}
+
+/// 散らばりが測れないときの受け皿 — 絶対差だけで判断する。
+///
+/// **`MAD == 0` を ε で割った代替ではない。** 正規化は一切せず、
+/// 指標ごとの最小有意変化量を超える差があったことだけを報告する
+/// (モジュール doc の「散らばりが測れないときの受け皿」を参照)。
+///
+/// 何も見つからなくても [`RouteStatus::Evaluated`] にはしない。
+/// 散らばりは測れていないので「逸脱は無かった」とは言えない (規律 7)。
+fn absolute_departures(
+    series: &PreparedSeries,
+    entry: &'static CatalogEntry,
+    baseline: &Baseline,
+) -> (Vec<Detection>, RouteStatus) {
+    let dispersion = baseline.evidence.dispersion;
+    let reason = match dispersion {
+        Dispersion::NotMeasurable => NotEvaluated::DispersionNotMeasurable,
+        Dispersion::TooSparse { .. } => NotEvaluated::DispersionTooSparse,
+        _ => NotEvaluated::TooFewBaselineSamples,
+    };
+    let declined = (Vec::new(), RouteStatus::NotEvaluated { reason });
+
+    // 材料が足りない場合は中央値そのものが比較基準にならない。
+    // 絶対差の受け皿も出さない
+    if !matches!(
+        dispersion,
+        Dispersion::NotMeasurable | Dispersion::TooSparse { .. }
+    ) {
+        return declined;
+    }
+    let Some(center) = baseline.evidence.median else {
+        return declined;
+    };
+    // 最小有意変化量を宣言していない系列 (普段 0 の事象カウンタ) は
+    // 固定条件経路が 1 回の発生から拾う。ここで基準を発明しない
+    let Some(floor) = magnitude_floor(entry.shift, center).filter(|f| *f > 0.0) else {
+        return declined;
+    };
+
+    let departs = |o: &Observation| {
+        let diff = o.value - center;
+        entry.deviation.accepts(ShiftDirection::of(diff)) && diff.abs() >= floor
+    };
+
+    let mut out = Vec::new();
+    for segment in series.iter_segments() {
+        for (a, b) in group_runs(segment, departs) {
+            let hit = &segment[a..b];
+            let diff = peak_deviation(hit, center);
+            let direction = ShiftDirection::of(diff);
+            let basis = DecisionBasis::AbsoluteDeparture {
+                reference: center,
+                dispersion,
+                min_absolute_deviation: floor,
+                peak_absolute_deviation: diff.abs(),
+                direction,
+            };
+            out.push(build(series, entry, baseline, basis, direction, hit));
+        }
+    }
+
+    if out.is_empty() {
+        return declined;
+    }
+    let count = out.len();
+    (out, RouteStatus::Detected { count })
+}
+
+/// 区間の中で最も基準から離れた点の差 (符号つき)。
+///
+/// 向きは**最も外れた点**で決める。区間の平均で決めると、
+/// 大きな上振れと小さな下振れが混ざったときに向きが揺れる。
+fn peak_deviation(hit: &[Observation], center: f64) -> f64 {
+    let peak = hit
+        .iter()
+        .max_by(|x, y| {
+            (x.value - center)
+                .abs()
+                .partial_cmp(&(y.value - center).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("非空");
+    peak.value - center
+}
+
+fn build(
+    series: &PreparedSeries,
+    entry: &'static CatalogEntry,
+    baseline: &Baseline,
+    basis: DecisionBasis,
+    direction: ShiftDirection,
+    hit: &[Observation],
+) -> Detection {
+    Detection {
+        detector_version: DETECTOR_VERSION,
+        series: SeriesKey::from_metric(&series.key),
+        metric_label: entry.label,
+        unit: series.unit,
+        kind: series.kind,
+        origin: series.origin,
+        pattern: match direction {
+            ShiftDirection::Rise => Pattern::Spike,
+            ShiftDirection::Fall => Pattern::Dip,
+        },
+        support: series.support_of(hit),
+        baseline: baseline.evidence.clone(),
+        decision: DecisionEvidence::new(basis, hit),
+        // 逸脱だけでは「このホストでは珍しい」までしか言えない。
+        // 絶対水準の裏付けが無いので単独では Watch を超えない。
+        base_priority: crate::analyze::assessment::Priority::Watch,
+        possible_interpretations: entry.interpretations,
+        not_established: entry.not_established,
+    }
 }
 
 #[cfg(test)]
@@ -200,35 +300,44 @@ mod tests {
     }
 
     /// 完全に一定の系列でも同じ (0 除算が起きない)。
+    ///
+    /// 何も見つからなくても [`RouteStatus::Evaluated`] にしない。
+    /// 散らばりを測れていないので「逸脱は無かった」とは言えない (規律 7)。
     #[test]
     fn a_perfectly_flat_series_is_safe() {
-        let (found, _, baseline) = run(runq(&vals(&[3.0; 30])));
+        let (found, status, baseline) = run(runq(&vals(&[3.0; 30])));
         assert!(found.is_empty());
         assert_eq!(baseline.evidence.dispersion, Dispersion::NotMeasurable);
-    }
-
-    /// 中央値と同じ値が大半を占める系列も降りる。
-    ///
-    /// `MAD` は偏差の中央値なので、同値が過半数なら厳密に 0 になる。
-    /// 半数前後では小さな正値になり得るため、別の状態として受ける。
-    #[test]
-    fn a_series_dominated_by_one_value_declines() {
-        // 21 点が 0、19 点が散らばる → MAD は 0 になる (同値が過半数)
-        let mut v = vec![0.0; 21];
-        v.extend((1..=19).map(|i| f64::from(i) * 10.0));
-        let (found, status, baseline) = run(runq(&vals(&v)));
-        assert!(found.is_empty());
         assert!(
             matches!(
                 status,
                 RouteStatus::NotEvaluated {
                     reason: NotEvaluated::DispersionNotMeasurable
-                        | NotEvaluated::DispersionTooSparse
                 }
             ),
-            "{status:?}"
+            "評価不能のまま (検出なしにしない): {status:?}"
         );
+    }
+
+    /// 中央値と同じ値が大半を占める系列では逸脱スコアを出さない。
+    ///
+    /// `MAD` は偏差の中央値なので、同値が過半数なら厳密に 0 になる。
+    /// 半数前後では小さな正値になり得るため、別の状態として受ける。
+    /// **比 (`MAD` の何倍) は出さない**が、絶対差が最小有意変化量を
+    /// 超えていれば受け皿が事実として報告する。
+    #[test]
+    fn a_series_dominated_by_one_value_reports_no_deviation_ratio() {
+        // 21 点が 0、19 点が散らばる → MAD は 0 になる (同値が過半数)
+        let mut v = vec![0.0; 21];
+        v.extend((1..=19).map(|i| f64::from(i) * 10.0));
+        let (found, _, baseline) = run(runq(&vals(&v)));
         assert!(!baseline.evidence.dispersion.is_measured());
+        assert!(
+            found
+                .iter()
+                .all(|d| matches!(d.decision.basis, DecisionBasis::AbsoluteDeparture { .. })),
+            "散らばりが測れないのに MAD の比を出してはいけない: {found:#?}"
+        );
     }
 
     /// 散らばりがある系列では逸脱を拾う。
@@ -299,6 +408,94 @@ mod tests {
         assert!(
             found.is_empty(),
             "18 ポイントの差は %idle の最小有意変化量 (20) に届かない"
+        );
+    }
+
+    /// `MAD = 0` の系列でも、絶対差が大きい短い変動は報告する。
+    ///
+    /// 再現条件: `runq_sz` が 144 点中 141 点は 0 で、連続 3 点だけ 100。
+    /// 固定条件は無く (CPU 数に依存するので置けない)、MAD が 0 なので
+    /// 逸脱スコアは出せず、後窓 5 点のうち高いのは 3 点なので水準変化の
+    /// 持続率 (0.7) にも届かない。受け皿が無いと**検出 0 件**になる。
+    #[test]
+    fn a_short_large_burst_in_a_flat_series_is_reported_by_absolute_difference() {
+        let mut v = vec![0.0; 144];
+        for x in v.iter_mut().skip(70).take(3) {
+            *x = 100.0;
+        }
+        let (found, status, baseline) = run(runq(&vals(&v)));
+
+        assert_eq!(baseline.evidence.dispersion, Dispersion::NotMeasurable);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let d = &found[0];
+        assert_eq!(d.support.samples, 3);
+        assert_eq!(d.pattern, Pattern::Spike);
+        assert_eq!(
+            d.route(),
+            DetectRoute::RobustDeviation,
+            "経路は 3 つのまま (同じ観点の別状態)"
+        );
+        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+
+        let DecisionBasis::AbsoluteDeparture {
+            reference,
+            dispersion,
+            min_absolute_deviation,
+            peak_absolute_deviation,
+            direction,
+        } = d.decision.basis
+        else {
+            panic!("絶対差で判断した根拠が入っているべき: {:#?}", d.decision);
+        };
+        assert_eq!(reference, 0.0);
+        assert_eq!(
+            dispersion,
+            Dispersion::NotMeasurable,
+            "測れなかった理由を残す"
+        );
+        assert!(
+            (min_absolute_deviation - 4.0).abs() < 1e-9,
+            "runq-sz の最小有意変化量 (4 タスク)"
+        );
+        assert!((peak_absolute_deviation - 100.0).abs() < 1e-9);
+        assert_eq!(direction, ShiftDirection::Rise);
+    }
+
+    /// 受け皿でも**指標ごとの最小有意変化量**を下回る揺れは拾わない。
+    ///
+    /// ε 正規化をしていないことの裏返し。整数 Gauge の 0 → 1 は
+    /// `runq-sz` では意味を持たない。
+    #[test]
+    fn the_absolute_receptacle_ignores_a_change_below_the_declared_magnitude() {
+        let mut v = vec![0.0; 40];
+        v[20] = 1.0;
+        v[21] = 2.0;
+        let (found, status, _) = run(runq(&vals(&v)));
+        assert!(found.is_empty(), "{found:#?}");
+        assert!(
+            matches!(
+                status,
+                RouteStatus::NotEvaluated {
+                    reason: NotEvaluated::DispersionNotMeasurable
+                }
+            ),
+            "{status:?}"
+        );
+    }
+
+    /// 最小有意変化量を宣言していない系列では受け皿も作らない。
+    ///
+    /// 普段 0 の事象カウンタ (スワップ) は、発生自体が事象なので
+    /// 固定条件経路が 1 回でも拾う。ここで基準を発明しない。
+    #[test]
+    fn a_metric_without_a_declared_magnitude_has_no_receptacle() {
+        let mut v = vec![0.0; 40];
+        v[20] = 500.0;
+        let (found, status, _) = run(pswpin(&vals(&v)));
+        assert!(found.is_empty(), "{found:#?}");
+        assert!(
+            matches!(status, RouteStatus::NotEvaluated { .. }),
+            "{status:?}"
         );
     }
 

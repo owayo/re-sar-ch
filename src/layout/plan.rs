@@ -903,6 +903,18 @@ mod tests {
         assert_eq!(rev.types_nr, [2, 0, 0]);
     }
 
+    /// 型別個数の増減は「全て増加方向」か「全て減少方向」でなければならない。
+    #[test]
+    fn types_nr_monotonicity() {
+        // 同じ / 全部増えた / 全部減った
+        assert!(types_nr_is_monotonic([10, 0, 0], [10, 0, 0]));
+        assert!(types_nr_is_monotonic([11, 1, 1], [10, 0, 0]));
+        assert!(types_nr_is_monotonic([5, 0, 0], [10, 0, 0]));
+        // 増加と減少の混在 (magic を上げずにこれは起こらない)
+        assert!(!types_nr_is_monotonic([0, 2, 0], [10, 0, 0]));
+        assert!(!types_nr_is_monotonic([11, 0, 0], [10, 1, 0]));
+    }
+
     /// magic を持たない世代 (`0x2170`) は申告サイズだけで判断する。
     #[test]
     fn generation_without_activity_magic_uses_size_only() {

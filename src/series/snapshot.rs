@@ -119,6 +119,9 @@ pub struct IntervalView<'a> {
     /// 前サンプルとの間に RESTART が無いか。
     pub continuous: bool,
     /// このレコードの直前に読み込んだイベント (RESTART / COMMENT)。
+    ///
+    /// 束ねて渡すのは [`walk`] 経路だけで、[`walk_items`] 経路では**常に空**
+    /// (イベントは [`WalkItem::Event`] として読んだ順に通知済み)。
     pub events: &'a [RecordEvent],
     /// デコード計画。列メタデータから値を引くのに使う。
     pub plans: &'a [ActivityPlan],
@@ -454,7 +457,9 @@ where
             Ok(ScanControl::Continue)
         }
         WalkItem::Sample(view) => {
-            // 束ねたイベントを載せ替えて渡す (他のフィールドはそのまま)
+            // 束ねたイベントを載せ替えて渡す (他のフィールドはそのまま)。
+            // `..*view` が書けるのは IntervalView の全フィールドが Copy だからで、
+            // 非 Copy のフィールドを足すとここが壊れる。
             let merged = IntervalView {
                 events: &pending,
                 ..*view
@@ -554,12 +559,21 @@ fn decode_activity_into(
                 ))
             })?;
 
-        item.key = plan
+        // 名前が変わらなければ確保し直さない (デバイス名は通常固定。texts 側と同じ扱い)。
+        //
+        // 計測 (criterion / `benches/decode.rs` の `walk_all_activities`、
+        // 名前付き 50 インターフェース × 2000 レコードの 9.5 MB ファイル、
+        // 交互に 4 往復) では 9.45 ms → 7.75 ms (約 18% 短縮)。
+        // 本家 fixture (22 KB) では雑音に埋もれて差が出ないので、
+        // 名前付き item が多いファイルで測る必要がある。
+        let key = plan
             .read_item_key(&view)
             .ok()
             .flatten()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned().into_boxed_str());
+            .filter(|s| !s.is_empty());
+        if item.key.as_deref() != key {
+            item.key = key.map(|s| s.to_owned().into_boxed_str());
+        }
 
         // 文字列フィールドを持つ activity は少数なので、無ければ何もしない
         if plan.text_fields.is_empty() {
@@ -1283,57 +1297,5 @@ mod tests {
                 Some("eth1".to_string())
             ]
         );
-    }
-}
-
-#[cfg(test)]
-mod tmp_probe {
-    use super::*;
-    #[test]
-    #[ignore]
-    fn probe_upstream_fixtures() {
-        let dir = std::path::Path::new("target/fixtures/upstream");
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                let n = p.file_name().unwrap().to_string_lossy().to_string();
-                n.starts_with("data-") && !n.ends_with(".xml") && !n.contains("err")
-            })
-            .collect();
-        names.sort();
-        for p in names {
-            match SaFile::open(&p) {
-                Ok(f) => {
-                    let planned = match plan_activities(&f, &Selection::All) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            println!(
-                                "{:40} plan error: {e}",
-                                p.file_name().unwrap().to_string_lossy()
-                            );
-                            continue;
-                        }
-                    };
-                    println!(
-                        "{:40} acts={:2} planned={:2} skipped={:2} {:?}",
-                        p.file_name().unwrap().to_string_lossy(),
-                        f.activities().len(),
-                        planned.plans.len(),
-                        planned.skipped.len(),
-                        planned
-                            .skipped
-                            .iter()
-                            .map(|s| format!("{}: {}", s.id, s.reason))
-                            .collect::<Vec<_>>()
-                    );
-                }
-                Err(e) => println!(
-                    "{:40} open error: {e}",
-                    p.file_name().unwrap().to_string_lossy()
-                ),
-            }
-        }
     }
 }

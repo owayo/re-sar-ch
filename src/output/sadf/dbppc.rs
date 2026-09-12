@@ -41,7 +41,7 @@ pub fn write_ppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Resu
 }
 
 fn write_dbppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig, isdb: bool) -> Result<()> {
-    let info = FileInfo::from_file(file);
+    let info = FileInfo::from_file_with(file, cfg.time_base);
     let specs = selected_specs(file, cfg);
     let blocks = scan_blocks(file)?;
 
@@ -197,7 +197,7 @@ fn emit_sample<W: Write>(
     let Some(pair) = ActivityPair::from_view(view, spec.id) else {
         return Ok(());
     };
-    for item in pair.output_items() {
+    for item in pair.compat_items() {
         let label = item_label_in(spec, section, &item);
         let mut line = String::with_capacity(96);
 
@@ -361,7 +361,7 @@ fn horizontal_line(
             continue;
         };
         for section in spec.active_sections(&cfg.section) {
-            for item in pair.output_items() {
+            for item in pair.compat_items() {
                 let label = item_label_in(spec, section, &item);
                 if !label.db.is_empty() {
                     line.push(';');
@@ -397,7 +397,34 @@ fn horizontal_line(
 pub struct RestartMark {
     pub ust_time: u64,
     pub hms: (u8, u8, u8),
+    /// 表示に使う CPU 数 (CPU "all" を含む数)。
+    ///
+    /// **レコードが持つ値ではなく、その時点で有効な `sa_cpu_nr`。**
+    /// `0x2171` の RESTART はペイロードを持たないので、レコード側は常に空になる。
+    /// 本家は `file_hdr.sa_cpu_nr` をメモリ上で持ち回り、RESTART が値を運んで
+    /// きたときだけ更新して `print_special_record()` に渡す。
+    /// レコードの値だけを見ると旧世代で `(1 CPU)` になる。
     pub cpu_count: Option<u32>,
+}
+
+/// RESTART の CPU 数を「その時点で有効な `sa_cpu_nr`」に解決する。
+///
+/// ファイルヘッダの値から始め、値を持つ RESTART を読むたびに更新する
+/// (本家がメモリ上の `sa_cpu_nr` を書き換えるのと同じ)。
+struct CpuNrTracker(Option<u32>);
+
+impl CpuNrTracker {
+    fn new(file: &SaFile) -> Self {
+        Self(file.header().cpu_nr)
+    }
+
+    /// RESTART 1 件を取り込み、その行に出すべき CPU 数を返す。
+    fn take(&mut self, record: Option<u32>) -> Option<u32> {
+        if record.is_some() {
+            self.0 = record;
+        }
+        self.0
+    }
 }
 
 /// `LINUX-RESTART` 行。
@@ -435,10 +462,23 @@ pub fn display_cpu_count(cpu_count: Option<u32>) -> u32 {
 // ===========================================================================
 
 /// ファイルに実データを持つ activity の出力定義を ID 昇順で返す。
+///
+/// **現行世代のファイルでは**、参照する `sar` 版と形式が違う activity を除く。
+/// 本家 `sa_common.c: check_file_actlst()` が `ACTIVITY_MAGIC_UNKNOWN` を
+/// 立てた activity は `id_seq[]` に入らないので、`sadf` のデータブロックも
+/// 出ない (`-H` の一覧には `[Unknown format]` 付きで出る)。
+/// 判定は [`SaFile::displays_activity`]。世代の扱い (旧世代では弾かない理由)
+/// もそちらの doc にまとめてある。`sar` テキスト側と同じ関数を使う。
+///
+/// 独自出力 (`table` / `json` / `csv` / `ndjson`) はこの関数を通らず、
+/// 世代を問わず読めたものをすべて出す。
 pub fn present_specs(file: &SaFile) -> Vec<&'static ActivitySpec> {
     let mut out: Vec<&'static ActivitySpec> = Vec::new();
     for entry in file.activities() {
         if entry.nr <= 0 {
+            continue;
+        }
+        if !file.displays_activity(entry.id) {
             continue;
         }
         if let Some(s) = spec::lookup(entry.id)
@@ -511,13 +551,14 @@ pub fn scan_blocks(file: &SaFile) -> Result<Blocks> {
         restarts: Vec::new(),
         stats: vec![0],
     };
+    let mut cpus = CpuNrTracker::new(file);
     file.scan(|rec| {
         match rec.kind {
             RecordKind::Restart => {
                 b.restarts.push(RestartMark {
                     ust_time: rec.ust_time,
                     hms: (rec.hour, rec.minute, rec.second),
-                    cpu_count: rec.cpu_count,
+                    cpu_count: cpus.take(rec.cpu_count),
                 });
                 b.stats.push(0);
             }
@@ -540,12 +581,13 @@ pub fn scan_blocks(file: &SaFile) -> Result<Blocks> {
 pub fn scan_restarts(file: &SaFile) -> Result<Vec<RestartMark>> {
     use crate::format::registry::RecordKind;
     let mut marks = Vec::new();
+    let mut cpus = CpuNrTracker::new(file);
     file.scan(|rec| {
         if rec.kind == RecordKind::Restart {
             marks.push(RestartMark {
                 ust_time: rec.ust_time,
                 hms: (rec.hour, rec.minute, rec.second),
-                cpu_count: rec.cpu_count,
+                cpu_count: cpus.take(rec.cpu_count),
             });
         }
         Ok(ScanControl::Continue)

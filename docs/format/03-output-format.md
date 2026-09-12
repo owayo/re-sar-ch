@@ -946,6 +946,35 @@ Rust 実装が計算を正しく行うために必須の前提を列挙する。
 | 17 | `--dec` / `--human` を `sadf` にも実装する | **どちらも sar 専用**。`sadf` は `--dec=` を受け付けず、`DISPLAY_UNIT` は `pr_stats.c` / `pr_xstats.c` からのみ参照される (sadf の各レンダラは `--human` を完全に無視する) |
 | 18 | ブロックデバイス名をローカル `/sys` から解決する | 他ホストのファイルでは誤名になる。既定は `dev<maj>-<min>` (§2.8.1) |
 
+#### 1.11 互換出力すべてに共通する不変条件
+
+`sar` と `sadf` の 6 形式 (`-d` / `-p` / `-r` / `-j` / `-x`、および `sar` テキスト) は
+**同じ入力から同じ値**を出す。書式が違うだけで、値の作り方は共通である。
+
+形式ごとにレンダラが分かれているため、**どれか 1 つだけで規則が抜ける**事故が起きやすい。
+実際に次の 5 件が「1 形式だけ違う」状態で見つかっている (Issue #1 / #4)。
+
+| 不変条件 | 抜けていた形式 | 症状 |
+|---|---|---|
+| 欠落フィールドのゼロ補完 (§1.9-1) は `UnsupportedBySource` **だけ**に適用する | `-r` のみ空欄 | 旧 `A_IO` の `dtps` が `-d` では `0.00`、`-r` では空欄 |
+| `LINUX-RESTART` の CPU 数はメモリ上の `sa_cpu_nr` から取る (§1.3) | `sadf` 全形式 | `0x2171` は RESTART がペイロードを持たないので `(1 CPU)` になる |
+| 未使用の item 枠は番兵で飛ばす | `sadf` 全形式 | `dev0-0` の 0 行が並ぶ |
+| 保存単位 → 表示単位の換算 (§9.6-2) | `sadf` 全形式 | `rxkB` がバイト、`rd_sec` が kB のまま |
+| 既知 ID かつ magic 不一致の activity は表示しない | `sar` / `sadf` 両方 | 本家に無いブロックが出る |
+
+**片方だけ直して終わりにしない。**「値は同じで書式だけ違う」ことは
+本家テスト 01500〜01550 (`sadf -d/-p/-r/-j/-x` を同じ入力・同じ activity 選択で並べたもの)
+の golden 比較で固定している (`docs/format/04-test-data.md` §5.5.1)。
+
+欠落の 2 種類を混同しないことも共通である。
+
+| 種別 | 互換出力 | 独自出力 |
+|---|---|---|
+| `UnsupportedBySource` (その世代にフィールドが無い) | **`0`** (本家がゼロ補完した構造体を読む) | `unsupported_by_source` |
+| `MissingInSample` (フィールドはあるがこのレコードで読めていない) | 空欄 / `null` | `missing_in_sample` |
+| 不連続 (`FirstSample` / `Restart` / …) | 空欄 / `null` | 理由つき |
+| 未実装 | 空欄 / `null` | 同左 |
+
 ---
 
 ## 第 II 部 — sar テキスト出力の全体構造
@@ -991,6 +1020,43 @@ flowchart TD
 
    09:33:48       proc/s   cswch/s
    ```
+
+2′. **ただし再表示されるのは `fpos` より後ろにあるイベントだけである。**
+   上の図で `fpos` を記憶するのは「最初の統計レコードを読んだ**後**」なので、
+   それより前にある `RESTART` / `COMMENT` は外側ループで 1 回出たあと
+   巻き戻しの範囲に入らない。境界は**最初の統計レコード**であって
+   最初に表示されるサンプルではない (`-s` で消費される基準サンプルも統計レコードなので
+   `fpos` はその後ろになる)。
+
+   | データ | イベント | 最初の統計 | 出方 |
+   |---|---|---|---|
+   | `data-12.0.0` | RESTART 05:39:21 | 05:39:33 | 先頭で 1 回 |
+   | `data-12.0.0` | COM 05:40:26 | 〃 | 各ブロック内 (ファイル順なのでデータ行と `Average:` 行の間) |
+   | `data-11.6.5` | RESTART 09:33:38 | 09:33:48 | 先頭で 1 回 |
+   | `data-11.6.5` | COM 09:34:30 | 〃 | 各ブロック内 |
+   | `data-9.1.6` | RESTART 08:16:11 / COM 08:16:56 | 08:17:01 | どちらも先頭で 1 回 |
+
+   両者を区別せず全イベントをブロックごとに出すと、`RESTART` 行が activity の数だけ
+   増える (実測で 5 ケースが同時に落ちた。Issue #4 の ①)。
+
+2″. **区間を終わらせた `RESTART` は全 activity ブロックの後に 1 回だけ出る。**
+   `handle_curr_act_stats()` のサンプルループは終了条件に
+   `record_hdr[*curr].record_type != R_RESTART` を持つので、`R_RESTART` を読んだ時点で
+   **印字せずに抜け**、そのあと `Average:` を出す。区切りの `RESTART` 行を出すのは
+   activity ループを抜けた後の `print_special_record()` である。
+
+   したがって入れ子は「**区間が外側、activity が内側**」になる。
+
+   ```text
+   区間 1: CPU の全サンプル → CPU の Average → PCSW の全サンプル → PCSW の Average
+   LINUX RESTART                                        ← 1 回だけ
+   区間 2: CPU の全サンプル → CPU の Average → PCSW の全サンプル → PCSW の Average
+   ```
+
+   「activity を外側」にすると `RESTART` 行が activity の数だけ出て、同じ時刻の
+   ブロックが出力の 2 か所に分かれる。**本家の期待出力はどれも `RESTART` を
+   最初の統計レコードより前に 1 個しか持たないため、golden 比較ではこの違いを突けない。**
+   reSARch は `tests/record_layout.rs` の自作 fixture で固定している。
 3. `AO_MULTIPLE_OUTPUTS` を持つ activity (`A_MEMORY` の `-r`/`-S`、`A_FS` の `-F`/`-F MOUNT` 等) は
    `opt_flags` の下位 8bit を 1 ビットずつ立てて **同じ activity を複数回まわす**。
    したがって `sar -r -S` は「メモリ表 → メモリ Average → スワップ表 → スワップ Average」の順になる。
@@ -1375,6 +1441,28 @@ printf("%s %s (%s) \t%s \t_%s_\t(%d CPU)\n", sysname, release, nodename, cur_dat
   - 環境変数 `S_TIME_FORMAT` が `ISO` なら `DATE_FORMAT_ISO` (`%Y-%m-%d`)、
     それ以外なら `DATE_FORMAT_LOCAL` (`%x` = ロケール依存、C ロケールでは `MM/DD/YY`)。
   - `strftime` が 0 を返した場合のみ `DEFAULT_ERROR_DATE` を出力。
+- **日付の元になる `struct tm` は `get_file_timestamp_struct()` が作る。**
+  ここが誤りやすい:
+
+  ```c
+  if (PRINT_TRUE_TIME(flags)) {          /* sar -t / sadf -t のときだけ */
+      rectime->tm_mday = file_hdr->sa_day;
+      rectime->tm_mon  = file_hdr->sa_month;   /* 0 起点 (tm_mon そのまま) */
+      rectime->tm_year = file_hdr->sa_year;
+      mktime(rectime);                          /* DST フラグを埋めるため */
+  } else {
+      *rectime = *localtime(&file_hdr->sa_ust_time);
+  }
+  ```
+
+  つまり**既定は `sa_ust_time` を現地時刻に直したもの**で、
+  ヘッダの `sa_day` / `sa_month` / `sa_year` を使うのは `-t` のときだけである。
+  同じ関数の結果が `sadf -H` の `File date:` にも使われる。
+
+  > 本家のテストデータ `data-ukwn` / `data-extra-12.1.7` は
+  > **`sa_ust_time` (1568533161 = 2019-09-15) とヘッダ日付 (2019-10-15) を意図的に食い違わせて**
+  > おり、時刻源を間違えると必ず落ちる。`sa_month` が 0 起点であることと合わせて
+  > 二重の罠になっている (Issue #4 の ⑦⑧)。
 - `cpu_nr` = `file_hdr.sa_cpu_nr > 1 ? sa_cpu_nr - 1 : 1`
   (`sa_cpu_nr` は「CPU "all" を含む数」なので 1 を引いて実 CPU 数にする。UP 機では 1)。
 - バナー行の直後に空行が入るが、それはバナー自身ではなく**次のヘッダ行が先頭に `\n` を
@@ -5701,6 +5789,21 @@ SOCK6: `tcp6sck`, `udp6sck`, `raw6sck`, `ip6-frag`
 - 未知の ID は name の位置に `Unknown activity` (翻訳対象)。
 - `nr2 > 1` のときのみ `x<nr2>` が付く。
 - 既知 ID だが magic が現行と違う場合、末尾に ` \t[Unknown format]` (空白 + タブ + 文字列)。
+- **未知 ID には `[Unknown format]` が付かない。**
+  印を立てるのは `check_file_actlst()` が `act[p]->magic = ACTIVITY_MAGIC_UNKNOWN` を
+  代入したときだけで、その代入は**自分の表に載っている ID** に対してしか起きない。
+  `expected.sadf-data-ukwn` の 3 行がこの区別をそのまま示している:
+
+  ```
+  01: [8b] A_CPU                Y:   3	(10,0,0)                  ← 既知・magic 一致
+  02: [ff] A_PCSW               N:   1	(0,1,0) 	[Unknown format]  ← 既知・magic 不一致
+  255: [8a] Unknown activity     Y:   2	(1,1,0)                   ← 未知 ID (印なし)
+  ```
+
+  両者を混ぜると「形式が古い既知 activity」と「そもそも知らない activity」の
+  区別が読み手から失われる。reSARch は 3 分類 (`FormatCompat`) として型に持ち、
+  `sar` が**ブロックを出すかどうか**の判断 (既知・magic 不一致は出さない) と
+  **印を付けるかどうか**の判断を別のメソッドに分けている (Issue #4 の ②⑨)。
 
 ##### 検証 (`tests/expected.data-12.0.0-H`, `sadf -H tests/data-12.0.0 | grep -v 0x2175`)
 

@@ -86,6 +86,13 @@ use crate::model::{ActivityId, Availability, CounterBits, ValueKind};
 // 派生列の計算は「同じ activity の別の列」を参照する。列メタデータの宣言順は
 // `layout::activities` で固定されているため、名前で引かずに添字で引く
 // (ホットパスに文字列比較を置かない)。
+//
+// **表は必ず全列を並べる。参照されていない定数も消さない。**
+// 後ろの定数の値は前の定数が存在することを前提にしているので、
+// 「誰も使っていないから」で 1 行消すと残りの添字の意味が変わる。
+// 識別子列 (`NAME` / `IFACE` / `MOUNTPOINT` / `MANUFACTURER` / `PRODUCT` など) は
+// 数値として読まないため参照が付かないが、列番号としては存在している。
+// dead-code 検査はこれらを未参照として挙げるが、対応は不要である。
 // ============================================================================
 
 /// `A_CPU` の列添字。
@@ -2520,17 +2527,6 @@ pub fn sadf_unit_value(
     ctx: &ComputeContext,
 ) -> Computed {
     sadf_unit_value_with(variant, plan, prev, curr, ctx, MissingPolicy::Compat)
-}
-
-/// [`sadf_unit_value`] の欠落を埋めない版。
-pub fn sadf_unit_value_strict(
-    variant: SadfUnitColumn,
-    plan: &DecodePlan,
-    prev: &ItemSnapshot,
-    curr: &ItemSnapshot,
-    ctx: &ComputeContext,
-) -> Computed {
-    sadf_unit_value_with(variant, plan, prev, curr, ctx, MissingPolicy::Strict)
 }
 
 fn sadf_unit_value_with(

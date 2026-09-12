@@ -47,8 +47,7 @@
 //! write_banner(&mut out, &file, &opts)?;
 //!
 //! for id in [ActivityId::CPU, ActivityId::MEMORY] {
-//!     for mut block in SarBlock::blocks_for(id, &opts) {
-//!         block.set_file_cpu_nr(file.header().cpu_nr);
+//!     for mut block in SarBlock::blocks_for(id, &opts, file.header().cpu_nr) {
 //!         walk_items(&file, &Selection::Only(vec![id]), |item| {
 //!             match item {
 //!                 WalkItem::Event(ev) => block.event(&mut out, &ev)?,
@@ -1410,6 +1409,16 @@ pub fn real_cpu_count(sa_cpu_nr: Option<u32>) -> u32 {
     }
 }
 
+/// `LINUX RESTART` 行に出す CPU 数。
+///
+/// 本家 `print_special_record()` が見るのは常に `file_hdr.sa_cpu_nr` である。
+/// RESTART レコードに CPU 数が入っている世代 (`0x2175`) はそれを読んで
+/// `sa_cpu_nr` を更新するので結果は同じだが、CPU 数を持たない旧世代では
+/// ファイルヘッダの値が残る。レコード側を優先し、無ければヘッダへ落とす。
+fn restart_cpu_count(record: Option<u32>, file_cpu_nr: Option<u32>) -> u32 {
+    real_cpu_count(record.or(file_cpu_nr))
+}
+
 /// バナー行 (`print_gal_header()`、03 §1)。
 ///
 /// ```text
@@ -1418,7 +1427,7 @@ pub fn real_cpu_count(sa_cpu_nr: Option<u32>) -> u32 {
 ///
 /// **区切りはタブ文字**であり空白ではない。`(nodename)` と日付の後には
 /// 「空白 1 個 + タブ」が入り、`_machine_` の後はタブのみ。
-pub fn write_banner<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> {
+pub fn write_banner<W: Write>(out: &mut W, file: &SaFile, opts: &SarTextOptions) -> io::Result<()> {
     let h = file.header();
     writeln!(
         out,
@@ -1426,15 +1435,58 @@ pub fn write_banner<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> {
         h.sysname,
         h.release,
         h.nodename,
-        report_date(h.year, h.month, h.day),
+        banner_date(h.ust_time, h.year, h.month, h.day, opts.time),
         h.machine,
         real_cpu_count(h.cpu_nr)
     )
 }
 
-/// バナーの日付 (`DATE_FORMAT_LOCAL` = `%x`、C ロケールでは `MM/DD/YY`)。
+/// バナーに載せる日付。
 ///
-/// `FileHeader::month` は既に 1 起点に正規化されている。
+/// 本家 `sa_common.c: get_file_timestamp_struct()` は
+///
+/// ```c
+/// if (PRINT_TRUE_TIME(flags)) {        /* sar -t */
+///     rectime->tm_mday = file_hdr->sa_day;
+///     rectime->tm_mon  = file_hdr->sa_month;
+///     rectime->tm_year = file_hdr->sa_year;
+/// } else {
+///     *rectime = *localtime(&file_hdr->sa_ust_time);
+/// }
+/// ```
+///
+/// つまり**既定は `sa_ust_time` 由来**で、ヘッダの `sa_day` / `sa_month` /
+/// `sa_year` を使うのは `-t` のときだけである。両者は一致するのが普通だが、
+/// 食い違うファイルがある (本家テストデータ `data-ukwn` は
+/// `sa_ust_time` が 2019-09-15、ヘッダ日付が 2019-10-15)。
+fn banner_date(ust_time: u64, year: i32, month: u8, day: u8, style: TimeStyle) -> String {
+    use chrono::{Datelike, Local, TimeZone, Utc};
+
+    /// エポック秒から落とした日付を `MM/DD/YY` にする。
+    fn from_epoch<Tz: TimeZone>(dt: &chrono::DateTime<Tz>) -> String {
+        report_date(dt.year(), dt.month() as u8, dt.day() as u8)
+    }
+
+    let fallback = || report_date(year, month, day);
+    match style {
+        // `-t`: ヘッダに焼き込まれた年月日をそのまま使う
+        TimeStyle::Recorded => fallback(),
+        // エポック表示でも日付そのものは UTC 換算 (`sadf` の `-U` 相当)
+        TimeStyle::Utc | TimeStyle::Epoch => Utc
+            .timestamp_opt(ust_time as i64, 0)
+            .single()
+            .map_or_else(fallback, |dt| from_epoch(&dt)),
+        TimeStyle::Local => Local
+            .timestamp_opt(ust_time as i64, 0)
+            .single()
+            .map_or_else(fallback, |dt| from_epoch(&dt)),
+    }
+}
+
+/// バナーの日付の書式 (`DATE_FORMAT_LOCAL` = `%x`、C ロケールでは `MM/DD/YY`)。
+///
+/// `FileHeader::month` は既に 1 起点に正規化されている
+/// (本家の `tm_mon` は 0 起点なので、そちらへ渡すなら `month - 1`)。
 pub fn report_date(year: i32, month: u8, day: u8) -> String {
     let yy = year.rem_euclid(100);
     format!("{month:02}/{day:02}/{yy:02}")
@@ -1444,17 +1496,26 @@ pub fn report_date(year: i32, month: u8, day: u8) -> String {
 ///
 /// 先頭に `\n` (= 直前に空行 1 行)、時刻の後に空白 2 個、
 /// **`LINUX RESTART` と `(N CPU)` の間はタブ 1 個**。
-pub fn write_restart<W: Write>(out: &mut W, timestamp: &str, cpu_nr: u32) -> io::Result<()> {
-    writeln!(
-        out,
-        "\n{}  LINUX RESTART\t({cpu_nr} CPU)",
+fn restart_line(timestamp: &str, cpu_nr: u32) -> String {
+    format!(
+        "\n{}  LINUX RESTART\t({cpu_nr} CPU)\n",
         pad_right(timestamp, TSW)
     )
 }
 
 /// `COM` 行 (03 §8.5)。**先頭に `\n` は入らない。**
+fn comment_line(timestamp: &str, text: &str) -> String {
+    format!("{}  COM {}\n", pad_right(timestamp, TSW), sanitize(text))
+}
+
+/// [`restart_line`] を書き出す。
+pub fn write_restart<W: Write>(out: &mut W, timestamp: &str, cpu_nr: u32) -> io::Result<()> {
+    out.write_all(restart_line(timestamp, cpu_nr).as_bytes())
+}
+
+/// [`comment_line`] を書き出す。
 pub fn write_comment<W: Write>(out: &mut W, timestamp: &str, text: &str) -> io::Result<()> {
-    writeln!(out, "{}  COM {}", pad_right(timestamp, TSW), sanitize(text))
+    out.write_all(comment_line(timestamp, text).as_bytes())
 }
 
 /// 非印字文字を `.` に置換する (`replace_nonprintable_char()`)。
@@ -1681,6 +1742,13 @@ pub struct SarBlock {
     cpu_first: Vec<ItemSnapshot>,
     /// `A_CPU` の区間終点の生 item 配列 (最後に表示したレコード)。
     cpu_last: Vec<ItemSnapshot>,
+    /// ファイルヘッダの `sa_cpu_nr`。`LINUX RESTART` 行の既定値。
+    ///
+    /// 本家 `print_special_record()` は常に `file_hdr.sa_cpu_nr` を出す。
+    /// RESTART レコードが CPU 数を持つ世代 (`0x2175`) ではその値で
+    /// 更新されるが、持たない旧世代ではヘッダの値がそのまま使われる
+    /// (`expected.data-9.1.6` の `LINUX RESTART` は `(8 CPU)`)。
+    file_cpu_nr: Option<u32>,
     items: Vec<ItemState>,
 }
 
@@ -1689,7 +1757,15 @@ impl SarBlock {
     ///
     /// 定義を持たない activity では空を返す。`A_MEMORY` のように
     /// 複数のサブレポートを持つ activity は複数返る。
-    pub fn blocks_for(id: ActivityId, opts: &SarTextOptions) -> Vec<SarBlock> {
+    /// `file_cpu_nr` は `LINUX RESTART` 行に出す CPU 数の既定値
+    /// (= その時点の `sa_cpu_nr`)。RESTART レコードが CPU 数を持たない世代
+    /// (`0x2171` / `0x2173`) ではこれが使われる。渡さないと本家が
+    /// `(8 CPU)` と出す行が `(1 CPU)` になる。
+    pub fn blocks_for(
+        id: ActivityId,
+        opts: &SarTextOptions,
+        file_cpu_nr: Option<u32>,
+    ) -> Vec<SarBlock> {
         let Some(def) = lookup(id) else {
             return Vec::new();
         };
@@ -1708,6 +1784,7 @@ impl SarBlock {
                 irq_cpu_cols: Vec::new(),
                 cpu_first: Vec::new(),
                 cpu_last: Vec::new(),
+                file_cpu_nr,
                 items: Vec::new(),
             })
             .collect()
@@ -1723,13 +1800,19 @@ impl SarBlock {
     /// 走査が**イベントを読んだ時点で**呼ばれる。統計レコードに束ねないので、
     /// 最後の統計レコードより後ろにあるイベントもここに届く
     /// (本家も読んだ順に `COM` / `LINUX RESTART` 行を出す。03 §1.10 の内側ループ)。
+    ///
+    /// **区間の外にあるイベントはここへ渡さない。**
+    /// 区間の先頭のイベントと、区間を終わらせた `LINUX RESTART` は
+    /// activity ループの外で 1 回だけ出す ([`plan_regions`] を参照)。
+    /// したがって通常この関数に届くのは区間内の `COMMENT` だけだが、
+    /// 区間の切り方が変わっても行が化けないよう `RESTART` の処理も残してある。
     pub fn event<W: Write>(&mut self, out: &mut W, ev: &RecordEvent) -> io::Result<()> {
         let ts = event_timestamp(ev, self.opts.time);
         match ev {
             RecordEvent::Restart { cpu_count, .. } => {
                 // 区間が終わるので平均を先に出す
                 self.flush_average(out)?;
-                write_restart(out, &ts, real_cpu_count(*cpu_count))?;
+                write_restart(out, &ts, restart_cpu_count(*cpu_count, self.file_cpu_nr))?;
                 self.reset_region();
             }
             RecordEvent::Comment { text, .. } => {
@@ -2262,6 +2345,16 @@ impl SarBlock {
             // 「現在オフライン」だけでなく「前サンプルでオフライン = 差分の
             // 基準値が無い」CPU も対象になる (03 §1.4.3)。
             if cpu_agg.as_ref().is_some_and(|a| a.is_offline(idx)) {
+                continue;
+            }
+            // 未使用の item スロットも行にしない。`file_activity.nr` は
+            // 「採取時に確保した枠数」なので空き枠が混ざる (`data-10.3.1` は
+            // 12 デバイスに対して枠が 20 ある)。本家は数を数えず、各
+            // `print_*_stats()` の先頭で activity 固有の番兵を見て `continue`
+            // する ([`compute::is_unused_item`] がその表)。
+            // 行を出さない = 累積もしないので、`Average:` 行と平均の分母からも
+            // 自動的に外れる ([`SarBlock::average_rows`] は `displayed` を見る)。
+            if compute::is_unused_item(self.view.id, idx, plan, &group.primary) {
                 continue;
             }
             let key = self.item_key(plan, &group.primary, idx);
@@ -2853,10 +2946,36 @@ pub fn activities_in_file(file: &SaFile) -> Vec<ActivityId> {
 
 /// バナー + 指定 activity のブロックを順に書き出す。
 ///
-/// activity ごとに [`walk_items`](crate::series::walk_items) を 1 回ずつ回す
-/// (本家がファイルを activity ごとに読み直すのと同じ構造)。
 /// レコードは溜めないので、`out` に [`std::io::BufWriter`] を渡せば
 /// そのままストリーミング出力になる。
+///
+/// 本家 `sar.c: read_stats_from_file()` の骨格をそのまま写している。
+///
+/// ```text
+/// バナーを出す (print_report_hdr)
+/// do {                                    ← 区間 (LINUX RESTART で区切られる) のループ
+///     do { レコードを読む                  ← 外側ループ
+///          RESTART / COMMENT ならその場で出す
+///     } while (特殊レコード || 範囲外)
+///     fpos = 現在位置                      ← 最初の統計レコードの直後
+///     for (activity) {                     ← activity のループ
+///         lseek(fpos); サンプルを出す; Average: を出す
+///     }                                    ← ループは RESTART を読んだ時点で抜ける
+///     区間を終わらせた RESTART を 1 回出す
+/// } while (!eof)
+/// ```
+///
+/// 帰結は 3 つある。
+///
+/// 1. **区間の先頭にあるイベントは全ブロックの前に 1 回だけ**出る
+/// 2. **区間内のイベント (`COM`) は各ブロックの中に**ファイル順で出る
+/// 3. **区間を終わらせた `LINUX RESTART` は全ブロックの後に 1 回だけ**出る。
+///    したがって出力は「区間 → activity」の順に入れ子になり、
+///    activity ごとに RESTART 行が繰り返されることはない
+///
+/// 3 は本家の期待出力では突けない (どの `expected.*` も RESTART を
+/// 最初の統計レコードより前に 1 個しか持たない)。
+/// `tests/record_layout.rs` の自作 fixture で固定している。
 pub fn write_report<W: Write>(
     out: &mut W,
     file: &SaFile,
@@ -2864,45 +2983,182 @@ pub fn write_report<W: Write>(
     activities: &[ActivityId],
 ) -> crate::Result<()> {
     use crate::format::file::ScanControl;
-    use crate::series::{Selection, WalkItem, walk_items};
+    use crate::series::{RecordRange, Selection, WalkItem, walk_items_in};
 
     let io = |e: io::Error| crate::Error::Io {
         path: file.path().to_path_buf(),
         source: e,
     };
 
-    write_banner(out, file).map_err(io)?;
-    for id in activities {
-        for mut block in SarBlock::blocks_for(*id, opts) {
-            // 本家はアクティビティごとにファイルを巻き戻して読み直し、そのたびに
-            // `cross_day` を戻す。走査ごとに cursor を作れば同じ状態になる。
-            let mut cursor = opts.time_filter.cursor();
-            // イベントは読んだ順にその場で渡す。最後の統計レコードより後ろにある
-            // `COM` / `LINUX RESTART` 行も、`Average:` 行の前に出る。
-            walk_items(file, &Selection::Only(vec![*id]), |item| {
-                match item {
-                    WalkItem::Event(ev) => {
-                        // 範囲外の特殊レコードは表示しない (`print_special_record()`)
-                        if cursor.event(ev.ust_time(), ev.time()) {
-                            block.event(out, &ev).map_err(io)?;
+    write_banner(out, file, opts).map_err(io)?;
+
+    for region in plan_regions(file, opts)? {
+        // 外側ループに相当。ここで出したイベントは各ブロックでは出さない。
+        for line in &region.leading {
+            out.write_all(line.as_bytes()).map_err(io)?;
+        }
+
+        for id in activities {
+            // magic が参照版と違う activity は `sar` 互換出力から丸ごと落とす
+            if !file.displays_activity(*id) {
+                continue;
+            }
+            for mut block in SarBlock::blocks_for(*id, opts, region.cpu_nr) {
+                // 本家は activity ごとに区間の先頭へシークし直し、そのたびに
+                // 範囲判定の状態を作り直す。区間ごとに cursor を作れば同じになる。
+                let mut cursor = opts.time_filter.cursor();
+                // 読み直しは「最初に採用した統計レコードの直後」から始まる。
+                // それより前のイベントは `region.leading` が出しているので、
+                // 最初のレコードを採るまでイベントを渡さない。
+                let mut started = false;
+                // 区間外は `walk_items_in` がデコードごと飛ばす。ここで添字を
+                // 数えて出力を絞ると、RESTART の個数に比例して無駄が増える。
+                let range = RecordRange::new(region.start, region.end);
+                walk_items_in(file, &Selection::Only(vec![*id]), range, |item| {
+                    match item {
+                        WalkItem::Event(ev) => {
+                            // 範囲外の特殊レコードは表示しない (`print_special_record()`)
+                            if started && cursor.event(ev.ust_time(), ev.time()) {
+                                block.event(out, &ev).map_err(io)?;
+                            }
                         }
+                        WalkItem::Sample(view) => match cursor.sample(view) {
+                            Admit::Skip => {}
+                            // `Reference` は `-s` に最初に合致したレコード。
+                            // `SarBlock` 側が「前サンプルが無い区間の基準」として
+                            // 表示せずに採る (`adopt_reference`)。
+                            Admit::Reference | Admit::Emit => {
+                                started = true;
+                                block.record(out, view).map_err(io)?;
+                            }
+                            // `-e` 超過。このレコードは出さずに打ち切る。
+                            Admit::Stop => return Ok(ScanControl::Stop),
+                        },
                     }
-                    WalkItem::Sample(view) => match cursor.sample(view) {
-                        Admit::Skip => {}
-                        // `Reference` は `-s` に最初に合致したレコード。
-                        // `SarBlock` 側が「前サンプルが無い区間の基準」として
-                        // 表示せずに採る (`adopt_reference`)。
-                        Admit::Reference | Admit::Emit => block.record(out, view).map_err(io)?,
-                        // `-e` 超過。このレコードは出さずに打ち切る。
-                        Admit::Stop => return Ok(ScanControl::Stop),
-                    },
-                }
-                Ok(ScanControl::Continue)
-            })?;
-            block.finish(out).map_err(io)?;
+                    Ok(ScanControl::Continue)
+                })?;
+                block.finish(out).map_err(io)?;
+            }
+        }
+
+        // 区間を終わらせた `LINUX RESTART` を 1 回だけ出す。
+        if let Some(line) = &region.terminator {
+            out.write_all(line.as_bytes()).map_err(io)?;
         }
     }
     Ok(())
+}
+
+/// `LINUX RESTART` で区切られた 1 区間の出力計画。
+///
+/// 本家 `sar.c: read_stats_from_file()` の外側ループ 1 周に対応する。
+#[derive(Debug, Default)]
+struct Region {
+    /// この区間の最初のレコードの通し番号 ([`walk_items`](crate::series::walk_items) の呼び出し順)。
+    start: usize,
+    /// 区間の終わり。**この番号のレコードは含まない** (区切りの RESTART か EOF)。
+    end: usize,
+    /// 区間の先頭で 1 回だけ出す行 (`LINUX RESTART` / `COM`)。
+    leading: Vec<String>,
+    /// 区間を終わらせた `LINUX RESTART` 行。最後の区間や範囲外なら `None`。
+    terminator: Option<String>,
+    /// 区間の開始時点で有効な CPU 数 (本家の `file_hdr.sa_cpu_nr` 相当)。
+    cpu_nr: Option<u32>,
+}
+
+/// 区間の境界と、区間の外で出す行を先に決める。
+///
+/// 1 パスで済ませるため、行はここで組み立てて文字列として持つ
+/// (特殊レコードはファイル全体でも数個なので、溜めても実害がない)。
+///
+/// 区切りとみなすのは「**その区間で採用した統計レコードが 1 件以上ある**
+/// RESTART」だけである。本家の外側ループは最初の統計レコードに達するまで
+/// 特殊レコードを出し続けるので、統計レコードより前の RESTART は区切りではなく
+/// 先頭イベントになる (`expected.data-11.6.5` の先頭 `LINUX RESTART` がこれ)。
+fn plan_regions(file: &SaFile, opts: &SarTextOptions) -> crate::Result<Vec<Region>> {
+    use crate::format::file::ScanControl;
+    use crate::series::{Selection, WalkItem, walk_items};
+
+    let mut cursor = opts.time_filter.cursor();
+    // RESTART レコードが CPU 数を持たない世代のための既定値。
+    // 本家の `file_hdr.sa_cpu_nr` と同じで、RESTART を読むたびに更新される。
+    let mut cpu_nr = file.header().cpu_nr;
+    let mut regions: Vec<Region> = Vec::new();
+    let mut cur = Region {
+        cpu_nr,
+        ..Region::default()
+    };
+    // この区間で採用した統計レコードがあるか (= 外側ループを抜けたか)。
+    let mut adopted = false;
+    let mut index = 0usize;
+    let mut stopped = false;
+
+    // ここではどの activity もデコードしない (レコード種別しか見ない)。
+    walk_items(file, &Selection::Only(Vec::new()), |item| {
+        let at = index;
+        index += 1;
+        match item {
+            WalkItem::Event(ev) => {
+                let show = cursor.event(ev.ust_time(), ev.time());
+                let ts = event_timestamp(&ev, opts.time);
+                match &ev {
+                    RecordEvent::Restart { cpu_count, .. } => {
+                        let line =
+                            show.then(|| restart_line(&ts, restart_cpu_count(*cpu_count, cpu_nr)));
+                        // 本家は RESTART が持つ CPU 数で `sa_cpu_nr` を上書きする。
+                        cpu_nr = cpu_count.or(cpu_nr);
+                        if adopted {
+                            // 区間の区切り。行は全ブロックの後に出す。
+                            cur.end = at;
+                            cur.terminator = line;
+                            regions.push(std::mem::replace(
+                                &mut cur,
+                                Region {
+                                    start: at + 1,
+                                    cpu_nr,
+                                    ..Region::default()
+                                },
+                            ));
+                            adopted = false;
+                            // 本家の外側ループは区間ごとに範囲判定をやり直し、
+                            // その区間で最初に範囲へ入ったレコードを基準値として
+                            // 消費する。cursor も区間ごとに作り直す。
+                            cursor = opts.time_filter.cursor();
+                        } else {
+                            // まだ基準レコードが無い = 外側ループの中。
+                            cur.leading.extend(line);
+                            cur.cpu_nr = cpu_nr;
+                        }
+                    }
+                    RecordEvent::Comment { text, .. } => {
+                        // 区間に入った後の COMMENT は各ブロックが出す。
+                        if !adopted && show && opts.comment {
+                            cur.leading.push(comment_line(&ts, text));
+                        }
+                    }
+                }
+            }
+            WalkItem::Sample(view) => match cursor.sample(view) {
+                // 範囲前のレコードはまだ外側ループの中なので、
+                // それに続くイベントも先頭イベントとして扱う。
+                Admit::Skip => {}
+                Admit::Reference | Admit::Emit => adopted = true,
+                // `-e` 超過。ここで走査ごと打ち切る。
+                Admit::Stop => {
+                    cur.end = at;
+                    stopped = true;
+                    return Ok(ScanControl::Stop);
+                }
+            },
+        }
+        Ok(ScanControl::Continue)
+    })?;
+
+    if !stopped {
+        cur.end = index;
+    }
+    regions.push(cur);
+    Ok(regions)
 }
 
 /// 比率列の平均計算に必要な「表示されない入力列」。
@@ -3413,6 +3669,34 @@ mod tests {
         assert_eq!(report_date(2026, 1, 2), "01/02/26");
     }
 
+    /// バナーの日付は既定で `sa_ust_time` 由来、`-t` だけヘッダ日付。
+    ///
+    /// 本家 `get_file_timestamp_struct()` の分岐 (`PRINT_TRUE_TIME`)。
+    /// 本家テストデータ `data-ukwn` は両者が意図的に食い違っており
+    /// (`sa_ust_time` = 1568533161 = 2019-09-15、ヘッダ日付は 2019-10-15)、
+    /// 期待出力は `09/15/19` である。
+    #[test]
+    fn banner_date_comes_from_ust_time_unless_true_time() {
+        const UST: u64 = 1_568_533_161;
+        assert_eq!(banner_date(UST, 2019, 10, 15, TimeStyle::Utc), "09/15/19");
+        assert_eq!(
+            banner_date(UST, 2019, 10, 15, TimeStyle::Recorded),
+            "10/15/19",
+            "-t はヘッダの年月日を使う"
+        );
+    }
+
+    /// `LINUX RESTART` 行の CPU 数はレコード優先・ヘッダ補完。
+    #[test]
+    fn restart_cpu_count_falls_back_to_the_file_header() {
+        // `0x2175`: レコードが新しい CPU 数 (集約スロットを含む 9) を持つ
+        assert_eq!(restart_cpu_count(Some(9), Some(3)), 8);
+        // 旧世代: レコードに CPU 数が無いのでヘッダの `sa_cpu_nr` を使う
+        assert_eq!(restart_cpu_count(None, Some(9)), 8);
+        // どちらも無ければ 1 (`sa_cpu_nr > 1 ? sa_cpu_nr - 1 : 1`)
+        assert_eq!(restart_cpu_count(None, None), 1);
+    }
+
     // ---- ラベル幅 ----
 
     /// タイムスタンプ・`Average:` はどれも `%-11s`。
@@ -3427,7 +3711,7 @@ mod tests {
     // ---- 行の組み立て ----
 
     fn block(id: ActivityId, opts: &SarTextOptions) -> SarBlock {
-        SarBlock::blocks_for(id, opts).remove(0)
+        SarBlock::blocks_for(id, opts, None).remove(0)
     }
 
     fn zeros(plan: &DecodePlan) -> ItemSnapshot {
@@ -3442,6 +3726,18 @@ mod tests {
         if let Some(Some(f)) = plan.column_fields.get(column) {
             item.values[f.index()] = Availability::Present(v);
         }
+    }
+
+    /// item に名前を入れる (`key` と `texts` の両方)。
+    ///
+    /// 実デコードは `key` と `texts[0]` の**両方**に同じ名前を入れる
+    /// ([`DecodePlan::read_texts_into`])。`key` だけ埋めると
+    /// [`compute::is_unused_item`] が「インターフェース名が空 = 未使用枠」と
+    /// 判定して行が消えるため、fixture でも両方を埋める。
+    fn name(plan: &DecodePlan, item: &mut ItemSnapshot, text: &str) {
+        item.key = Some(text.into());
+        item.texts = vec![None; plan.text_fields.len().max(1)];
+        item.texts[0] = Some(text.into());
     }
 
     /// `A_CPU` のデータ行が本家の桁に一致する。
@@ -3741,13 +4037,13 @@ mod tests {
             swap: true,
             ..Default::default()
         };
-        let blocks = SarBlock::blocks_for(ActivityId::MEMORY, &opts);
+        let blocks = SarBlock::blocks_for(ActivityId::MEMORY, &opts, None);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].view.pos, 0);
         assert_eq!(blocks[1].view.pos, 1);
         // 未指定なら -r 相当 1 ブロック
         assert_eq!(
-            SarBlock::blocks_for(ActivityId::MEMORY, &SarTextOptions::default()).len(),
+            SarBlock::blocks_for(ActivityId::MEMORY, &SarTextOptions::default(), None).len(),
             1
         );
     }
@@ -3982,6 +4278,61 @@ mod tests {
 
     // ---- 区間管理 (CPU 集約 / -z / avg_count / -x) ----
 
+    /// 未使用の item スロットは行にも `Average:` にも出ない。
+    ///
+    /// `file_activity.nr` は採取時に確保した枠数なので空き枠が混ざる。
+    /// 本家は各 `print_*_stats()` の先頭で activity 固有の番兵を見て
+    /// `continue` する ([`compute::is_unused_item`])。
+    /// `expected.data-10.3.1` の `Average:` 行は 12 デバイスぶんしか無い。
+    #[test]
+    fn unused_item_slots_are_not_rows() {
+        // `A_DISK`: `major + minor == 0` は確保しただけの空き枠
+        let opts = SarTextOptions::default();
+        let mut blk = block(ActivityId::DISK, &opts);
+        let plan = plan_for(ActivityId::DISK);
+        blk.plan = Some(plan.clone());
+        let dev = |major: u64, minor: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, disk_col::MAJOR, major);
+            put(&plan, &mut it, disk_col::MINOR, minor);
+            it
+        };
+        let items = vec![dev(8, 0), dev(0, 0), dev(0, 0)];
+        adopt(&mut blk, &plan, &items, 0);
+        let text = feed(&mut blk, &plan, &items, &items, 100, 100);
+        assert_eq!(text.lines().count(), 1, "空き枠が行になった: {text}");
+        let avg = tail(&mut blk);
+        assert_eq!(
+            avg.lines().filter(|l| l.starts_with("Average:")).count(),
+            1,
+            "空き枠が Average: 行になった: {avg}"
+        );
+
+        // `A_NET_SOFT`: 5 カウンタが全 0 の CPU はオフライン。
+        // CPU "all" (item 0) は常に表示する。
+        let all = SarTextOptions {
+            cpus: CpuSelection::All,
+            ..Default::default()
+        };
+        let mut soft = block(ActivityId::NET_SOFT, &all);
+        let splan = plan_for(ActivityId::NET_SOFT);
+        soft.plan = Some(splan.clone());
+        let cpu = |total: u64| {
+            let mut it = zeros(&splan);
+            put(&splan, &mut it, soft_col::TOTAL, total);
+            it
+        };
+        // [集約スロット, CPU0 (稼働), CPU1 (オフライン)]
+        let sitems = vec![cpu(0), cpu(100), cpu(0)];
+        adopt(&mut soft, &splan, &sitems, 0);
+        let stext = feed(&mut soft, &splan, &sitems, &sitems, 100, 100);
+        assert_eq!(
+            stext.lines().count(),
+            2,
+            "オフライン CPU の行が出た (期待は all と CPU0 の 2 行): {stext}"
+        );
+    }
+
     /// 表示されない基準サンプルを 1 件食わせる。
     fn adopt(blk: &mut SarBlock, plan: &DecodePlan, items: &[ItemSnapshot], uptime_cs: u64) {
         let snap = Snapshot {
@@ -4150,13 +4501,21 @@ mod tests {
         let nplan = plan_for(ActivityId::NET_DEV);
         net.plan = Some(nplan.clone());
         let mut iface = zeros(&nplan);
-        iface.key = Some("eth0".into());
+        name(&nplan, &mut iface, "eth0");
         put(&nplan, &mut iface, net_dev_col::RXPCK, 100);
         let nitems = vec![iface];
         assert!(
             net.build_rows(&nplan, &nitems, &nitems, 0, 1_000)
                 .is_empty(),
             "-z が A_NET_DEV の同一行を残した"
+        );
+        // `-z` 以外の理由 (未使用枠の判定) で消えていないことを確かめる
+        let mut off = block(ActivityId::NET_DEV, &SarTextOptions::default());
+        off.plan = Some(nplan.clone());
+        assert_eq!(
+            off.build_rows(&nplan, &nitems, &nitems, 0, 1_000).len(),
+            1,
+            "-z 無しで A_NET_DEV の行が消えた"
         );
     }
 
@@ -4175,7 +4534,7 @@ mod tests {
 
         let iface = |rxpck: u64| {
             let mut it = zeros(&plan);
-            it.key = Some("eth0".into());
+            name(&plan, &mut it, "eth0");
             put(&plan, &mut it, net_dev_col::RXPCK, rxpck);
             it
         };

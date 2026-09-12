@@ -159,9 +159,12 @@ pub struct FileActivityEntry {
 impl FileActivityEntry {
     /// 参照する `sar` 版から見た形式の互換性。
     ///
-    /// `sar` / `sadf` 互換出力が「このブロックを出すか」「`[Unknown format]` を
-    /// 付けるか」の判断に使う (`layout::registry::format_compat`)。
-    /// 独自出力はこれで弾かない (旧 revision も読めるのが reSARch の目的)。
+    /// **magic だけを見る判定**で、ファイルの世代は考えない。
+    /// `sadf -H` の `[Unknown format]` のように「その activity 単体の形式」を
+    /// 報告する用途に使う。
+    ///
+    /// 「ブロックを出すか」の判断には
+    /// [`SaFile::displays_activity`] を使うこと (世代を踏まえる)。
     pub fn format_compat(&self) -> crate::layout::registry::FormatCompat {
         // magic を持たない世代は 0 が入っている。
         let magic = (self.magic != 0).then_some(self.magic);
@@ -744,6 +747,40 @@ impl SaFile {
         &self.activities
     }
 
+    /// `sar` / `sadf` 互換出力がこの activity のブロックを出すか。
+    ///
+    /// 本家 `sa_common.c: check_file_actlst()` は、**既知 ID だが magic が
+    /// 参照版と違う** activity に `ACTIVITY_MAGIC_UNKNOWN` を立てて
+    /// `id_seq[]` に入れない。`sar -A` / `sadf` はそのブロックを出さない
+    /// (`data-12.0.0` の `A_IRQ` は magic `0x8b` で、`expected.data-12.0.0` に
+    /// `INTR` ブロックが無い)。`sadf -H` の一覧には
+    /// `[Unknown format]` 付きで残る。
+    ///
+    /// # 判定を自己記述世代に限る理由
+    ///
+    /// magic の比較が意味を持つのは、本家がそのまま開ける世代 (`0x2175`) だけ
+    /// である。旧世代 (`0x2170`〜`0x2173`) は `sar -f` / `sadf` が
+    /// 「Cannot read the format of this file」で拒否するため
+    /// `check_file_actlst()` に到達しない。旧世代の golden は
+    /// `sadf -c` で変換したファイル = **全 activity の magic が現行値に
+    /// 書き換わったもの**に対する出力である
+    /// (`docs/format/04-test-data.md` §4.3)。原本を直読する reSARch が
+    /// 「参照版より古い magic」を理由に弾くと、`data-9.1.6` では
+    /// 32 activity のうち 13 が消えてレポートがほぼ空になる。
+    ///
+    /// **独自出力 (`json` / `csv` / `ndjson` / `table`) はこれで弾かない。**
+    /// 旧 revision も読めるのが reSARch の目的なので、
+    /// 読めたものは観測結果として出す。
+    pub fn displays_activity(&self, id: ActivityId) -> bool {
+        if !crate::format::registry::is_self_describing(self.spec) {
+            return true;
+        }
+        self.activities
+            .iter()
+            .filter(|act| act.id == id)
+            .all(|act| act.format_compat().is_displayed_by_sar())
+    }
+
     pub fn records_offset(&self) -> usize {
         self.records_offset
     }
@@ -968,8 +1005,15 @@ impl SaFile {
                             // 初期の activity リストだけ検証しても、ここで上限を超える
                             // 値を与えられると item 数とデコード後の確保量が無制限になる。
                             // バイト数制限だけでは防げない (小さな size なら通ってしまう)。
+                            //
+                            // **0 は拒否しない。** 本家は `read_nr_value` を
+                            // `non_zero = FALSE` で呼び、`count == 0` を
+                            // 「このサンプルはアイテム 0 件」として受け入れる
+                            // (01 §6.2 の表)。番兵で切り詰めた結果 0 になるのは
+                            // 正当な出力で、`sadf -c` が書くファイルにも現れ得る。
+                            // `file_activity.nr == 0` (activity リスト側) の拒否とは別物。
                             let limit = act.id.nr_max().min(NR_MAX);
-                            if v == 0 || v > limit {
+                            if v > limit {
                                 return Err(Error::LimitExceeded {
                                     path: self.path.clone(),
                                     what: format!(

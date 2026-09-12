@@ -46,7 +46,8 @@ Also handled:
 - **All 43 activities** — CPU, memory, disk, every IPv4/IPv6 protocol, PSI, power sensors,
   filesystems, HugePages, interrupts, and the rest
 - **Big-endian and 32-bit producers** — a PowerPC log opens the same as an x86-64 one
-- **Files converted by `sadf -c`** — the `upgraded` marker is read and reported
+- **Files converted by `sadf -c`** — the `upgraded` marker is read and reported, and
+  reSARch can perform the conversion itself
 - **Malformed input** — truncation, impossible item counts, size/offset contradictions and
   the `nr × nr2 × size` integer overflow are all detected rather than trusted
 
@@ -89,9 +90,72 @@ The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs f
 resarch info sa01                        # generation, ABI, activity table
 resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
+resarch detect sa01                      # where and what looks off
 resarch summarize sa01 sa02 --format json
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
+
+### Finding what went wrong
+
+`resarch detect` takes a file and tells you **when** and **what** looks off, without
+needing you to know what to look for. It runs three views over every series it can
+evaluate — fixed conditions on values whose meaning is established, deviation from the
+file's own median and MAD, and level changes between adjacent windows — and groups
+what fires into episodes.
+
+What it will not do is dress up a guess as a measurement:
+
+- **No confidence percentages.** A calibrated probability cannot be built from one host's
+  144 samples. You get an ordinal investigation priority and, separately, how much
+  evidence backed it.
+- **It says when its own yardstick is suspect.** The comparison basis comes from the input
+  itself, so if the anomaly dominates the file, the basis moves with it. When the median
+  itself satisfies a fixed condition, the report says the deviation check for that series
+  cannot be trusted.
+- **`MAD = 0` is not divided by epsilon.** A series that barely moves has unmeasurable
+  spread, which is reported as such rather than turned into an enormous score.
+- **Sampling is not disguised as duration.** Three high readings are "high across 3
+  samples spanning 20 minutes", never "high for 20 minutes". What happened between
+  samples was not observed.
+- **"Not evaluated" is not "nothing found".** Every series it could not assess is listed
+  with the reason.
+
+### Converting an old file
+
+```bash
+resarch sadf -c sa01 > sa01-current        # 0x2171 / 0x2173 → 0x2175
+resarch sadf -c sa01 -O hz=250 > out       # override the assumed HZ
+```
+
+Old headers do not record HZ, and upstream's `sadf -c` substitutes the HZ of whatever
+machine runs the conversion — so the same input produces different output elsewhere.
+reSARch estimates it from the file's own `uptime` counters instead, never pairing samples
+across a restart, and reports which value it used and how it got there.
+
+## How the output is verified
+
+Every expected-output file that `sysstat` keeps in its own test suite is compared
+**line by line** against what reSARch produces — 21 cases in total:
+
+| | |
+|---|---:|
+| Byte-identical | 16 |
+| Identical after masking | 4 |
+| Mismatched | 0 |
+| Not comparable | 1 |
+
+The four masked cases mask exactly one thing: the `A_DISK` device-name column.
+Upstream resolves `major:minor` through the **reading host's** `/dev` and `/sys`, so
+`sda1` is a property of the machine that produced the expected output, not of the file.
+reSARch deliberately prints `dev8-1` instead rather than inventing a name that would be
+wrong for a log collected elsewhere.
+
+The one case that cannot be compared is `sadf -g`, which draws SVG. That output format
+is not implemented, and the suite reports it as "not comparable" on every run rather than
+quietly counting it as a pass.
+
+Mismatches are never tolerated: a single one fails the suite. "Hard to implement" and
+"the number doesn't match" are not accepted reasons to mask something.
 
 ## What "sar compatible" means here
 
@@ -104,7 +168,8 @@ than implying all of them:
 | **Computation and output** | Which `sar` / `sadf` version's rendering is reproduced |
 | **CLI compatibility** | Which options and calling conventions are accepted |
 
-reSARch is a **reader**. Live collection (`sadc`) is out of scope.
+reSARch never collects: live sampling (`sadc`) is out of scope. The only thing it writes
+is a re-encoding of a file it just read (`sadf -c`), and that leaves every value alone.
 The generation of the file being read and the output format being reproduced are separate
 settings: a v10 file can be rendered in v12 `sar` style, and vice versa.
 
@@ -113,9 +178,8 @@ Options that are parsed but not yet acted upon are rejected at run time with a r
 | Option | Status |
 |---|---|
 | `sar -o` / `--sadc` | Collection is out of scope — rejected explicitly |
-| `sadf -c` / `-g` / `-l` | Conversion, SVG and PCP output are not implemented |
+| `sadf -g` / `-l` | SVG and PCP output are not implemented |
 | `sar -i`, positional `interval` / `count` | Not implemented (every record is emitted) |
-| `sar -x` `Minimum:` / `Maximum:` rows | Not implemented (only the label switch is honoured) |
 | `--int=` | Not implemented (`A_IRQ` uses a matrix layout) |
 | `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
 

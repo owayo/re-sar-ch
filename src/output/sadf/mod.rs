@@ -14,10 +14,23 @@
 //! # 値の扱い
 //!
 //! 表示値は `series` 層 ([`crate::series::compute`]) の結果だけを使う。
-//! 出力層では再計算しない。まだ計算式が実装されていない列
-//! ([`crate::series::compute::ComputeIssue::NotImplemented`]) は
-//! **0 にせず「値なし」として出す** ([`Unavailable`])。
-//! 0 を代入すると「正常に 0」と区別できなくなり、集計が静かに誤る。
+//! 出力層では再計算しない。単位が違う列 (`rxkB` / `MBfsfree` / `rd_sec` …) も
+//! 出力層で掛け算をせず、[`crate::series::compute::SadfUnitColumn`] に
+//! 換算させる。形式ごとに計算がずれる事故を層の分離で防ぐのが目的。
+//!
+//! 値が出ないときの表記は欠落の種類で 2 通りに分かれる
+//! ([`crate::series::compute::missing_kind`])。
+//!
+//! - **その世代のファイルにフィールドが無いだけ** の列は `0` を書く。
+//!   本家が 0 埋めした構造体で計算を完了するため (03 §1.9-1)、
+//!   互換出力としては `0.00` が正解である (旧 `A_IO` の `dtps` / `bdscd`)。
+//! - **レコードで欠測 / 不連続 / 計算未実装** は `0` にせず「値なし」として出す
+//!   ([`Unavailable`])。0 を代入すると「正常に 0」と区別できなくなり、
+//!   集計が静かに誤る。
+//!
+//! この分岐は互換出力だけのもの。独自出力 (`table` / `json` / `csv` /
+//! `ndjson`) は欠落を欠落のまま残す
+//! ([`crate::series::compute::column_value_strict`])。
 
 pub mod access;
 pub mod dbppc;
@@ -35,7 +48,7 @@ use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use crate::format::file::SaFile;
 use crate::model::ActivityId;
 use crate::output::time_filter::TimeFilter;
-use crate::series::compute::{ComputeIssue, Computed};
+use crate::series::compute::{ComputeIssue, Computed, MissingKind, missing_kind};
 
 pub use spec::{ActivitySpec, Fmt, Group, ItemKind, SectionConfig, Shape};
 
@@ -100,8 +113,7 @@ pub fn wrap_io(e: std::io::Error) -> crate::error::Error {
 /// 値を出せない理由と、その形式での表記。
 ///
 /// 「未提供」「当該レコードで欠落」「不連続」「計算未実装」を区別したまま
-/// 運ぶ。`sadf` 互換形式はテキストで区別を表現できないので表記は 1 つに潰れるが、
-/// **0 にはしない**。
+/// 運ぶ。`sadf` 互換形式はテキストで区別を表現できないので表記は 1 つに潰れる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unavailable(pub ComputeIssue);
 
@@ -119,25 +131,47 @@ impl Unavailable {
     }
 }
 
-/// `-d` / `-p` / `-r` で値が無いときの表記。
+/// `-d` / `-p` / `-r` で値が「観測できなかった」ときの表記。
 ///
 /// 空フィールドにする。`0` を書くと正常値と区別できない。
+/// **その世代にフィールドが無いだけの列はここに落とさない**
+/// ([`write_value`] のゼロ補完を参照)。
 pub const ABSENT_TEXT: &str = "";
-/// `-j` で値が無いときの表記。
+/// `-j` で値が観測できなかったときの表記。
 pub const ABSENT_JSON: &str = "null";
-/// `-x` で値が無いときの属性値。
+/// `-x` で値が観測できなかったときの属性値。
 pub const ABSENT_XML: &str = "";
 
 // ===========================================================================
 // 数値の書式
 // ===========================================================================
 
-/// 表示値を書式化して書き出す。
+/// 表示値を書式化して書き出す (**互換出力**)。
 ///
-/// `absent` は値が無いときに書く文字列 (形式ごとに違う)。
+/// `absent` は値が観測できなかったときに書く文字列 (形式ごとに違う)。
+///
+/// # 欠落の 2 分類
+///
+/// 本家は「期待する型別本数よりファイル側が少なければ足りない分を 0 埋め」した
+/// 構造体で計算を完了するので、**その世代にフィールドが無い列は `0.00` として
+/// 表示される** (03 §1.9-1)。discard 統計を持たない旧 `A_IO` の
+/// `dtps` / `bdscd` がこれに当たる。この分類は計算層の
+/// [`missing_kind`] が持っており、出力層は表記を選ぶだけにする。
+///
+/// | 分類 | 例 | 表記 |
+/// |---|---|---|
+/// | [`MissingKind::ZeroFilled`] | その世代にフィールドが無い | `0.00` (本家と同じ) |
+/// | [`MissingKind::Absent`] | レコードで欠測 / 不連続 | `absent` |
+/// | (分類なし) | 識別子列 / item 群が必要 / 未実装 | `absent` |
+///
+/// `0` を書くのは 1 行目だけで、`MissingInSample` や不連続を `0` にしてはいけない
+/// (「正常に 0」と区別できなくなる)。独自出力は
+/// [`crate::series::compute::column_value_strict`] 系を使うのでこの補完を通らない。
 pub fn write_value(out: &mut String, v: Computed, fmt: Fmt, absent: &str) {
     match v {
         Ok(x) => write_f64(out, x, fmt),
+        // 本家が 0 埋めして表示する欠落だけ 0 にする (03 §1.9-1)
+        Err(e) if missing_kind(e) == Some(MissingKind::ZeroFilled) => write_f64(out, 0.0, fmt),
         Err(_) => out.push_str(absent),
     }
 }
@@ -202,7 +236,7 @@ pub struct FileInfo {
     pub machine: String,
     /// 表示用 CPU 数 (`sa_cpu_nr > 1 ? sa_cpu_nr - 1 : 1`)。
     pub cpu_count: u32,
-    /// `YYYY-MM-DD` (ファイルヘッダの年月日)。
+    /// `YYYY-MM-DD`。`sa_ust_time` を暦に開いた日付 (`-t` ではヘッダの年月日)。
     pub file_date: String,
     /// `HH:MM:SS` (UTC)。
     pub file_utc_time: String,
@@ -213,20 +247,45 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
+    /// 既定の時刻基準でファイル情報を作る。
     pub fn from_file(file: &SaFile) -> Self {
+        Self::from_file_with(file, TimeBase::default())
+    }
+
+    /// 時刻基準を指定してファイル情報を作る。
+    ///
+    /// `file_date` の求め方は `sa_common.c: get_file_timestamp_struct()`。
+    /// **既定は `sa_ust_time` 由来**で、ヘッダの `sa_day` / `sa_month` /
+    /// `sa_year` を使うのは `-t` ([`TimeBase::TrueTime`]) のときだけ (§1.5)。
+    /// 両者は食い違い得る (本家のテストデータ `data-ukwn` は `sa_ust_time` が
+    /// 09-15、ヘッダ日付が 10-15)。
+    ///
+    /// 既定側は次の `file_utc_time` と同じ UTC で開く。本家は `localtime_r()`
+    /// を使うが、本家のテストは `TZ=GMT` 固定であり、reSARch は環境変数に
+    /// 依存せず基準系で表す (§1.6 の対応表)。
+    pub fn from_file_with(file: &SaFile, base: TimeBase) -> Self {
         let h = file.header();
         let cpu_count = match h.cpu_nr {
             Some(n) if n > 1 => n - 1,
             _ => 1,
         };
         let utc = utc_of(h.ust_time);
+        let file_date = match base {
+            TimeBase::TrueTime => format_date(h.year, u32::from(h.month), u32::from(h.day)),
+            // `-T` は読み手のローカル時刻。レコードの [`Stamp`] と同じ基準に揃える
+            TimeBase::LocalTime => {
+                let l = utc.with_timezone(&chrono::Local);
+                format_date(l.year(), l.month(), l.day())
+            }
+            _ => format_date(utc.year(), utc.month(), utc.day()),
+        };
         Self {
             nodename: h.nodename.clone(),
             sysname: h.sysname.clone(),
             release: h.release.clone(),
             machine: h.machine.clone(),
             cpu_count,
-            file_date: format!("{:04}-{:02}-{:02}", h.year, h.month, h.day),
+            file_date,
             file_utc_time: format!("{:02}:{:02}:{:02}", utc.hour(), utc.minute(), utc.second()),
             ust_time: h.ust_time,
             tzname: h.tzname.clone().unwrap_or_default(),
@@ -551,6 +610,53 @@ mod tests {
             ABSENT_JSON,
         );
         assert_eq!(s, "null");
+
+        // レコードでの欠測・不連続も 0 にしない
+        for issue in [
+            ComputeIssue::MissingInSample,
+            ComputeIssue::Discontinuous(crate::series::delta::Discontinuity::Restart),
+            ComputeIssue::NeedsItemGroup,
+        ] {
+            s.clear();
+            write_value(&mut s, Err(issue), Fmt::R2, ABSENT_JSON);
+            assert_eq!(s, "null", "{issue:?} を 0 にしてはいけない");
+        }
+    }
+
+    /// **回帰テスト (指摘 6)**: その世代に無いフィールドは本家と同じ `0`。
+    ///
+    /// 本家は足りない型別本数を 0 埋めした構造体で計算を完了するので
+    /// (03 §1.9-1)、discard 統計を持たない旧 `A_IO` の `dtps` / `bdscd` は
+    /// `0.00` と表示される。全エラーを空欄にすると `sar` 互換出力と
+    /// `sadf` 互換出力で不統一になる。
+    #[test]
+    fn unsupported_by_source_is_zero_filled_like_upstream() {
+        let cases = [
+            (Fmt::R2, "0.00"),
+            (Fmt::R0, "0"),
+            (Fmt::Int, "0"),
+            (Fmt::Hex, "0"),
+        ];
+        for (fmt, want) in cases {
+            let mut s = String::new();
+            write_value(
+                &mut s,
+                Err(ComputeIssue::UnsupportedBySource),
+                fmt,
+                ABSENT_TEXT,
+            );
+            assert_eq!(s, want, "{fmt:?}");
+
+            // JSON でも `null` ではなく 0
+            let mut s = String::new();
+            write_value(
+                &mut s,
+                Err(ComputeIssue::UnsupportedBySource),
+                fmt,
+                ABSENT_JSON,
+            );
+            assert_eq!(s, want, "{fmt:?} (JSON)");
+        }
     }
 
     fn dummy_info() -> FileInfo {

@@ -29,7 +29,7 @@ use crate::series::{IntervalView, Selection, WalkItem, walk_items};
 
 /// `-j` の出力。
 pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file(file);
+    let info = FileInfo::from_file_with(file, cfg.time_base);
     let specs = selected_specs(file, cfg);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
@@ -265,7 +265,7 @@ fn activity_block(
         Shape::Array => {
             let inner = tabs(tab + 1);
             let mut rows: Vec<String> = Vec::new();
-            for item in pair.output_items() {
+            for item in pair.compat_items() {
                 let mut members: Vec<String> = Vec::new();
                 for section in spec.active_sections(&cfg.section) {
                     let label = item_label_in(spec, section, &item);

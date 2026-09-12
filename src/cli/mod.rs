@@ -7,6 +7,7 @@
 //! ```text
 //! resarch show <FILE>...        # 独自形式での閲覧
 //! resarch summarize <FILE>...   # 期間集計
+//! resarch detect <FILE>...      # 異変の当たり付け
 //! resarch compare --host ...    # ホスト比較
 //! resarch info <FILE>...        # ヘッダのみ表示
 //! resarch sar  [sar オプション]  # sar 互換入口
@@ -38,7 +39,15 @@ pub use sar_args::{
 /// ルートが受け付けるサブコマンド名。
 ///
 /// 先頭引数がこのいずれでもなければ `sar` 互換として解釈する。
-pub const SUBCOMMAND_NAMES: [&str; 6] = ["show", "summarize", "compare", "info", "sar", "sadf"];
+pub const SUBCOMMAND_NAMES: [&str; 7] = [
+    "show",
+    "summarize",
+    "detect",
+    "compare",
+    "info",
+    "sar",
+    "sadf",
+];
 
 // ============================================================================
 // 共通の値型
@@ -176,6 +185,111 @@ pub struct SummarizeArgs {
     pub common: CommonArgs,
 }
 
+// ----------------------------------------------------------------------------
+// `resarch detect`
+// ----------------------------------------------------------------------------
+
+/// 異変検出の出力形式。
+///
+/// [`OutputFormat`] を流用しない。`detect` の所見は表でもなく `sar` 互換でもなく、
+/// 出せない形式を `--help` に並べると読み手を惑わせる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum DetectFormat {
+    /// 人が読む形式 (既定)。
+    #[default]
+    Text,
+    /// 独自 JSON (エージェント向け。型のフィールドをそのまま出す)。
+    Json,
+    /// 独自 NDJSON (エピソード 1 件 = 1 行)。
+    Ndjson,
+}
+
+/// 比較基準の材料をどこから取るか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum BaselineScopeArg {
+    /// 入力全体から作る (既定)。
+    #[default]
+    Input,
+    /// `--from` / `--to` の範囲だけから作る。
+    Window,
+}
+
+/// 報告する調査優先度の下限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum PriorityArg {
+    /// すべて出す (既定)。
+    #[default]
+    Informational,
+    Watch,
+    Investigate,
+}
+
+/// `resarch detect` の引数。
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct DetectArgs {
+    // ルートの `disable_help_flag` は子コマンドへ伝播するため、
+    // このサブコマンドだけ自前で `--help` を定義する。
+    // `--from` / `--to` と `--baseline-scope` の関係は説明が要るので、
+    // ヘルプが読めないままにしておけない。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
+    /// 解析対象の `sa` ファイル。
+    #[arg(value_name = "FILE", required = true, num_args = 1..)]
+    pub files: Vec<PathBuf>,
+
+    /// 出力形式。
+    #[arg(long, value_enum, default_value_t = DetectFormat::Text)]
+    pub format: DetectFormat,
+
+    /// 比較基準の材料をどこから取るか。
+    ///
+    /// **`--from` / `--to` は報告範囲を絞るだけで、基準の材料は絞らない。**
+    /// 狭い調査範囲の外から比較材料を取れるようにするため、既定は `input`
+    /// (入力全体) である。`window` を指定したときだけ、基準の材料も
+    /// `--from` / `--to` の範囲に絞られる。
+    ///
+    /// どちらの場合も基準は**この入力自身**から作ったものであり、
+    /// 外部の正常値ではない。異変が入力の大半を占めていれば基準もそちらへ寄る。
+    #[arg(long, value_enum, default_value_t = BaselineScopeArg::Input, verbatim_doc_comment)]
+    pub baseline_scope: BaselineScopeArg,
+
+    /// 報告する調査優先度の下限。
+    ///
+    /// 優先度は順序尺度であり、確率ではない。
+    #[arg(long, value_enum, default_value_t = PriorityArg::Informational)]
+    pub min_priority: PriorityArg,
+
+    /// 対象 activity をカンマ区切りで絞る (例: `cpu,disk`)。
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub activity: Vec<String>,
+
+    /// 報告範囲の開始時刻。**基準の材料は絞らない** (`--baseline-scope` を参照)。
+    #[arg(long, value_name = "TIME")]
+    pub from: Option<String>,
+
+    /// 報告範囲の終了時刻。**基準の材料は絞らない** (`--baseline-scope` を参照)。
+    #[arg(long, value_name = "TIME")]
+    pub to: Option<String>,
+
+    /// 疑わしいデータをエラーにする (既定)。
+    #[arg(long, conflicts_with = "lenient")]
+    pub strict: bool,
+
+    /// 回復可能な破損を診断付きで読み飛ばす。
+    #[arg(long)]
+    pub lenient: bool,
+
+    /// mmap を使わず BufReader で読む (採取進行中のファイル向け)。
+    #[arg(long)]
+    pub no_mmap: bool,
+
+    /// 並列処理するファイル数。
+    #[arg(long, value_name = "N")]
+    pub jobs: Option<usize>,
+}
+
 /// `resarch compare` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct CompareArgs {
@@ -239,6 +353,12 @@ pub enum Commands {
     Show(ShowArgs),
     /// 期間集計とボトルネック判定を出す。
     Summarize(SummarizeArgs),
+    /// いつ・何に異変があったか当たりを付ける。
+    ///
+    /// 自動生成の `--help` を止めて [`DetectArgs`] 側で定義する
+    /// (ルートと同じ作法。理由は [`DetectArgs::help`] を参照)。
+    #[command(disable_help_flag = true)]
+    Detect(DetectArgs),
     /// 複数ホストを比較する。
     Compare(CompareArgs),
     /// ファイルヘッダ (世代・ABI・activity 一覧) のみ表示する。
@@ -510,6 +630,67 @@ mod tests {
         };
         assert_eq!(args.files.len(), 2);
         assert_eq!(args.common.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn detect_subcommand() {
+        let Invocation::Native(cmd) = dispatch(&argv(&["detect", "sa01", "sa02"])).unwrap() else {
+            panic!("独自サブコマンドとして解釈されるべき");
+        };
+        let Commands::Detect(args) = *cmd else {
+            panic!("detect が選ばれるべき");
+        };
+        assert_eq!(args.files.len(), 2);
+        // 既定は text / 入力全体 / 下限なし
+        assert_eq!(args.format, DetectFormat::Text);
+        assert_eq!(args.baseline_scope, BaselineScopeArg::Input);
+        assert_eq!(args.min_priority, PriorityArg::Informational);
+    }
+
+    #[test]
+    fn detect_accepts_the_documented_options() {
+        let Invocation::Native(cmd) = dispatch(&argv(&[
+            "detect",
+            "sa01",
+            "--format",
+            "json",
+            "--baseline-scope",
+            "window",
+            "--min-priority",
+            "investigate",
+            "--from",
+            "09:00",
+            "--to",
+            "18:00",
+            "--activity",
+            "cpu,disk",
+        ]))
+        .unwrap() else {
+            panic!();
+        };
+        let Commands::Detect(args) = *cmd else {
+            panic!()
+        };
+        assert_eq!(args.format, DetectFormat::Json);
+        assert_eq!(args.baseline_scope, BaselineScopeArg::Window);
+        assert_eq!(args.min_priority, PriorityArg::Investigate);
+        assert_eq!(args.from.as_deref(), Some("09:00"));
+        assert_eq!(args.to.as_deref(), Some("18:00"));
+        assert_eq!(args.activity, vec!["cpu", "disk"]);
+    }
+
+    /// `--from` / `--to` が報告範囲だけを絞ることを help に明記する。
+    #[test]
+    fn detect_help_explains_the_baseline_scope_distinction() {
+        let mut cmd = Cli::command();
+        let sub = cmd
+            .get_subcommands_mut()
+            .find(|c| c.get_name() == "detect")
+            .expect("detect サブコマンド");
+        let rendered = sub.render_long_help().to_string();
+        assert!(rendered.contains("報告範囲を絞るだけ"), "{rendered}");
+        assert!(rendered.contains("基準の材料は絞らない"), "{rendered}");
+        assert!(rendered.contains("外部の正常値ではない"), "{rendered}");
     }
 
     #[test]

@@ -267,13 +267,21 @@ pub fn activity_out(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Option<Activ
 }
 
 /// item 1 個を公開スキーマへ写す。
+///
+/// # 行列型 (`A_IRQ` / `A_PWR_FREQ`) の表し方
+///
+/// 行列型は [`ActivityPair::output_items`] が「出力 1 行」を 1 item として返す。
+/// `A_IRQ` なら 1 行 = 1 割り込みで、行の中に CPU ぶんのスロットが並ぶ。
+/// 公開スキーマは 1 列 1 値なので、ここで出すのは
+/// **その行の代表スロット** (`A_IRQ` は CPU `all`、02 §6.1) の値である。
+/// `sar -I` の既定表示と同じ粒度で、CPU 別の内訳は `sar` 互換出力
+/// (CPU 列を展開する `-P` 相当の経路) から得る。
 pub fn item_out(
     def: &'static ActivityDef,
     sp: &spec::ActivitySpec,
     item: &ItemPair<'_>,
     cfg: &CustomConfig,
 ) -> ItemOut {
-    let label = item_label(sp, item);
     let mut raw = Vec::new();
     let mut rates = Vec::new();
 
@@ -286,8 +294,13 @@ pub fn item_out(
         }
     }
 
+    // item の識別子は `sadf` と同じ組み立て (`render::item_label`) を共有する。
+    // 行列型 (`A_IRQ`) の行も割り込み名で識別されるので、ここに独自出力専用の
+    // 分岐は要らない (`irq_rows_are_identified_by_interrupt_name` が固定)。
+    let label = item_label(sp, item);
     ItemOut {
         item: if label.jx.is_empty() {
+            // アイテムを持たない activity (`A_MEMORY` など)
             "-".to_string()
         } else {
             label.jx
@@ -675,5 +688,100 @@ mod tests {
             text: String::new(),
         }]);
         assert_eq!(b.get(), 1, "COMMENT では増えない");
+    }
+
+    /// **`A_IRQ` が独自出力から消えない。**
+    ///
+    /// `A_IRQ` は「行 = 割り込み、列 = CPU」の行列型で、ファイル上の並びは
+    /// その転置 (行 = CPU / 列 = 割り込み、02 §6.1)。`sadf` は専用経路で
+    /// 扱うためアイテム識別子を持たない (`ItemKind::Irq`) が、独自出力は
+    /// [`ActivityPair::output_items`] をそのまま並べるので、
+    /// 行の識別子 (= 割り込み名) をここで当てる必要がある。
+    /// 当てなければ `item` 列が全行 `-` になり割り込みを区別できない。
+    #[test]
+    fn irq_rows_are_identified_by_interrupt_name() {
+        use crate::layout::plan::DecodePlan;
+        use crate::model::Availability;
+        use crate::series::{ActivitySnapshot, ItemSnapshot};
+
+        let def = crate::layout::registry::lookup(ActivityId::IRQ).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = crate::format::abi::SourceEncoding::new(
+            crate::format::abi::Endian::Little,
+            crate::format::abi::LayoutAbi::LP64,
+        );
+        // ファイル上は 行 = CPU (all + cpu0) × 列 = 割り込み (sum + eth0-tx)
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 2, 2, &enc).unwrap();
+        let sp = spec::lookup(ActivityId::IRQ).unwrap();
+        let cfg = CustomConfig::default();
+
+        // 割り込み名は CPU 行 0 にしか入らない (02 §6.2)
+        let cell = |name: Option<&str>, count: u64| ItemSnapshot {
+            key: name.map(|k| k.into()),
+            texts: vec![name.map(|k| k.into())],
+            values: plan
+                .fields
+                .iter()
+                .map(|f| Availability::Present(if f.name == "irq_nr" { count } else { 0 }))
+                .collect(),
+        };
+        let snapshot = |scale: u64| ActivitySnapshot {
+            id: ActivityId::IRQ,
+            index: 0,
+            nr: 2,
+            nr2: 2,
+            items: vec![
+                // CPU all
+                cell(Some("sum"), 300 * scale),
+                cell(Some("eth0-tx"), 100 * scale),
+                // cpu0 (名前は入らない)
+                cell(None, 200 * scale),
+                cell(None, 40 * scale),
+            ],
+        };
+        let (prev, curr) = (snapshot(0), snapshot(1));
+        let pair = ActivityPair {
+            id: ActivityId::IRQ,
+            def,
+            plan: &plan,
+            curr: &curr,
+            prev: Some(&prev),
+            itv_cs: 100,
+            has_prev: true,
+            continuous: true,
+        };
+
+        let items = pair.output_items();
+        assert_eq!(items.len(), 2, "出力は割り込みごとの 1 行 (nr2 行)");
+        let rows: Vec<ItemOut> = items.iter().map(|it| item_out(def, sp, it, &cfg)).collect();
+
+        // 行の識別子は割り込み名 (`-` にしない)
+        assert_eq!(rows[0].item, "sum");
+        assert_eq!(rows[1].item, "eth0-tx");
+        // 割り込み名は列としても出る (文字列フィールドなので `text`)
+        let name_of = |r: &ItemOut| {
+            r.rates
+                .iter()
+                .find(|f| f.name == "intr_name")
+                .unwrap()
+                .text
+                .clone()
+        };
+        assert_eq!(name_of(&rows[1]).as_deref(), Some("eth0-tx"));
+        // 値は行の代表スロット = CPU "all" のレート (1 秒で 100 回)
+        let count_of = |r: &ItemOut| -> FieldOut {
+            r.rates
+                .iter()
+                .find(|f| f.name == "intr")
+                .expect("intr 列")
+                .clone()
+        };
+        assert_eq!(count_of(&rows[1]).value, Some(100.0));
+        assert_eq!(count_of(&rows[1]).quality, Quality::Ok);
+        assert_eq!(
+            count_of(&rows[0]).value,
+            Some(300.0),
+            "sum 列は全割り込みの和"
+        );
     }
 }

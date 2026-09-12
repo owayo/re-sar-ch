@@ -4,6 +4,8 @@
 
 pub mod analyze;
 pub mod cli;
+pub mod convert;
+pub mod detect;
 pub mod error;
 pub mod format;
 pub mod layout;

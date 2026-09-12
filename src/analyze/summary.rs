@@ -47,9 +47,7 @@ use crate::series::snapshot::{
 };
 
 use super::percentile::{PercentileResult, PercentileSpec, PercentileUnavailable, WeightedSamples};
-use super::timeline::{
-    Coverage, ExclusionReason, MetricKey, MetricPoint, MetricTimeline, SINGLE_ITEM, Timelines,
-};
+use super::timeline::{ExclusionReason, MetricKey, MetricPoint, SINGLE_ITEM, Timelines};
 
 /// 独自サマリのスキーマ版。出力契約として固定する (`docs/design.md` §11)。
 pub const SUMMARY_SCHEMA_VERSION: &str = "1";
@@ -206,16 +204,6 @@ pub struct PeriodBounds {
     pub covered_cs: u64,
 }
 
-impl PeriodBounds {
-    /// 最初と最後のサンプルの時刻差 (秒)。観測が無ければ `None`。
-    pub fn wall_secs(&self) -> Option<u64> {
-        match (self.first_ust, self.last_ust) {
-            (Some(a), Some(b)) if b >= a => Some(b - a),
-            _ => None,
-        }
-    }
-}
-
 /// 除外理由ごとの件数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExclusionCount {
@@ -334,11 +322,6 @@ impl NativePeriodSummary {
             .columns
             .iter()
             .find(|c| c.column == column)
-    }
-
-    /// 除外区間の総数。
-    pub fn excluded_total(&self) -> u64 {
-        self.exclusions.iter().map(|e| e.intervals).sum()
     }
 }
 
@@ -1076,11 +1059,6 @@ pub fn summarize_file(
     Ok(builder.finish(source))
 }
 
-/// 時系列の網羅度をまとめる (判定の前段検査用)。
-pub fn coverage_of(timeline: Option<&MetricTimeline>) -> Coverage {
-    timeline.map(MetricTimeline::coverage).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,6 +1171,189 @@ mod tests {
         SummaryOptions {
             retain: RetainTimelines::All,
             ..Default::default()
+        }
+    }
+
+    /// 全フィールドに別々の値を入れた item を作る。
+    ///
+    /// 列の取り違え (隣の列の差分を読んでいる) を検出できるようにするため、
+    /// 一様な値にはしない。
+    fn graded_item(plan: &DecodePlan, base: u64, step: u64) -> ItemSnapshot {
+        ItemSnapshot {
+            key: None,
+            texts: Vec::new(),
+            values: (0..plan.fields.len())
+                .map(|i| Availability::Present(base + step * i as u64))
+                .collect(),
+        }
+    }
+
+    /// その activity の最新 revision で 1 item のデコード計画を作る
+    /// (revision を持たない / 計画が作れない activity は `None`)。
+    fn latest_plan(def: &'static crate::layout::registry::ActivityDef) -> Option<DecodePlan> {
+        let rev = def.latest()?;
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // 保存値 → 表示単位のスケーリング (指摘 2)
+    // -----------------------------------------------------------------------
+
+    /// **回帰テスト (指摘 2)**: 単一区間の平均は、その区間の瞬時値と一致する。
+    ///
+    /// 期間平均は「差分合計 ÷ 分母合計」から作るため、保存値 → 表示単位の
+    /// スケーリング ([`crate::series::compute::rate_scale`]) を掛け忘れると、
+    /// 瞬時値から作る最大 / 最小 / p95 とだけ単位が食い違う
+    /// (`rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
+    /// PSI の圧力割合が 10,000 倍)。
+    ///
+    /// 区間が 1 本だけの集計は定義上その区間の瞬時値に等しいので、
+    /// 全 activity の全レート列で `平均 == 最大` を確認すれば漏れが機械的に出る。
+    /// 増加する区間と逆行する区間の両方を見る (本家が 0 にクランプする列は
+    /// 逆行区間でも値が出るので、そこでも一致しなければならない)。
+    #[test]
+    fn single_interval_mean_matches_instant_value() {
+        let mut mismatched: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for increasing in [true, false] {
+            for def in crate::layout::registry::all() {
+                let Some(plan) = latest_plan(def) else {
+                    continue;
+                };
+                let lo = graded_item(&plan, 100, 7);
+                let hi = graded_item(&plan, 1_000, 37);
+                let (first, second) = if increasing { (lo, hi) } else { (hi, lo) };
+
+                let mut f = Feed::new(def.id, opts_all());
+                f.push(snapshot(def.id, 1_000, 100_000, vec![first]), true);
+                f.push(snapshot(def.id, 1_010, 101_000, vec![second]), true);
+                let s = f.finish();
+
+                let Some(item) = s.activities.first().and_then(|a| a.items.first()) else {
+                    continue;
+                };
+                for c in &item.columns {
+                    if c.method != AggregationMethod::RateOverValidIntervals || c.intervals == 0 {
+                        continue;
+                    }
+                    // 集計が値を作らなかった区間は比較対象外。
+                    // 「値を出したなら瞬時値と一致する」が守りたい不変量。
+                    let (Some(mean), Some(max)) = (c.mean, c.max) else {
+                        continue;
+                    };
+                    checked += 1;
+                    if (mean - max.value).abs() > max.value.abs() * 1e-9 + 1e-12 {
+                        mismatched.push(format!(
+                            "{} {} (increasing={increasing}): 平均 {mean} vs 瞬時 {}",
+                            def.id, c.column, max.value
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            mismatched.is_empty(),
+            "1 区間の平均と瞬時値が食い違う列がある (スケーリング漏れ): {mismatched:?}"
+        );
+        assert!(checked > 50, "検査した列が少なすぎる: {checked}");
+    }
+
+    /// スケールが必要な代表列の平均が、表示単位で出ること。
+    ///
+    /// 機械的なテストが「たまたま全部 1.0 倍」で通っていないことの確認も兼ねる。
+    /// 期待値の根拠は `docs/format/03-output-format.md` §id=11 (ディスク列) と
+    /// §1.5.3 (PSI)。
+    #[test]
+    fn scaled_rate_columns_are_averaged_in_display_units() {
+        // --- A_DISK: 10 秒で 1,000 セクタ / 1,000 ms ---
+        let id = ActivityId::DISK;
+        let plan = plan_for(id);
+        let mut f = Feed::new(id, opts_all());
+        let fields = |sect: u64, ticks: u64| {
+            item_of(
+                &plan,
+                &[
+                    ("major", 8),
+                    ("minor", 0),
+                    ("rd_sect", sect),
+                    ("rq_ticks", ticks),
+                    ("tot_ticks", ticks),
+                ],
+            )
+        };
+        f.push(snapshot(id, 1_000, 100_000, vec![fields(0, 0)]), true);
+        f.push(
+            snapshot(id, 1_010, 101_000, vec![fields(1_000, 1_000)]),
+            true,
+        );
+        let s = f.finish();
+        let disk = s.activities.first().and_then(|a| a.items.first()).unwrap();
+        let col = |name: &str| disk.columns.iter().find(|c| c.column == name).unwrap();
+
+        // 100 セクタ/秒 = 50 kB/s (セクタは 512 B なので 2 倍にならない)
+        assert_eq!(col("read_kb_per_sec").mean, Some(50.0));
+        // rq_ticks 1,000 ms / 10 秒 → 平均キュー長 0.1 (1,000 倍にならない)
+        assert_eq!(col("avg_queue_size").mean, Some(0.1));
+        // tot_ticks 1,000 ms / 10 秒 = 10% ビジー (10 倍にならない)
+        assert_eq!(col("util_pct").mean, Some(10.0));
+        // 平均は瞬時値と一致する (区間は 1 本だけ)
+        assert_eq!(col("read_kb_per_sec").max.unwrap().value, 50.0);
+        assert_eq!(col("avg_queue_size").max.unwrap().value, 0.1);
+        assert_eq!(col("util_pct").max.unwrap().value, 10.0);
+
+        // --- A_PSI_CPU: 10 秒のうち 1 秒 (1e6 µs) 停止 → 10% ---
+        let id = ActivityId::PSI_CPU;
+        let plan = plan_for(id);
+        let mut f = Feed::new(id, opts_all());
+        f.push(
+            snapshot(
+                id,
+                1_000,
+                100_000,
+                vec![item_of(&plan, &[("some_cpu_total", 0)])],
+            ),
+            true,
+        );
+        f.push(
+            snapshot(
+                id,
+                1_010,
+                101_000,
+                vec![item_of(&plan, &[("some_cpu_total", 1_000_000)])],
+            ),
+            true,
+        );
+        let s = f.finish();
+        let psi = s.activities.first().and_then(|a| a.items.first()).unwrap();
+        let scpu = psi.columns.iter().find(|c| c.column == "scpu").unwrap();
+        assert_eq!(scpu.mean, Some(10.0), "10,000 倍にならない");
+        assert_eq!(scpu.max.unwrap().value, 10.0);
+    }
+
+    /// `Aggregation::Sum` の列に保存値スケールが必要なものは無い。
+    ///
+    /// [`AggregationMethod::DeltaSum`] は差分の総量をそのまま平均欄に出すため、
+    /// レートのスケール係数を掛けない。スケールが必要な列が `Sum` で宣言されたら
+    /// 単位が壊れるので、その組み合わせが現れないことを機械的に固定する。
+    #[test]
+    fn sum_columns_need_no_rate_scale() {
+        use crate::series::compute::rate_scale;
+        for def in crate::layout::registry::all() {
+            for (column, meta) in def.columns.iter().enumerate() {
+                if meta.aggregation != Aggregation::Sum {
+                    continue;
+                }
+                assert_eq!(
+                    rate_scale(def.id, column),
+                    1.0,
+                    "{} {} は Sum 宣言だがレートのスケールを持つ",
+                    def.id,
+                    meta.public_name
+                );
+            }
         }
     }
 

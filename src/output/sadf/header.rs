@@ -29,7 +29,7 @@ use chrono::{Datelike, TimeZone, Utc};
 
 use crate::format::file::SaFile;
 
-use super::{SadfConfig, TimeBase};
+use super::SadfConfig;
 
 /// 現行の `FORMAT_MAGIC`。これ以外のファイルはヘッダ 2 行で打ち切る。
 pub const FORMAT_MAGIC: u16 = 0x2175;
@@ -41,8 +41,8 @@ pub fn write_header<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> {
     write_header_with(out, file, &SadfConfig::default())
 }
 
-/// `-H` の出力。`cfg.time_base` が [`TimeBase::TrueTime`] (`-t`) のときだけ
-/// `File date:` がヘッダの日付フィールド由来になる (§1.5)。
+/// `-H` の出力。`cfg.time_base` が [`super::TimeBase::TrueTime`] (`-t`) の
+/// ときだけ `File date:` がヘッダの日付フィールド由来になる (§1.5)。
 pub fn write_header_with<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> io::Result<()> {
     let magic = file.magic();
     let h = file.header();
@@ -86,15 +86,14 @@ pub fn write_header_with<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig)
     // `-t` (`PRINT_TRUE_TIME`) のときだけ (§1.5)。両者は食い違い得る
     // (本家のテストデータ `data-ukwn` は ust_time が 09-15、ヘッダ日付が 10-15)。
     //
-    // 既定側の暦は次行の `File time:` と同じ UTC で開く。本家は
-    // `localtime_r()` を使うが、本家のテストは `TZ=GMT` 固定であり、
-    // reSARch は環境変数に依存せず既定の基準系 ([`TimeBase::Utc`]) で表す
-    // (`docs/format/03-output-format.md` §1.6 の対応表)。
-    let (year, month, day) = match cfg.time_base {
-        TimeBase::TrueTime => (h.year, u32::from(h.month), u32::from(h.day)),
-        _ => (utc.year(), utc.month(), utc.day()),
-    };
-    writeln!(out, "File date: {year:04}-{month:02}-{day:02}")?;
+    // `-j` / `-x` の `file-date` も本家は同じ関数で作るので
+    // ([`super::FileInfo::from_file_with`])、そちらと同じ値を使う。
+    // `-H` だけ別実装にすると、同じファイルの日付が形式ごとに食い違う。
+    writeln!(
+        out,
+        "File date: {}",
+        super::FileInfo::from_file_with(file, cfg.time_base).file_date
+    )?;
     writeln!(
         out,
         "File time: {} UTC ({})",

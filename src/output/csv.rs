@@ -54,9 +54,29 @@ pub const HEADER: &[&str] = &[
 /// `csv::Writer` が内部バッファを持つので、レコードを書いた時点で
 /// 順次書き出される。全レコードを溜めることはしない。
 pub fn write_csv<W: Write>(out: W, file: &SaFile, cfg: &CustomConfig) -> Result<()> {
+    write_csv_with(out, file, cfg, true)
+}
+
+/// ヘッダ行を出すかどうかを指定して書き出す。
+///
+/// **複数ファイルを 1 本の CSV に連結する場合、ヘッダは先頭の 1 回だけ**にする。
+/// ファイルごとに出すと 2 本目以降のヘッダが**データ行として読まれ**、
+/// `pandas.read_csv` や表計算ソフトで列の型が壊れる
+/// (`hostname` 列に `"hostname"` という文字列が混ざる)。
+///
+/// JSON は配列で包めるので同じ問題が起きない。NDJSON は 1 行 1 オブジェクトなので
+/// そもそもヘッダを持たない。CSV だけがこの区別を必要とする。
+pub fn write_csv_with<W: Write>(
+    out: W,
+    file: &SaFile,
+    cfg: &CustomConfig,
+    header: bool,
+) -> Result<()> {
     let host = HostOut::new(file);
     let mut w = csv::WriterBuilder::new().from_writer(out);
-    w.write_record(HEADER).map_err(csv_err)?;
+    if header {
+        w.write_record(HEADER).map_err(csv_err)?;
+    }
 
     let mut boot: u32 = 0;
     let mut cursor = cfg.time_filter.cursor();

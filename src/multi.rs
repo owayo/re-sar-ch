@@ -22,6 +22,18 @@
 //! | [`IdentityVerdict::Ambiguous`] | `nodename` は一致、`machine` / `sysname` が違う | 別マシンの可能性。起動区間を分ける |
 //! | [`IdentityVerdict::Different`] | `nodename` が違う | 別ホスト |
 //!
+//! **この判定は境界ごとに実際に効く。** マージ側は直前サンプルのファイルと
+//! 当該ファイルの識別材料を比べ、`Identical` 以外なら
+//! [`BreakReason::IdentityChanged`] として差分を切る。比較相手は
+//! 「グループ代表」ではなく**直前サンプル**である (`A → B → B → A` と
+//! 構成が戻る並びで、切るべき境界だけを切るため)。
+//!
+//! 実際にマージ経路へ来るのは `Identical` と `LikelySameMachine` がほとんどで、
+//! `Ambiguous` / `Different` は [`HostIdentity::group_key`] の段階で
+//! 別グループに分かれる (`machine` / `sysname` / `nodename` が鍵に入っている)。
+//! それでも判定を渡すのは、グループ分けと境界判定が別の鍵で動いており、
+//! 片方だけを信用すると診断と挙動が食い違うためである。
+//!
 //! # 連続性が不明なら差分を作らない
 //!
 //! 日境界の引き継ぎは、次のすべてを確認できたときだけ行う。
@@ -50,6 +62,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -103,11 +116,37 @@ impl HostIdentity {
     /// `release` と `cpu_nr` は**含めない** (カーネル更新や CPU 数の変化でも
     /// 同じホストの系列として扱い、起動区間の分割で対処する)。
     /// 逆に `machine` / `sysname` が違うものは同じホスト扱いにしない。
+    ///
+    /// **この鍵は「差分を引き継いでよいか」の判断には使えない。**
+    /// そちらは [`HostIdentity::continuity_key`] を見る。
     pub fn group_key(&self) -> (String, String, String) {
         (
             self.nodename.clone(),
             self.sysname.clone(),
             self.machine.clone(),
+        )
+    }
+
+    /// 「カウンタの差分を引き継いでよいか」を決める鍵。
+    ///
+    /// [`HostIdentity::group_key`] と違い **`release` と `cpu_nr` を含める**。
+    /// この 2 つは別の判断であり、混ぜると診断と挙動が矛盾する。
+    ///
+    /// | 判断 | 鍵 | 違ったときの扱い |
+    /// |---|---|---|
+    /// | 同じホストの系列か | [`group_key`](HostIdentity::group_key) | 別ホストとして分ける |
+    /// | 差分を引き継げるか | `continuity_key` | 同じホストのまま**起動区間を分ける** |
+    ///
+    /// カーネル更新や CPU 数の変化は「同じマシンだが再起動を挟んだ」ことを
+    /// 意味するので、系列は 1 つのまま保ちつつ差分は切る。
+    /// 文字列を確保しないよう参照のタプルを返す (ファイル境界ごとに引く)。
+    pub fn continuity_key(&self) -> (&str, &str, &str, &str, Option<u32>) {
+        (
+            &self.nodename,
+            &self.sysname,
+            &self.machine,
+            &self.release,
+            self.cpu_nr,
         )
     }
 }
@@ -214,6 +253,19 @@ pub fn compare_identity(a: &HostIdentity, b: &HostIdentity) -> IdentityCompariso
         fields,
         notes,
     }
+}
+
+/// 2 つの識別材料の判定だけを求める (判定材料の一覧は作らない)。
+///
+/// サンプル境界ごとに呼ぶため、[`compare_identity`] の
+/// `IdentityFieldMatch` (5 項目 × 2 本の `String`) を毎回確保しない。
+/// 同一ファイル内および構成が変わっていないファイル間では
+/// [`HostIdentity::continuity_key`] の比較だけで済み、確保は起きない。
+fn identity_verdict(prev: &HostIdentity, next: &HostIdentity) -> IdentityVerdict {
+    if prev.continuity_key() == next.continuity_key() {
+        return IdentityVerdict::Identical;
+    }
+    compare_identity(prev, next).verdict
 }
 
 // ===========================================================================
@@ -563,7 +615,19 @@ struct SampleRecord {
 /// **差分は含まない。** 差分はマージ側 (ホスト・起動区間ごとの処理器) が計算する。
 struct FileSamples {
     index: usize,
-    signature: PlanSignature,
+    /// このファイルのヘッダが申告する識別材料。
+    ///
+    /// グループ代表の識別材料ではなく**ファイルごとの値**を持つ。
+    /// ファイル境界で `release` / `cpu_nr` の変化を見るために必要
+    /// ([`HostIdentity::continuity_key`])。
+    ///
+    /// `Arc` で持つのは、マージ側が**サンプルごとに**直前の識別材料を
+    /// 抱え直すため (`PrevSample`)。ファイル内では不変な 4 本の `String` を
+    /// サンプル数だけ確保し直すのは無駄なので、参照だけを配る。
+    identity: Arc<HostIdentity>,
+    /// レイアウト署名。`identity` と同じ理由で `Arc` にする
+    /// (activity 数ぶんの `Vec` をサンプルごとに複製しない)。
+    signature: Arc<PlanSignature>,
     plans: Vec<ActivityPlan>,
     samples: Vec<SampleRecord>,
 }
@@ -658,7 +722,8 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
 
     Ok(FileSamples {
         index: outline.index,
-        signature,
+        identity: Arc::new(outline.identity.clone()),
+        signature: Arc::new(signature),
         plans,
         samples,
     })
@@ -672,6 +737,12 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
 struct OpenSegment {
     index: usize,
     boot_epoch: Option<i64>,
+    /// この区間を開いたファイルの識別材料。
+    ///
+    /// 区間は識別材料が変わった時点で切れる (`BreakReason::IdentityChanged`) ため、
+    /// 区間内では `release` / `cpu_nr` が一定である。グループ代表 (先頭ファイル)
+    /// の値を出力に載せると、カーネル更新後の区間に更新前の `release` が付く。
+    identity: Arc<HostIdentity>,
     builder: NativeSummaryBuilder,
     files: Vec<usize>,
     boundaries: Vec<BoundaryRecord>,
@@ -682,14 +753,19 @@ struct OpenSegment {
 struct PrevSample {
     snapshot: Snapshot,
     file_index: usize,
-    signature: PlanSignature,
+    /// そのサンプルが入っていたファイルの識別材料 (参照のみ。複製しない)。
+    identity: Arc<HostIdentity>,
+    signature: Arc<PlanSignature>,
 }
 
 /// 1 ホスト分の系列を組み立てる。
 ///
 /// ファイルを決定的順序で受け取り、**ファイル境界をまたいで差分を作る**。
+///
+/// 識別材料はグループ代表の 1 つを持たず、[`FileSamples::identity`] として
+/// ファイルごとに受け取る。境界での差分引き継ぎの可否も、出力に載せる
+/// `release` / `cpu_nr` も、**代表ではなくその場のファイルの申告値**で決まる。
 struct GroupMerger<'o> {
-    identity: HostIdentity,
     opts: &'o MultiOptions,
     /// 入力ファイルの概要。出力にパスを載せるために参照する。
     outlines: &'o [FileOutline],
@@ -703,9 +779,8 @@ struct GroupMerger<'o> {
 }
 
 impl<'o> GroupMerger<'o> {
-    fn new(identity: HostIdentity, opts: &'o MultiOptions, outlines: &'o [FileOutline]) -> Self {
+    fn new(opts: &'o MultiOptions, outlines: &'o [FileOutline]) -> Self {
         Self {
-            identity,
             opts,
             outlines,
             tzname: None,
@@ -726,12 +801,17 @@ impl<'o> GroupMerger<'o> {
             .unwrap_or_else(|| format!("#{index}"))
     }
 
-    fn open_segment(&mut self, boot_epoch: Option<i64>) -> &mut OpenSegment {
+    fn open_segment(
+        &mut self,
+        boot_epoch: Option<i64>,
+        identity: Arc<HostIdentity>,
+    ) -> &mut OpenSegment {
         let index = self.next_segment_index;
         self.next_segment_index += 1;
         self.current = Some(OpenSegment {
             index,
             boot_epoch,
+            identity,
             builder: NativeSummaryBuilder::new(self.opts.summary.clone()),
             files: Vec::new(),
             boundaries: Vec::new(),
@@ -747,21 +827,25 @@ impl<'o> GroupMerger<'o> {
         if seg.observed == 0 {
             return;
         }
+        // `release` / `cpu_nr` は**その区間の**申告値を載せる。
+        // 区間は識別材料の変化で切れるので区間内では一定であり、
+        // グループ代表の値を使うとカーネル更新後の区間に更新前の版が付く。
         let source = SummarySource {
-            label: self.identity.nodename.clone(),
-            nodename: Some(self.identity.nodename.clone()),
-            release: Some(self.identity.release.clone()),
-            machine: Some(self.identity.machine.clone()),
-            cpu_nr: self.identity.cpu_nr,
+            label: seg.identity.nodename.clone(),
+            nodename: Some(seg.identity.nodename.clone()),
+            release: Some(seg.identity.release.clone()),
+            machine: Some(seg.identity.machine.clone()),
+            cpu_nr: seg.identity.cpu_nr,
             tzname: self.tzname.clone(),
             files: seg.files.iter().map(|i| self.file_label(*i)).collect(),
             boot_segment: Some(seg.index),
         };
         let summary = seg.builder.finish(source);
+        // 判定 (`run_queue` など) の分母も区間の CPU 数を使う
         let findings = evaluate(
             &summary,
             &RuleContext {
-                cpu_nr: self.identity.cpu_nr,
+                cpu_nr: seg.identity.cpu_nr,
             },
         );
         self.segments.push(BootSegment {
@@ -821,7 +905,13 @@ impl<'o> GroupMerger<'o> {
                             BoundaryPoint::of(&prev.snapshot),
                             point,
                             prev.signature == fs.signature,
-                            IdentityVerdict::Identical,
+                            // **同一性検査の結果をそのまま渡す。**
+                            // ここを固定値 `Identical` にすると、
+                            // `LikelySameMachine` (カーネル更新 / CPU 数変化) と
+                            // 診断したファイル間でも、時刻とレイアウトが揃えば
+                            // 差分を引き継いでしまい、出力される診断と
+                            // 実際の集計動作が食い違う。
+                            identity_verdict(&prev.identity, &fs.identity),
                             cross_file,
                             &self.opts.continuity,
                         );
@@ -837,7 +927,7 @@ impl<'o> GroupMerger<'o> {
             };
             if start_new {
                 self.close_segment();
-                self.open_segment(point.boot_epoch());
+                self.open_segment(point.boot_epoch(), Arc::clone(&fs.identity));
             }
 
             // --- ファイル境界の記録 ---
@@ -894,7 +984,9 @@ impl<'o> GroupMerger<'o> {
             self.prev = Some(PrevSample {
                 snapshot: sample.snapshot.clone(),
                 file_index: fs.index,
-                signature: fs.signature.clone(),
+                // Arc の参照だけを増やす (ファイル内で不変なものを複製しない)
+                identity: Arc::clone(&fs.identity),
+                signature: Arc::clone(&fs.signature),
             });
         }
     }
@@ -940,7 +1032,7 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
             .map(|i| compare_identity(&identity, &outlines[*i].identity))
             .collect();
 
-        let mut merger = GroupMerger::new(identity.clone(), opts, &outlines);
+        let mut merger = GroupMerger::new(opts, &outlines);
         let limit = opts.max_concurrent_files.max(1);
         // **全結果を collect しない。** 同時処理数の上限ごとに区切って
         // デコードし、その都度マージへ流して解放する。
@@ -1018,11 +1110,6 @@ fn outline_one(path: &Path, index: usize, opts: &MultiOptions) -> Result<FileOut
         header_ust_time: h.ust_time,
         activities: file.activities().len(),
     })
-}
-
-/// 1 ファイルだけを横断処理と同じ経路で扱う (`analyze_files` の薄い包み)。
-pub fn analyze_one(path: impl AsRef<Path>, opts: &MultiOptions) -> Result<MultiFileAnalysis> {
-    analyze_files(&[path.as_ref().to_path_buf()], opts)
 }
 
 // ===========================================================================
@@ -1575,6 +1662,9 @@ mod tests {
     }
 
     /// テスト用のファイル 1 つ分を組む。
+    ///
+    /// 識別材料は `testhost` の既定値。ファイル間で構成が変わる状況を作る
+    /// テストは、戻り値の [`FileSamples::identity`] を直接書き換える。
     fn file_samples(
         index: usize,
         id: ActivityId,
@@ -1593,7 +1683,8 @@ mod tests {
             .collect();
         FileSamples {
             index,
-            signature: PlanSignature {
+            identity: Arc::new(ident("testhost")),
+            signature: Arc::new(PlanSignature {
                 activities: vec![ActivitySignature {
                     id,
                     magic: signature_tag,
@@ -1601,7 +1692,7 @@ mod tests {
                     item_size: 16,
                     fields: plan.fields.len(),
                 }],
-            },
+            }),
             plans: vec![ActivityPlan { index: 0, id, plan }],
             samples: records,
         }
@@ -1624,7 +1715,7 @@ mod tests {
     fn delta_is_carried_across_the_file_boundary() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         // ファイル 1: 起動時刻 1000。カウンタ 0 → 100
         m.push_file(file_samples(
             0,
@@ -1665,7 +1756,7 @@ mod tests {
     fn unverifiable_boundary_does_not_produce_a_delta() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1704,7 +1795,7 @@ mod tests {
     fn layout_change_across_files_is_not_carried() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1725,12 +1816,162 @@ mod tests {
         );
     }
 
+    /// **同一性検査の結果が境界判定に効く。**
+    ///
+    /// カーネル版が変わったファイル間は [`IdentityVerdict::LikelySameMachine`]
+    /// と診断される。時刻もレイアウトも揃っているので、判定を使わずに
+    /// `Identical` 固定で境界を見ると差分を引き継いでしまい、
+    /// 「再起動を挟んでいるので差分は引き継がない」という診断の注記と
+    /// 実際の集計動作が矛盾する。
+    #[test]
+    fn identity_change_across_files_breaks_the_delta() {
+        let id = ActivityId::SWAP;
+        let opts = opts_for_merge();
+        let mut m = GroupMerger::new(&opts, &[]);
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        // 起動時刻・レイアウトは揃っているが、カーネル版だけが違うファイル
+        let mut next = file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 300), (2_030, 103_000, 400)],
+            &[],
+            1,
+        );
+        next.identity = Arc::new(HostIdentity {
+            release: "6.1.0-generic".to_string(),
+            ..ident("testhost")
+        });
+        assert_eq!(
+            identity_verdict(&ident("testhost"), &next.identity),
+            IdentityVerdict::LikelySameMachine
+        );
+        m.push_file(next);
+
+        let (_, segments) = m.finish();
+        assert_eq!(segments.len(), 2, "識別材料が変わったら起動区間を分ける");
+        for seg in &segments {
+            let c = seg.summary.column(id, SINGLE_ITEM, "pswpin").expect("列");
+            assert_eq!(c.intervals, 1, "境界の差分は作らない: {c:?}");
+            assert_eq!(c.delta_total.as_deref(), Some("100"));
+        }
+        // 区間ごとに、その区間のファイルが申告した版が載る
+        assert_eq!(
+            segments[0].summary.source.release.as_deref(),
+            Some("5.15.0-generic")
+        );
+        assert_eq!(
+            segments[1].summary.source.release.as_deref(),
+            Some("6.1.0-generic")
+        );
+        // 境界の記録には理由が残る
+        let b = &segments[1].boundaries[0];
+        assert!(!b.decision.continuous);
+        assert_eq!(b.decision.reason, Some(BreakReason::IdentityChanged));
+        assert!(b.decision.new_segment);
+    }
+
+    /// CPU 数だけが変わった場合も差分を引き継がない。
+    ///
+    /// `cpu_nr` は判定 (`run_queue`) の分母でもあるので、
+    /// 区間ごとにその区間の申告値が使われることも併せて確認する。
+    #[test]
+    fn cpu_count_change_across_files_breaks_the_delta() {
+        let id = ActivityId::SWAP;
+        let opts = opts_for_merge();
+        let mut m = GroupMerger::new(&opts, &[]);
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        let mut next = file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 300), (2_030, 103_000, 400)],
+            &[],
+            1,
+        );
+        next.identity = Arc::new(HostIdentity {
+            cpu_nr: Some(8),
+            ..ident("testhost")
+        });
+        m.push_file(next);
+
+        let (_, segments) = m.finish();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].summary.source.cpu_nr, Some(4));
+        assert_eq!(segments[1].summary.source.cpu_nr, Some(8));
+    }
+
+    /// **切るのは識別材料が変わった境界だけ。**
+    ///
+    /// 判定は「グループ代表との比較」ではなく「直前サンプルとの比較」で行う。
+    /// 代表と比べると `A → B → B → A` の 2 本目の B で無用に区間が切れ、
+    /// 構成が戻った 4 本目で切れない。
+    #[test]
+    fn only_the_changing_boundary_is_broken() {
+        let id = ActivityId::SWAP;
+        let opts = opts_for_merge();
+        let other = Arc::new(HostIdentity {
+            release: "6.1.0-generic".to_string(),
+            ..ident("testhost")
+        });
+        let mut m = GroupMerger::new(&opts, &[]);
+        // A → B → B → A の 4 ファイル (時刻・レイアウトはすべて連続)
+        for (index, release_changed) in [(0, false), (1, true), (2, true), (3, false)] {
+            let ust = 2_000 + index as u64 * 20;
+            let uptime = 100_000 + index as u64 * 2_000;
+            let counter = index as u64 * 200;
+            let mut fs = file_samples(
+                index,
+                id,
+                vec![
+                    (ust, uptime, counter),
+                    (ust + 10, uptime + 1_000, counter + 100),
+                ],
+                &[],
+                1,
+            );
+            if release_changed {
+                fs.identity = Arc::clone(&other);
+            }
+            m.push_file(fs);
+        }
+        let (_, segments) = m.finish();
+
+        assert_eq!(segments.len(), 3, "切れるのは A→B と B→A の 2 箇所だけ");
+        // 区間 1 は B のファイル 2 本分。その内側と境界で 3 区間ぶん差分が取れる
+        let c = segments[1]
+            .summary
+            .column(id, SINGLE_ITEM, "pswpin")
+            .expect("列");
+        assert_eq!(c.intervals, 3, "B → B の境界は引き継ぐ: {c:?}");
+        assert_eq!(segments[1].files, vec![1, 2]);
+        assert_eq!(
+            segments[1].summary.source.release.as_deref(),
+            Some("6.1.0-generic")
+        );
+        assert_eq!(
+            segments[2].summary.source.release.as_deref(),
+            Some("5.15.0-generic"),
+            "構成が戻った区間は元の版で報告する"
+        );
+    }
+
     /// ファイル内の RESTART でも起動区間を分ける。
     #[test]
     fn restart_inside_a_file_splits_segments() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1758,7 +1999,7 @@ mod tests {
     fn findings_are_attached_per_segment() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,

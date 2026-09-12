@@ -32,7 +32,7 @@ pub const XML_DTD_VERSION: &str = "3.18";
 
 /// `-x` の出力。
 pub fn write_xml<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file(file);
+    let info = FileInfo::from_file_with(file, cfg.time_base);
     let specs = selected_specs(file, cfg);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
@@ -295,7 +295,7 @@ fn activity_body(
             let wrap = spec.group != Group::Network;
             let child_depth = if wrap { depth + 1 } else { depth };
             let mut rows = String::new();
-            for item in pair.output_items() {
+            for item in pair.compat_items() {
                 let attrs = attr_list(spec, &item, cfg);
                 rows.push_str(&format!(
                     "{}<{}{}/>\n",

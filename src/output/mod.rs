@@ -5,6 +5,7 @@
 //! 形式ごとに計算がずれる事故を層の分離で防ぐ。
 
 pub mod csv;
+pub mod detect_report;
 pub mod json;
 pub mod ndjson;
 pub mod sadf;

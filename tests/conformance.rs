@@ -54,13 +54,14 @@ use fixtures::{Corruption, ExpectedError, FixtureAbi};
 use golden::{Comparison, Mask};
 
 use re_sar_ch::Error;
+use re_sar_ch::cli::sadf_args::{SadfFormat, parse_sadf_args};
 use re_sar_ch::cli::sar_args::{Activity, OptFlags, SarOptions, parse_sar_args};
 use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::ResolvedLayout;
 use re_sar_ch::format::{SaFile, ScanControl, layouts, selfdesc};
 use re_sar_ch::model::ActivityId;
-use re_sar_ch::output::sadf;
+use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
 use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::TimeFilter;
 use re_sar_ch::series::{Selection, walk};
@@ -152,6 +153,12 @@ enum Repro {
     /// `sadf -H`。本家テストは `| grep -v 0x2175` を通すので、
     /// reSARch 側の出力からも同じ行を落とす (先頭行が入力パスを含むため)。
     SadfHeader,
+    /// `sadf` の各出力形式 (`-d` / `-p` / `-r` / `-j` / `-x`)。
+    ///
+    /// 要素は本家のコマンドラインの引数そのまま。`--` の後ろの `sar` 側引数
+    /// (`-m FAN,IN,TEMP` など) も含める。[`parse_sadf_args`] に通してから
+    /// 対応する writer を呼ぶ。
+    Sadf(&'static [&'static str]),
     /// reSARch にその出力形式が無く、比較できないケース。
     Unsupported {
         /// 何が無いのか。報告にそのまま出す。
@@ -329,7 +336,63 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         repro: Repro::Sar(&["-C", "-A"]),
         masks: &[Mask::DiskDeviceName],
     },
+    // --- sadf の各出力形式 (テスト 01500〜01550) ---
+    //
+    // どれも同じ入力・同じ activity 選択 (`-m FAN,IN,TEMP`) で形式だけが違う。
+    // 5 形式を横に並べることで「値は同じなのに書式だけ違う」ことを固定できる
+    // (単位換算やゼロ補完の不統一は、この並びで初めて見える)。
+    // 電源センサは IEEE-754 double で保存されており、`%temp` / `%in` は
+    // min/max を使う比率なので、計算層の特殊経路もここで検証される。
+    GoldenCase {
+        upstream_test: "01500",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -d <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-d",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-d", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01510",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -p <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-p",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-p", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01520",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -r <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-r",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-r", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01540",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -j <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-j",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-j", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01550",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -x <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-x",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-x", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
 ];
+// 本家テスト 01530 (`sadf -g ... -- -m FAN,IN,TEMP`) はここに入れていない。
+// `-g` の期待出力は 144 KB の SVG で、対応する出力形式が reSARch に無い。
+// 「SVG が無い」ことは 01405 の [`Repro::Unsupported`] で 1 件数えており、
+// 同じ理由のケースを 2 件並べても情報が増えないため取得対象からも外している。
 
 /// 期待出力を持たず「エラーメッセージと終了コードだけ」を見るケース (§4.2 の後半)。
 struct ErrorCase {
@@ -425,6 +488,80 @@ fn render_sadf_header(file: &SaFile) -> Result<String, String> {
         .filter(|l| !l.contains(SADF_H_GREP_V))
         .map(|l| format!("{l}\n"))
         .collect())
+}
+
+/// `sadf` の各出力形式を生成する。
+///
+/// 引数列は本家のコマンドラインそのまま ([`parse_sadf_args`] に通すので
+/// `--` の前後の解釈も検証される)。時刻基準は本家テストの `TZ=GMT` に合わせて
+/// [`TimeBase::Utc`] にする。
+///
+/// **[`SadfConfig`] のフィールドは `..Default::default()` で省略しない。**
+/// 出力オプションが増えたときにコンパイルエラーで気付けるようにして、
+/// 「新しいオプションが既定値のまま無視され、再現が静かに崩れる」のを防ぐ
+/// ([`sar_text_options`] と同じ方針)。
+fn render_sadf(
+    file: &SaFile,
+    data: &Path,
+    args: &'static [&'static str],
+) -> Result<String, String> {
+    // 本家は `sadf <fmt> <file> -- <sar 引数>` の順に並べる。
+    // `--` より前にファイル名を置く必要があるので、先頭の形式指定の直後に挿す。
+    // [`parse_sadf_args`] はプログラム名を含まない引数列を受け取る。
+    let mut argv: Vec<String> = vec![args[0].to_string(), data.display().to_string()];
+    argv.extend(args[1..].iter().map(|s| s.to_string()));
+
+    let parsed =
+        parse_sadf_args(&argv).map_err(|e| format!("引数 {args:?} を解析できない: {e}"))?;
+    let format = parsed
+        .format
+        .ok_or_else(|| format!("引数 {args:?} から出力形式が決まらない"))?;
+
+    let cfg = SadfConfig {
+        time_base: TimeBase::Utc,
+        comments: parsed.sar.flags.comment,
+        debug: parsed.output.debug,
+        horizontally: parsed.horizontally,
+        section: SectionConfig {
+            cpu_all: parsed
+                .sar
+                .opt_flags(Activity::Cpu)
+                .contains(OptFlags::CPU_ALL),
+            memory: parsed
+                .sar
+                .opt_flags(Activity::Memory)
+                .contains(OptFlags::MEMORY),
+            swap: parsed
+                .sar
+                .opt_flags(Activity::Memory)
+                .contains(OptFlags::SWAP),
+            mem_all: parsed
+                .sar
+                .opt_flags(Activity::Memory)
+                .contains(OptFlags::MEM_ALL),
+            fs_mount: parsed.sar.opt_flags(Activity::Fs).contains(OptFlags::MOUNT),
+        },
+        activities: Some(
+            parsed
+                .sar
+                .selected_activities()
+                .map(|a| ActivityId(u32::from(a.id())))
+                .collect(),
+        ),
+        time_filter: TimeFilter::default(),
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    let r = match format {
+        SadfFormat::Db => sadf::dbppc::write_db(&mut buf, file, &cfg),
+        SadfFormat::Ppc => sadf::dbppc::write_ppc(&mut buf, file, &cfg),
+        SadfFormat::Json => sadf::json::write_json(&mut buf, file, &cfg),
+        SadfFormat::Xml => sadf::xml::write_xml(&mut buf, file, &cfg),
+        SadfFormat::Raw => sadf::raw::write_raw(&mut buf, file, &cfg),
+        other => return Err(format!("{other:?} は golden 比較の対象外")),
+    };
+    r.map_err(|e| format!("sadf 出力を書けない: {e}"))?;
+    String::from_utf8(buf).map_err(|e| format!("出力が UTF-8 でない: {e}"))
 }
 
 /// [`SarOptions`] (CLI 層) を [`SarTextOptions`] (出力層) へ写す。
@@ -867,7 +1004,7 @@ fn upstream_headers_decode_to_the_measured_facts() {
 ///
 /// 1. 入力 `sa` ファイルを [`SaFile`] で開く
 /// 2. 本家のコマンドラインに相当する出力をライブラリ API で生成する
-///    ([`render_sar_text`] / [`render_sadf_header`])
+///    ([`render_sar_text`] / [`render_sadf_header`] / [`render_sadf`])
 /// 3. `expected*` と 1 行ずつ突き合わせる ([`golden::compare`])
 /// 4. 「全文一致 / N 行マスクして一致 / 不一致」をケースごとに出す
 ///
@@ -879,22 +1016,19 @@ fn upstream_headers_decode_to_the_measured_facts() {
 /// [`Repro::Unsupported`] を宣言したケースだけは「比較不能」として集計し、
 /// 失敗にはしない (実装の誤りではなく、出力形式そのものが無いため)。
 ///
-/// # 現在の不一致 (2026-09-12 時点: 全文一致 5 / 不一致 10 / 比較不能 1)
+/// # 到達点
 ///
-/// 残っている差分はすべて次の 9 件に帰着する。いずれも**ファイルの中身から
-/// 再現できる**値なのでマスクせず、不一致のまま残してある。直したらこの表も消す。
+/// 全 21 件のうち **全文一致 16 / マスクして一致 4 / 不一致 0 / 比較不能 1**。
 ///
-/// | # | 症状 | 本家の規則 |
-/// |---|---|---|
-/// | 1 | 先頭イベント (最初の統計レコードより前の `LINUX RESTART` / `COM`) を activity ブロックごとに再出力する | 先頭イベントは activity ループの**外**で 1 回だけ出す (`sar.c: read_stats_from_file()`、03 §2.1) |
-/// | 2 | `magic` が現行と違う activity を表示してしまう (`data-12.0.0` の `A_IRQ` = `0x8b`) | 既知 ID でも magic 不一致なら `id_seq[]` に入れない = 表示しない (`sa_common.c: check_file_actlst()`) |
-/// | 3 | `sa_cpu_nr` を持たない世代 (`0x2171`) で CPU 数が 1 になる | `A_CPU` の `file_activity.nr` を CPU 数として使う (01 §5.x の変換表) |
-/// | 4 | 同世代で `kbavail` が 0 になる | `availablekb` が無い世代は `frmkb` (空きメモリ) で代用する (01 §5.x) |
-/// | 5 | item 数を `file_activity.nr` (割り当て上限) で回し、空スロットまで表示する | `has_nr` の無い世代は番兵で数える (`count_stats_*`、01 §5.9)。`nr[curr] == 0` の activity はブロックごと出さない (03 §3 の平均行の条件) |
-/// | 6 | `A_NET_SOFT` のオフライン CPU 行を出す | 前サンプルの 6 カウンタが全 0 の CPU は出さない (`count.c: get_global_soft_statistics()`) |
-/// | 7 | `sadf -H` の `File date:` がヘッダの `sa_day/month/year` 由来 | `localtime(sa_ust_time)` 由来 (`sa_common.c: get_file_timestamp_struct()`)。ヘッダ日付を使うのは `-t` のときだけ |
-/// | 8 | `sar` のバナー日付が同じ理由でずれる (`data-ukwn` 系は手書きで両者が食い違う) | 同上 |
-/// | 9 | 未知 activity ID に `[Unknown format]` を付ける | 付くのは**既知 ID かつ magic 不一致**のときだけ (`sadf_misc.c: print_hdr_header()`) |
+/// - マスクが効いているのは `A_DISK` のデバイス名列だけ (4 件)。
+///   `major:minor` を実行ホストの `/dev` で解決した結果なので、`sa` ファイルからは
+///   再現できない。reSARch は他ホストのファイルに誤名を出さないよう
+///   `dev<major>-<minor>` のまま出す
+/// - 比較不能は `sadf -g` (SVG) の 1 件のみ。対応する出力形式が無い
+///
+/// 実測で見つかった 9 件の不一致 (先頭イベントの再出力・magic 不一致 activity の表示・
+/// CPU 数・`kbavail`・空きスロット・オフライン CPU・日付の時刻源・`[Unknown format]`) は
+/// すべて解消済み。経緯と本家の規則は Issue #4 に残してある。
 #[test]
 #[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
 fn golden_outputs_match_upstream() {
@@ -942,6 +1076,7 @@ fn golden_outputs_match_upstream() {
             Ok(file) => match case.repro {
                 Repro::Sar(args) => render_sar_text(&file, &data, args),
                 Repro::SadfHeader => render_sadf_header(&file),
+                Repro::Sadf(args) => render_sadf(&file, &data, args),
                 Repro::Unsupported { .. } => unreachable!("上で処理済み"),
             },
             Err(e) => Err(format!("ファイルを開けない: {e}")),

@@ -13,23 +13,23 @@
 //! - **オフライン CPU も必ず出す** (他形式は除外する、§11.3)。
 //! - `hdr_line` に無い直書きフィールド名が多数ある (§14.5-3)。
 //!
-//! # 既知の制約
+//! # 文字列フィールド
 //!
-//! `series` 層のスナップショットは item ごとに**文字列を 1 本だけ**
-//! (`ItemSnapshot::key`) 保持する。そのため 1 item に文字列フィールドが 2 つ以上
-//! ある activity では、識別キー以外が空になる。
+//! 1 item に文字列フィールドが複数ある activity (`A_PWR_USB` の
+//! `manufact` / `product`、`A_FS` の `fs_name` / `mountp`) も
+//! `ItemSnapshot::texts` からすべて引ける。
+//! その世代のファイルに無いフィールドだけが空になる
+//! (例: 最古の `A_FS` は `mountp` を持たない)。
 //!
-//! | activity | 取れる | 空になる |
-//! |---|---|---|
-//! | `A_PWR_USB` | `product` (識別キー) | `manufact` |
-//!
-//! 0 や適当な値で埋めず**空**にしてある。埋めるには `series` 層が
-//! 複数の文字列フィールドを運べるようにする必要がある。
+//! `A_DISK` のデバイス名だけはファイルに入っていないため、
+//! 本家 `get_devname()` の最終フォールバックと同じ `dev<major>-<minor>` を
+//! 組み立てる (§2.8.1)。ローカルの `/sys` は引かない — 他ホストで採取した
+//! ファイルでは別デバイスの名前が出てしまう。
 
 use std::io::{self, Write};
 
 use super::access::{ActivityPair, ItemPair};
-use super::render::{item_label, raw_pair};
+use super::render::{item_label_in, raw_pair};
 use super::spec::{ActivitySpec, ItemKind, RawField, RawSpec, RawStyle, Section};
 use super::{
     ABSENT_TEXT, FileInfo, SadfConfig, Stamp, double_from_bits, render, spec, write_sensor,
@@ -200,12 +200,12 @@ fn write_generic<W: Write>(
         let mut tok = vec![ts.to_string()];
         for (i, f) in fields.iter().enumerate() {
             if i == label_at {
-                push_item_label(&mut tok, spec, &item, cfg);
+                push_item_label(&mut tok, spec, section, &item, cfg);
             }
             push_raw_field(&mut tok, spec, &item, f, cfg);
         }
         if fields.len() <= label_at {
-            push_item_label(&mut tok, spec, &item, cfg);
+            push_item_label(&mut tok, spec, section, &item, cfg);
         }
         out.write_all(join_tokens(&tok).as_bytes())?;
     }
@@ -230,18 +230,17 @@ fn join_tokens(tokens: &[String]) -> String {
 fn push_item_label(
     tok: &mut Vec<String>,
     spec: &ActivitySpec,
+    section: &Section,
     item: &ItemPair<'_>,
     cfg: &SadfConfig,
 ) {
     if spec.item == ItemKind::None || spec.id == ActivityId::PWR_USB {
         return;
     }
-    let head = spec.sections[0]
-        .hdr_line
-        .split(';')
-        .next()
-        .unwrap_or_default();
-    let label = item_label(spec, item);
+    // 先頭のフィールド名はそのセクションの `hdr_line` から取る
+    // (`A_FS` は `-F MOUNT` で `FILESYSTEM` → `MOUNTPOINT` に変わる)。
+    let head = section.hdr_line.split(';').next().unwrap_or_default();
+    let label = item_label_in(spec, section, item);
 
     // -O debug では A_CPU のオフライン判定を名前の直後に付ける (§4.4-4)
     if cfg.debug && spec.id == ActivityId::CPU && item.ctx.tick_total == Some(0) {

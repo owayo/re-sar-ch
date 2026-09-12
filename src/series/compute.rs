@@ -25,13 +25,35 @@
 //! ここでは `ColumnMeta::unit` どおりの値 (バイト / バイト毎秒) を返し、
 //! 表示単位への換算は出力層の単位処理に委ねる (03 §1.8.1)。
 //!
+//! ## 差分は「元のフィールド幅」で取る
+//!
+//! レイアウト層は 4 バイトのフィールドも `u64` へゼロ拡張して渡してくる。
+//! そのまま 64bit で引くと 32bit カウンタの一周を復元できず、
+//! `4294967290 → 4` のような入力で差分が 1.84×10¹⁹ になる。
+//! この層では [`DecodePlan::column_bits`] で列のカウンタ幅を引き、
+//! [`wrapping_delta`] / [`s_value_bits`] に幅を渡す
+//! (詳しい理由と本家との関係は [`super::delta`] のモジュールドキュメント)。
+//!
+//! ## 欠落の扱いは方針で分ける
+//!
+//! 「その世代のファイルに無いフィールド」を 0 とみなすと、
+//! 総量から引く形の派生列が静かに嘘の値になる
+//! (`%memused` = `(tlmkb - availablekb) / tlmkb` で `availablekb` を 0 にすると
+//! 常に 100%)。一方で互換出力は**本家が表示した値**を出さなければならない。
+//! そこで [`MissingPolicy`] で 2 つの方針を分ける。
+//!
+//! - [`MissingPolicy::Compat`] — [`column_value`]。本家の挙動 (0 埋め /
+//!   世代別の代替フィールド) を再現する。`sar` / `sadf` 互換出力用。
+//! - [`MissingPolicy::Strict`] — [`column_value_strict`]。欠落は
+//!   [`ComputeIssue::UnsupportedBySource`] として返す。独自出力・集計用。
+//!
 //! 典拠: `docs/format/03-output-format.md` 第 I 部 §1.2〜§1.5、第 III 部 §7。
 
-use super::delta::{Discontinuity, s_value};
+use super::delta::{Discontinuity, s_value_bits, wrapping_delta};
 use super::snapshot::ItemSnapshot;
 use crate::layout::plan::DecodePlan;
 use crate::layout::registry::ColumnMeta;
-use crate::model::{ActivityId, Availability, ValueKind};
+use crate::model::{ActivityId, Availability, CounterBits, ValueKind};
 
 // ============================================================================
 // 列インデックス定数
@@ -364,6 +386,25 @@ pub enum ComputeIssue {
 /// 表示値。
 pub type Computed = Result<f64, ComputeIssue>;
 
+/// 「その世代のファイルに無い入力フィールド」の扱い方。
+///
+/// 派生列の入力が欠落したとき、互換出力と独自出力で求められるものが違う。
+///
+/// - 互換出力は**本家が表示した値**を出す必要がある。本家は期待する型別本数より
+///   ファイル側が少なければ 0 埋めした構造体で計算する (03 §1.9-1)。
+///   さらに旧形式の変換 (`sadf -c`) では、世代別に**代替フィールドを代入**する
+///   ものもある (`availablekb` ← `frmkb`、02 §8)。
+/// - 独自出力・集計では「欠落」と「0」を混同してはいけない (`docs/design.md` §4)。
+///   欠落を 0 とみなした結果が値の意味を変える箇所では、計算せずに理由を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MissingPolicy {
+    /// 本家互換: その世代の `sar` が表示した値を再現する。
+    #[default]
+    Compat,
+    /// 厳密: 欠落を代替値で埋めず、[`ComputeIssue`] として報告する。
+    Strict,
+}
+
 // ============================================================================
 // 生値アクセス
 // ============================================================================
@@ -390,7 +431,10 @@ pub fn raw_column(
 /// 本家は「期待する型別本数よりファイル側が少なければ足りない分を 0 埋め」して
 /// 構造体を組み立てる (03 §1.9-1)。したがって `discard` 統計を持たない世代の
 /// `dc_sect` は本家でも 0 として `areq-sz` の分子に入る。
-/// 派生計算の**加算項**だけこの関数を使い、主要項には [`raw_column`] を使う。
+///
+/// **使ってよいのは「0 を足しても値の意味が変わらない加算項」だけ**である。
+/// 分子・分母・被減数のような主要項には [`primary_input`] を使う
+/// (0 埋めが `%memused` = 100% のような嘘を作る)。
 #[inline]
 fn raw_or_zero(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> Result<u64, ComputeIssue> {
     match plan.column_value(&item.values, column) {
@@ -398,6 +442,41 @@ fn raw_or_zero(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> Result<
         Availability::UnsupportedBySource => Ok(0),
         Availability::MissingInSample => Err(ComputeIssue::MissingInSample),
     }
+}
+
+/// 派生計算の**主要項** (分子・分母・被減数) を取り出す。
+///
+/// 欠落を 0 で埋めると値そのものが嘘になる位置で使う。
+/// 「総量 - 欠落」は総量に等しくなり使用率 100% を、
+/// 「欠落 / 総量」は 0% を、静かに作り出す。
+///
+/// [`MissingPolicy::Compat`] では本家と同じ 0 埋めを行い、
+/// [`MissingPolicy::Strict`] では計算せずに理由を返す。
+#[inline]
+fn primary_input(
+    plan: &DecodePlan,
+    item: &ItemSnapshot,
+    column: usize,
+    policy: MissingPolicy,
+) -> Result<u64, ComputeIssue> {
+    match plan.column_value(&item.values, column) {
+        Availability::Present(v) => Ok(v),
+        Availability::MissingInSample => Err(ComputeIssue::MissingInSample),
+        Availability::UnsupportedBySource => match policy {
+            // 本家は 0 埋めした構造体で計算する (03 §1.9-1)
+            MissingPolicy::Compat => Ok(0),
+            MissingPolicy::Strict => Err(ComputeIssue::UnsupportedBySource),
+        },
+    }
+}
+
+/// 列のカウンタ幅。
+///
+/// 派生列 (対応する wire フィールドが無い) は 64bit 扱いにする。
+/// 派生列の差分は入力列ごとに幅を引いて計算するため、ここは使われない。
+#[inline]
+fn counter_bits(plan: &DecodePlan, column: usize) -> CounterBits {
+    plan.column_bits(column).unwrap_or(CounterBits::B64)
 }
 
 /// IEEE-754 の `double` として保存されているフィールドを読む。
@@ -447,10 +526,14 @@ pub fn tick_total(prev: &ItemSnapshot, curr: &ItemSnapshot) -> u64 {
 // 列の表示値
 // ============================================================================
 
-/// 1 列分の表示値を計算する。
+/// 1 列分の表示値を計算する (**本家互換**)。
 ///
 /// 直接列 (単一の wire フィールドに対応) はここで計算する。
 /// 派生列は activity 固有の計算が必要なため [`derived_value`] に委譲する。
+///
+/// 入力フィールドが「その世代のファイルに無い」場合は本家と同じ扱いをする
+/// ([`MissingPolicy::Compat`])。欠落を欠落として受け取りたい場合は
+/// [`column_value_strict`] を使う。
 pub fn column_value(
     id: ActivityId,
     column: usize,
@@ -460,8 +543,61 @@ pub fn column_value(
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
 ) -> Computed {
+    column_value_with(
+        id,
+        column,
+        meta,
+        plan,
+        prev,
+        curr,
+        ctx,
+        MissingPolicy::Compat,
+    )
+}
+
+/// 1 列分の表示値を計算する (**欠落を埋めない**)。
+///
+/// 独自出力・集計はこちらを使う。その世代のファイルに入力フィールドが無く、
+/// 0 で埋めると値の意味が変わる派生列は [`ComputeIssue::UnsupportedBySource`]
+/// を返す (`docs/design.md` §4「欠落とゼロを混同しない」)。
+///
+/// 計算式自体は [`column_value`] と同一の実装を共有する。
+/// 形式ごとに式が分岐するとこの層を置いた意味が無くなるため、
+/// 分岐させるのは**欠落の埋め方だけ**に限定している。
+pub fn column_value_strict(
+    id: ActivityId,
+    column: usize,
+    meta: &ColumnMeta,
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    ctx: &ComputeContext,
+) -> Computed {
+    column_value_with(
+        id,
+        column,
+        meta,
+        plan,
+        prev,
+        curr,
+        ctx,
+        MissingPolicy::Strict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn column_value_with(
+    id: ActivityId,
+    column: usize,
+    meta: &ColumnMeta,
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    ctx: &ComputeContext,
+    policy: MissingPolicy,
+) -> Computed {
     if !meta.is_direct() {
-        return derived_value(id, column, meta, plan, prev, curr, ctx);
+        return derived_value(id, column, meta, plan, prev, curr, ctx, policy);
     }
 
     // 保存形式が特殊な直接列を先に処理する
@@ -485,10 +621,17 @@ pub fn column_value(
             }
             let prev_v = raw_column(plan, prev, column)?;
 
-            // 逆行クランプ (`ll_sp_value` / 各 print 関数の明示クランプ)
+            // 逆行クランプ (`ll_sp_value` / 各 print 関数の明示クランプ)。
+            // ラップの復元より先に判定する: クランプ対象の列は本家が
+            // 「減っていたら 0」と決めているので、そこに合わせる。
             if curr_v < prev_v && clamps_decrease(id, column, ctx) {
                 return Ok(0.0);
             }
+
+            // 差分は列の元の幅で取る。32bit カウンタ (`unsigned int` のフィールドや
+            // 32bit ライタの `unsigned long`) を 64bit のまま引くと、一周した入力で
+            // 差分が 1.84e19 になる。本家も `unsigned int` は 32bit で引いている。
+            let bits = counter_bits(plan, column);
 
             // CPU 時間で正規化する activity は tick 合計を分母にする
             let rate = match ctx.tick_total {
@@ -497,8 +640,8 @@ pub fn column_value(
                         Discontinuity::NonPositiveElapsed,
                     ));
                 }
-                Some(total) => curr_v.wrapping_sub(prev_v) as f64 / total as f64 * 100.0,
-                None => s_value(prev_v, curr_v, ctx.itv_cs),
+                Some(total) => wrapping_delta(prev_v, curr_v, bits) as f64 / total as f64 * 100.0,
+                None => s_value_bits(prev_v, curr_v, ctx.itv_cs, bits),
             };
             Ok(rate * counter_scale(id, column))
         }
@@ -663,6 +806,9 @@ pub fn signed_byte(v: u64) -> i8 {
 /// activity 固有の計算式を実装する場所。未実装の列は
 /// [`ComputeIssue::NotImplemented`] を返し、出力側で「未対応」と分かる形にする
 /// (0 を返して正常値に見せてはいけない)。
+///
+/// `policy` は入力フィールドが欠落したときの扱い ([`MissingPolicy`])。
+#[allow(clippy::too_many_arguments)]
 pub fn derived_value(
     id: ActivityId,
     column: usize,
@@ -671,6 +817,7 @@ pub fn derived_value(
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Computed {
     // 識別子列 (デバイス名・CPU 番号など) は数値ではない
     if meta.kind == ValueKind::Identity {
@@ -679,11 +826,11 @@ pub fn derived_value(
 
     match id {
         ActivityId::CPU => cpu_derived(column, plan, prev, curr, ctx),
-        ActivityId::MEMORY => memory_derived(column, plan, curr),
+        ActivityId::MEMORY => memory_derived(column, plan, curr, policy),
         ActivityId::HUGE => huge_derived(column, plan, curr),
         ActivityId::DISK => disk_derived(column, plan, prev, curr, ctx),
         ActivityId::FS => fs_derived(column, plan, curr),
-        ActivityId::NET_DEV => net_dev_derived(column, plan, prev, curr, ctx),
+        ActivityId::NET_DEV => net_dev_derived(column, plan, prev, curr, ctx, policy),
         ActivityId::PWR_FAN => fan_derived(column, plan, curr),
         ActivityId::PWR_TEMP => temp_derived(column, plan, curr),
         ActivityId::PWR_IN => in_derived(column, plan, curr),
@@ -774,18 +921,60 @@ fn sp_value(m: u64, n: u64, p: u64) -> f64 {
     n.wrapping_sub(m) as f64 / p as f64 * 100.0
 }
 
+/// `availablekb` (= `/proc/meminfo` の `MemAvailable`) を取り出す。
+///
+/// このフィールドは **v11.5.3 で追加**されたもので、それより前の `A_MEMORY`
+/// (`magic 0x8a` / `size` 128 以下) には存在しない (02 §9.4)。
+///
+/// 欠落を 0 として `tlmkb - 0` を計算すると、総量が正のとき
+/// `kbmemused` = 総量、`%memused` = **100%** になる。旧世代のファイルを
+/// 読んだだけで「メモリ使用率 100%」という嘘を表示することになるため、
+/// 0 埋め ([`raw_or_zero`]) は使ってはいけない。
+///
+/// 世代別の正しい扱い:
+///
+/// - 本家は旧形式を直接読めず `sadf -c` で変換してから読む。その変換は
+///   `availablekb` が無い世代に **`frmkb` を代入する**。02 §8 に
+///   「`%memused` が 100% にならないようにするため」と明記されている。
+///   これは `availablekb` 導入前の `sar` が `%memused` を
+///   `(tlmkb - frmkb) / tlmkb` として表示していたことと一致する。
+/// - したがって [`MissingPolicy::Compat`] では `frmkb` を代替に使う
+///   (= その世代の `sar` が出していた値)。
+/// - [`MissingPolicy::Strict`] では代替せず欠落を返す。
+///   `kbavail` 相当の値はこのファイルからは得られない、が正しい報告である。
+#[inline]
+fn memory_available(
+    plan: &DecodePlan,
+    item: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Result<u64, ComputeIssue> {
+    match plan.column_value(&item.values, mem_col::KBAVAIL) {
+        Availability::Present(v) => Ok(v),
+        Availability::MissingInSample => Err(ComputeIssue::MissingInSample),
+        Availability::UnsupportedBySource => match policy {
+            MissingPolicy::Compat => raw_column(plan, item, mem_col::KBMEMFREE),
+            MissingPolicy::Strict => Err(ComputeIssue::UnsupportedBySource),
+        },
+    }
+}
+
 /// `A_MEMORY` の派生列。すべてゲージ (差分化しない)。
-fn memory_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed {
+fn memory_derived(
+    column: usize,
+    plan: &DecodePlan,
+    curr: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Computed {
     match column {
         // kbmemused = tlmkb - availablekb (frmkb ではない)
         mem_col::KBMEMUSED => {
             let total = raw_column(plan, curr, mem_col::KBMEMTOTAL)?;
-            let avail = raw_or_zero(plan, curr, mem_col::KBAVAIL)?;
+            let avail = memory_available(plan, curr, policy)?;
             Ok(total.wrapping_sub(avail) as f64)
         }
         mem_col::MEMUSED_PCT => {
             let total = raw_column(plan, curr, mem_col::KBMEMTOTAL)?;
-            let avail = raw_or_zero(plan, curr, mem_col::KBAVAIL)?;
+            let avail = memory_available(plan, curr, policy)?;
             Ok(if total != 0 {
                 sp_value(avail, total, total)
             } else {
@@ -793,12 +982,15 @@ fn memory_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Comp
             })
         }
         mem_col::COMMIT_PCT => {
+            // tlskb は分母の加算項。swap を持たない世代では 0 でよい
+            // (RAM だけが分母になる = その世代の sar と同じ)。
             let total = raw_column(plan, curr, mem_col::KBMEMTOTAL)?.wrapping_add(raw_or_zero(
                 plan,
                 curr,
                 mem_col::KBSWPTOTAL,
             )?);
-            let com = raw_or_zero(plan, curr, mem_col::KBCOMMIT)?;
+            // comkb は分子そのもの。欠落を 0 にすると %commit が常に 0% になる
+            let com = primary_input(plan, curr, mem_col::KBCOMMIT, policy)?;
             Ok(if total != 0 {
                 sp_value(0, com, total)
             } else {
@@ -822,7 +1014,8 @@ fn memory_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Comp
         mem_col::SWPCAD_PCT => {
             let total = raw_column(plan, curr, mem_col::KBSWPTOTAL)?;
             let free = raw_column(plan, curr, mem_col::KBSWPFREE)?;
-            let cad = raw_or_zero(plan, curr, mem_col::KBSWPCAD)?;
+            // caskb は分子そのもの。欠落を 0 にすると %swpcad が常に 0% になる
+            let cad = primary_input(plan, curr, mem_col::KBSWPCAD, policy)?;
             let used = total.wrapping_sub(free);
             Ok(if used != 0 {
                 sp_value(0, cad, used)
@@ -866,18 +1059,29 @@ fn disk_derived(
 
     let ios_p = raw_column(plan, prev, disk_col::TPS)?;
     let ios_c = raw_column(plan, curr, disk_col::TPS)?;
-    // 完了 I/O が増えていないときは 0 (0 除算回避も兼ねる)
+    // 完了 I/O が増えていないときは 0 (0 除算回避も兼ねる)。
+    // 本家も `nr_ios_c > nr_ios_p` を素の比較で行い、偽なら 0.0 を返す (03 §5.1)。
     if ios_c <= ios_p {
         return Ok(0.0);
     }
     let d_ios = (ios_c - ios_p) as f64;
 
+    // 各入力列の差分は**その列の幅**で取る。
+    //
+    // `rd_ticks` / `wr_ticks` / `dc_ticks` は全世代で `unsigned int` (02 §7)。
+    // 64bit のまま引くと、tick カウンタが一周した区間で差分が 1.84e19 になり、
+    // `await` が 10¹⁸ ms という値になる。本家は `unsigned int` 同士の減算なので
+    // 32bit で一周が畳まれ、正しい ms が出る。ここを合わせる。
+    //
+    // 3 本の和は f64 で取る。本家は `unsigned int` の和なので 2^32 ms
+    // (約 49 日分の tick) を超えると本家側だけが一周するが、
+    // 1 区間でそこまで積み上がる入力は現実には無い。
     let sum_delta = |cols: [usize; 3]| -> Result<f64, ComputeIssue> {
         let mut acc = 0.0;
         for c in cols {
             let p = raw_or_zero(plan, prev, c)?;
             let n = raw_or_zero(plan, curr, c)?;
-            acc += n.wrapping_sub(p) as f64;
+            acc += wrapping_delta(p, n, counter_bits(plan, c)) as f64;
         }
         Ok(acc)
     };
@@ -948,6 +1152,7 @@ fn net_dev_derived(
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Computed {
     if column != net_dev_col::IFUTIL_PCT {
         return Err(ComputeIssue::NotImplemented);
@@ -959,18 +1164,27 @@ fn net_dev_derived(
         return Err(ComputeIssue::Discontinuous(Discontinuity::Restart));
     }
 
-    // rx / tx は**バイト毎秒**。名前が rxkb でも 1024 で割ってはいけない (03 §1.8.1)
-    let rx = s_value(
+    // rx / tx は**バイト毎秒**。名前が rxkb でも 1024 で割ってはいけない (03 §1.8.1)。
+    // 差分は列の幅で取る (旧世代の `rx_bytes` は `unsigned long`。
+    // 32bit ライタのファイルでは一周が 2^32 で起きる)。
+    let rx = s_value_bits(
         raw_column(plan, prev, net_dev_col::RXKB)?,
         raw_column(plan, curr, net_dev_col::RXKB)?,
         ctx.itv_cs,
+        counter_bits(plan, net_dev_col::RXKB),
     );
-    let tx = s_value(
+    let tx = s_value_bits(
         raw_column(plan, prev, net_dev_col::TXKB)?,
         raw_column(plan, curr, net_dev_col::TXKB)?,
         ctx.itv_cs,
+        counter_bits(plan, net_dev_col::TXKB),
     );
-    let speed = raw_or_zero(plan, curr, net_dev_col::SPEED)?;
+    // speed は分母。この世代に `speed` が無いと 0 になり、
+    // 本家は `speed == 0` を「不明」として 0.0 を返す (03 §5.2)。
+    // 互換出力ではそれに従うが、独自出力では「不明」を 0% と見せない。
+    let speed = primary_input(plan, curr, net_dev_col::SPEED, policy)?;
+    // duplex は式の選択にしか使わない。本家も未提供時は
+    // 0 = C_DUPLEX_UNKNOWN として半二重側の式を使う。
     let duplex_v = raw_or_zero(plan, curr, net_dev_col::DUPLEX)?;
     Ok(ifutil(rx, tx, speed, duplex_v))
 }
@@ -1375,6 +1589,23 @@ impl ItemAccum {
     }
 }
 
+/// `Average:` 行で「平均 availablekb」を引く列。
+///
+/// `availablekb` を持たない世代では、その位置に累積されているものが無いため
+/// [`ItemAccum`] の合計は 0 のままになる。そのまま `tlmkb - 0` を計算すると
+/// `Average:` 行だけ `%memused` = 100% になる。
+///
+/// [`memory_available`] と同じ理由で `frmkb` の平均に切り替える。
+/// [`average_ratio`] は本家の `Average:` 行専用なので、方針は
+/// [`MissingPolicy::Compat`] 固定でよい。
+#[inline]
+fn average_available_column(plan: &DecodePlan, last: &ItemSnapshot) -> usize {
+    match plan.column_value(&last.values, mem_col::KBAVAIL) {
+        Availability::UnsupportedBySource => mem_col::KBMEMFREE,
+        _ => mem_col::KBAVAIL,
+    }
+}
+
 /// 比率列の `Average:` 値 (方式 B′)。
 ///
 /// 「分子と分母をそれぞれ平均してから比を取る」列がこれに該当する。
@@ -1382,6 +1613,9 @@ impl ItemAccum {
 ///
 /// `last` は最後に表示したサンプル。`tlmkb` / `temp_min` / `temp_max` のように
 /// **累積せず最終値を使う**フィールドの参照元になる。
+///
+/// これは本家の `Average:` 行を再現する経路なので、欠落の扱いは
+/// [`MissingPolicy::Compat`] 相当に固定している。
 pub fn average_ratio(
     id: ActivityId,
     column: usize,
@@ -1396,13 +1630,17 @@ pub fn average_ratio(
         // kbmemused = 最終サンプルの tlmkb - 平均 availablekb (浮動小数除算)
         (ActivityId::MEMORY, mem_col::KBMEMUSED) => {
             let total = raw_column(plan, last, mem_col::KBMEMTOTAL)?;
-            Ok(total as f64 - acc.float_mean(mem_col::KBAVAIL))
+            Ok(total as f64 - acc.float_mean(average_available_column(plan, last)))
         }
         // %memused は **整数除算**を経由する (03 §7-A の落とし穴)
         (ActivityId::MEMORY, mem_col::MEMUSED_PCT) => {
             let total = raw_column(plan, last, mem_col::KBMEMTOTAL)?;
             Ok(if total != 0 {
-                sp_value(acc.int_mean(mem_col::KBAVAIL), total, total)
+                sp_value(
+                    acc.int_mean(average_available_column(plan, last)),
+                    total,
+                    total,
+                )
             } else {
                 0.0
             })

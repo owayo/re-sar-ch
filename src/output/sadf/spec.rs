@@ -176,6 +176,12 @@ pub enum RawSpec {
 #[derive(Debug, Clone, Copy)]
 pub struct Section {
     pub gate: SectionGate,
+    /// アイテム識別子に使う列 (`ColumnMeta::public_name`)。空なら
+    /// [`ActivitySpec::item`] の規則に従う。
+    ///
+    /// `A_FS` だけはセクションで切り替わる: `-F` は `fs_name`、
+    /// `-F MOUNT` は `mountp` を表示する (§2.8.1)。
+    pub item_col: &'static str,
     /// `activity.c` の `hdr_line` セグメント。**そのままの文字列**。
     ///
     /// `-d` のフィールド名一覧行の出典。`&` は「`-r ALL` 指定時のみ現れる境界」。
@@ -1191,6 +1197,7 @@ macro_rules! one_section {
     ($hdr:literal, $fields:expr, $raw:expr) => {
         &[Section {
             gate: SectionGate::Always,
+            item_col: "",
             hdr_line: $hdr,
             fields: $fields,
             jx_order: &[],
@@ -1200,6 +1207,7 @@ macro_rules! one_section {
     ($hdr:literal, $fields:expr, $raw:expr, $order:expr) => {
         &[Section {
             gate: SectionGate::Always,
+            item_col: "",
             hdr_line: $hdr,
             fields: $fields,
             jx_order: $order,
@@ -1229,6 +1237,7 @@ pub const SPECS: &[ActivitySpec] = &[
         sections: &[
             Section {
                 gate: SectionGate::CpuDef,
+                item_col: "",
                 hdr_line: "CPU;%user;%nice;%system;%iowait;%steal;%idle",
                 fields: CPU_DEF_FIELDS,
                 jx_order: &[],
@@ -1236,6 +1245,7 @@ pub const SPECS: &[ActivitySpec] = &[
             },
             Section {
                 gate: SectionGate::CpuAll,
+                item_col: "",
                 hdr_line: "CPU;%usr;%nice;%sys;%iowait;%steal;%irq;%soft;%guest;%gnice;%idle",
                 fields: CPU_ALL_FIELDS,
                 jx_order: &[],
@@ -1344,6 +1354,7 @@ pub const SPECS: &[ActivitySpec] = &[
         sections: &[
             Section {
                 gate: SectionGate::Memory,
+                item_col: "",
                 hdr_line: "kbmemfree;kbavail;kbmemused;%memused;kbbuffers;kbcached;kbcommit;%commit;kbactive;kbinact;kbdirty;kbshmem&kbanonpg;kbslab;kbkstack;kbpgtbl;kbvmused",
                 fields: MEMORY_FIELDS,
                 jx_order: &[],
@@ -1351,6 +1362,7 @@ pub const SPECS: &[ActivitySpec] = &[
             },
             Section {
                 gate: SectionGate::Swap,
+                item_col: "",
                 hdr_line: "kbswpfree;kbswpused;%swpused;kbswpcad;%swpcad",
                 fields: SWAP_MEM_FIELDS,
                 jx_order: &[],
@@ -2000,6 +2012,7 @@ pub const SPECS: &[ActivitySpec] = &[
         sections: &[
             Section {
                 gate: SectionGate::FsName,
+                item_col: "filesystem",
                 hdr_line: "FILESYSTEM;MBfsfree;MBfsused;%fsused;%ufsused;Ifree;Iused;%Iused",
                 fields: FS_NAME_FIELDS,
                 jx_order: &[],
@@ -2007,6 +2020,7 @@ pub const SPECS: &[ActivitySpec] = &[
             },
             Section {
                 gate: SectionGate::FsMount,
+                item_col: "mountpoint",
                 hdr_line: "MOUNTPOINT;MBfsfree;MBfsused;%fsused;%ufsused;Ifree;Iused;%Iused",
                 fields: FS_MOUNT_FIELDS,
                 jx_order: &[],

@@ -25,6 +25,21 @@ pub fn bat_status(v: u64) -> &'static str {
     }
 }
 
+/// セクションを踏まえてアイテム識別子を組み立てる。
+///
+/// `A_FS` だけは `-F` / `-F MOUNT` で表示するフィールドが変わる (§2.8.1)。
+/// 該当フィールドがその世代のファイルに無い場合は、
+/// 適当な値で埋めずアイテム添字へ落とす。
+pub fn item_label_in(spec: &ActivitySpec, section: &Section, item: &ItemPair<'_>) -> ItemLabel {
+    if !section.item_col.is_empty() {
+        return match item.text(section.item_col) {
+            Some(name) => ItemLabel::named(name),
+            None => ItemLabel::numbered("", item.index as u64),
+        };
+    }
+    item_label(spec, item)
+}
+
 /// アイテム識別子を組み立てる。
 pub fn item_label(spec: &ActivitySpec, item: &ItemPair<'_>) -> ItemLabel {
     match spec.item {
@@ -35,6 +50,10 @@ pub fn item_label(spec: &ActivitySpec, item: &ItemPair<'_>) -> ItemLabel {
             // 名前を持たない item は位置で表す (0 で埋めない)
             None => ItemLabel::numbered("", item.index as u64),
         },
+        // ブロックデバイス名はファイルに入っていない (§2.8.1)。
+        // 本家 `get_devname()` の最終フォールバック `DEF_DEVICE_NAME` と同じ
+        // `dev<major>-<minor>` 形式で組み立てる。ローカルの /sys を引くと
+        // 「別ホストの major/minor に対応する名前」という誤った名前になるため引かない。
         ItemKind::Index { prefix, base } => {
             ItemLabel::numbered(prefix, item.index as u64 + base as u64)
         }
@@ -42,8 +61,6 @@ pub fn item_label(spec: &ActivitySpec, item: &ItemPair<'_>) -> ItemLabel {
             Availability::Present(v) => ItemLabel::numbered(prefix, v),
             _ => ItemLabel::numbered(prefix, item.index as u64),
         },
-        // デバイス名はファイルに入っていないので major/minor から作る
-        // (本家 `get_devname()` のフォールバックと同じ `dev<major>-<minor>`)。
         ItemKind::Disk => {
             let major = item.raw_curr_by_name("major");
             let minor = item.raw_curr_by_name("minor");

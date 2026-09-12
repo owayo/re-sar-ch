@@ -187,6 +187,13 @@ pub struct FieldOut {
     /// 派生値 (レート・割合)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
+    /// 文字列フィールドの値 (デバイス名 / マウントポイント / 製品名など)。
+    ///
+    /// `A_FS` の `mountpoint` や `A_PWR_USB` の `manufacturer` のように、
+    /// 1 item が複数の文字列を持つ activity でもすべて出せる。
+    /// その世代に無いフィールドは `None` + `quality` に理由が入る。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     pub quality: Quality,
 }
 
@@ -290,6 +297,9 @@ pub fn item_out(
 /// 書かれているので、ビット列のままでは意味を持たない。
 /// ここで実数として解釈し、`sadf -r` と同じ小数 6 桁で文字列化する。
 fn raw_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
+    if item.is_text_column(col.public_name) {
+        return text_field(col, item);
+    }
     let (raw, quality) = match item.raw_curr(index) {
         Availability::Present(v) if is_double_field(col) => {
             (Some(format!("{:.6}", f64::from_bits(v))), Quality::Ok)
@@ -304,12 +314,21 @@ fn raw_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
         kind: kind_name(col.kind),
         raw,
         value: None,
+        text: None,
         quality,
     }
 }
 
 /// 派生値 1 列。
 fn rate_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
+    if item.is_text_column(col.public_name) {
+        return text_field(col, item);
+    }
+    // 識別子列にレートは無い。数値の識別子 (バス番号 / ベンダ ID / バッテリ ID)
+    // は生値をそのまま見せる。`-` に落とすと item の同定ができなくなる。
+    if col.kind == ValueKind::Identity {
+        return raw_identity_field(col, item, index);
+    }
     let (value, quality) = match item.computed(index) {
         Ok(v) => (Some(v), Quality::Ok),
         Err(e) => (None, Quality::from_issue(e)),
@@ -320,6 +339,50 @@ fn rate_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
         kind: kind_name(col.kind),
         raw: None,
         value,
+        text: None,
+        quality,
+    }
+}
+
+/// 数値の識別子 1 列。
+///
+/// 十進で出す。`sadf -j` が 16 進文字列にする `idvendor` / `idprod` とは表記が
+/// 違うが、独自スキーマは互換仕様に縛られないので機械処理しやすい十進に揃える。
+fn raw_identity_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
+    let (raw, quality) = match item.raw_curr(index) {
+        Availability::Present(v) => (Some(v.to_string()), Quality::Ok),
+        Availability::UnsupportedBySource => (None, Quality::UnsupportedBySource),
+        Availability::MissingInSample => (None, Quality::MissingInSample),
+    };
+    FieldOut {
+        name: col.public_name,
+        unit: unit_name(col),
+        kind: kind_name(col.kind),
+        raw,
+        value: None,
+        text: None,
+        quality,
+    }
+}
+
+/// 文字列 1 列。
+///
+/// 数値として意味を持たないので `raw` / `value` は空にし、`text` に入れる。
+fn text_field(col: &ColumnMeta, item: &ItemPair<'_>) -> FieldOut {
+    let text = item.text(col.public_name).map(|s| s.to_string());
+    let quality = if text.is_some() {
+        Quality::Ok
+    } else {
+        // 空文字とフィールド自体が無い場合は区別できないため欠落として扱う
+        Quality::MissingInSample
+    };
+    FieldOut {
+        name: col.public_name,
+        unit: unit_name(col),
+        kind: kind_name(col.kind),
+        raw: None,
+        value: None,
+        text,
         quality,
     }
 }
@@ -507,6 +570,7 @@ mod tests {
             kind: "counter",
             raw: Some(18_446_744_073_709_551_615u64.to_string()),
             value: None,
+            text: None,
             quality: Quality::Ok,
         };
         let s = serde_json::to_string(&f).unwrap();
@@ -526,6 +590,7 @@ mod tests {
             kind: "gauge",
             raw: None,
             value: None,
+            text: None,
             quality: Quality::NotImplemented,
         };
         let s = serde_json::to_string(&f).unwrap();

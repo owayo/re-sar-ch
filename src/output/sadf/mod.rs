@@ -689,6 +689,81 @@ mod smoke {
         }
     }
 
+    /// 公開スキーマが文字列フィールドを `text` として運ぶこと。
+    ///
+    /// `A_FS` は `filesystem` と `mountpoint` の両方、
+    /// `A_PWR_USB` は `manufacturer` と `product` の両方が出る。
+    #[test]
+    fn public_schema_carries_every_text_field() {
+        let Some(file) = open("data-12.0.0") else {
+            return;
+        };
+        let cfg = CustomConfig {
+            values: ValueScope::Both,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        crate::output::ndjson::write_ndjson(&mut buf, &file, &cfg).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        let mut seen_fs = false;
+        let mut seen_usb = false;
+        for line in out.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let texts = |act: &str| -> Vec<(String, Option<String>)> {
+                if v["activity"] != act {
+                    return Vec::new();
+                }
+                v["raw"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|f| f["kind"] == "identity")
+                            .map(|f| {
+                                (
+                                    f["name"].as_str().unwrap_or("").to_string(),
+                                    f["text"].as_str().map(|s| s.to_string()),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            let fs = texts("A_FS");
+            if !fs.is_empty() {
+                seen_fs = true;
+                let names: Vec<&str> = fs.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(names.contains(&"filesystem"), "{names:?}");
+                assert!(names.contains(&"mountpoint"), "{names:?}");
+                // 両方に実際の値が入る
+                assert!(
+                    fs.iter().all(|(_, t)| t.is_some()),
+                    "文字列が欠けている: {fs:?}"
+                );
+            }
+
+            let usb = texts("A_PWR_USB");
+            if !usb.is_empty() {
+                seen_usb = true;
+                let names: Vec<&str> = usb.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(names.contains(&"manufacturer"), "{names:?}");
+                assert!(names.contains(&"product"), "{names:?}");
+                // 数値の識別子 (バス番号 / ベンダ ID) は raw に十進で入る
+                let ids: Vec<&str> = v["raw"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| f["name"] == "vendor_id")
+                    .filter_map(|f| f["raw"].as_str())
+                    .collect();
+                assert_eq!(ids.len(), 1, "vendor_id の生値が無い");
+            }
+        }
+        assert!(seen_fs, "A_FS の行が無い");
+        assert!(seen_usb, "A_PWR_USB の行が無い");
+    }
+
     /// 4 種の独自形式がすべて出力できること。
     #[test]
     fn all_custom_formats_produce_output() {
@@ -1012,6 +1087,148 @@ mod golden {
                 .nth(1)
                 .unwrap()
                 .starts_with("File created by sar/sadc from sysstat version 9.1.6")
+        );
+    }
+
+    /// `A_PWR_USB` の `manufact` / `product` が全形式で出ること。
+    ///
+    /// 1 item が文字列フィールドを 2 つ持つ activity。`product` が主識別子で、
+    /// `manufact` も `ItemSnapshot::texts` から引ける。
+    #[test]
+    fn usb_strings_appear_in_every_format() {
+        let Some(file) = open("data-12.0.0") else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let product = "HP Wireless Keyboard Mouse Kit";
+
+        // -d: hdr_line の列順はバグったまま、データは BUS→idvendor→idprod→
+        // maxpower→manufact→product の順 (§11.2 (b))
+        let d = emit(&file, dbppc::write_db);
+        assert!(
+            d.contains(&format!(";3f0;862;196;HP;{product}")),
+            "-d に manufact が出ていない"
+        );
+
+        // -p: 1 メトリック 1 行なので名前付きで出る
+        let p = emit(&file, dbppc::write_ppc);
+        assert!(p.contains("\tmanufact\tHP"), "-p に manufact が出ていない");
+        assert!(p.contains(&format!("\tproduct\t{product}")));
+
+        // -r: 文字列 2 つはダブルクォートで囲まれる (§14.5-5)
+        let r = emit(&file, raw::write_raw);
+        assert!(
+            r.contains(&format!("manufact; \"HP\"; product; \"{product}\";")),
+            "-r の引用付き文字列が出ていない"
+        );
+
+        // -j / -x
+        let j = emit(&file, json::write_json);
+        assert!(j.contains(&format!("\"manufact\": \"HP\", \"product\": \"{product}\"")));
+        let x = emit(&file, xml::write_xml);
+        assert!(x.contains(&format!("manufact=\"HP\" product=\"{product}\"")));
+    }
+
+    /// 空の文字列フィールドは `-d`/`-p`/`-x` で空、`-j` でも `""` (null ではない)。
+    ///
+    /// 本家は空の `manufact` を空フィールド / `""` として出す (§11.2 (b) の実測)。
+    #[test]
+    fn empty_strings_stay_empty_not_null() {
+        let Some(file) = open("data-12.0.0") else {
+            return;
+        };
+        let j = emit(&file, json::write_json);
+        assert!(
+            j.contains("\"manufact\": \"\", \"product\": \"\""),
+            "-j の空文字が null になっている"
+        );
+        let x = emit(&file, xml::write_xml);
+        assert!(x.contains("manufact=\"\" product=\"\""));
+        let d = emit(&file, dbppc::write_db);
+        assert!(d.contains(";8087;24;0;;"), "-d の空フィールドが崩れている");
+    }
+
+    /// `A_FS` は `-F` が `fs_name`、`-F MOUNT` が `mountp` を出す (§2.8.1)。
+    #[test]
+    fn filesystem_switches_between_device_and_mountpoint() {
+        let Some(file) = open("data-12.0.0") else {
+            return;
+        };
+        let mount = SadfConfig {
+            section: SectionConfig {
+                fs_mount: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        dbppc::write_db(&mut buf, &file, &mount).unwrap();
+        let d = String::from_utf8(buf).unwrap();
+        assert_has_line(
+            &d,
+            "# hostname;interval;timestamp;MOUNTPOINT;MBfsfree;MBfsused;%fsused;%ufsused;Ifree;Iused;%Iused",
+        );
+        // 既定 (-F) はデバイス名、-F MOUNT はマウントポイント
+        let plain = emit(&file, dbppc::write_db);
+        assert!(plain.contains(";/dev/sda9;"), "-F でデバイス名が出ていない");
+        assert!(
+            d.lines().any(|l| l.contains(";/;")),
+            "-F MOUNT でマウントポイントが出ていない"
+        );
+
+        // -x の属性名と -j のキー名も切り替わる
+        let mut buf = Vec::new();
+        xml::write_xml(&mut buf, &file, &mount).unwrap();
+        let x = String::from_utf8(buf).unwrap();
+        assert!(
+            x.contains("<filesystem mountp=\"/\""),
+            "属性名が mountp でない"
+        );
+        assert!(!x.contains("<filesystem fsname="));
+
+        let mut buf = Vec::new();
+        json::write_json(&mut buf, &file, &mount).unwrap();
+        let j = String::from_utf8(buf).unwrap();
+        assert!(
+            j.contains("{\"mountpoint\": \"/\""),
+            "キー名が mountpoint でない"
+        );
+
+        // -r のラベルも MOUNTPOINT になり、値はダブルクォート付き
+        let mut buf = Vec::new();
+        raw::write_raw(&mut buf, &file, &mount).unwrap();
+        let r = String::from_utf8(buf).unwrap();
+        assert!(
+            r.contains("; MOUNTPOINT; \"/\";"),
+            "-r のラベルが切り替わっていない"
+        );
+    }
+
+    /// `A_DISK` のデバイス名はファイルに無いので `dev<major>-<minor>` を組み立てる。
+    ///
+    /// ローカルの `/sys` は引かない (他ホストのファイルで誤った名前が出る、§2.8.1)。
+    #[test]
+    fn disk_names_use_the_major_minor_fallback() {
+        let Some(file) = open("data-12.0.0") else {
+            return;
+        };
+        let d = emit(&file, dbppc::write_db);
+        assert!(
+            d.contains(";dev8-0;"),
+            "-d のデバイス名が dev<major>-<minor> でない"
+        );
+
+        let x = emit(&file, xml::write_xml);
+        assert!(x.contains("<disk-device dev=\"dev8-0\""));
+
+        let j = emit(&file, json::write_json);
+        assert!(j.contains("{\"disk-device\": \"dev8-0\""));
+
+        // raw は直書きの major / minor が hdr_line のラベルより前に出る (§4.5)
+        let r = emit(&file, raw::write_raw);
+        assert!(
+            r.contains("; major; 8; minor; 0; DEV; dev8-0; tps; "),
+            "-r の major/minor/DEV の並びが違う"
         );
     }
 

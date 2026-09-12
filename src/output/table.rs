@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use super::json::{CustomConfig, FieldOut, Quality, item_out, selected_ids};
+use super::json::{CustomConfig, FieldOut, item_out, selected_ids};
 use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
@@ -223,18 +223,21 @@ fn display_fields<'a>(raw: &'a [FieldOut], rates: &'a [FieldOut]) -> Vec<&'a Fie
 }
 
 /// セルの文字列。値が無ければ [`ABSENT`]。
+///
+/// 文字列フィールド (デバイス名 / マウントポイント / 製品名) はそのまま出す。
+/// 値が取れなかった理由は表には出さず `-` で表す (理由が要るときは
+/// NDJSON / CSV の `quality` 列を見る)。
 fn cell_text(f: &FieldOut) -> String {
+    if let Some(t) = &f.text {
+        return t.clone();
+    }
     if let Some(v) = f.value {
         return format_number(v);
     }
     if let Some(r) = &f.raw {
         return r.clone();
     }
-    // 理由は品質列ではなく記号で示す。0 にはしない。
-    match f.quality {
-        Quality::Ok => ABSENT.to_string(),
-        _ => ABSENT.to_string(),
-    }
+    ABSENT.to_string()
 }
 
 /// 数値の表示。桁が大きいものは小数を落とす。
@@ -286,7 +289,7 @@ pub fn default_config() -> CustomConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::json::unit_name;
+    use super::super::json::{Quality, unit_name};
     use super::*;
 
     #[test]
@@ -334,6 +337,7 @@ mod tests {
             kind: "gauge",
             raw: None,
             value: None,
+            text: None,
             quality: Quality::NotImplemented,
         };
         assert_eq!(cell_text(&f), "-");
@@ -354,6 +358,7 @@ mod tests {
             kind: "counter",
             raw: Some("96538".into()),
             value: None,
+            text: None,
             quality: Quality::Ok,
         }];
         let picked = display_fields(&raw, &[]);

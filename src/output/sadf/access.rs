@@ -259,15 +259,37 @@ impl<'a> ItemPair<'a> {
         }
     }
 
-    /// 文字列フィールド。`Availability` を保つため `Option` ではなく在否で返す。
+    /// 列の文字列値。
     ///
-    /// 数値としてデコードされないフィールド (`FieldTy::Bytes`) はスナップショットに
-    /// 入らないので、識別子は `key()` から、それ以外は空として扱う。
+    /// 1 item が文字列フィールドを複数持つ activity (`A_PWR_USB` の
+    /// `manufact`/`product`、`A_FS` の `fs_name`/`mountp`) でも正しく引ける。
+    /// その世代に無いフィールドや空文字は `None` (空文字で埋めない)。
     pub fn text(&self, public_name: &str) -> Option<&'a str> {
-        if self.def.item_key == self.column_wire_name(public_name)? {
-            return self.key();
+        self.text_by_wire(self.column_wire_name(public_name)?)
+    }
+
+    /// wire フィールド名で文字列値を引く。
+    ///
+    /// 名前の照合先は `DecodePlan::text_fields` で、1 item あたり数個しかない。
+    /// ここは 1 フィールド 1 文字列を生成する書式化経路なので、
+    /// 名前照合のコストは無視できる。
+    pub fn text_by_wire(&self, wire_name: &str) -> Option<&'a str> {
+        if wire_name.is_empty() {
+            return None;
         }
-        None
+        let i = self.plan.text_index(wire_name)?;
+        self.curr.text(i)
+    }
+
+    /// その列がファイル上の文字列フィールドか。
+    ///
+    /// 世代によってフィールドが無いこともあるので、レイアウト記述ではなく
+    /// **このファイルのデコード計画**に問い合わせる。
+    pub fn is_text_column(&self, public_name: &str) -> bool {
+        match self.column_wire_name(public_name) {
+            Some(w) if !w.is_empty() => self.plan.text_index(w).is_some(),
+            _ => false,
+        }
     }
 
     fn column_wire_name(&self, public_name: &str) -> Option<&'static str> {

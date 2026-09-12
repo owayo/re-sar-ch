@@ -18,7 +18,7 @@ use std::io::{self, Write};
 
 use super::access::ActivityPair;
 use super::dbppc::{display_cpu_count, present_specs, scan_comments, scan_restarts};
-use super::render::{item_label, jx_fields};
+use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Fmt, Group, Shape};
 use super::{ABSENT_JSON, FileInfo, SadfConfig, Stamp, interval_secs, render, spec};
 use crate::error::Result;
@@ -234,9 +234,9 @@ fn activity_block(
         Shape::Object | Shape::TextChildren => {
             // TextChildren (A_MEMORY / A_HUGE) は JSON ではフラットなオブジェクト
             let item = pair.item(0)?;
-            let label = item_label(spec, &item);
             let mut members: Vec<String> = Vec::new();
             for section in spec.active_sections(&cfg.section) {
+                let label = item_label_in(spec, section, &item);
                 for field in jx_fields(section) {
                     if field.key.is_empty() || !cfg.section.allows_field(field.gate) {
                         continue;
@@ -254,9 +254,9 @@ fn activity_block(
             let inner = tabs(tab + 1);
             let mut rows: Vec<String> = Vec::new();
             for item in pair.output_items() {
-                let label = item_label(spec, &item);
                 let mut members: Vec<String> = Vec::new();
                 for section in spec.active_sections(&cfg.section) {
+                    let label = item_label_in(spec, section, &item);
                     for field in jx_fields(section) {
                         if field.key.is_empty() || !cfg.section.allows_field(field.gate) {
                             continue;
@@ -291,17 +291,16 @@ fn member(
     label: &super::ItemLabel,
 ) -> String {
     let quoted = matches!(field.jx_fmt, Fmt::Str | Fmt::ItemKeyStr | Fmt::Hex);
-    let v = render::field_value(spec, item, field, field.jx_fmt, label, ABSENT_JSON);
     if quoted {
-        // 値が取れなかった場合は文字列にせず null にする (空文字と区別する)
-        if v == ABSENT_JSON {
-            format!("\"{}\": {ABSENT_JSON}", field.key)
-        } else {
-            format!("\"{}\": \"{}\"", field.key, esc(&v))
-        }
-    } else {
-        format!("\"{}\": {v}", field.key)
+        // 文字列列は本家と同じく**空文字**を出す。`null` にはしない
+        // (本家は空の `manufact` を `""` として出す、§11.2 (b) の実測)。
+        // 「その世代に無い」と「空文字」の区別が要る用途は独自 JSON / NDJSON の
+        // `quality` を使う。
+        let v = render::field_value(spec, item, field, field.jx_fmt, label, "");
+        return format!("\"{}\": \"{}\"", field.key, esc(&v));
     }
+    let v = render::field_value(spec, item, field, field.jx_fmt, label, ABSENT_JSON);
+    format!("\"{}\": {v}", field.key)
 }
 
 /// `A_IO` は `io-reads` / `io-writes` / `io-discard` に入れ子になる (§9.5)。

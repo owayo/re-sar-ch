@@ -18,6 +18,35 @@
 //! 重要なのは **減算が符号なしのまま行われる**点である。
 //! `curr as f64 - prev as f64` と書くとカウンタが逆行した場合に本家と値が食い違う。
 //! ここでは `wrapping_sub` を使って本家の挙動をそのまま再現する。
+//!
+//! ## 減算の幅は「元のフィールド幅」で決まる
+//!
+//! レイアウト層はどのフィールドも `u64` へゼロ拡張して返す。しかし
+//! **カウンタが一周する周期は元のフィールド幅**で決まるため、
+//! 32bit 幅のカウンタを `u64` のまま引くと一周を復元できない。
+//!
+//! 例: `unsigned int` のカウンタが `4294967290 → 4` と一周した場合、
+//! 正しい差分は 10 だが、`u64::wrapping_sub` では 18446744073709551620
+//! (≈1.84×10¹⁹) になり、レートが 10¹⁸ 台の嘘の値として表示される。
+//!
+//! これは本家との一致の問題でもある。本家の統計構造体は
+//! `unsigned long long` / `unsigned long` / `unsigned int` の 3 グループを持ち、
+//! `unsigned int` のフィールドは C の整数変換規則により
+//! **`S_VALUE` に渡る前に 32bit のまま減算**される (`unsigned int - unsigned int`
+//! は `unsigned int`)。つまり本家は 32bit カウンタの一周を正しく扱っており、
+//! 64bit で引いている reSARch 側だけが 10¹⁹ を出していた。
+//! `int` グループのカウンタは `stats_serial` / `stats_net_sock` / `stats_softnet` /
+//! `stats_disk` の tick 群 / NFS 系など多数ある (02 §7)。
+//!
+//! そのため差分関数を 2 系統持つ。
+//!
+//! | 関数 | 減算の幅 | 使う場面 |
+//! |---|---|---|
+//! | [`s_value`] / [`ll_sp_value`] | 常に 64bit | 本家が `unsigned long long` で引いている列 |
+//! | [`s_value_bits`] / [`ll_sp_value_bits`] / [`wrapping_delta`] | 列の幅に従う | 列のカウンタ幅が分かる経路 (`DecodePlan::column_bits()`) |
+//!
+//! 列の幅が `B64` のとき両者は完全に同一の結果になるので、
+//! 幅が分かる経路では常に `*_bits` 版を使ってよい。
 
 use crate::model::CounterBits;
 
@@ -31,21 +60,62 @@ pub fn interval_cs(prev_uptime_cs: u64, curr_uptime_cs: u64) -> u64 {
     if itv == 0 { 1 } else { itv }
 }
 
-/// 本家 `S_VALUE` / `SP_VALUE` 相当。
+/// 本家 `S_VALUE` / `SP_VALUE` 相当 (**64bit 減算**)。
 ///
 /// 経過時間が 1/100 秒単位なので、100 倍して「毎秒あたり」にする。
+///
+/// 本家が `unsigned long long` のフィールドを引いている列専用。
+/// 32bit 幅のカウンタに使うと一周を復元できないので、
+/// 列の幅が分かる経路では [`s_value_bits`] を使う (モジュール冒頭の表)。
 #[inline]
 pub fn s_value(prev: u64, curr: u64, itv_cs: u64) -> f64 {
-    (curr.wrapping_sub(prev)) as f64 / itv_cs as f64 * 100.0
+    s_value_bits(prev, curr, itv_cs, CounterBits::B64)
 }
 
-/// 本家 `ll_sp_value` 相当。カウンタが逆行したら 0 を返す。
+/// 本家 `ll_sp_value` 相当 (**64bit 減算**)。カウンタが逆行したら 0 を返す。
 #[inline]
 pub fn ll_sp_value(prev: u64, curr: u64, itv_cs: u64) -> f64 {
+    ll_sp_value_bits(prev, curr, itv_cs, CounterBits::B64)
+}
+
+/// 元のフィールド幅で行う符号なし減算。
+///
+/// ファイルから読んだ値は `u64` へゼロ拡張されているが、カウンタが一周する
+/// 周期は**元の幅**で決まる。32bit カウンタが `4294967290 → 4` と一周したとき、
+/// 正しい差分は 10 なのに `u64::wrapping_sub` は 1.84×10¹⁹ を返す。
+/// 下位 32bit だけを残せば、C の `unsigned int` 同士の減算と同じ値になる。
+///
+/// 幅が `B64` のときは `u64::wrapping_sub` と完全に同一。
+#[inline]
+pub fn wrapping_delta(prev: u64, curr: u64, bits: CounterBits) -> u64 {
+    let raw = curr.wrapping_sub(prev);
+    match bits {
+        // 本家の `unsigned int` 減算 (mod 2^32) と同じ
+        CounterBits::B32 => raw & u64::from(u32::MAX),
+        CounterBits::B64 => raw,
+    }
+}
+
+/// 幅を意識した `S_VALUE` / `SP_VALUE`。
+///
+/// 32bit 幅のカウンタでは一周を復元してからレート化する。
+/// これは本家が `unsigned int` フィールドに対して行っている計算と一致する。
+#[inline]
+pub fn s_value_bits(prev: u64, curr: u64, itv_cs: u64, bits: CounterBits) -> f64 {
+    wrapping_delta(prev, curr, bits) as f64 / itv_cs as f64 * 100.0
+}
+
+/// 幅を意識した `ll_sp_value`。
+///
+/// 逆行クランプは本家と同じく**元の値の比較**で行う (幅を意識した差分を
+/// 取る前に判定する)。クランプ対象の列では一周と逆行を区別できないため、
+/// 本家に合わせて 0 を返す方を選ぶ。
+#[inline]
+pub fn ll_sp_value_bits(prev: u64, curr: u64, itv_cs: u64, bits: CounterBits) -> f64 {
     if curr < prev {
         0.0
     } else {
-        s_value(prev, curr, itv_cs)
+        s_value_bits(prev, curr, itv_cs, bits)
     }
 }
 
@@ -209,6 +279,55 @@ mod tests {
         assert_eq!(ll_sp_value(10, 20, 100), 10.0);
     }
 
+    /// **回帰テスト (指摘 1)**: 32bit カウンタの一周を 64bit で引くと
+    /// 1.84×10¹⁹ になる。幅を渡せば正しい差分 10 が出る。
+    #[test]
+    fn wrapping_delta_restores_32bit_wraparound() {
+        let prev = 4_294_967_290u64; // u32::MAX - 5
+        let curr = 4u64;
+
+        assert_eq!(
+            wrapping_delta(prev, curr, CounterBits::B32),
+            10,
+            "5 (上限まで) + 1 (0 へ) + 4 = 10"
+        );
+        // 64bit のまま引くと約 1.84e19 になる (これが修正前の値)
+        let as_64 = wrapping_delta(prev, curr, CounterBits::B64);
+        assert_eq!(as_64, u64::MAX - (prev - curr) + 1, "2^64 - 4294967286");
+        assert!(as_64 as f64 > 1.0e19, "約 1.84e19: {as_64}");
+    }
+
+    /// 32bit 幅のカウンタのレートが巨大値にならないこと。
+    #[test]
+    fn s_value_bits_rate_is_sane_across_32bit_wrap() {
+        let (prev, curr, itv) = (4_294_967_290u64, 4u64, 100u64);
+
+        // 1 秒 (100 cs) の間に 10 増えた → 10/s
+        assert_eq!(s_value_bits(prev, curr, itv, CounterBits::B32), 10.0);
+        // 64bit 減算では 1.8e19/s という表示不能な値になる
+        assert!(s_value(prev, curr, itv) > 1.0e19);
+        // 逆行クランプ付きの経路では本家と同じく 0 (幅の復元より本家一致を採る)
+        assert_eq!(ll_sp_value_bits(prev, curr, itv, CounterBits::B32), 0.0);
+    }
+
+    /// 一周していない通常の増加では幅の指定が結果を変えない。
+    ///
+    /// 幅を意識した減算を全経路に通しても、既存の値が動かないことの保証。
+    #[test]
+    fn width_does_not_change_monotonic_increase() {
+        for (prev, curr) in [(0u64, 1u64), (100, 150), (4_294_967_000, 4_294_967_290)] {
+            assert_eq!(
+                s_value_bits(prev, curr, 100, CounterBits::B32),
+                s_value_bits(prev, curr, 100, CounterBits::B64),
+                "増加のみなら幅に依らず同じ ({prev} → {curr})"
+            );
+            assert_eq!(
+                s_value_bits(prev, curr, 100, CounterBits::B64),
+                s_value(prev, curr, 100)
+            );
+        }
+    }
+
     #[test]
     fn delta_is_valid_when_increasing() {
         let d = compute_delta(100, 150, CounterBits::B64, DeltaContext::default());
@@ -223,6 +342,16 @@ mod tests {
         let curr = 20u64;
         let d = compute_delta(prev, curr, CounterBits::B32, DeltaContext::default());
         assert_eq!(d, Delta::Wrapped(31), "10 + 1 + 20 = 31");
+    }
+
+    /// **回帰テスト (指摘 1)**: 指摘にあった実例をそのまま固定する。
+    #[test]
+    fn delta_of_wrapped_32bit_counter_is_not_astronomical() {
+        let d = compute_delta(4_294_967_290, 4, CounterBits::B32, DeltaContext::default());
+        assert_eq!(d, Delta::Wrapped(10));
+        assert_eq!(d.value(), Some(10));
+        // 1 秒あたり 10 件。1.84e19 ではない
+        assert_eq!(d.rate_per_sec(100), Some(10.0));
     }
 
     /// 64bit カウンタの減少はラップと断定しない。

@@ -16,7 +16,7 @@
 use std::io::{self, Write};
 
 use super::access::ActivityPair;
-use super::render::item_label;
+use super::render::item_label_in;
 use super::spec::{ActivitySpec, Section};
 use super::{
     ABSENT_TEXT, EVENT_INTERVAL, FileInfo, SadfConfig, Stamp, interval_secs, render, spec,
@@ -167,7 +167,7 @@ fn emit_sample<W: Write>(
         return Ok(());
     };
     for item in pair.output_items() {
-        let label = item_label(spec, &item);
+        let label = item_label_in(spec, section, &item);
         let mut line = String::with_capacity(96);
 
         if isdb {
@@ -321,7 +321,7 @@ fn horizontal_line(
         };
         for section in spec.active_sections(&cfg.section) {
             for item in pair.output_items() {
-                let label = item_label(spec, &item);
+                let label = item_label_in(spec, section, &item);
                 if !label.db.is_empty() {
                     line.push(';');
                     line.push_str(&label.db);

@@ -202,6 +202,7 @@ mod tests {
             kind: "counter",
             raw: Some("9007199254740993".to_string()),
             value: None,
+            text: None,
             quality: Quality::Ok,
         }];
         let rates = vec![FieldOut {
@@ -210,6 +211,7 @@ mod tests {
             kind: "counter",
             raw: None,
             value: Some(2.15),
+            text: None,
             quality: Quality::Ok,
         }];
         let row = Row {
@@ -282,6 +284,7 @@ mod tests {
             kind: "counter",
             raw: Some("1".into()),
             value: None,
+            text: None,
             quality: Quality::Ok,
         }];
         let row = Row {
@@ -315,6 +318,7 @@ mod tests {
             kind: "gauge",
             raw: None,
             value: None,
+            text: None,
             quality: Quality::NotImplemented,
         };
         let s = serde_json::to_string(&f).unwrap();

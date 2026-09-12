@@ -967,6 +967,8 @@ pub struct FixtureSpec {
     pub records: Vec<RecordSpec>,
     /// `file_header.extra_next` を立てて `file_activity[]` の直後に置く extra 連鎖。
     pub file_extra: Vec<ExtraSpec>,
+    /// 統計フィールドに詰める値の作り方。
+    pub fill: StatFill,
 }
 
 impl FixtureSpec {
@@ -996,6 +998,7 @@ impl FixtureSpec {
             activities: Vec::new(),
             records: Vec::new(),
             file_extra: Vec::new(),
+            fill: StatFill::Deterministic,
         }
     }
 
@@ -1050,6 +1053,65 @@ pub fn stat_value(act_id: u32, record_seq: usize, item: usize, field: usize) -> 
         | ((record_seq as u64) << 16)
         | ((item as u64) << 8)
         | (field as u64 + 1)
+}
+
+/// 統計フィールドに詰める値の作り方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatFill {
+    /// [`stat_value`] の決定的な小さい値 (既定)。
+    #[default]
+    Deterministic,
+    /// 型の上限近傍 ([`extreme_stat_value`])。桁溢れ・符号誤り・
+    /// `unsigned long` の 2^32 倍化を値レベルで捕まえるために使う。
+    Extreme,
+}
+
+/// 型の上限近傍の値。
+///
+/// - `unsigned long long` (`group = 0`) は **u64 の上位ビットまで**使う。
+///   符号付きとして読むと負になるので、`i64` 経由の実装を捕まえられる。
+/// - `unsigned long` (`group = 1`) と `int` (`group = 2`) は u32 の上限近傍にする。
+///   32bit ファイルでは `unsigned long` の有効バイト数が 4 しかないため、
+///   「LE / BE / 32bit / 64bit で同じ論理値」を保つにはこの範囲に収める必要がある。
+pub fn extreme_stat_value(group: usize, field: usize) -> u64 {
+    debug_assert!(group <= 2 && field < 0xff);
+    match group {
+        0 => u64::MAX - field as u64,
+        _ => u64::from(u32::MAX - field as u32),
+    }
+}
+
+/// `types_nr` の並び (ull → ul → int) で、`field` 番目が属する型グループ。
+///
+/// 0 = `unsigned long long`、1 = `unsigned long`、2 = `int`。
+pub fn field_type_group(types_nr: [u32; 3], field: usize) -> usize {
+    let ull = types_nr[0] as usize;
+    let ul = ull + types_nr[1] as usize;
+    if field < ull {
+        0
+    } else if field < ul {
+        1
+    } else {
+        2
+    }
+}
+
+/// fixture が `field` 番目のフィールドに書き込む値。
+///
+/// 生成側 ([`write_typed_item`]) と読み出し側の期待値がこの 1 か所から出るので、
+/// 「書いた値がそのまま読めること」を検証できる。
+pub fn expected_stat(
+    fill: StatFill,
+    types_nr: [u32; 3],
+    act_id: u32,
+    record_seq: usize,
+    item: usize,
+    field: usize,
+) -> u64 {
+    match fill {
+        StatFill::Deterministic => stat_value(act_id, record_seq, item, field),
+        StatFill::Extreme => extreme_stat_value(field_type_group(types_nr, field), field),
+    }
 }
 
 // ===========================================================================
@@ -1142,6 +1204,33 @@ pub fn with_extra_chains(generation: Generation, abi: FixtureAbi) -> Fixture {
         );
     }
     build(spec)
+}
+
+/// カウンタに型の上限近傍を詰めた fixture ([`StatFill::Extreme`])。
+///
+/// `A_PCSW` (`ull` 1 個 + `ul` 1 個) と `A_QUEUE` (`ull` 3 個 + `int` 3 個) を並べ、
+/// 3 つの型すべてで上限近傍の値を通す。どちらも `has_nr` が偽なので
+/// レコード内前置件数は入らない。
+pub fn extreme_values(generation: Generation, abi: FixtureAbi) -> Fixture {
+    let mut spec = FixtureSpec::skeleton(generation, abi);
+    spec.fill = StatFill::Extreme;
+    spec.activities = vec![ActivitySpec::a_pcsw(), ActivitySpec::a_queue()];
+    spec.records = vec![
+        RecordSpec::stats(Vec::new(), 1_600_000_011, 12, 26, 51),
+        RecordSpec::stats(Vec::new(), 1_600_000_021, 12, 27, 1),
+    ];
+    build(spec)
+}
+
+/// 全世代 × 全 ABI の上限近傍 fixture。
+pub fn all_extreme_values() -> Vec<Fixture> {
+    let mut out = Vec::new();
+    for generation in Generation::ALL {
+        for abi in FixtureAbi::ALL {
+            out.push(extreme_values(generation, abi));
+        }
+    }
+    out
 }
 
 // ===========================================================================
@@ -1360,8 +1449,18 @@ fn write_extra_chain(b: &mut Bytes, start: usize, chain: &[ExtraSpec]) -> usize 
         cur += EXTRA_DESC_SIZE;
         for item in 0..x.nr as usize {
             // 本体の中身は未知拡張なので、読み側はスキップするだけ。
-            // ここでは types_nr に沿った決定的な値を置く。
-            write_typed_item(b, cur, x.types_nr, x.size as usize, 0, 0, item);
+            // ここでは types_nr に沿った決定的な値を置く
+            // (読まれない領域なので `StatFill` の指定は反映しない)。
+            write_typed_item(
+                b,
+                cur,
+                x.types_nr,
+                x.size as usize,
+                0,
+                0,
+                item,
+                StatFill::Deterministic,
+            );
             cur += x.size as usize;
         }
     }
@@ -1369,6 +1468,7 @@ fn write_extra_chain(b: &mut Bytes, start: usize, chain: &[ExtraSpec]) -> usize 
 }
 
 /// `types_nr` の並び (ull → ul → int) に沿って 1 アイテム分の値を書く (§4.1)。
+#[allow(clippy::too_many_arguments)]
 fn write_typed_item(
     b: &mut Bytes,
     base: usize,
@@ -1377,23 +1477,25 @@ fn write_typed_item(
     act_id: u32,
     record_seq: usize,
     item: usize,
+    fill: StatFill,
 ) {
     b.grow_to(base + size);
     let mut o = base;
     let mut field = 0usize;
+    let value = |field: usize| expected_stat(fill, types_nr, act_id, record_seq, item, field);
     for _ in 0..types_nr[0] {
-        b.u64(o, stat_value(act_id, record_seq, item, field));
+        b.u64(o, value(field));
         o += 8;
         field += 1;
     }
     for _ in 0..types_nr[1] {
         // unsigned long は 8 バイトスロット・有効バイト数のみ ABI 依存
-        b.ul(o, stat_value(act_id, record_seq, item, field));
+        b.ul(o, value(field));
         o += UL_SLOT_WIDTH;
         field += 1;
     }
     for _ in 0..types_nr[2] {
-        b.u32(o, stat_value(act_id, record_seq, item, field) as u32);
+        b.u32(o, value(field) as u32);
         o += 4;
         field += 1;
     }
@@ -1487,7 +1589,16 @@ fn write_record(
                     act.nr
                 };
                 for item in 0..(count as i64 * act.nr2 as i64) as usize {
-                    write_typed_item(b, cur, act.types_nr, act.size as usize, act.id, seq, item);
+                    write_typed_item(
+                        b,
+                        cur,
+                        act.types_nr,
+                        act.size as usize,
+                        act.id,
+                        seq,
+                        item,
+                        spec.fill,
+                    );
                     cur += act.size as usize;
                 }
                 b.grow_to(cur);
@@ -1679,14 +1790,151 @@ impl Corruption {
 
     /// ヘッダ表示 (`sadf -H` 相当) でも失敗すべきか。
     ///
-    /// `ActTypesNrNonMonotonic` と `IrqOverflow` はヘッダ表示は成功しなければならない
-    /// (`04-test-data.md` §5.2 / 本家テスト 00732 / 00734)。
+    /// 偽になるのは「ヘッダは完全に読めるが、統計を読もうとすると破綻する」もの。
+    ///
+    /// - `ActTypesNrNonMonotonic` / `IrqOverflow`: 単調性検査と確保サイズの検査には
+    ///   ヘッダ表示モードの免除が付いている (`01-file-format.md` §10.2 の ⑱ / ㉑、
+    ///   本家テスト 00732 / 00734)。
+    /// - `TruncatedRecordHeader` / `TruncatedStats`: ヘッダと activity リストは
+    ///   完全なので、ヘッダ表示は成功しなければならない
+    ///   (本家 `data-trunc` は `sadf -H` が成功し `sar -f` だけが失敗する。テスト 01400)。
     pub fn fails_header_only_mode(self) -> bool {
         !matches!(
             self,
-            Corruption::ActTypesNrNonMonotonic | Corruption::IrqOverflow
+            Corruption::ActTypesNrNonMonotonic
+                | Corruption::IrqOverflow
+                | Corruption::TruncatedRecordHeader
+                | Corruption::TruncatedStats
         )
     }
+
+    /// 本体が返すべきエラーの分類。
+    ///
+    /// **実装が現に返す値ではなく、`01-file-format.md` §10.2 / §10.3 の
+    /// 検査表から決めた値**である。ここが実装と食い違う場合、疑うのは実装の側。
+    pub fn expected_error(self) -> ExpectedError {
+        use Corruption as C;
+        use ExpectedError as E;
+        match self {
+            // 定数上限の超過 (⑨⑮⑰㉑)。value > limit が必ず成り立つ。
+            C::HdrSaActNr => E::LimitExceeded, // ⑨ sa_act_nr > MAX_NR_ACT
+            C::ActNrHuge => E::LimitExceeded,  // ⑮ nr > NR_MAX
+            C::ActNrOverNrMax => E::LimitExceeded, // ⑰ nr > nr_max
+            C::ActNr2Huge => E::LimitExceeded, // ⑮ nr2 > NR2_MAX
+            C::ActSizeHuge => E::LimitExceeded, // ⑮ size > MAX_ITEM_STRUCT_SIZE
+            C::IrqOverflow => E::LimitExceeded, // ㉑ nr × nr2 × size > UINT_MAX
+
+            // 下限割れ・申告値同士の矛盾 (⑩⑪⑫⑬⑮⑱⑲)。
+            // 「上限の超過」ではないので LimitExceeded 単独には固定しない。
+            C::HdrActSize => E::HeaderRejected,             // ⑩
+            C::HdrRecSize => E::HeaderRejected,             // ⑪
+            C::HdrMapSizeActTypesNr => E::HeaderRejected,   // ⑫
+            C::HdrMapSizeRecTypesNr => E::HeaderRejected,   // ⑬
+            C::ActNrZero => E::HeaderRejected,              // ⑮ nr < 1
+            C::ActNr2Zero => E::HeaderRejected,             // ⑮ nr2 < 1
+            C::ActSizeZero => E::HeaderRejected,            // ⑮ size <= 0
+            C::ActMapSizeTypesNr => E::HeaderRejected,      // ⑲
+            C::ActTypesNrNonMonotonic => E::HeaderRejected, // ⑱
+
+            // マジックナンバー (②③)
+            C::BadSysstatMagic => E::NotSysstatFile,
+            C::UnknownFormatMagic => E::UnsupportedFormat,
+
+            // 途中で EOF
+            C::TruncatedFileHeader
+            | C::TruncatedActivityList
+            | C::TruncatedRecordHeader
+            | C::TruncatedStats => E::Truncated,
+        }
+    }
+}
+
+/// 本体 (`re_sar_ch::Error`) が返すべきエラーの分類。
+///
+/// バリアント名は本体のエラー型に合わせてあるが、**独立した宣言**であり
+/// `re_sar_ch::Error` の定義から導出していない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedError {
+    /// `Error::NotSysstatFile`
+    NotSysstatFile,
+    /// `Error::UnsupportedFormat`
+    UnsupportedFormat,
+    /// `Error::Truncated`
+    Truncated,
+    /// `Error::LimitExceeded`。**定数として決まっている上限**の超過に限る。
+    LimitExceeded,
+    /// ヘッダ記述そのものの不正。
+    ///
+    /// 下限割れ (`nr = 0` など) と申告値同士の矛盾 (`MAP_SIZE > size` など) が該当する。
+    /// これらは「定数上限の超過」ではないため `Error::InconsistentHeader` が本来の姿だが、
+    /// `Error::LimitExceeded` での分類も (上限の一種と見れば) 妥当なので両方を許す。
+    /// どちらであっても「ヘッダ段で拒否する」という検証の要点は変わらない。
+    HeaderRejected,
+}
+
+impl ExpectedError {
+    /// 本体のエラーがこの分類に当てはまるか。
+    pub fn matches(self, err: &re_sar_ch::Error) -> bool {
+        use re_sar_ch::Error as E;
+        match self {
+            ExpectedError::NotSysstatFile => matches!(err, E::NotSysstatFile { .. }),
+            ExpectedError::UnsupportedFormat => matches!(err, E::UnsupportedFormat { .. }),
+            ExpectedError::Truncated => matches!(err, E::Truncated { .. }),
+            ExpectedError::LimitExceeded => matches!(err, E::LimitExceeded { .. }),
+            ExpectedError::HeaderRejected => {
+                matches!(err, E::InconsistentHeader { .. } | E::LimitExceeded { .. })
+            }
+        }
+    }
+
+    /// 期待値を人間向けに書いた文字列。
+    pub fn describe(self) -> &'static str {
+        match self {
+            ExpectedError::NotSysstatFile => "Error::NotSysstatFile",
+            ExpectedError::UnsupportedFormat => "Error::UnsupportedFormat",
+            ExpectedError::Truncated => "Error::Truncated",
+            ExpectedError::LimitExceeded => "Error::LimitExceeded",
+            ExpectedError::HeaderRejected => "Error::InconsistentHeader か Error::LimitExceeded",
+        }
+    }
+}
+
+/// エラー値そのものの整合性 (バリアントの契約) を確かめる。
+///
+/// 分類が合っていても、値が契約を満たしていなければメッセージが意味を失う。
+///
+/// - `LimitExceeded` の表示は「`{what}` が上限を超えています (`{value}` > `{limit}`)」。
+///   `value > limit` でなければ「0 が上限を超えています (0 > 1)」のような表示になる。
+/// - `Truncated` の表示は「`{need}` バイト必要, 残り `{have}`」。
+///   `need > have` でなければ切り詰めていないことになる。
+pub fn error_invariants(err: &re_sar_ch::Error) -> Result<(), String> {
+    use re_sar_ch::Error as E;
+    match err {
+        E::LimitExceeded {
+            what, value, limit, ..
+        } => {
+            if value <= limit {
+                return Err(format!(
+                    "LimitExceeded なのに value <= limit ({what}: {value} <= {limit})。\
+                     下限割れや矛盾は上限の超過ではないので、この分類は使えない"
+                ));
+            }
+        }
+        E::Truncated {
+            context,
+            need,
+            have,
+            ..
+        } => {
+            if need <= have {
+                return Err(format!(
+                    "Truncated なのに need <= have ({context}: {need} <= {have})"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// 壊した fixture。

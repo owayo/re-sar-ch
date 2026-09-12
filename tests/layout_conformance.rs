@@ -16,15 +16,33 @@
 //! 4. レコード列を走査するとファイル末尾にぴったり到達すること
 //! 5. 異常系 fixture が、本家 `data-12.6.0-*` と同じバイト位置の 1 フィールドだけを
 //!    壊したものになっていること
+//! 6. **正常系 fixture を本体 (`SaFile` / `SaFile::scan` / `series::walk`) に読ませて**、
+//!    レコード境界・終端・統計値が期待どおりであること
+//! 7. **異常系 fixture を本体に読ませて**、期待した分類のエラーで拒否されること
+//! 8. 正常系 fixture のあらゆる長さの先頭部分を本体に読ませても panic しないこと
+//!
+//! 6〜8 が無いと、fixture を 21 種そろえても「本体の bootstrap・上限検証・走査が
+//! 壊れても通るテスト」になる。4 の終端検証もテスト専用の [`walk_records`] だけでなく
+//! 本体の [`SaFile::scan`] で行う (両者が一致することも確かめる)。
 
 mod fixtures;
 
-use fixtures::{ActivitySpec, Corruption, Fixture, FixtureAbi, GenFacts, Generation, RecordKind};
+use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use fixtures::{
+    ActivitySpec, Corruption, Fixture, FixtureAbi, GenFacts, Generation, RecordKind, StatFill,
+};
+
+use re_sar_ch::Error;
 use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::{FieldTy, ResolvedLayout, WireLayout};
-use re_sar_ch::format::{layouts, selfdesc};
+use re_sar_ch::format::{
+    MmapPolicy, OpenOptions, SaFile, ScanControl, ScanSummary, Tolerance, layouts, selfdesc,
+};
+use re_sar_ch::model::ActivityId;
+use re_sar_ch::series::{Selection, Snapshot, walk};
 
 // ===========================================================================
 // fixture の ABI → 本体の SourceEncoding
@@ -370,22 +388,26 @@ fn file_header_values_round_trip_through_resolved_layout() {
         assert_eq!(ust, f.spec.ust_time, "{label}: sa_ust_time");
 
         assert_eq!(
-            c.read_str(base, r.field("sa_sysname").unwrap()).unwrap(),
+            c.read_str_lossy(base, r.field("sa_sysname").unwrap())
+                .unwrap(),
             f.spec.sysname,
             "{label}: sa_sysname"
         );
         assert_eq!(
-            c.read_str(base, r.field("sa_nodename").unwrap()).unwrap(),
+            c.read_str_lossy(base, r.field("sa_nodename").unwrap())
+                .unwrap(),
             f.spec.nodename,
             "{label}: sa_nodename"
         );
         assert_eq!(
-            c.read_str(base, r.field("sa_release").unwrap()).unwrap(),
+            c.read_str_lossy(base, r.field("sa_release").unwrap())
+                .unwrap(),
             f.spec.release,
             "{label}: sa_release"
         );
         assert_eq!(
-            c.read_str(base, r.field("sa_machine").unwrap()).unwrap(),
+            c.read_str_lossy(base, r.field("sa_machine").unwrap())
+                .unwrap(),
             f.spec.machine,
             "{label}: sa_machine"
         );
@@ -673,10 +695,10 @@ fn all_four_abis_normalize_to_the_same_values() {
             values.extend(read_all_stats(&f, &enc));
 
             let strings = vec![
-                c.read_str(base, r.field("sa_sysname").unwrap())
+                c.read_str_lossy(base, r.field("sa_sysname").unwrap())
                     .unwrap()
                     .to_string(),
-                c.read_str(base, r.field("sa_nodename").unwrap())
+                c.read_str_lossy(base, r.field("sa_nodename").unwrap())
                     .unwrap()
                     .to_string(),
             ];
@@ -802,6 +824,10 @@ fn stats_payload_carries_the_declared_values() {
 /// `docs/format/04-test-data.md` §1.3 が本家データに対して行った検証と同じ手口を
 /// 自作 fixture に適用する。レイアウト定義と fixture のどちらかが 1 バイトでも
 /// 食い違えば残余が出る。
+///
+/// ここで使う [`walk_records`] は**走査アルゴリズムをテスト側で書き下ろしたもの**で、
+/// 本体の走査 ([`SaFile::scan`]) とは独立している。本体での終端検証は
+/// [`body_scan_lands_exactly_on_eof`] が行い、ここでは両者が一致することも押さえる。
 #[test]
 fn record_walk_lands_exactly_on_eof() {
     for f in fixtures::all_minimal() {
@@ -812,6 +838,16 @@ fn record_walk_lands_exactly_on_eof() {
             end,
             f.bytes.len(),
             "{label}: 走査終端がファイル末尾と一致しない"
+        );
+
+        // 本体の走査と一致すること (どちらか一方だけが正しく動く状態を許さない)
+        let file = open_fixture(&f);
+        let summary = file
+            .scan(|_| Ok(ScanControl::Continue))
+            .unwrap_or_else(|e| panic!("{label}: 本体の走査が失敗した: {e}"));
+        assert_eq!(
+            summary.end_offset, end,
+            "{label}: 本体の走査終端がテスト側の走査と一致しない"
         );
     }
 }
@@ -848,6 +884,23 @@ fn record_walk_lands_exactly_on_eof_with_extra_chains() {
                 walk_records(&f, &enc),
                 f.bytes.len(),
                 "{}: extra 連鎖ありで走査終端が一致しない",
+                f.label()
+            );
+
+            // 本体も extra 連鎖を読み飛ばして末尾にぴったり到達すること
+            let file = open_fixture(&f);
+            let summary = file
+                .scan(|_| Ok(ScanControl::Continue))
+                .unwrap_or_else(|e| panic!("{}: 本体の走査が失敗した: {e}", f.label()));
+            assert!(
+                summary.is_exact(),
+                "{}: 本体が extra 連鎖ありで末尾に到達しない ({summary:?})",
+                f.label()
+            );
+            assert_eq!(
+                summary.extras,
+                1,
+                "{}: 統計を持たない R_EXTRA レコードが 1 件数えられること",
                 f.label()
             );
         }

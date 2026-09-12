@@ -18,7 +18,7 @@ use std::io::{self, Write};
 
 use super::access::{ActivityPair, ItemPair};
 use super::dbppc::{display_cpu_count, present_specs, scan_comments, scan_restarts};
-use super::render::{item_label, jx_fields};
+use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Field, Fmt, Group, Shape};
 use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, render, spec};
 use crate::error::Result;
@@ -238,8 +238,7 @@ fn activity_body(
             let Some(item) = pair.item(0) else {
                 return String::new();
             };
-            let label = item_label(spec, &item);
-            let attrs = attr_list(spec, &item, cfg, &label);
+            let attrs = attr_list(spec, &item, cfg);
             format!(
                 "{}<{}{}{}/>\n",
                 tabs(depth),
@@ -253,7 +252,6 @@ fn activity_body(
             let Some(item) = pair.item(0) else {
                 return String::new();
             };
-            let label = item_label(spec, &item);
             let mut s = format!(
                 "{}<{}{}>\n",
                 tabs(depth),
@@ -261,6 +259,7 @@ fn activity_body(
                 spec.xml_wrapper_attrs
             );
             for section in spec.active_sections(&cfg.section) {
+                let label = item_label_in(spec, section, &item);
                 for field in jx_fields(section) {
                     if field.attr.is_empty() || !cfg.section.allows_field(field.gate) {
                         continue;
@@ -285,8 +284,7 @@ fn activity_body(
             let child_depth = if wrap { depth + 1 } else { depth };
             let mut rows = String::new();
             for item in pair.output_items() {
-                let label = item_label(spec, &item);
-                let attrs = attr_list(spec, &item, cfg, &label);
+                let attrs = attr_list(spec, &item, cfg);
                 rows.push_str(&format!(
                     "{}<{}{}/>\n",
                     tabs(child_depth),
@@ -319,19 +317,15 @@ fn activity_body(
 }
 
 /// 属性列 (` name="value"` の連結)。
-fn attr_list(
-    spec: &ActivitySpec,
-    item: &ItemPair<'_>,
-    cfg: &SadfConfig,
-    label: &ItemLabel,
-) -> String {
+fn attr_list(spec: &ActivitySpec, item: &ItemPair<'_>, cfg: &SadfConfig) -> String {
     let mut s = String::new();
     for section in spec.active_sections(&cfg.section) {
+        let label = item_label_in(spec, section, item);
         for field in jx_fields(section) {
             if field.attr.is_empty() || !cfg.section.allows_field(field.gate) {
                 continue;
             }
-            s.push_str(&attr(spec, item, field, label));
+            s.push_str(&attr(spec, item, field, &label));
         }
     }
     s

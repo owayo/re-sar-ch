@@ -39,6 +39,12 @@ use crate::model::{ActivityId, MAX_NR_ACT};
 /// sysstat のファイル識別子。
 pub const SYSSTAT_MAGIC: u16 = 0xd596;
 
+/// 全世代に共通する `file_magic` の最小バイト数。
+///
+/// 識別子 2 + 形式 2 + バージョン 4 = 8。これより短い入力は、世代を判定する前に
+/// 切り詰めとして拒否する (バージョン部分の読み取りで添字が範囲外になるため)。
+const MIN_FILE_MAGIC_BYTES: usize = 8;
+
 /// 型別フィールド数の健全性上限。これを超える申告は破損とみなす。
 const TYPES_NR_LIMIT: u32 = 1024;
 
@@ -273,6 +279,10 @@ pub struct SaFile {
     record_layout: ResolvedLayout,
     /// 解決済み `file_activity` レイアウト (RESTART の volatile リスト用)。
     activity_layout: ResolvedLayout,
+    /// `file_activity` 1 件のストライド。**申告値を優先する** (指摘 9)。
+    act_stride: usize,
+    /// `record_header` のストライド。**申告値を優先する**。
+    rec_stride: usize,
     /// レコード列の開始オフセット。
     records_offset: usize,
     diagnostics: Vec<Diagnostic>,
@@ -335,11 +345,15 @@ impl SaFile {
         let mut diagnostics = Vec::new();
 
         // --- 1. バイト順の判定 ---
-        if bytes.len() < 4 {
+        //
+        // 全世代の `file_magic` は最低 8 バイト (識別子 2 + 形式 2 + バージョン 4)。
+        // ここで長さを確定させておかないと、世代判定でバージョン部分を読むときに
+        // 添字が範囲外になる。`96 d5 72 21` のような 4 バイト入力で panic した実例がある。
+        if bytes.len() < MIN_FILE_MAGIC_BYTES {
             return Err(Error::Truncated {
                 path,
                 context: "file_magic".into(),
-                need: 4,
+                need: MIN_FILE_MAGIC_BYTES,
                 have: bytes.len(),
             });
         }
@@ -379,6 +393,49 @@ impl SaFile {
             decode_file_magic(&cur, &magic_layout, spec).map_err(|e| oob(e, "file_magic"))?;
         let file_header_offset = magic_layout.size;
 
+        // --- 2.5 申告値の検証 (レイアウト構築より前に行う) ---
+        //
+        // 型別個数はファイルから読んだ未検証の入力値であり、レイアウト構築では
+        // その個数だけフィールドを並べる。検証を後回しにすると、
+        // 「入力が足りない」と返す前に個数に比例した確保を試みることになり、
+        // 小さな入力でも巨大な要求で落とせる。
+        if let Some(t) = magic.hdr_types_nr {
+            let types = TypesNr(t);
+            if !types.within(TYPES_NR_LIMIT) {
+                return Err(Error::LimitExceeded {
+                    path,
+                    what: "hdr_types_nr".into(),
+                    value: t.iter().copied().max().unwrap_or(0) as u64,
+                    limit: TYPES_NR_LIMIT as u64,
+                });
+            }
+            // 数値フィールド部が申告サイズに収まること
+            if let Some(declared) = magic.header_size {
+                let map = types.map_size();
+                if map > declared as u64 {
+                    return Err(Error::InconsistentHeader {
+                        path,
+                        detail: format!(
+                            "MAP_SIZE(hdr_types_nr = {t:?}) = {map} が header_size = {declared} を超える"
+                        ),
+                    });
+                }
+            }
+        }
+        // 申告サイズが入力の残量を超えていないこと
+        if let Some(declared) = magic.header_size {
+            let declared = declared as usize;
+            let remaining = bytes.len().saturating_sub(file_header_offset);
+            if declared > remaining {
+                return Err(Error::Truncated {
+                    path,
+                    context: "file_header".into(),
+                    need: declared,
+                    have: remaining,
+                });
+            }
+        }
+
         // --- 3. 生成元 ABI の判定 ---
         //
         // `sa_sizeof_long` は `unsigned long` の幅に依存しない位置にある
@@ -404,14 +461,16 @@ impl SaFile {
         }
 
         let machine_field = header_layout_probe.field("sa_machine");
+        // ABI の推定に使うだけなので、不正バイトは置換文字にして落とさない
         let machine = match machine_field {
             Some(f) => cur
-                .read_str(file_header_offset, f)
-                .map_err(|e| oob(e, "file_header.sa_machine"))?,
-            None => "",
+                .read_str_lossy(file_header_offset, f)
+                .map_err(|e| oob(e, "file_header.sa_machine"))?
+                .into_owned(),
+            None => String::new(),
         };
 
-        let abi = match LayoutAbi::infer(machine, sizeof_long) {
+        let abi = match LayoutAbi::infer(&machine, sizeof_long) {
             Some(a) => a,
             None => {
                 // 32bit で machine 名から判別できない場合、8 バイト整数の
@@ -442,17 +501,25 @@ impl SaFile {
         // 自己記述形式では、申告サイズと解決サイズが一致すべき。
         if let Some(declared) = magic.header_size {
             let declared = declared as usize;
-            if declared != header_layout.size {
-                let detail = format!(
-                    "header_size の申告値 {declared} が解決サイズ {} と一致しない",
-                    header_layout.size
-                );
-                if options.tolerance == Tolerance::Strict {
-                    return Err(Error::InconsistentHeader { path, detail });
-                }
+            // 既知フィールドが申告領域に収まることだけを要求する。
+            // 等しさを要求してはいけない: 将来の版が末尾にフィールドを足すと
+            // 申告サイズの方が大きくなるのが正常だからである。
+            if header_layout.size > declared {
+                return Err(Error::InconsistentHeader {
+                    path,
+                    detail: format!(
+                        "既知フィールドが header_size に収まらない (必要 {} > 申告 {declared})",
+                        header_layout.size
+                    ),
+                });
+            }
+            if header_layout.size < declared {
                 diagnostics.push(Diagnostic {
                     offset: Some(file_header_offset),
-                    message: detail,
+                    message: format!(
+                        "header_size {declared} のうち末尾 {} バイトは未知の領域 (読み飛ばす)",
+                        declared - header_layout.size
+                    ),
                 });
             }
         }
@@ -481,7 +548,13 @@ impl SaFile {
             });
         }
 
-        let mut offset = file_header_offset + header_layout.size;
+        // 次の構造体への移動は**申告サイズ**で行う。
+        // 導出サイズで進めると、末尾に未知領域があるファイルで境界がずれる。
+        let header_bytes = magic
+            .header_size
+            .map(|v| v as usize)
+            .unwrap_or(header_layout.size);
+        let mut offset = file_header_offset + header_bytes;
 
         for (label, t) in [
             ("act_types_nr", header.act_types_nr),
@@ -503,30 +576,31 @@ impl SaFile {
             resolve_file_activity(spec, &header, &encoding).map_err(Error::from)?;
         if let Some(declared) = header.act_size {
             let declared = declared as usize;
-            if declared != activity_layout.size {
-                let detail = format!(
-                    "act_size の申告値 {declared} が解決サイズ {} と一致しない",
-                    activity_layout.size
-                );
-                if options.tolerance == Tolerance::Strict {
-                    return Err(Error::InconsistentHeader { path, detail });
-                }
-                diagnostics.push(Diagnostic {
-                    offset: Some(offset),
-                    message: detail,
+            if activity_layout.size > declared {
+                return Err(Error::InconsistentHeader {
+                    path,
+                    detail: format!(
+                        "既知フィールドが act_size に収まらない (必要 {} > 申告 {declared})",
+                        activity_layout.size
+                    ),
                 });
             }
         }
 
+        // ストライドは申告値を優先する (末尾に未知領域があっても境界がずれない)
+        let act_stride = header
+            .act_size
+            .map(|v| v as usize)
+            .unwrap_or(activity_layout.size);
         let mut activities = Vec::with_capacity(header.act_nr as usize);
         for i in 0..header.act_nr as usize {
-            let base = offset + i * activity_layout.size;
+            let base = offset + i * act_stride;
             let entry = decode_file_activity(&cur, &activity_layout, base)
                 .map_err(|e| oob(e, "file_activity"))?;
-            validate_activity_entry(&entry, &path, options.tolerance, &mut diagnostics, base)?;
+            validate_activity_entry(&entry, &path)?;
             activities.push(entry);
         }
-        offset += header.act_nr as usize * activity_layout.size;
+        offset += header.act_nr as usize * act_stride;
 
         // `extra_desc` チェーンは **file_activity[] の後**に置かれる。
         //
@@ -551,20 +625,21 @@ impl SaFile {
         let record_layout = resolve_record_header(spec, &header, &encoding).map_err(Error::from)?;
         if let Some(declared) = header.rec_size {
             let declared = declared as usize;
-            if declared != record_layout.size {
-                let detail = format!(
-                    "rec_size の申告値 {declared} が解決サイズ {} と一致しない",
-                    record_layout.size
-                );
-                if options.tolerance == Tolerance::Strict {
-                    return Err(Error::InconsistentHeader { path, detail });
-                }
-                diagnostics.push(Diagnostic {
-                    offset: Some(offset),
-                    message: detail,
+            if record_layout.size > declared {
+                return Err(Error::InconsistentHeader {
+                    path,
+                    detail: format!(
+                        "既知フィールドが rec_size に収まらない (必要 {} > 申告 {declared})",
+                        record_layout.size
+                    ),
                 });
             }
         }
+
+        let rec_stride = header
+            .rec_size
+            .map(|v| v as usize)
+            .unwrap_or(record_layout.size);
 
         Ok(Self {
             path,
@@ -577,6 +652,8 @@ impl SaFile {
             activities,
             record_layout,
             activity_layout,
+            act_stride,
+            rec_stride,
             records_offset: offset,
             diagnostics,
         })
@@ -632,7 +709,7 @@ impl SaFile {
     {
         let bytes: &[u8] = &self.source;
         let cur = Cursor::new(bytes, self.encoding.endian);
-        let rec_size = self.record_layout.size;
+        let rec_size = self.rec_stride;
         let hz = self.effective_hz();
         let self_describing = registry::is_self_describing(self.spec);
 
@@ -777,13 +854,31 @@ impl SaFile {
                             // 単純にスキップすると以降の位置が全部ずれる。
                             let n = self.header.vol_act_nr.unwrap_or(0) as usize;
                             for i in 0..n {
-                                let base = payload + i * self.activity_layout.size;
+                                let base = payload + i * self.act_stride;
                                 let e = decode_file_activity(&cur, &self.activity_layout, base)
                                     .map_err(|e| self.truncated(e, "restart.volatile_activity"))?;
                                 if e.id.0 == 0 || e.nr <= 0 {
                                     // 空スロット
                                     continue;
                                 }
+                                // ここで更新される個数が以降のレコードの item 数になるため、
+                                // 初期リストと同じ上限検証を必ず通す。
+                                let limit = e.id.nr_max().min(NR_MAX);
+                                if e.nr as u32 > limit {
+                                    return Err(Error::LimitExceeded {
+                                        path: self.path.clone(),
+                                        what: format!(
+                                            "{} の RESTART 後 item 数 (offset={base})",
+                                            e.id
+                                        ),
+                                        value: e.nr as u64,
+                                        limit: limit as u64,
+                                    });
+                                }
+                                // **volatile エントリでは nr 以外を検証しない。**
+                                // このリストは「item 数が変わった」ことだけを伝えるもので、
+                                // size / nr2 / types_nr は 0 で書かれる (実データで確認済み)。
+                                // 初期リストと同じ検証を当てると正常なファイルを弾いてしまう。
                                 if let Some(pos) = self.activities.iter().position(|a| a.id == e.id)
                                 {
                                     nr_state[pos] = e.nr as u32;
@@ -792,7 +887,7 @@ impl SaFile {
                                     }
                                 }
                             }
-                            payload += n * self.activity_layout.size;
+                            payload += n * self.act_stride;
                         }
                     }
                     summary.restarts += 1;
@@ -811,6 +906,23 @@ impl SaFile {
                                 .u32_at(payload)
                                 .map_err(|e| self.truncated(e, "record.item_count"))?;
                             payload += 4;
+
+                            // **レコード内の個数も activity 別上限で検証する。**
+                            // 初期の activity リストだけ検証しても、ここで上限を超える
+                            // 値を与えられると item 数とデコード後の確保量が無制限になる。
+                            // バイト数制限だけでは防げない (小さな size なら通ってしまう)。
+                            let limit = act.id.nr_max().min(NR_MAX);
+                            if v == 0 || v > limit {
+                                return Err(Error::LimitExceeded {
+                                    path: self.path.clone(),
+                                    what: format!(
+                                        "{} のレコード内 item 数 (offset={})",
+                                        act.id, payload
+                                    ),
+                                    value: v as u64,
+                                    limit: limit as u64,
+                                });
+                            }
                             nr = v;
                         }
                         let nr2 = act.nr2.max(0) as u32;
@@ -959,27 +1071,22 @@ impl ScanSummary {
 ///
 /// 本家が `check_file_actlst()` で行う検証に対応する。
 /// 上限を超える値をそのまま信じると、オフセット計算や確保サイズが破綻する。
-fn validate_activity_entry(
-    e: &FileActivityEntry,
-    path: &Path,
-    tolerance: Tolerance,
-    diagnostics: &mut Vec<Diagnostic>,
-    offset: usize,
-) -> Result<()> {
-    let mut reject = |detail: String, what: &str, value: u64, limit: u64| -> Result<()> {
-        if tolerance == Tolerance::Strict {
-            return Err(Error::LimitExceeded {
-                path: path.to_path_buf(),
-                what: format!("{} ({detail})", what),
-                value,
-                limit,
-            });
-        }
-        diagnostics.push(Diagnostic {
-            offset: Some(offset),
-            message: format!("{}: {detail}", e.id),
-        });
-        Ok(())
+fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
+    // **構造と資源量の制限は Lenient でも緩めない。**
+    //
+    // これらは「読めたところまで返す」で済む破損ではなく、境界そのものを
+    // 確定できなくする矛盾である。たとえば size = 0 を受理すると、
+    // レコードのバイト数制限を満たしたまま、同じ位置を大量の item として
+    // デコードする経路が成立してしまう。
+    // Lenient が許すのは「末尾の不完全なレコードを捨てる」「未知 activity を飛ばす」
+    // のように、境界を安全に確定できる場合だけ (docs/design.md の 7 章)。
+    let reject = |detail: String, what: &str, value: u64, limit: u64| -> Result<()> {
+        Err(Error::LimitExceeded {
+            path: path.to_path_buf(),
+            what: format!("{what} ({detail})"),
+            value,
+            limit,
+        })
     };
 
     // 1 item のサイズ: 0 は不可、上限は MAX_ITEM_STRUCT_SIZE
@@ -1238,7 +1345,8 @@ fn decode_file_header(
     };
     let text = |name: &str| -> std::result::Result<Option<String>, OutOfBounds> {
         match g(name) {
-            Some(f) => Ok(Some(cur.read_str(base, f)?.to_string())),
+            // ヘッダの uname 文字列は表示用。不正バイトは置換文字にして捨てない
+            Some(f) => Ok(Some(cur.read_str_lossy(base, f)?.into_owned())),
             None => Ok(None),
         }
     };
@@ -1358,6 +1466,58 @@ mod tests {
     fn rejects_tiny_file() {
         let err = SaFile::from_bytes("x", vec![0x96, 0xd5]).unwrap_err();
         assert!(matches!(err, Error::Truncated { .. }), "{err}");
+    }
+
+    /// 未知フォーマットの短い入力で panic しない。
+    ///
+    /// 以前は世代判定の時点で 4 バイトしか確認しておらず、エラーメッセージを
+    /// 組み立てる際にバージョン部分 (`bytes[4..=6]`) を直接参照して panic した。
+    /// 外部レビューで `96 d5 72 21` の 4 バイト入力が終了コード 101 になることを
+    /// 再現確認された。
+    #[test]
+    fn short_input_with_unknown_magic_does_not_panic() {
+        let bytes = vec![0x96, 0xd5, 0x72, 0x21];
+        let err = SaFile::from_bytes("x", bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::Truncated { .. }),
+            "切り詰めとして返すこと: {err}"
+        );
+    }
+
+    /// ヘッダ境界付近のあらゆる長さで panic しない。
+    #[test]
+    fn every_short_prefix_is_handled_without_panic() {
+        // 正しい識別子 + 各世代の magic を並べ、1 バイトずつ切り詰める
+        for magic in [0x2170u16, 0x2171, 0x2173, 0x2175, 0x2172] {
+            let mut bytes = vec![0u8; 400];
+            bytes[0..2].copy_from_slice(&SYSSTAT_MAGIC.to_le_bytes());
+            bytes[2..4].copy_from_slice(&magic.to_le_bytes());
+            for len in 0..bytes.len() {
+                // Ok でも Err でもよいが panic してはいけない
+                let _ = SaFile::from_bytes("x", bytes[..len].to_vec());
+            }
+        }
+    }
+
+    /// 型別個数の申告は、レイアウトを組み立てる前に上限で弾く。
+    ///
+    /// 検証を後回しにすると、「入力が足りない」と返す前に個数に比例した確保を
+    /// 試みることになり、小さな入力でも巨大な要求で落とせる。
+    #[test]
+    fn absurd_types_nr_is_rejected_before_allocating() {
+        let mut bytes = vec![0u8; 128];
+        bytes[0..2].copy_from_slice(&SYSSTAT_MAGIC.to_le_bytes());
+        bytes[2..4].copy_from_slice(&0x2175u16.to_le_bytes());
+        bytes[4] = 12; // version
+        bytes[8..12].copy_from_slice(&336u32.to_le_bytes()); // header_size
+        // hdr_types_nr = [u32::MAX, 0, 0]
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let err = SaFile::from_bytes("x", bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::LimitExceeded { .. }),
+            "上限超過として返すこと: {err}"
+        );
     }
 
     /// 未知の format_magic は未対応フォーマットとして報告する (0x2172 は欠番)。

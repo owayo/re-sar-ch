@@ -416,9 +416,9 @@ fn read_upstream_header(bytes: &[u8]) -> UpstreamHeader {
         .read_signed(fh_off, provisional.field("sa_sizeof_long").unwrap())
         .unwrap();
     let machine = c
-        .read_str(fh_off, provisional.field("sa_machine").unwrap())
+        .read_str_lossy(fh_off, provisional.field("sa_machine").unwrap())
         .unwrap()
-        .to_string();
+        .into_owned();
 
     // ③ 本当の ABI で解決し直す
     let abi = LayoutAbi::infer(&machine, sizeof_long as u8)
@@ -470,7 +470,7 @@ fn read_upstream_header(bytes: &[u8]) -> UpstreamHeader {
         machine,
         tzname: fh
             .field("sa_tzname")
-            .map(|f| c.read_str(fh_off, f).unwrap().to_string()),
+            .map(|f| c.read_str_lossy(fh_off, f).unwrap().into_owned()),
     }
 }
 

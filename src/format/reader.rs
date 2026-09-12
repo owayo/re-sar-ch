@@ -115,15 +115,41 @@ impl<'a> Cursor<'a> {
         self.array::<8>(offset).map(|b| self.endian.u64_from(b))
     }
 
-    /// NUL 終端の文字列フィールドを読む (UTF-8 として不正なバイトは置換文字になる)。
-    pub fn cstr_at(&self, offset: usize, capacity: usize) -> ReadResult<&'a str> {
+    /// NUL 終端のフィールドを**バイト列のまま**返す。
+    ///
+    /// Linux のデバイス名やマウントパスが UTF-8 である保証はない。
+    /// item の同一性判定は**このバイト列で行うこと**。UTF-8 として解釈した文字列で
+    /// 比べると、不正バイトを含む別々の名前が同一視される危険がある。
+    pub fn cbytes_at(&self, offset: usize, capacity: usize) -> ReadResult<&'a [u8]> {
         let raw = self.raw(offset, capacity)?;
         let end = raw.iter().position(|&b| b == 0).unwrap_or(capacity);
         // 文字列フィールドはバイト順の影響を受けない
-        Ok(std::str::from_utf8(&raw[..end]).unwrap_or_else(|e| {
-            // 不正バイトの手前までを返す。呼び出し側で診断する場合に備え無音で切る。
-            std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or("")
-        }))
+        Ok(&raw[..end])
+    }
+
+    /// NUL 終端の文字列フィールドを UTF-8 として読む。
+    ///
+    /// **不正なバイトを含む場合は `None`** を返す。
+    /// 以前は「不正バイトの手前まで」を返していたが、それでは
+    /// `dev\xffA` と `dev\xfeB` がどちらも `"dev"` になり、
+    /// 別の item を同一視してしまう。
+    /// 表示だけが目的なら [`Cursor::cstr_lossy_at`] を使う。
+    pub fn cstr_at(&self, offset: usize, capacity: usize) -> ReadResult<Option<&'a str>> {
+        let raw = self.cbytes_at(offset, capacity)?;
+        Ok(std::str::from_utf8(raw).ok())
+    }
+
+    /// NUL 終端のフィールドを、表示用に置換文字つきで読む。
+    ///
+    /// 不正バイトは U+FFFD になる。**同一性判定には使わないこと**
+    /// (異なるバイト列が同じ文字列になり得る)。
+    pub fn cstr_lossy_at(
+        &self,
+        offset: usize,
+        capacity: usize,
+    ) -> ReadResult<std::borrow::Cow<'a, str>> {
+        let raw = self.cbytes_at(offset, capacity)?;
+        Ok(String::from_utf8_lossy(raw))
     }
 
     /// 解決済みフィールドを符号なし 64bit へゼロ拡張して読む。
@@ -188,18 +214,46 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// 文字列フィールドを読む。
+    /// 文字列フィールドを UTF-8 として読む。不正バイトを含む場合は `None`。
+    ///
+    /// item の同一性判定にはこの結果を使ってよい (不正な名前は `None` になり、
+    /// 別の名前と同一視されない)。表示だけなら [`Cursor::read_str_lossy`] を使う。
     #[inline]
-    pub fn read_str(&self, base: usize, f: &PlacedField) -> ReadResult<&'a str> {
+    pub fn read_str(&self, base: usize, f: &PlacedField) -> ReadResult<Option<&'a str>> {
+        let (off, cap) = self.text_span(base, f)?;
+        self.cstr_at(off, cap)
+    }
+
+    /// 文字列フィールドをバイト列のまま読む。
+    #[inline]
+    pub fn read_bytes(&self, base: usize, f: &PlacedField) -> ReadResult<&'a [u8]> {
+        let (off, cap) = self.text_span(base, f)?;
+        self.cbytes_at(off, cap)
+    }
+
+    /// 文字列フィールドを表示用に読む (不正バイトは U+FFFD)。
+    #[inline]
+    pub fn read_str_lossy(
+        &self,
+        base: usize,
+        f: &PlacedField,
+    ) -> ReadResult<std::borrow::Cow<'a, str>> {
+        let (off, cap) = self.text_span(base, f)?;
+        self.cstr_lossy_at(off, cap)
+    }
+
+    #[inline]
+    fn text_span(&self, base: usize, f: &PlacedField) -> ReadResult<(usize, usize)> {
         let off = base.checked_add(f.offset).ok_or(OutOfBounds {
             offset: base,
             need: f.width,
             len: self.buf.len(),
         })?;
-        match f.ty {
-            FieldTy::Bytes(n) => self.cstr_at(off, n as usize),
-            _ => self.cstr_at(off, f.width),
-        }
+        let cap = match f.ty {
+            FieldTy::Bytes(n) => n as usize,
+            _ => f.width,
+        };
+        Ok((off, cap))
     }
 }
 
@@ -289,14 +343,14 @@ mod tests {
         let mut buf = [0u8; 8];
         buf[..5].copy_from_slice(b"Linux");
         let c = Cursor::new(&buf, Endian::Little);
-        assert_eq!(c.cstr_at(0, 8), Ok("Linux"));
+        assert_eq!(c.cstr_at(0, 8), Ok(Some("Linux")));
     }
 
     #[test]
     fn string_without_terminator_uses_full_capacity() {
         let buf = *b"abcd";
         let c = Cursor::new(&buf, Endian::Little);
-        assert_eq!(c.cstr_at(0, 4), Ok("abcd"));
+        assert_eq!(c.cstr_at(0, 4), Ok(Some("abcd")));
     }
 
     /// 同じ値を LE / BE で表現しても、対応するバイト順で読めば一致する。

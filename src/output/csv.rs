@@ -44,6 +44,7 @@ pub const HEADER: &[&str] = &[
     "kind",
     "value",
     "raw",
+    "text",
     "quality",
 ];
 
@@ -122,6 +123,7 @@ fn write_field<W: Write>(
     // 値が無い列は空欄にする。**0 を書いてはいけない** (正常な 0 と区別できない)。
     let value = f.value.map(|v| format!("{v:.4}")).unwrap_or_default();
     let raw = f.raw.clone().unwrap_or_default();
+    let text = f.text.clone().unwrap_or_default();
 
     w.write_record([
         host.hostname.as_str(),
@@ -140,6 +142,7 @@ fn write_field<W: Write>(
         f.kind,
         &value,
         &raw,
+        &text,
         quality_label(f.quality),
     ])
     .map_err(csv_err)?;
@@ -166,6 +169,7 @@ mod tests {
         assert!(HEADER.contains(&"space"), "生値と派生値を列で区別する");
         assert!(HEADER.contains(&"raw"));
         assert!(HEADER.contains(&"value"));
+        assert!(HEADER.contains(&"text"), "文字列フィールドも出す");
     }
 
     /// 値が無い列は空欄。0 にはしない。
@@ -187,6 +191,7 @@ mod tests {
             kind: "gauge",
             raw: None,
             value: None,
+            text: None,
             quality: Quality::NotImplemented,
         };
         let mut buf = Vec::new();
@@ -199,10 +204,10 @@ mod tests {
             w.flush().unwrap();
         }
         let s = String::from_utf8(buf).unwrap();
-        // value と raw が空欄で、その後に理由が入る (0 で埋めない)
+        // value / raw / text が空欄で、その後に理由が入る (0 で埋めない)
         assert!(
-            s.contains("gauge,,,not_implemented"),
-            "空欄 2 つの後に理由: {s}"
+            s.contains("gauge,,,,not_implemented"),
+            "空欄 3 つの後に理由: {s}"
         );
         assert!(!s.contains("gauge,0,"), "0 で埋めてはいけない: {s}");
     }
@@ -226,6 +231,7 @@ mod tests {
             kind: "counter",
             raw: Some("18446744073709551615".into()),
             value: None,
+            text: None,
             quality: Quality::Ok,
         };
         let mut buf = Vec::new();

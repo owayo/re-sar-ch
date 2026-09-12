@@ -22,13 +22,19 @@
 //! [`GOLDEN_CASES`] の各ケースに `run_resarch` を差し込んで埋める。
 //! 埋めるべき内容は `docs/format/04-test-data.md` §5 のフェーズ別計画に対応する。
 
+mod fixtures;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fixtures::{Corruption, ExpectedError, FixtureAbi};
+
+use re_sar_ch::Error;
 use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::ResolvedLayout;
-use re_sar_ch::format::{layouts, selfdesc};
+use re_sar_ch::format::{SaFile, ScanControl, layouts, selfdesc};
+use re_sar_ch::series::{Selection, walk};
 
 // ===========================================================================
 // 取得物の発見
@@ -714,15 +720,250 @@ fn golden_cases_are_enumerable() {
     );
 }
 
-/// 異常系の枠。
+// ===========================================================================
+// 本家データを本体 (SaFile / scan / series::walk) に読ませる
+// ===========================================================================
+
+/// 本家データ 1 件に対する reSARch の**あるべき挙動**。
 ///
-/// TODO(後続担当): `resarch` が各ファイルを**拒否する**ことと、
-/// ヘッダ表示モードの免除 (`-SARerr` / `A_IRQ_overflow` はヘッダ表示は成功) を検証する。
-/// 本家のメッセージ (英語) と一致させる必要はない。分類が一致していればよい。
+/// 本家の挙動と意図的に違う場合がある。例えば `data-9.1.5` は本家が
+/// 「現行版では読めない、変換しろ」と言う最古世代だが、reSARch は直読できる
+/// (`docs/design.md` の目的そのもの)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// 開けて、レコード列を末尾まで余りなく読める。
+    Readable,
+    /// ヘッダは読めるが、統計を読もうとすると拒否する (`sadf -H` 相当は成功)。
+    HeaderOnly(ExpectedError),
+    /// 開く時点で拒否する。
+    Rejected(ExpectedError),
+}
+
+/// 正常系データの判定表。
+///
+/// 異常系 16 本の判定は [`Corruption::expected_error`] から引くのでここには載せない
+/// (自作 fixture と**同じ期待値**を使うことで、両者が同じ検査を突いていることも保証する)。
+const NORMAL_VERDICTS: &[(&str, Verdict)] = &[
+    // 最古世代 (0x2170)。本家は変換なしでは読めないが reSARch は読める。
+    ("data-9.1.5", Verdict::Readable),
+    ("data-9.1.6", Verdict::Readable),
+    ("data-10.3.1", Verdict::Readable),
+    ("data-11.6.5", Verdict::Readable),
+    ("data-12.0.0", Verdict::Readable),
+    // ビッグエンディアン + 32bit (ppc)
+    ("data-ppc-11.7.2", Verdict::Readable),
+    // extra_desc チェーンつき
+    ("data-extra-12.1.7", Verdict::Readable),
+    ("data-non-printable", Verdict::Readable),
+    // 未知 id / 未知 magic は読み飛ばして残りを読む (§10.4)
+    ("data-ukwn", Verdict::Readable),
+    ("data-ukwn0", Verdict::Readable),
+    ("data-ukwn1", Verdict::Readable),
+    ("data-12.5.6-A_QUEUE_modified", Verdict::Readable),
+    // sadf -x の期待出力。名前が data で始まるが sa ファイルではない。
+    (
+        "data-12.7.6.xml",
+        Verdict::Rejected(ExpectedError::NotSysstatFile),
+    ),
+];
+
+/// 本家ファイル名に対応する自作の壊し方。
+fn corruption_for(name: &str) -> Option<Corruption> {
+    Corruption::ALL
+        .into_iter()
+        .find(|c| c.upstream_name() == Some(name))
+}
+
+/// 壊し方から判定を組み立てる (自作 fixture と同じ表を使う)。
+fn verdict_of(corruption: Corruption) -> Verdict {
+    let expected = corruption.expected_error();
+    if corruption.fails_header_only_mode() {
+        Verdict::Rejected(expected)
+    } else {
+        Verdict::HeaderOnly(expected)
+    }
+}
+
+/// 本体に読ませた結果を「段 + エラーバリアント名」で表す。
+///
+/// 自作 fixture と本家ファイルの突合に使う。メッセージ本文は比較しない
+/// (本家は英語・reSARch は日本語で、一致させる必要がない)。
+fn outcome_label(label: &str, bytes: Vec<u8>) -> String {
+    match SaFile::from_bytes(label.to_string(), bytes) {
+        Err(err) => format!("open:{}", fixtures::error_variant(&err)),
+        Ok(file) => {
+            if let Err(err) = file.scan(|_| Ok(ScanControl::Continue)) {
+                return format!("scan:{}", fixtures::error_variant(&err));
+            }
+            match walk(&file, &Selection::All, |_| Ok(ScanControl::Continue)) {
+                Err(err) => format!("walk:{}", fixtures::error_variant(&err)),
+                Ok(summary) if summary.is_exact() => "ok".to_string(),
+                Ok(_) => "ok(末尾に未読が残る)".to_string(),
+            }
+        }
+    }
+}
+
+/// 1 件を判定どおりに扱えているか確かめ、食い違いを `problems` へ足す。
+fn check_verdict(name: &str, bytes: Vec<u8>, verdict: Verdict, problems: &mut Vec<String>) {
+    let note = |problems: &mut Vec<String>, stage: &str, expected: ExpectedError, err: &Error| {
+        if !expected.matches(err) {
+            problems.push(format!(
+                "{name}: {stage} で {} を期待したが {err:?}",
+                expected.describe()
+            ));
+        }
+        if let Err(detail) = fixtures::error_invariants(err) {
+            problems.push(format!("{name}: {stage}: {detail}"));
+        }
+    };
+
+    match SaFile::from_bytes(name.to_string(), bytes) {
+        Err(err) => match verdict {
+            Verdict::Rejected(expected) => note(problems, "オープン", expected, &err),
+            _ => problems.push(format!(
+                "{name}: ヘッダは読めなければならないのに {err:?} で拒否された"
+            )),
+        },
+        Ok(file) => {
+            if let Verdict::Rejected(_) = verdict {
+                problems.push(format!("{name}: 拒否されるべきファイルが開けた"));
+                return;
+            }
+            let scanned = file.scan(|_| Ok(ScanControl::Continue));
+            let walked = walk(&file, &Selection::All, |_| Ok(ScanControl::Continue));
+            match verdict {
+                Verdict::Readable => {
+                    match &scanned {
+                        Ok(s) if s.is_exact() => {}
+                        Ok(s) => problems.push(format!(
+                            "{name}: 走査が末尾に到達しない (end={} size={})",
+                            s.end_offset, s.file_size
+                        )),
+                        Err(e) => problems.push(format!("{name}: 走査が失敗した: {e:?}")),
+                    }
+                    match &walked {
+                        Ok(s) if s.is_exact() => {}
+                        Ok(s) => problems.push(format!(
+                            "{name}: 統計走査が末尾に到達しない (end={} size={})",
+                            s.end_offset, s.file_size
+                        )),
+                        Err(e) => problems.push(format!("{name}: 統計デコードが失敗した: {e:?}")),
+                    }
+                    if let Ok(s) = &scanned
+                        && s.total_records() == 0
+                    {
+                        problems.push(format!("{name}: レコードが 1 件も読めていない"));
+                    }
+                }
+                Verdict::HeaderOnly(expected) => match (scanned, walked) {
+                    (Err(err), _) => note(problems, "走査", expected, &err),
+                    (Ok(_), Err(err)) => note(problems, "統計デコード", expected, &err),
+                    (Ok(_), Ok(_)) => {
+                        problems.push(format!("{name}: 統計読みで拒否されるべきファイルが通った"))
+                    }
+                },
+                Verdict::Rejected(_) => unreachable!("上で処理済み"),
+            }
+        }
+    }
+}
+
+/// 本家データを 1 件ずつ本体に読ませ、判定表どおりに読める / 拒否されること。
+///
+/// 異常系の期待値は自作 fixture と同じ [`Corruption::expected_error`] から引く。
+/// 本家のメッセージ (英語) と一致させる必要はなく、**分類が一致していればよい** (§10.3)。
+///
+/// 取得物に判定表の無いファイルがあれば失敗させる。新しい本家データが増えたときに
+/// 「検証されないまま増える」ことを防ぐため。
 #[test]
 #[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
-fn error_cases_are_enumerable() {
-    let Some(dir) = upstream_or_skip("error_cases_are_enumerable") else {
+fn upstream_files_are_read_or_rejected_as_expected() {
+    let Some(dir) = upstream_or_skip("upstream_files_are_read_or_rejected_as_expected") else {
+        return;
+    };
+
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("取得物のディレクトリが読めない")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        // 入力データだけを見る (`expected*` は golden 出力)
+        .filter(|n| n.starts_with("data"))
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "入力データが 1 件も無い");
+
+    let mut problems: Vec<String> = Vec::new();
+    for name in &names {
+        let verdict = match corruption_for(name) {
+            Some(c) => verdict_of(c),
+            None => match NORMAL_VERDICTS.iter().find(|(n, _)| n == name) {
+                Some((_, v)) => *v,
+                None => {
+                    problems.push(format!("{name}: 判定表に無い (期待する挙動が未記載)"));
+                    continue;
+                }
+            },
+        };
+        let bytes = std::fs::read(dir.join(name)).expect("本家データが読めない");
+        check_verdict(name, bytes, verdict, &mut problems);
+    }
+
+    assert!(
+        problems.is_empty(),
+        "本家データの扱いが期待と違う ({} 件 / 全 {} 件):\n{}",
+        problems.len(),
+        names.len(),
+        problems.join("\n")
+    );
+}
+
+/// 自作の異常系 fixture と本家の異常系ファイルが、**同じ段・同じエラー分類**で拒否されること。
+///
+/// 自作 fixture は本家データを同梱できないために用意したもので、
+/// 「同じ検査を突いている」ことがここで初めて実証される。
+/// どちらかが通ってしまう組み合わせがあれば、fixture の作り方か本体の検査が偏っている。
+#[test]
+#[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
+fn self_made_and_upstream_error_files_are_rejected_alike() {
+    let Some(dir) = upstream_or_skip("self_made_and_upstream_error_files_are_rejected_alike")
+    else {
+        return;
+    };
+
+    // 本家データは x86_64 (64bit LE) で作られている (§2.1 の実測表)
+    let abi = FixtureAbi::Le64;
+    let mut compared = 0usize;
+    for corruption in Corruption::ALL {
+        let Some(name) = corruption.upstream_name() else {
+            continue;
+        };
+        let Some(path) = upstream_file(&dir, name) else {
+            continue;
+        };
+        let upstream = outcome_label(name, std::fs::read(&path).expect("本家データが読めない"));
+        let mine = outcome_label(
+            &format!("{corruption:?}"),
+            fixtures::corrupted(abi, corruption).bytes,
+        );
+        assert_eq!(
+            mine, upstream,
+            "{corruption:?}: 自作 fixture と本家 {name} で拒否の段・分類が違う"
+        );
+        compared += 1;
+    }
+    assert!(compared >= 14, "突合できたのが {compared} 件しかない");
+    eprintln!("自作 fixture と本家データを {compared} 件突合した");
+}
+
+/// 448 バイトの `-err` 系が本家と同じ構成であること (自作 fixture の前提の裏取り)。
+///
+/// 自作の基準ファイルが 448 バイト・activity 1 件・レコード 0 件であることは
+/// `layout_conformance` 側で検証している。ここでは本家側がその形を保っていることを見る。
+#[test]
+#[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
+fn upstream_err_files_have_the_expected_shape() {
+    let Some(dir) = upstream_or_skip("upstream_err_files_have_the_expected_shape") else {
         return;
     };
 
@@ -730,22 +971,44 @@ fn error_cases_are_enumerable() {
         let Some(path) = upstream_file(&dir, name) else {
             continue;
         };
-        // 本家は 1 フィールドだけを壊した 448 バイトのファイルとして作っている (§2.2)。
-        // 自作 fixture (tests/fixtures) が同じ構成であることは layout_conformance 側で検証済み。
+        // 本家は 1 フィールドだけを壊した 448 バイトのファイルとして作っている (§2.2)
         let len = std::fs::metadata(&path)
             .expect("メタデータが読めない")
             .len();
         assert_eq!(len, 448, "{name}: 448 バイトのはず");
-        eprintln!("pending [00730] 拒否されるべき: {name}");
     }
 
+    // ERROR_CASES 側は「ヘッダ表示モードでも失敗するか」の対応を確認する。
+    // reSARch が本家と意図的に違うのは data-9.1.5 (旧世代を直読できる) だけ。
     for case in ERROR_CASES {
         if upstream_file(&dir, case.data).is_none() {
             continue;
         }
+        if case.data == "data-9.1.5" {
+            // reSARch は 0x2170 を直読できるので、本家の
+            // 「cannot read the format of this file」には対応しない
+            eprintln!(
+                "[{}] {}: 本家は {:?} で拒否するが reSARch は読める",
+                case.upstream_test, case.data, case.upstream_message
+            );
+            continue;
+        }
+        let corruption = corruption_for(case.data)
+            .unwrap_or_else(|| panic!("{}: 対応する自作の壊し方が無い", case.data));
+        assert_eq!(
+            corruption.fails_header_only_mode(),
+            case.fails_header_only,
+            "{}: ヘッダ表示モードの免除が本家テスト {} と食い違う",
+            case.data,
+            case.upstream_test
+        );
+        // 本家メッセージ (英語) と reSARch の分類の対応を記録に残す
         eprintln!(
-            "pending [{}] {} -> 本家メッセージ {:?} (ヘッダ表示も失敗: {})",
-            case.upstream_test, case.data, case.upstream_message, case.fails_header_only
+            "[{}] {}: 本家 {:?} → reSARch は {} で拒否する",
+            case.upstream_test,
+            case.data,
+            case.upstream_message,
+            corruption.expected_error().describe()
         );
     }
 }

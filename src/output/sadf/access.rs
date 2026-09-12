@@ -12,7 +12,9 @@
 use crate::layout::plan::DecodePlan;
 use crate::layout::registry::{ActivityDef, ColumnMeta, ItemShape};
 use crate::model::{ActivityId, Availability};
-use crate::series::compute::{ComputeContext, ComputeIssue, Computed, column_value, tick_total};
+use crate::series::compute::{
+    ComputeContext, ComputeIssue, Computed, column_value, column_value_strict, tick_total,
+};
 use crate::series::{ActivitySnapshot, IntervalView, ItemSnapshot};
 
 /// activity の「前後 1 対」。
@@ -179,6 +181,27 @@ impl<'a> ItemPair<'a> {
             return Err(ComputeIssue::UnsupportedBySource);
         };
         column_value(
+            self.def.id,
+            column,
+            meta,
+            self.plan,
+            self.prev,
+            self.curr,
+            &self.ctx,
+        )
+    }
+
+    /// 表示値 (**厳密モード**)。
+    ///
+    /// 互換出力用の [`ItemPair::computed`] は、欠落したフィールドを本家と同じ規則で
+    /// 代替して埋める (旧世代の `%memused` を `frmkb` から出す等)。
+    /// 独自出力と集計では嘘の値を出さないことが優先なので、
+    /// 欠落は欠落のまま返すこちらを使う。
+    pub fn computed_strict(&self, column: usize) -> Computed {
+        let Some(meta) = self.def.columns.get(column) else {
+            return Err(ComputeIssue::UnsupportedBySource);
+        };
+        column_value_strict(
             self.def.id,
             column,
             meta,

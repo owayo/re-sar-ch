@@ -329,7 +329,8 @@ fn rate_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
     if col.kind == ValueKind::Identity {
         return raw_identity_field(col, item, index);
     }
-    let (value, quality) = match item.computed(index) {
+    // 独自出力は欠落を代替で埋めない (互換出力だけが本家の代替規則に従う)
+    let (value, quality) = match item.computed_strict(index) {
         Ok(v) => (Some(v), Quality::Ok),
         Err(e) => (None, Quality::from_issue(e)),
     };

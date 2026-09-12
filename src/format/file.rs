@@ -29,7 +29,8 @@ use super::layouts;
 use super::reader::{Cursor, OutOfBounds};
 use super::registry::{
     self, EXTRA_DESC_SIZE, FormatSpec, MAX_COMMENT_LEN, MAX_EXTRA_NR, MAX_EXTRA_SIZE,
-    MAX_ITEM_STRUCT_SIZE, NR_MAX, NR2_MAX, RecordKind, RestartPayload, StructSource,
+    MAX_FILE_ACTIVITY_SIZE, MAX_ITEM_STRUCT_SIZE, MAX_RECORD_HEADER_SIZE, NR_MAX, NR2_MAX,
+    RecordKind, RestartPayload, StructSource,
 };
 use super::selfdesc::{self, TypesNr};
 use super::wire::ResolvedLayout;
@@ -576,6 +577,14 @@ impl SaFile {
             resolve_file_activity(spec, &header, &encoding).map_err(Error::from)?;
         if let Some(declared) = header.act_size {
             let declared = declared as usize;
+            if declared > MAX_FILE_ACTIVITY_SIZE as usize {
+                return Err(Error::LimitExceeded {
+                    path,
+                    what: "file_header.act_size".into(),
+                    value: declared as u64,
+                    limit: MAX_FILE_ACTIVITY_SIZE as u64,
+                });
+            }
             if activity_layout.size > declared {
                 return Err(Error::InconsistentHeader {
                     path,
@@ -625,6 +634,14 @@ impl SaFile {
         let record_layout = resolve_record_header(spec, &header, &encoding).map_err(Error::from)?;
         if let Some(declared) = header.rec_size {
             let declared = declared as usize;
+            if declared > MAX_RECORD_HEADER_SIZE as usize {
+                return Err(Error::LimitExceeded {
+                    path,
+                    what: "file_header.rec_size".into(),
+                    value: declared as u64,
+                    limit: MAX_RECORD_HEADER_SIZE as u64,
+                });
+            }
             if record_layout.size > declared {
                 return Err(Error::InconsistentHeader {
                     path,
@@ -1072,6 +1089,16 @@ impl ScanSummary {
 /// 本家が `check_file_actlst()` で行う検証に対応する。
 /// 上限を超える値をそのまま信じると、オフセット計算や確保サイズが破綻する。
 fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
+    // 下限割れ (0 / 負値) と内容の矛盾は「上限の超過」ではないので、
+    // `LimitExceeded` ではなく `InconsistentHeader` に分類する。
+    // `value <= limit` の `LimitExceeded` はエラーの説明として成立しない。
+    let inconsistent = |detail: String| -> Error {
+        Error::InconsistentHeader {
+            path: path.to_path_buf(),
+            detail: format!("{}: {detail}", e.id),
+        }
+    };
+
     // **構造と資源量の制限は Lenient でも緩めない。**
     //
     // これらは「読めたところまで返す」で済む破損ではなく、境界そのものを
@@ -1089,8 +1116,11 @@ fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
         })
     };
 
-    // 1 item のサイズ: 0 は不可、上限は MAX_ITEM_STRUCT_SIZE
-    if e.size == 0 || e.size > MAX_ITEM_STRUCT_SIZE {
+    // 1 item のサイズ: 0 は「矛盾」、上限超過は「資源の超過」
+    if e.size == 0 {
+        return Err(inconsistent("size = 0 (1 item のサイズが 0)".into()));
+    }
+    if e.size > MAX_ITEM_STRUCT_SIZE {
         reject(
             format!("size = {}", e.size),
             "file_activity.size",
@@ -1102,13 +1132,9 @@ fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
     // item 数: 0 と負値は不可。上限は activity 別 (汎用上限だけでは緩すぎる)
     let nr_max = e.id.nr_max().min(NR_MAX);
     if e.nr <= 0 {
-        reject(
-            format!("nr = {}", e.nr),
-            "file_activity.nr",
-            e.nr.max(0) as u64,
-            nr_max as u64,
-        )?;
-    } else if e.nr as u32 > nr_max {
+        return Err(inconsistent(format!("nr = {} (item 数が 0 以下)", e.nr)));
+    }
+    if e.nr as u32 > nr_max {
         reject(
             format!("nr = {} (この activity の上限は {nr_max})", e.nr),
             "file_activity.nr",
@@ -1119,13 +1145,12 @@ fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
 
     // sub-item 数: 0 と負値は不可、上限は NR2_MAX
     if e.nr2 <= 0 {
-        reject(
-            format!("nr2 = {}", e.nr2),
-            "file_activity.nr2",
-            e.nr2.max(0) as u64,
-            NR2_MAX as u64,
-        )?;
-    } else if e.nr2 as u32 > NR2_MAX {
+        return Err(inconsistent(format!(
+            "nr2 = {} (sub-item 数が 0 以下)",
+            e.nr2
+        )));
+    }
+    if e.nr2 as u32 > NR2_MAX {
         reject(
             format!("nr2 = {}", e.nr2),
             "file_activity.nr2",
@@ -1147,12 +1172,11 @@ fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
         } else {
             let map = types.map_size();
             if map > e.size as u64 {
-                reject(
-                    format!("MAP_SIZE({t:?}) = {map} > size = {}", e.size),
-                    "file_activity の MAP_SIZE",
-                    map,
-                    e.size as u64,
-                )?;
+                // 数値フィールド部が申告サイズに収まらない = 内容の矛盾
+                return Err(inconsistent(format!(
+                    "MAP_SIZE({t:?}) = {map} が size = {} を超える",
+                    e.size
+                )));
             }
         }
     }

@@ -49,7 +49,9 @@
 //!
 //! 典拠: `docs/format/03-output-format.md` 第 I 部 §1.2〜§1.5、第 III 部 §7。
 
-use super::delta::{Discontinuity, s_value_bits, wrapping_delta};
+use super::delta::{
+    Delta, DeltaContext, Discontinuity, compute_delta, s_value_bits, wrapping_delta,
+};
 use super::snapshot::ItemSnapshot;
 use crate::layout::plan::DecodePlan;
 use crate::layout::registry::ColumnMeta;
@@ -470,10 +472,11 @@ fn primary_input(
     }
 }
 
-/// 列のカウンタ幅。
+/// 列のカウンタ幅 (ラップの復元幅)。
 ///
-/// 派生列 (対応する wire フィールドが無い) は 64bit 扱いにする。
-/// 派生列の差分は入力列ごとに幅を引いて計算するため、ここは使われない。
+/// このファイルに無い列は 64bit として扱う。その列は [`raw_column`] が
+/// [`ComputeIssue::UnsupportedBySource`] を返すので差分計算まで到達しない
+/// (幅の既定値が結果に影響することはない)。
 #[inline]
 fn counter_bits(plan: &DecodePlan, column: usize) -> CounterBits {
     plan.column_bits(column).unwrap_or(CounterBits::B64)
@@ -633,16 +636,35 @@ fn column_value_with(
             // 差分が 1.84e19 になる。本家も `unsigned int` は 32bit で引いている。
             let bits = counter_bits(plan, column);
 
-            // CPU 時間で正規化する activity は tick 合計を分母にする
-            let rate = match ctx.tick_total {
+            let delta = match policy {
+                // 本家は符号なし減算の結果をそのまま表示する。幅で復元できない
+                // 逆行 (64bit カウンタの巻き戻し) で巨大値が出るのも本家の値。
+                MissingPolicy::Compat => wrapping_delta(prev_v, curr_v, bits),
+                // 独自出力・集計では「一周として説明できる減少」だけを差分にする。
+                // 説明できない減少に値を与えると、巨大な外れ値が平均や p95 を壊す。
+                MissingPolicy::Strict => {
+                    // 連続性はこの関数の入口で確認済み
+                    match compute_delta(prev_v, curr_v, bits, DeltaContext::default()) {
+                        Delta::Valid(d) | Delta::Wrapped(d) => d,
+                        Delta::Unavailable(disc) => {
+                            return Err(ComputeIssue::Discontinuous(disc));
+                        }
+                    }
+                }
+            };
+
+            // `S_VALUE(m, n, p)` = `(n - m) / p * 100`。
+            // CPU 時間で正規化する activity は itv ではなく tick 合計を分母にする。
+            let denominator = match ctx.tick_total {
                 Some(0) => {
                     return Err(ComputeIssue::Discontinuous(
                         Discontinuity::NonPositiveElapsed,
                     ));
                 }
-                Some(total) => wrapping_delta(prev_v, curr_v, bits) as f64 / total as f64 * 100.0,
-                None => s_value_bits(prev_v, curr_v, ctx.itv_cs, bits),
+                Some(total) => total,
+                None => ctx.itv_cs,
             };
+            let rate = delta as f64 / denominator as f64 * 100.0;
             Ok(rate * counter_scale(id, column))
         }
     }
@@ -863,7 +885,12 @@ fn cpu_derived(
         Some(t) => t,
     };
 
-    // ll_sp_value(v1, v2, dj) 相当
+    // `ll_sp_value(v1, v2, dj)` 相当。
+    //
+    // ここは 64bit 減算のままでよい。CPU の tick は本家では
+    // `unsigned long long` (旧世代は `unsigned long`) で、複数フィールドの
+    // 和を取ってから引くため減算の幅は 64bit になる。加えて逆行は
+    // 本家と同じく 0.0 にクランプするので、一周した区間でも巨大値は出ない。
     let llsp = |p: u64, c: u64| -> f64 {
         if c < p {
             0.0
@@ -2581,6 +2608,307 @@ mod tests {
         assert!(
             missing.is_empty(),
             "未実装の sar 列が残っている: {missing:?}"
+        );
+    }
+
+    // ---- カウンタ幅 (指摘 1) ----
+
+    /// 指定した revision のデコード計画を作る (旧世代 / 32bit ライタの再現用)。
+    fn plan_for_revision(id: ActivityId, magic: u32, size: usize, abi: LayoutAbi) -> DecodePlan {
+        let def = lookup(id).expect("定義がある");
+        let rev = def
+            .revision_for_magic_and_size(magic, size)
+            .expect("revision がある");
+        let enc = SourceEncoding::new(Endian::Little, abi);
+        DecodePlan::build(def, rev, size, 1, 1, &enc).expect("計画を作れる")
+    }
+
+    /// 公開名から列添字を引く。
+    fn column_of(id: ActivityId, public_name: &str) -> usize {
+        lookup(id)
+            .expect("定義がある")
+            .columns
+            .iter()
+            .position(|c| c.public_name == public_name)
+            .expect("列がある")
+    }
+
+    /// **回帰テスト (指摘 1)**: `unsigned int` のカウンタが一周した区間で、
+    /// レートが 1.84×10¹⁹ ではなく正しい値になる。
+    ///
+    /// `A_SERIAL` の `rx` は全世代で `unsigned int` (4 バイト)。
+    /// 本家も `unsigned int` 同士の減算なので 32bit で畳まれ、同じ値になる。
+    #[test]
+    fn counter_rate_folds_32bit_wraparound() {
+        let plan = plan_for(ActivityId::SERIAL);
+        let col = column_of(ActivityId::SERIAL, "rcvin");
+        assert_eq!(
+            plan.column_bits(col),
+            Some(CounterBits::B32),
+            "4 バイトのフィールドは B32 として計画に載る"
+        );
+
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, col, 4_294_967_290);
+        put(&plan, &mut c, col, 4);
+        let ctx = ComputeContext::new(100); // 1 秒
+
+        assert_eq!(
+            compute(ActivityId::SERIAL, col, &plan, &p, &c, &ctx).unwrap(),
+            10.0,
+            "6 (0 へ) + 4 = 10 件/秒"
+        );
+        // 64bit のまま引いていたときの値 (修正前はこれが表示されていた)
+        assert!(
+            crate::series::delta::s_value(4_294_967_290, 4, 100) > 1.0e19,
+            "64bit 減算は 1.8e19 台になる"
+        );
+    }
+
+    /// **回帰テスト (指摘 1)**: `disk_derived` の tick 差分も幅を意識する。
+    ///
+    /// `rd_ticks` / `rq_ticks` は全世代で `unsigned int`。64bit で引くと
+    /// `await` が 10¹⁸ ms、`aqu-sz` が 10¹⁶ という表示不能な値になっていた。
+    #[test]
+    fn disk_tick_derivations_fold_32bit_wraparound() {
+        let plan = plan_for(ActivityId::DISK);
+        for col in [disk_col::RD_TICKS, disk_col::AQU_SZ, disk_col::UTIL_PCT] {
+            assert_eq!(
+                plan.column_bits(col),
+                Some(CounterBits::B32),
+                "tick 群は unsigned int"
+            );
+        }
+
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        // rd_ticks: 2^32-6 → 4 で一周 = 10 ms
+        put(&plan, &mut p, disk_col::RD_TICKS, 4_294_967_290);
+        put(&plan, &mut c, disk_col::RD_TICKS, 4);
+        // rq_ticks: 2^32-1000 → 1000 で一周 = 2000 ms
+        put(&plan, &mut p, disk_col::AQU_SZ, 4_294_966_296);
+        put(&plan, &mut c, disk_col::AQU_SZ, 1_000);
+        // 1 秒間に 10 件完了
+        put(&plan, &mut c, disk_col::TPS, 10);
+        let ctx = ComputeContext::new(100);
+
+        assert_eq!(
+            compute(ActivityId::DISK, disk_col::AWAIT, &plan, &p, &c, &ctx).unwrap(),
+            1.0,
+            "10 ms / 10 I/O"
+        );
+        assert_eq!(
+            compute(ActivityId::DISK, disk_col::AQU_SZ, &plan, &p, &c, &ctx).unwrap(),
+            2.0,
+            "2000 ms/s / 1000"
+        );
+        // %util は本家が「減っていたら 0」と決めているので一周も 0 のまま (03 §5.1)
+        put(&plan, &mut p, disk_col::UTIL_PCT, 4_294_967_290);
+        put(&plan, &mut c, disk_col::UTIL_PCT, 4);
+        assert_eq!(
+            compute(ActivityId::DISK, disk_col::UTIL_PCT, &plan, &p, &c, &ctx).unwrap(),
+            0.0,
+            "逆行クランプは本家どおり維持する"
+        );
+    }
+
+    /// 32bit ライタが書いた `unsigned long` のカウンタも一周を復元する。
+    ///
+    /// 旧 `A_NET_DEV` (`magic 0x8a`) の `rx_bytes` は `unsigned long` で、
+    /// 32bit マシンが書いたファイルでは有効 4 バイト = 一周も 2^32 で起きる。
+    ///
+    /// **ここは本家と値が変わる箇所**である。本家は読み込み先が
+    /// `unsigned long` (読み手側で 8 バイト) なので 64bit で引き、
+    /// 一周した区間で 1.8e19 を表示する。01 §8.3 が 32bit ライタの
+    /// `unsigned long` の扱いを「本家より正しい」側に倒すと決めているので、
+    /// 差分でも同じ方針を採る (逆行が一周で説明できる唯一のケース)。
+    #[test]
+    fn counter_of_32bit_writer_long_field_folds_at_2_pow_32() {
+        let plan = plan_for_revision(ActivityId::NET_DEV, 0x8a, 72, LayoutAbi::I386);
+        let col = column_of(ActivityId::NET_DEV, "rx_bytes_per_sec");
+        assert_eq!(
+            plan.column_bits(col),
+            Some(CounterBits::B32),
+            "sa_sizeof_long == 4 のファイルでは unsigned long の有効幅は 4"
+        );
+
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, col, 4_294_967_290);
+        put(&plan, &mut c, col, 4);
+        let ctx = ComputeContext::new(100);
+        assert_eq!(
+            compute(ActivityId::NET_DEV, col, &plan, &p, &c, &ctx).unwrap(),
+            10.0,
+            "10 バイト/秒"
+        );
+
+        // 同じ revision を 64bit ライタのファイルとして読むと幅は 64bit になる
+        let plan64 = plan_for_revision(ActivityId::NET_DEV, 0x8a, 72, LayoutAbi::LP64);
+        assert_eq!(plan64.column_bits(col), Some(CounterBits::B64));
+    }
+
+    /// 一周として説明できない逆行の扱いは方針で分かれる。
+    ///
+    /// `A_PCSW` のカウンタは `unsigned long long` で逆行クランプも無いため、
+    /// 本家は符号なし減算の巨大値をそのまま表示する。互換出力はそれに合わせ、
+    /// 独自出力では値を作らずに理由を返す (外れ値が平均や p95 を壊さないように)。
+    #[test]
+    fn unexplainable_decrease_is_refused_only_in_strict_policy() {
+        let plan = plan_for(ActivityId::PCSW);
+        let col = 0;
+        let meta = &lookup(ActivityId::PCSW).unwrap().columns[col];
+        assert_eq!(plan.column_bits(col), Some(CounterBits::B64));
+
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, col, 1_000_000);
+        put(&plan, &mut c, col, 10);
+        let ctx = ComputeContext::new(100);
+
+        let compat = column_value(ActivityId::PCSW, col, meta, &plan, &p, &c, &ctx).unwrap();
+        assert!(compat > 1.0e19, "本家と同じ符号なし減算の結果: {compat}");
+        assert_eq!(
+            column_value_strict(ActivityId::PCSW, col, meta, &plan, &p, &c, &ctx),
+            Err(ComputeIssue::Discontinuous(
+                Discontinuity::AmbiguousDecrease
+            )),
+            "64bit カウンタの一周は現実的でないので差分を作らない"
+        );
+    }
+
+    // ---- 欠落の扱い (指摘 2) ----
+
+    /// **回帰テスト (指摘 2)**: `availablekb` を持たない世代のファイルで
+    /// `%memused` が 100% にならないこと。
+    ///
+    /// - 互換出力: `frmkb` を代替に使う (本家の `sadf -c` と同じ。02 §8)
+    /// - 独自 API: 欠落として返す (0 で埋めない)
+    #[test]
+    fn memused_without_available_field_is_not_100_percent() {
+        // v11.1.3〜v11.5.2 の A_MEMORY (16 フィールド / 128 バイト) に availablekb は無い
+        let plan = plan_for_revision(ActivityId::MEMORY, 0x8a, 128, LayoutAbi::LP64);
+        assert_eq!(
+            plan.column_value(&zeros(&plan).values, mem_col::KBAVAIL),
+            Availability::UnsupportedBySource,
+            "この世代には availablekb が無い"
+        );
+
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, mem_col::KBMEMTOTAL, 8_000_000);
+        put(&plan, &mut c, mem_col::KBMEMFREE, 2_000_000);
+        let ctx = ComputeContext::new(100);
+        let meta = |col: usize| &lookup(ActivityId::MEMORY).unwrap().columns[col];
+
+        // --- 互換出力: その世代の sar が出していた値 (tlmkb - frmkb) ---
+        let pct = column_value(
+            ActivityId::MEMORY,
+            mem_col::MEMUSED_PCT,
+            meta(mem_col::MEMUSED_PCT),
+            &plan,
+            &p,
+            &c,
+            &ctx,
+        )
+        .unwrap();
+        assert_ne!(pct, 100.0, "欠落を 0 として扱うと 100% になる");
+        assert_eq!(pct, 75.0, "(8,000,000 - 2,000,000) / 8,000,000");
+        assert_eq!(
+            column_value(
+                ActivityId::MEMORY,
+                mem_col::KBMEMUSED,
+                meta(mem_col::KBMEMUSED),
+                &plan,
+                &p,
+                &c,
+                &ctx
+            )
+            .unwrap(),
+            6_000_000.0,
+            "kbmemused も総量そのものにはならない"
+        );
+
+        // --- 独自 API: 欠落を維持する ---
+        for col in [mem_col::MEMUSED_PCT, mem_col::KBMEMUSED] {
+            assert_eq!(
+                column_value_strict(ActivityId::MEMORY, col, meta(col), &plan, &p, &c, &ctx),
+                Err(ComputeIssue::UnsupportedBySource),
+                "availablekb 無しでは使用量は求められない"
+            );
+        }
+
+        // --- availablekb を持つ世代では両方針が一致する ---
+        let modern = plan_for(ActivityId::MEMORY);
+        let mut mc = zeros(&modern);
+        put(&modern, &mut mc, mem_col::KBMEMTOTAL, 8_000_000);
+        put(&modern, &mut mc, mem_col::KBMEMFREE, 1_000_000);
+        put(&modern, &mut mc, mem_col::KBAVAIL, 4_000_000);
+        let mp = zeros(&modern);
+        for col in [mem_col::MEMUSED_PCT, mem_col::KBMEMUSED] {
+            assert_eq!(
+                column_value(ActivityId::MEMORY, col, meta(col), &modern, &mp, &mc, &ctx),
+                column_value_strict(ActivityId::MEMORY, col, meta(col), &modern, &mp, &mc, &ctx),
+                "フィールドが揃っていれば方針で値は変わらない"
+            );
+        }
+    }
+
+    /// **回帰テスト (指摘 2)**: `Average:` 行も 100% にならないこと。
+    ///
+    /// 累積器は「欠落」を知らないため、`availablekb` の合計が 0 のまま
+    /// `tlmkb - 0` を計算すると平均行だけ 100% になる。
+    #[test]
+    fn average_memused_without_available_field_falls_back_to_free() {
+        let plan = plan_for_revision(ActivityId::MEMORY, 0x8a, 128, LayoutAbi::LP64);
+        let mut last = zeros(&plan);
+        put(&plan, &mut last, mem_col::KBMEMTOTAL, 1_000);
+        put(&plan, &mut last, mem_col::KBMEMFREE, 250);
+
+        let mut acc = ItemAccum::new(24);
+        // frmkb = 250, 250, 250 → 平均 250
+        for _ in 0..3 {
+            acc.add(mem_col::KBMEMFREE, Some(250), Some(250.0));
+            // availablekb は列が無いので何も累積されない
+            acc.add(mem_col::KBAVAIL, None, None);
+            acc.count += 1;
+        }
+
+        let pct =
+            average_ratio(ActivityId::MEMORY, mem_col::MEMUSED_PCT, &plan, &acc, &last).unwrap();
+        assert_ne!(pct, 100.0);
+        assert_eq!(pct, 75.0, "(1000 - 250) / 1000");
+        assert_eq!(
+            average_ratio(ActivityId::MEMORY, mem_col::KBMEMUSED, &plan, &acc, &last).unwrap(),
+            750.0
+        );
+    }
+
+    /// **指摘 2 の点検**: `speed` を持たない世代の `%ifutil`。
+    ///
+    /// 互換出力は本家と同じ 0.0 (`speed == 0` = 不明 → 0)、
+    /// 独自 API では「この世代では求められない」を返す。
+    #[test]
+    fn ifutil_without_speed_field_is_zero_only_in_compat() {
+        // v10.1.2〜v10.1.6 の A_NET_DEV (128 バイト) に speed / duplex は無い
+        let plan = plan_for_revision(ActivityId::NET_DEV, 0x8b, 128, LayoutAbi::LP64);
+        let col = net_dev_col::IFUTIL_PCT;
+        let meta = &lookup(ActivityId::NET_DEV).unwrap().columns[col];
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, net_dev_col::RXKB, 1_000_000);
+        let ctx = ComputeContext::new(100);
+
+        assert_eq!(
+            column_value(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx).unwrap(),
+            0.0,
+            "本家は speed 不明を 0.0 として表示する (03 §5.2)"
+        );
+        assert_eq!(
+            column_value_strict(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx),
+            Err(ComputeIssue::UnsupportedBySource),
+            "リンク速度が分からないのに利用率 0% と見せない"
         );
     }
 

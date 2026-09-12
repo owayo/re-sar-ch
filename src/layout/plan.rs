@@ -255,6 +255,20 @@ pub fn select_revision(
         .ok_or(Incompatible::UnknownMagic(magic))
 }
 
+/// 申告された型別個数が、既知の個数に対して「全て増加方向」か
+/// 「全て減少方向」のどちらかに収まっているか。
+///
+/// sysstat の規約では**フィールドを減らすときは activity magic を上げる**ため、
+/// 同じ magic のまま「ULL は増えたが int は減った」という混在は起こらない
+/// (`docs/format/01-file-format.md` §4.5)。混在しているファイルは申告が壊れており、
+/// どちらの配置で読んでも意味が合わないので、統計を読む段で拒否する
+/// (ヘッダ表示だけなら通す、という免除が本家にもある)。
+pub fn types_nr_is_monotonic(declared: [u32; 3], known: [u32; 3]) -> bool {
+    let all_ge = declared.iter().zip(known).all(|(f, g)| *f >= g);
+    let all_le = declared.iter().zip(known).all(|(f, g)| *f <= g);
+    all_ge || all_le
+}
+
 impl DecodePlan {
     /// 計画を組み立てる (申告サイズだけを使う経路)。
     ///
@@ -746,6 +760,10 @@ mod tests {
             plan.column_value(&values, col),
             Availability::UnsupportedBySource
         );
+        // 存在しないフィールドにカウンタ幅を答えてはいけない
+        // (差分計算がラップ判定の根拠として使う値なので、
+        //  「読めない列に 64bit カウンタがある」と答えると誤った差分を作る)
+        assert_eq!(plan.column_bits(col), None);
     }
 
     /// 欠落したフィールドは、隣の item の値ではなく未提供としてデコードされる。
@@ -842,8 +860,8 @@ mod tests {
             types_nr: Some([10, 0, 0]),
         };
         assert_eq!(
-            select_revision(def_of(ActivityId::CPU), &shape),
-            Err(Incompatible::UnknownMagic(0x99))
+            select_revision(def_of(ActivityId::CPU), &shape).err(),
+            Some(Incompatible::UnknownMagic(0x99))
         );
     }
 
@@ -902,8 +920,8 @@ mod tests {
             types_nr: None,
         };
         assert_eq!(
-            select_revision(def, &unknown),
-            Err(Incompatible::UnknownSize(96))
+            select_revision(def, &unknown).err(),
+            Some(Incompatible::UnknownSize(96))
         );
     }
 

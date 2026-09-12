@@ -102,6 +102,12 @@ pub const MAX_EXTRA_SIZE: u32 = 1024;
 /// `file_activity.size` (1 item のサイズ) の上限。
 pub const MAX_ITEM_STRUCT_SIZE: u32 = 1024;
 
+/// `file_header.act_size` (`file_activity` 構造体のサイズ) の上限。
+pub const MAX_FILE_ACTIVITY_SIZE: u32 = 1024;
+
+/// `file_header.rec_size` (`record_header` のサイズ) の上限。
+pub const MAX_RECORD_HEADER_SIZE: u32 = 512;
+
 /// 未知 activity の item 数上限 (`65536 × 4096`)。
 pub const NR_MAX: u32 = 268_435_456;
 

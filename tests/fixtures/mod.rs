@@ -1816,24 +1816,24 @@ impl Corruption {
         use Corruption as C;
         use ExpectedError as E;
         match self {
-            // 定数上限の超過 (⑨⑮⑰㉑)。value > limit が必ず成り立つ。
-            C::HdrSaActNr => E::LimitExceeded, // ⑨ sa_act_nr > MAX_NR_ACT
+            // 定数上限の超過 (⑨⑩⑪⑮⑰㉑)。value > limit が必ず成り立つ。
+            C::HdrSaActNr => E::LimitExceeded, // ⑨ sa_act_nr > MAX_NR_ACT (256)
+            C::HdrActSize => E::LimitExceeded, // ⑩ act_size > MAX_FILE_ACTIVITY_SIZE (1024)
+            C::HdrRecSize => E::LimitExceeded, // ⑪ rec_size > MAX_RECORD_HEADER_SIZE (512)
             C::ActNrHuge => E::LimitExceeded,  // ⑮ nr > NR_MAX
             C::ActNrOverNrMax => E::LimitExceeded, // ⑰ nr > nr_max
             C::ActNr2Huge => E::LimitExceeded, // ⑮ nr2 > NR2_MAX
             C::ActSizeHuge => E::LimitExceeded, // ⑮ size > MAX_ITEM_STRUCT_SIZE
             C::IrqOverflow => E::LimitExceeded, // ㉑ nr × nr2 × size > UINT_MAX
 
-            // 下限割れ・申告値同士の矛盾 (⑩⑪⑫⑬⑮⑱⑲)。
+            // 下限割れ・申告値同士の矛盾 (⑫⑬⑮⑱⑲)。
             // 「上限の超過」ではないので LimitExceeded 単独には固定しない。
-            C::HdrActSize => E::HeaderRejected,             // ⑩
-            C::HdrRecSize => E::HeaderRejected,             // ⑪
-            C::HdrMapSizeActTypesNr => E::HeaderRejected,   // ⑫
-            C::HdrMapSizeRecTypesNr => E::HeaderRejected,   // ⑬
-            C::ActNrZero => E::HeaderRejected,              // ⑮ nr < 1
-            C::ActNr2Zero => E::HeaderRejected,             // ⑮ nr2 < 1
-            C::ActSizeZero => E::HeaderRejected,            // ⑮ size <= 0
-            C::ActMapSizeTypesNr => E::HeaderRejected,      // ⑲
+            C::HdrMapSizeActTypesNr => E::HeaderRejected, // ⑫
+            C::HdrMapSizeRecTypesNr => E::HeaderRejected, // ⑬
+            C::ActNrZero => E::HeaderRejected,            // ⑮ nr < 1
+            C::ActNr2Zero => E::HeaderRejected,           // ⑮ nr2 < 1
+            C::ActSizeZero => E::HeaderRejected,          // ⑮ size <= 0
+            C::ActMapSizeTypesNr => E::HeaderRejected,    // ⑲
             C::ActTypesNrNonMonotonic => E::HeaderRejected, // ⑱
 
             // マジックナンバー (②③)
@@ -1899,6 +1899,24 @@ impl ExpectedError {
     }
 }
 
+/// 本体のエラーのバリアント名。分類の比較・報告に使う。
+pub fn error_variant(err: &re_sar_ch::Error) -> &'static str {
+    use re_sar_ch::Error as E;
+    match err {
+        E::Io { .. } => "Io",
+        E::NotSysstatFile { .. } => "NotSysstatFile",
+        E::UnsupportedFormat { .. } => "UnsupportedFormat",
+        E::Truncated { .. } => "Truncated",
+        E::AmbiguousAbi { .. } => "AmbiguousAbi",
+        E::InconsistentHeader { .. } => "InconsistentHeader",
+        E::RecordBoundaryLost { .. } => "RecordBoundaryLost",
+        E::LimitExceeded { .. } => "LimitExceeded",
+        E::Layout(_) => "Layout",
+        E::Write(_) => "Write",
+        E::Other(_) => "Other",
+    }
+}
+
 /// エラー値そのものの整合性 (バリアントの契約) を確かめる。
 ///
 /// 分類が合っていても、値が契約を満たしていなければメッセージが意味を失う。
@@ -1925,12 +1943,10 @@ pub fn error_invariants(err: &re_sar_ch::Error) -> Result<(), String> {
             need,
             have,
             ..
-        } => {
-            if need <= have {
-                return Err(format!(
-                    "Truncated なのに need <= have ({context}: {need} <= {have})"
-                ));
-            }
+        } if need <= have => {
+            return Err(format!(
+                "Truncated なのに need <= have ({context}: {need} <= {have})"
+            ));
         }
         _ => {}
     }

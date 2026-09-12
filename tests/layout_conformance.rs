@@ -39,9 +39,8 @@ use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::{FieldTy, ResolvedLayout, WireLayout};
 use re_sar_ch::format::{
-    MmapPolicy, OpenOptions, SaFile, ScanControl, ScanSummary, Tolerance, layouts, selfdesc,
+    MmapPolicy, OpenOptions, SaFile, ScanControl, Tolerance, layouts, selfdesc,
 };
-use re_sar_ch::model::ActivityId;
 use re_sar_ch::series::{Selection, Snapshot, walk};
 
 // ===========================================================================
@@ -1222,4 +1221,653 @@ fn truncation_series_is_monotonically_shorter() {
         assert!(pair[0].len() > pair[1].len(), "単調に短くなること");
     }
     assert_eq!(series.last().unwrap().len(), 0);
+}
+
+// ===========================================================================
+// 7. 正常系 fixture を本体 (SaFile / scan / series::walk) に読ませる
+// ===========================================================================
+
+/// fixture のバイト列を本体に開かせる (strict)。
+fn open_fixture(f: &Fixture) -> SaFile {
+    SaFile::from_bytes(f.label(), f.bytes.clone())
+        .unwrap_or_else(|e| panic!("{}: 本体が fixture を開けない: {e}", f.label()))
+}
+
+/// STATS レコード 1 件分の統計値 (activity id → item → フィールド)。
+///
+/// 値が読めなかったフィールドは `None` にして、取り違えを検出できるようにする。
+type RecordStats = BTreeMap<u32, Vec<Vec<Option<u64>>>>;
+
+/// スナップショットから全 activity の値を取り出す。
+fn snapshot_stats(snap: &Snapshot) -> RecordStats {
+    snap.activities
+        .iter()
+        .map(|act| {
+            let items: Vec<Vec<Option<u64>>> = act
+                .items
+                .iter()
+                .map(|item| item.values.iter().map(|v| v.get().copied()).collect())
+                .collect();
+            (act.id.0, items)
+        })
+        .collect()
+}
+
+/// 本体の [`walk`] で STATS レコードの統計値を集める。
+fn walk_stats(file: &SaFile, label: &str) -> Vec<RecordStats> {
+    let mut out: Vec<RecordStats> = Vec::new();
+    let summary = walk(file, &Selection::All, |view| {
+        out.push(snapshot_stats(view.curr));
+        Ok(ScanControl::Continue)
+    })
+    .unwrap_or_else(|e| panic!("{label}: series::walk が失敗した: {e}"));
+    assert!(
+        summary.is_exact(),
+        "{label}: walk がファイル末尾まで到達しない ({summary:?})"
+    );
+    out
+}
+
+/// fixture が書き込んだ統計値 (レコード順 → activity id → item → フィールド)。
+///
+/// 期待値は `docs/format/01-file-format.md` §4.1 (型の並び) と §6.2 (item 数) の
+/// 規則から組み立てる。item 数は「自己記述世代で `has_nr` が真ならレコード内前置件数、
+/// それ以外は `file_activity.nr`」(§5.14)。
+fn declared_stats(f: &Fixture) -> Vec<RecordStats> {
+    let self_desc = f.facts().act_types_nr.is_some();
+    let mut out: Vec<RecordStats> = Vec::new();
+    for (seq, rec) in f.spec.records.iter().enumerate() {
+        let RecordKind::Stats { counts } = &rec.kind else {
+            continue;
+        };
+        let mut per_act = RecordStats::new();
+        for (i, act) in f.spec.activities.iter().enumerate() {
+            let count = if self_desc && act.has_nr {
+                counts.get(i).copied().unwrap_or(act.nr)
+            } else {
+                act.nr
+            };
+            // ここで使う activity は nr2 = 1 で、単一値のものは nr = 1 なので
+            // 本体の item 数 (`ItemShape` 依存) と一致する。
+            let items = count.max(0) as usize * act.nr2.max(1) as usize;
+            let fields = act.types_nr.iter().sum::<u32>() as usize;
+            let values: Vec<Vec<Option<u64>>> = (0..items)
+                .map(|item| {
+                    (0..fields)
+                        .map(|field| {
+                            Some(fixtures::expected_stat(
+                                f.spec.fill,
+                                act.types_nr,
+                                act.id,
+                                seq,
+                                item,
+                                field,
+                            ))
+                        })
+                        .collect()
+                })
+                .collect();
+            per_act.insert(act.id, values);
+        }
+        out.push(per_act);
+    }
+    out
+}
+
+/// 正常系 fixture 24 通り (6 世代バリアント × 4 ABI) を本体に読ませ、
+/// レコード境界・時刻・ペイロードと終端が fixture の論理値どおりであること。
+///
+/// テスト専用の [`walk_records`] ではなく**本体の走査**を使うので、
+/// bootstrap (バイト順 → 世代 → ABI) と上限検証も一緒に通る。
+#[test]
+fn body_scan_lands_exactly_on_eof() {
+    /// 本体が返したレコードの見え方。
+    #[derive(Debug, PartialEq, Eq)]
+    struct Seen {
+        offset: usize,
+        ust_time: u64,
+        time: (u8, u8, u8),
+        uptime_cs: Option<u64>,
+        comment: Option<String>,
+        cpu_count: Option<u32>,
+    }
+
+    for f in fixtures::all_minimal() {
+        let label = f.label();
+        let file = open_fixture(&f);
+
+        assert_eq!(
+            file.records_offset(),
+            f.first_record_off,
+            "{label}: レコード列の開始位置"
+        );
+        assert_eq!(
+            file.activities().len(),
+            f.spec.activities.len(),
+            "{label}: activity 数"
+        );
+
+        let mut seen: Vec<Seen> = Vec::new();
+        let summary = file
+            .scan(|rec| {
+                seen.push(Seen {
+                    offset: rec.offset,
+                    ust_time: rec.ust_time,
+                    time: (rec.hour, rec.minute, rec.second),
+                    uptime_cs: rec.uptime_cs,
+                    comment: rec.comment.map(str::to_string),
+                    cpu_count: rec.cpu_count,
+                });
+                Ok(ScanControl::Continue)
+            })
+            .unwrap_or_else(|e| panic!("{label}: 本体の走査が失敗した: {e}"));
+
+        assert!(
+            summary.is_exact(),
+            "{label}: ファイル末尾まで余りなく読めること ({summary:?})"
+        );
+        assert_eq!(summary.trailing_bytes, 0, "{label}: 末尾に切れ端が残らない");
+        assert_eq!(
+            summary.total_records() as usize,
+            f.spec.records.len(),
+            "{label}: レコード件数"
+        );
+
+        // 期待値は fixture の論理値と、独立に計算したオフセットから組み立てる
+        let old_restart_has_no_payload =
+            matches!(f.generation(), Generation::G2170 | Generation::G2171);
+        let want: Vec<Seen> = f
+            .spec
+            .records
+            .iter()
+            .zip(&f.record_offsets)
+            .map(|(rec, (off, _))| Seen {
+                offset: *off,
+                ust_time: rec.ust_time,
+                time: (rec.hour, rec.minute, rec.second),
+                // 旧世代の jiffies も HZ (既定 100) で 1/100 秒へ換算される
+                uptime_cs: Some(rec.uptime),
+                comment: match &rec.kind {
+                    RecordKind::Comment { text } => Some(text.clone()),
+                    _ => None,
+                },
+                cpu_count: match &rec.kind {
+                    // 0x2170 / 0x2171 の RESTART はペイロードを持たない (§5.7)
+                    RecordKind::Restart { cpu_nr, .. } if !old_restart_has_no_payload => {
+                        Some(*cpu_nr as u32)
+                    }
+                    _ => None,
+                },
+            })
+            .collect();
+
+        assert_eq!(
+            seen, want,
+            "{label}: レコードの境界・時刻・ペイロードが期待と違う"
+        );
+    }
+}
+
+/// 本体の [`walk`] が統計値まで到達し、fixture が書き込んだ値そのものを返すこと。
+///
+/// サイズとオフセットが合っているだけでは、型の並び (§4.1) を取り違えても通る。
+/// 値まで固定して初めてレイアウト解釈の誤りが捕まる。
+#[test]
+fn walk_reaches_the_declared_statistics() {
+    for f in fixtures::all_minimal() {
+        let label = f.label();
+        let file = open_fixture(&f);
+        let got = walk_stats(&file, &label);
+        let want = declared_stats(&f);
+
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{label}: walk が返した STATS レコード件数"
+        );
+        assert_eq!(got, want, "{label}: 統計値が fixture の書き込み値と違う");
+
+        // 自己検査: 期待値が空 (何も検証していない) ことを許さない
+        assert!(!want.is_empty(), "{label}: STATS レコードが無い");
+        for per_act in &want {
+            assert_eq!(per_act.len(), 2, "{label}: A_CPU と A_PCSW の 2 種");
+            assert_eq!(per_act[&1].len(), 3, "{label}: A_CPU は CPU 数分の item");
+            assert_eq!(per_act[&1][0].len(), 10, "{label}: A_CPU は 10 フィールド");
+            assert_eq!(per_act[&2].len(), 1, "{label}: A_PCSW は単一 item");
+        }
+    }
+}
+
+/// 同じ論理値を 4 通りの ABI で書いた fixture から、**本体経由でも**同じ値が読めること。
+///
+/// バイト列はエンディアンも `unsigned long` の有効幅も違うが、正規化結果は一致する。
+#[test]
+fn walk_normalizes_every_abi_to_the_same_values() {
+    for generation in Generation::ALL {
+        for build in [
+            fixtures::minimal as fn(Generation, FixtureAbi) -> Fixture,
+            fixtures::extreme_values as fn(Generation, FixtureAbi) -> Fixture,
+        ] {
+            let mut baseline: Option<(FixtureAbi, Vec<RecordStats>)> = None;
+            for abi in FixtureAbi::ALL {
+                let f = build(generation, abi);
+                let file = open_fixture(&f);
+                let stats = walk_stats(&file, &f.label());
+                match &baseline {
+                    None => baseline = Some((abi, stats)),
+                    Some((first_abi, first)) => assert_eq!(
+                        &stats,
+                        first,
+                        "{}: {} と {} で正規化結果が違う",
+                        generation.name(),
+                        abi.name(),
+                        first_abi.name()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// 32bit で書かれた `unsigned long` の統計値が 2^32 倍にならないこと (BE でも)。
+///
+/// `A_PCSW` の 2 番目のフィールド (`processes`) が `unsigned long` で、
+/// 32bit ファイルではスロット 8 バイトのうち**先頭 4 バイトだけ**が有効 (§3.0)。
+/// 後半 4 バイトを読む実装や 8 バイトまとめて読む実装は、BE で 2^32 倍の値になる。
+#[test]
+fn unsigned_long_statistics_are_not_scaled_on_32bit_files() {
+    for generation in Generation::ALL {
+        for abi in [FixtureAbi::Le32, FixtureAbi::Be32] {
+            let f = fixtures::minimal(generation, abi);
+            let label = f.label();
+            let file = open_fixture(&f);
+            let got = walk_stats(&file, &label);
+            let want = declared_stats(&f);
+
+            for (i, (per_act, expect)) in got.iter().zip(&want).enumerate() {
+                let value = per_act[&2][0][1].unwrap_or_else(|| {
+                    panic!("{label}: レコード {i} の A_PCSW.processes が読めない")
+                });
+                let expected = expect[&2][0][1].expect("期待値は必ずある");
+                assert_eq!(
+                    value,
+                    expected,
+                    "{label}: レコード {i} の A_PCSW.processes \
+                     (実測 0x{value:016x} / 期待 0x{expected:016x} / 2^32 倍なら 0x{:016x})",
+                    expected << 32
+                );
+                assert!(
+                    value <= u64::from(u32::MAX),
+                    "{label}: 32bit ファイルの unsigned long が 32bit に収まらない (0x{value:016x})"
+                );
+            }
+        }
+    }
+}
+
+/// カウンタに型の上限近傍を詰めても値が壊れないこと。
+///
+/// `unsigned long long` は u64 の上位ビットまで、`unsigned long` と `int` は
+/// u32 の上限近傍を入れる。符号付きとして読む実装や、32bit の `unsigned long` を
+/// 8 バイトまとめて読む実装がここで落ちる。
+#[test]
+fn walk_survives_extreme_counter_values() {
+    for f in fixtures::all_extreme_values() {
+        let label = f.label();
+        assert_eq!(
+            f.spec.fill,
+            StatFill::Extreme,
+            "{label}: 上限近傍の fixture"
+        );
+        let file = open_fixture(&f);
+        let got = walk_stats(&file, &label);
+        let want = declared_stats(&f);
+        assert_eq!(got, want, "{label}: 上限近傍の値が読み出しで壊れている");
+
+        // 自己検査: 本当に上限近傍の値が通っているか (期待値の作り方の取り違え防止)
+        let first = got
+            .first()
+            .unwrap_or_else(|| panic!("{label}: STATS が無い"));
+        assert_eq!(
+            first[&2][0][0],
+            Some(u64::MAX),
+            "{label}: A_PCSW.context_switch (ull) に u64::MAX が入る"
+        );
+        assert_eq!(
+            first[&2][0][1],
+            Some(u64::from(u32::MAX - 1)),
+            "{label}: A_PCSW.processes (ul) に u32 上限近傍が入る"
+        );
+        assert_eq!(
+            first[&9][0][2],
+            Some(u64::MAX - 2),
+            "{label}: A_QUEUE の 3 番目 (ull)"
+        );
+        assert_eq!(
+            first[&9][0][5],
+            Some(u64::from(u32::MAX - 5)),
+            "{label}: A_QUEUE の 6 番目 (int)"
+        );
+    }
+}
+
+// ===========================================================================
+// 8. 異常系 fixture を本体に読ませる
+// ===========================================================================
+
+/// 本体が返したエラーを期待値と突き合わせ、食い違いを `problems` へ足す。
+///
+/// 分類 ([`Corruption::expected_error`]) だけでなく、エラー値そのものの契約
+/// ([`fixtures::error_invariants`]) も確かめる。
+fn check_rejection(
+    problems: &mut Vec<String>,
+    label: &str,
+    stage: &str,
+    corruption: Corruption,
+    err: &Error,
+) {
+    let expected = corruption.expected_error();
+    if !expected.matches(err) {
+        problems.push(format!(
+            "{label}: {stage} で {} を期待したが {err:?} ({})",
+            expected.describe(),
+            corruption.detects()
+        ));
+    }
+    if let Err(detail) = fixtures::error_invariants(err) {
+        problems.push(format!("{label}: {stage}: {detail}"));
+    }
+}
+
+/// 異常系 21 種 × 4 ABI を本体に読ませ、期待した分類のエラーで拒否されること。
+///
+/// 期待値は [`Corruption::expected_error`] (= `01-file-format.md` §10.2 / §10.3 の
+/// 検査表) から決めており、実装が現に返す値からは導出していない。
+/// 拒否される段も分けて検証する: ヘッダ表示モード相当 (`SaFile::from_bytes`) で
+/// 失敗すべきものと、ヘッダは読めて統計読み (`scan` / `walk`) で失敗すべきもの
+/// (§10.2 の ⑱ / ㉑ の免除、本家 00732 / 00734 / 01400)。
+#[test]
+fn corrupted_fixtures_are_rejected_by_the_body() {
+    let mut problems: Vec<String> = Vec::new();
+
+    for abi in FixtureAbi::ALL {
+        for corruption in Corruption::ALL {
+            let c = fixtures::corrupted(abi, corruption);
+            let label = format!("{}/{corruption:?}", abi.name());
+            let header_must_fail = corruption.fails_header_only_mode();
+
+            let opened = SaFile::from_bytes(label.clone(), c.bytes.clone());
+            match opened {
+                Err(err) => {
+                    if header_must_fail {
+                        check_rejection(&mut problems, &label, "オープン", corruption, &err);
+                    } else {
+                        problems.push(format!(
+                            "{label}: ヘッダ表示は成功しなければならないのに {err:?} で拒否された"
+                        ));
+                    }
+                }
+                Ok(file) => {
+                    if header_must_fail {
+                        problems.push(format!(
+                            "{label}: 拒否されるべきファイルが開けた ({})",
+                            corruption.detects()
+                        ));
+                        continue;
+                    }
+                    // ヘッダは読めるが、統計を読もうとすると破綻するもの。
+                    // 走査で気づくか、デコード計画の構築で気づくかは実装の裁量。
+                    let scanned = file.scan(|_| Ok(ScanControl::Continue));
+                    let walked = walk(&file, &Selection::All, |_| Ok(ScanControl::Continue));
+                    match (scanned, walked) {
+                        (Err(err), _) => {
+                            check_rejection(&mut problems, &label, "走査", corruption, &err)
+                        }
+                        (Ok(_), Err(err)) => {
+                            check_rejection(&mut problems, &label, "統計デコード", corruption, &err)
+                        }
+                        (Ok(summary), Ok(_)) => problems.push(format!(
+                            "{label}: 統計読みで拒否されるべきファイルが通った \
+                             ({}, scan={summary:?})",
+                            corruption.detects()
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "本体の拒否処理が期待と違う ({} 件):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+/// `hdr_types_nr` / `header_size` の申告が現行レイアウトと矛盾するファイルを拒否すること。
+///
+/// `01-file-format.md` §10.2 の ⑤ (`0 < header_size <= 8192`) と
+/// ⑥ (`MAP_SIZE(hdr_types_nr) <= header_size`) は
+/// **`file_header` を読む前**に発火しなければならない検査である。
+///
+/// ここで使う値を上限ぎりぎり (1025 フィールド) にとどめているのは意図的:
+/// 本体は `file_magic` の 4 バイトを個数として受け取ってからフィールド列を組み立てるため、
+/// `hdr_types_nr = 0xffffffff` のような申告を渡すと検査の前に巨大な確保が走る。
+/// 確保失敗は unwind ではなく abort なのでテストでは捕まえられず、
+/// テストプロセスごと落ちる。検査が ⑥ の位置に入れば、この入力も安全に拒否できる。
+#[test]
+fn absurd_self_describing_header_declarations_are_rejected() {
+    for abi in [FixtureAbi::Le64, FixtureAbi::Be32] {
+        let base = fixtures::err_base(abi);
+        let big = abi.is_big_endian();
+        let put_u32 = |bytes: &mut [u8], off: usize, v: u32| {
+            let b = if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            };
+            bytes[off..off + 4].copy_from_slice(&b);
+        };
+
+        // hdr_types_nr = (1025, 0, 0) → MAP_SIZE = 8200 > header_size (336)
+        let mut bytes = base.bytes.clone();
+        put_u32(&mut bytes, 16, 1025); // file_magic.hdr_types_nr[0] (§3.2.4)
+        let err = SaFile::from_bytes("hdr_types_nr", bytes)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: MAP_SIZE(hdr_types_nr) > header_size が拒否されない",
+                    abi.name()
+                )
+            });
+        assert!(
+            matches!(
+                err,
+                Error::InconsistentHeader { .. } | Error::LimitExceeded { .. }
+            ),
+            "{}: ヘッダ記述の矛盾として拒否されること: {err:?}",
+            abi.name()
+        );
+
+        // header_size = 0 → ⑤ の下限違反
+        let mut bytes = base.bytes.clone();
+        put_u32(&mut bytes, 8, 0); // file_magic.header_size (§3.2.4)
+        let err = SaFile::from_bytes("header_size", bytes)
+            .err()
+            .unwrap_or_else(|| panic!("{}: header_size = 0 が拒否されない", abi.name()));
+        assert!(
+            matches!(
+                err,
+                Error::InconsistentHeader { .. } | Error::LimitExceeded { .. }
+            ),
+            "{}: header_size = 0 はヘッダ記述の不正: {err:?}",
+            abi.name()
+        );
+    }
+}
+
+// ===========================================================================
+// 9. 切り詰め入力の非 panic 検証
+// ===========================================================================
+
+/// panic を報告する上限。これを超えたら打ち切る (出力が数万行になるのを防ぐ)。
+const MAX_PANIC_REPORTS: usize = 20;
+
+/// panic の payload を文字列にする。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(payload を文字列化できない)".to_string()
+    }
+}
+
+/// バイト列を本体に読ませ、**panic しないこと**だけを確かめる。
+///
+/// 結果が `Ok` でも `Err` でもよい。壊れた入力に対する正しい応答はエラーであって、
+/// パニック (終了コード 101) ではない。`strict` と `lenient` の両方を通す
+/// (lenient は「読めたところまで返す」経路に入るので、strict より深く進む)。
+fn probe_without_panic(label: &str, bytes: &[u8], problems: &mut Vec<String>) {
+    for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+        let options = OpenOptions {
+            mmap: MmapPolicy::Never,
+            tolerance,
+            ..OpenOptions::default()
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            if let Ok(file) = SaFile::from_bytes_with("prefix", bytes.to_vec(), options) {
+                let _ = file.scan(|_| Ok(ScanControl::Continue));
+                let _ = walk(&file, &Selection::All, |_| Ok(ScanControl::Continue));
+            }
+        }));
+        if let Err(payload) = outcome {
+            problems.push(format!(
+                "{label} ({} バイト, {tolerance:?}): panic = {}",
+                bytes.len(),
+                panic_message(&*payload)
+            ));
+        }
+    }
+}
+
+/// 正常系 fixture の**あらゆる長さの先頭部分**を本体に読ませても panic しないこと。
+///
+/// 1 バイト刻みで全長を試す。fixture は 1.2 KB 程度なのでヘッダ境界付近も含めて
+/// 全長を刻める。外部レビューで「未知フォーマットの短い入力で終了コード 101」の
+/// 再現報告があり、この種の検証が効く。
+#[test]
+fn every_prefix_of_a_fixture_is_parsed_without_panic() {
+    let mut problems: Vec<String> = Vec::new();
+    'outer: for f in fixtures::all_minimal() {
+        for len in 0..=f.bytes.len() {
+            probe_without_panic(&f.label(), &f.bytes[..len], &mut problems);
+            if problems.len() >= MAX_PANIC_REPORTS {
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "先頭部分だけの入力で panic した:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// 異常系 fixture の先頭部分でも panic しないこと。
+///
+/// 壊れたヘッダと切り詰めが重なる入力を作る。
+/// LE / BE 両方を通してバイト順の取り違えも踏む。
+#[test]
+fn every_prefix_of_a_corrupted_fixture_is_parsed_without_panic() {
+    let mut problems: Vec<String> = Vec::new();
+    'outer: for abi in [FixtureAbi::Le64, FixtureAbi::Be32] {
+        for corruption in Corruption::ALL {
+            let c = fixtures::corrupted(abi, corruption);
+            for len in 0..=c.bytes.len() {
+                probe_without_panic(
+                    &format!("{}/{corruption:?}", abi.name()),
+                    &c.bytes[..len],
+                    &mut problems,
+                );
+                if problems.len() >= MAX_PANIC_REPORTS {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "異常系の先頭部分で panic した:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// 未知フォーマット・雑なバイト列の短い入力で panic しないこと。
+///
+/// `format_magic` を実在する 4 世代・欠番 (`0x2172` / `0x2174` / `0x2176`)・
+/// 未来の未知世代・0 / 0xffff に振り、ヘッダ境界付近 (0〜400 バイト) を 1 バイト刻みで試す。
+///
+/// 自己記述世代では `header_size` と `hdr_types_nr` だけは現実的な値を書く。
+/// ここを filler のまま (例えば 0x41414141 = 10 億) にすると、
+/// 本体が検査前にその個数のフィールド列を組み立てようとして確保で落ちる
+/// ([`absurd_self_describing_header_declarations_are_rejected`] のコメント参照)。
+#[test]
+fn short_inputs_with_any_format_magic_do_not_panic() {
+    let magics: [u16; 9] = [
+        0x2170, 0x2171, 0x2173, 0x2175, 0x2172, 0x2174, 0x2176, 0x0000, 0xffff,
+    ];
+    let mut problems: Vec<String> = Vec::new();
+
+    'outer: for format_magic in magics {
+        for big in [false, true] {
+            for filler in [0x00u8, 0xff, 0x41] {
+                for len in 0..=400usize {
+                    let mut bytes = vec![filler; len];
+                    let head = if big {
+                        let m = fixtures::SYSSTAT_MAGIC.to_be_bytes();
+                        let f = format_magic.to_be_bytes();
+                        [m[0], m[1], f[0], f[1]]
+                    } else {
+                        let m = fixtures::SYSSTAT_MAGIC.to_le_bytes();
+                        let f = format_magic.to_le_bytes();
+                        [m[0], m[1], f[0], f[1]]
+                    };
+                    for (i, b) in head.iter().enumerate().take(len) {
+                        bytes[i] = *b;
+                    }
+                    if format_magic == 0x2175 && len >= 28 {
+                        let put = |bytes: &mut [u8], off: usize, v: u32| {
+                            let b = if big {
+                                v.to_be_bytes()
+                            } else {
+                                v.to_le_bytes()
+                            };
+                            bytes[off..off + 4].copy_from_slice(&b);
+                        };
+                        put(&mut bytes, 8, 336); // header_size
+                        put(&mut bytes, 16, 1); // hdr_types_nr[0]
+                        put(&mut bytes, 20, 1); // hdr_types_nr[1]
+                        put(&mut bytes, 24, 12); // hdr_types_nr[2]
+                    }
+                    probe_without_panic(
+                        &format!("magic=0x{format_magic:04x}/filler=0x{filler:02x}/big={big}"),
+                        &bytes,
+                        &mut problems,
+                    );
+                    if problems.len() >= MAX_PANIC_REPORTS {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "短い入力で panic した:\n{}",
+        problems.join("\n")
+    );
 }

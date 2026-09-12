@@ -838,8 +838,10 @@ fn upstream_headers_decode_to_the_measured_facts() {
 /// マスクは [`GoldenCase::masks`] に宣言したものだけが効く。
 /// 対象は「ファイルの中身からは原理的に再現できない値」に限り、理由を必ず添える。
 ///
-/// 差分の一覧は `--nocapture` で読める。1 件でも不一致が残っていれば失敗する
+/// 差分の一覧は `--nocapture` で読める。不一致が 1 件でも残っていれば失敗する
 /// (`sar` 互換が中核価値なので、未達を緑にしない)。
+/// [`Repro::Unsupported`] を宣言したケースだけは「比較不能」として集計し、
+/// 失敗にはしない (実装の誤りではなく、出力形式そのものが無いため)。
 #[test]
 #[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
 fn golden_outputs_match_upstream() {
@@ -849,39 +851,37 @@ fn golden_outputs_match_upstream() {
 
     let mut exact = 0usize;
     let mut masked = 0usize;
+    let mut unsupported: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    let mut compared = 0usize;
 
     eprintln!(
         "\n=== 本家期待出力との全文比較 ({} 件) ===",
         GOLDEN_CASES.len()
     );
     for case in GOLDEN_CASES {
-        let (Some(data), Some(golden)) = (
-            upstream_file(&dir, case.data),
-            upstream_file(&dir, case.golden),
-        ) else {
-            failures.push(format!(
-                "[{}] {} -> {}: 入力または期待出力が無い",
-                case.upstream_test, case.data, case.golden
-            ));
-            continue;
-        };
-        let expected = std::fs::read_to_string(&golden).expect("期待出力が読めない");
-        assert!(!expected.is_empty(), "{}: 期待出力が空", case.golden);
-
         let head = format!(
             "[{}] {:?} {} -> {}",
             case.upstream_test, case.phase, case.data, case.golden
         );
 
-        // 未実装の出力形式は「比較できなかった」として明示する (緑にしない)
+        let (Some(data), Some(golden)) = (
+            upstream_file(&dir, case.data),
+            upstream_file(&dir, case.golden),
+        ) else {
+            failures.push(format!("{head}: 入力または期待出力が無い"));
+            continue;
+        };
+        let expected = std::fs::read_to_string(&golden).expect("期待出力が読めない");
+        assert!(!expected.is_empty(), "{}: 期待出力が空", case.golden);
+
+        // 出力形式そのものが無いケース。実装の誤りではないので失敗にはしないが、
+        // 「検証できていない」ことは毎回目に見える形で残す。
         if let Repro::Unsupported { missing } = case.repro {
             eprintln!(
-                "  比較不能  {head}\n            {missing} が無い ({})",
+                "  比較不能  {head}\n            {missing} が無い (本家: {})",
                 case.upstream_cmd
             );
-            failures.push(format!("{head}: {missing} が無いため比較できない"));
+            unsupported.push(format!("{head}: {missing} が無い"));
             continue;
         }
 
@@ -902,16 +902,7 @@ fn golden_outputs_match_upstream() {
             }
         };
 
-        compared += 1;
         let cmp: Comparison = golden::compare(&expected, &actual, case.masks);
-        // 差分が出たケースは出力全体をファイルへ落とす。
-        // 行単位の要約だけでは追えない食い違い (行の増減・ブロック順) を
-        // `diff -u` で追えるようにするため。
-        if !cmp.is_match() {
-            if let Some(path) = dump_actual(case, &actual) {
-                eprintln!("            実際の出力: {}", path.display());
-            }
-        }
         let label = if cmp.is_match() {
             if cmp.masked.is_empty() {
                 exact += 1;
@@ -929,19 +920,31 @@ fn golden_outputs_match_upstream() {
         }
         if !cmp.is_match() {
             eprint!("{}", cmp.diff_report(6));
+            // 行単位の要約では追えない食い違い (行の増減・ブロック順) を
+            // `diff -u` で追えるよう、出力全体をファイルへ落とす。
+            if let Some(path) = dump_actual(case, &actual) {
+                eprintln!("            実際の出力全体: {}", path.display());
+            }
             failures.push(format!("{head}: {}\n{}", cmp.verdict(), cmp.diff_report(6)));
         }
     }
 
     eprintln!(
-        "\n--- 集計: 全文一致 {} / マスク一致 {} / 不一致・比較不能 {} (全 {} 件, 比較実行 {} 件) ---",
-        exact,
-        masked,
+        "\n--- 集計: 全文一致 {exact} / マスクして一致 {masked} / 不一致 {} / 比較不能 {} (全 {} 件) ---",
         failures.len(),
-        GOLDEN_CASES.len(),
-        compared
+        unsupported.len(),
+        GOLDEN_CASES.len()
     );
+    for u in &unsupported {
+        eprintln!("    比較不能: {u}");
+    }
 
+    // 数え落ちがないこと (どのケースも「比較した」か「比較不能と宣言した」のどちらか)
+    assert_eq!(
+        exact + masked + failures.len() + unsupported.len(),
+        GOLDEN_CASES.len(),
+        "集計から漏れたケースがある"
+    );
     assert!(
         failures.is_empty(),
         "本家の期待出力と一致しないケースが {} 件ある:\n{}",

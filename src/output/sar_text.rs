@@ -2358,8 +2358,9 @@ impl SarBlock {
 
     /// 1 行分の値を計算する。`None` なら行を出さない (オフライン CPU など)。
     ///
-    /// `cpu_total` は `A_CPU` 集約行の分母 (`deltot_jiffies`)。
-    /// [`compute::aggregate_cpu`] が返した値をそのまま使う。
+    /// `cpu_all` は `A_CPU` 集約行 (`idx == 0`) のときだけ
+    /// [`compute::aggregate_cpu`] の結果を渡す。分母 (`deltot_jiffies`) は
+    /// そこから引く。
     #[allow(clippy::too_many_arguments)]
     fn make_row(
         &self,
@@ -2370,7 +2371,7 @@ impl SarBlock {
         prev_primary: &ItemSnapshot,
         prev_slots: &[ItemSnapshot],
         itv_cs: u64,
-        cpu_total: Option<u64>,
+        cpu_all: Option<&compute::CpuAggregate>,
     ) -> Option<Row> {
         let curr = &group.primary;
         let mut ctx = ComputeContext::new(itv_cs);
@@ -2396,12 +2397,11 @@ impl SarBlock {
             }
             // --- A_CPU: 集約行 / オフライン / tickless の特別扱い ---
             Layout::Cpu if self.view.id == ActivityId::CPU => {
-                if let Some(total) = cpu_total {
+                if let Some(agg) = cpu_all {
                     // 集約行 (SMP)。`prev_primary` / `curr` は既に
-                    // offline 補正込みで合算済み、`total` はその合算に使った
-                    // CPU の tick 合計。CPU "all" が tickless になることは
-                    // ない前提で 0 は 1 に差し替える (03 §1.4.3 / §1.4.5)。
-                    ctx.tick_total = Some(total.max(1));
+                    // offline 補正込みで合算済みで、分母もその合算に使った
+                    // CPU の tick 合計 (`deltot_jiffies`) になる。
+                    ctx = agg.context(itv_cs);
                     self.cell_values(plan, prev_primary, curr, &ctx)
                 } else {
                     if compute::cpu_is_offline(plan, curr) {
@@ -2750,26 +2750,25 @@ impl SarBlock {
                 continue;
             }
             // 区間の端点でオフラインだった CPU は平均行も出さない
-            if cpu_agg
-                .as_ref()
-                .is_some_and(|a| a.offline.contains(&state.index))
-            {
+            if cpu_agg.as_ref().is_some_and(|a| a.is_offline(state.index)) {
                 continue;
             }
-            let mut ctx = ComputeContext::new(itv);
-            ctx.aggregate_item = state.index == 0;
             // 集約行だけは合算済みの端点と `deltot_jiffies` に差し替える
             let aggregated = cpu_agg.as_ref().filter(|_| state.index == 0);
             let (first, last) = match aggregated {
                 Some(agg) => (&agg.prev, &agg.curr),
                 None => (&state.first, &state.last),
             };
-            if self.view.id == ActivityId::CPU {
-                let total = match aggregated {
-                    Some(agg) => agg.tick_total,
-                    None => compute::per_cpu_interval(plan, first, last).1,
-                };
-                ctx.tick_total = Some(total.max(1));
+            let mut ctx = match aggregated {
+                Some(agg) => agg.context(itv),
+                None => ComputeContext::new(itv),
+            };
+            if aggregated.is_none() {
+                ctx.aggregate_item = state.index == 0;
+                if self.view.id == ActivityId::CPU {
+                    let total = compute::per_cpu_interval(plan, first, last).1;
+                    ctx.tick_total = Some(total.max(1));
+                }
             }
 
             let values: Vec<Computed> = match self.view.layout {
@@ -3458,10 +3457,19 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 10_000)
+            .make_row(
+                &plan,
+                0,
+                ItemKey::Index(0),
+                &group,
+                &prev,
+                &[],
+                10_000,
+                None,
+            )
             .expect("行が出る");
         let mut s = String::new();
-        blk.render_row(&mut s, "09:34:34", &row, false);
+        blk.render_row(&mut s, "09:34:34", &row, RowMode::Instant);
         assert_eq!(
             s,
             "09:34:34        all      0.47      0.00      0.70      0.08      0.00     98.75\n"
@@ -3482,7 +3490,7 @@ mod tests {
             slots: Vec::new(),
         };
         assert!(
-            blk.make_row(&plan, 1, ItemKey::Index(1), &group, &zero, &[], 100)
+            blk.make_row(&plan, 1, ItemKey::Index(1), &group, &zero, &[], 100, None)
                 .is_none()
         );
     }
@@ -3503,10 +3511,10 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(&plan, 1, ItemKey::Index(1), &group, &same, &[], 100)
+            .make_row(&plan, 1, ItemKey::Index(1), &group, &same, &[], 100, None)
             .expect("tickless でも行は出る");
         let mut s = String::new();
-        blk.render_row(&mut s, "10:00:01", &row, false);
+        blk.render_row(&mut s, "10:00:01", &row, RowMode::Instant);
         assert_eq!(
             s,
             "10:00:01          0      0.00      0.00      0.00      0.00      0.00    100.00\n"
@@ -3759,10 +3767,11 @@ mod tests {
                 &item,
                 &[],
                 100,
+                None,
             )
             .unwrap();
         let mut s = String::new();
-        blk.render_row(&mut s, "09:34:34", &row, false);
+        blk.render_row(&mut s, "09:34:34", &row, RowMode::Instant);
         assert_eq!(
             s,
             "09:34:34          2      8087        24         0                         \n"
@@ -3795,10 +3804,10 @@ mod tests {
         };
         // itv = 6000 cs = 60 秒 → -2.00 %/分
         let row = blk
-            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 6_000)
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 6_000, None)
             .unwrap();
         let mut s = String::new();
-        blk.render_row(&mut s, "10:00:01", &row, false);
+        blk.render_row(&mut s, "10:00:01", &row, RowMode::Instant);
         assert_eq!(
             s,
             "10:00:01            0        78     -2.00         \u{2198}\n"
@@ -3808,7 +3817,7 @@ mod tests {
 
         // 平均行は status を出さず、%cap が 2 桁になる
         let mut avg = String::new();
-        blk.render_row(&mut avg, "Average:", &row, true);
+        blk.render_row(&mut avg, "Average:", &row, RowMode::Average);
         assert_eq!(avg, "Average:            0     78.00     -2.00\n");
     }
 
@@ -3825,10 +3834,10 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(&plan, 0, ItemKey::Index(0), &group, &curr, &[], 100)
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &curr, &[], 100, None)
             .unwrap();
         let mut s = String::new();
-        blk.render_row(&mut s, "10:00:01", &row, false);
+        blk.render_row(&mut s, "10:00:01", &row, RowMode::Instant);
         assert_eq!(
             s.trim_end_matches('\n').len(),
             51,
@@ -3872,10 +3881,11 @@ mod tests {
                 &p0,
                 &[p0.clone(), p1],
                 100,
+                None,
             )
             .unwrap();
         let mut s = String::new();
-        blk.render_row(&mut s, "10:00:01", &row, false);
+        blk.render_row(&mut s, "10:00:01", &row, RowMode::Instant);
         // (1500 × 100 + 800 × 300) / 400 = 975
         assert_eq!(s, "10:00:01          0    975.00\n");
     }
@@ -3900,10 +3910,10 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 1_000)
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 1_000, None)
             .unwrap();
         let mut s = String::new();
-        blk.render_row(&mut s, "10:00:01", &row, false);
+        blk.render_row(&mut s, "10:00:01", &row, RowMode::Instant);
         assert_eq!(
             s,
             "10:00:01        12.34      0.00      0.00     10.00      0.00      0.00      0.00      5.00\n"
@@ -3926,10 +3936,10 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(&plan, 0, ItemKey::Line(64), &group, &prev, &[], 100)
+            .make_row(&plan, 0, ItemKey::Line(64), &group, &prev, &[], 100, None)
             .unwrap();
         let mut s = String::new();
-        blk.render_row(&mut s, "10:00:01", &row, false);
+        blk.render_row(&mut s, "10:00:01", &row, RowMode::Instant);
         assert_eq!(
             s,
             "10:00:01           64      0.00      0.00      0.00      0.00      0.00      0.00\n"
@@ -3948,7 +3958,7 @@ mod tests {
         put(&plan, &mut cpu1, soft_col::TOTAL, 300);
         let items = vec![zeros(&plan), cpu0, cpu1];
 
-        let groups = blk.iter_groups(&plan, &items, 1);
+        let groups = blk.iter_groups(&plan, &items, 1, None);
         assert_eq!(groups.len(), 1, "既定は集約行のみ");
         let total = compute::raw_column(&plan, &groups[0].1.primary, soft_col::TOTAL).unwrap();
         assert_eq!(total, 400, "ファイルの item 0 ではなく個別 CPU の和");
@@ -3957,6 +3967,340 @@ mod tests {
         // `A_PWR_CPU` は収集時に平均が入っているので合算しない
         let pwr = block(ActivityId::PWR_CPU, &opts);
         assert!(!pwr.recomputes_aggregate());
+        // `A_CPU` は単純和ではなく aggregate_cpu() 経由
+        assert!(!block(ActivityId::CPU, &opts).recomputes_aggregate());
+    }
+
+    // ---- 区間管理 (CPU 集約 / -z / avg_count / -x) ----
+
+    /// 表示されない基準サンプルを 1 件食わせる。
+    fn adopt(blk: &mut SarBlock, plan: &DecodePlan, items: &[ItemSnapshot], uptime_cs: u64) {
+        let snap = Snapshot {
+            uptime_cs,
+            ..Default::default()
+        };
+        blk.adopt_reference(plan, items, 0, &snap);
+    }
+
+    /// 表示レコードを 1 件食わせ、出力されたデータ行を返す。
+    fn feed(
+        blk: &mut SarBlock,
+        plan: &DecodePlan,
+        prev: &[ItemSnapshot],
+        curr: &[ItemSnapshot],
+        itv_cs: u64,
+        uptime_cs: u64,
+    ) -> String {
+        let rows = blk.build_rows(plan, prev, curr, 0, itv_cs);
+        let mut text = String::new();
+        for row in &rows {
+            blk.render_row(&mut text, "10:00:01", row, RowMode::Instant);
+        }
+        blk.commit_record(rows, curr, uptime_cs, "10:00:01".to_string());
+        text
+    }
+
+    /// ブロックを閉じて平均ブロックの文字列を得る。
+    fn tail(blk: &mut SarBlock) -> String {
+        let mut out = Vec::new();
+        blk.finish(&mut out).expect("書き出せる");
+        String::from_utf8(out).expect("UTF-8")
+    }
+
+    /// オフラインになった CPU の減少が `all` 行の増加を打ち消さない (指摘 1)。
+    ///
+    /// 前後のサンプルを**それぞれ**単純合計してから差分化すると、
+    /// 現値が 0 になった CPU のぶん合計が減り、他 CPU の増加が消える。
+    /// 本家は CPU ごとに offline 判定 → 前値で埋める → 合算する (03 §1.4.3)。
+    #[test]
+    fn cpu_all_row_survives_an_offline_cpu() {
+        let opts = SarTextOptions {
+            cpus: CpuSelection::All,
+            ..Default::default()
+        };
+        let mut blk = block(ActivityId::CPU, &opts);
+        let plan = plan_for(ActivityId::CPU);
+        blk.plan = Some(plan.clone());
+
+        let cpu = |user: u64, idle: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, cpu_col::USER, user);
+            put(&plan, &mut it, cpu_col::IDLE, idle);
+            it
+        };
+        // item 0 = ファイルの `cpu` 行 (集約行は作り直すので値は使われない)
+        let prev = vec![cpu(600, 1_400), cpu(100, 900), cpu(500, 500)];
+        // CPU0 は +100 tick user / +900 tick idle、CPU1 はオフライン (全ゼロ)
+        let curr = vec![cpu(600, 1_400), cpu(200, 1_800), cpu(0, 0)];
+
+        adopt(&mut blk, &plan, &prev, 0);
+        let text = feed(&mut blk, &plan, &prev, &curr, 1_000, 1_000);
+
+        // `all` と CPU0 の 2 行だけ。オフラインの CPU1 は行そのものが出ない
+        assert_eq!(
+            text,
+            "10:00:01        all     10.00      0.00      0.00      0.00      0.00     90.00\n\
+             10:00:01          0     10.00      0.00      0.00      0.00      0.00     90.00\n",
+            "単純和だと all 行が 0.00 / 100.00 に潰れる"
+        );
+
+        // 平均行も同じ集約・同じ分母で出る (端点は最初と最後のサンプル)
+        let avg = tail(&mut blk);
+        assert_eq!(
+            avg,
+            "Average:        all     10.00      0.00      0.00      0.00      0.00     90.00\n\
+             Average:          0     10.00      0.00      0.00      0.00      0.00     90.00\n",
+            "{avg}"
+        );
+    }
+
+    /// 前サンプルでオフラインだった CPU は基準値が無いので行が出ない。
+    #[test]
+    fn cpu_returning_from_offline_has_no_row() {
+        let opts = SarTextOptions {
+            cpus: CpuSelection::All,
+            ..Default::default()
+        };
+        let mut blk = block(ActivityId::CPU, &opts);
+        let plan = plan_for(ActivityId::CPU);
+        blk.plan = Some(plan.clone());
+
+        let cpu = |user: u64, idle: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, cpu_col::USER, user);
+            put(&plan, &mut it, cpu_col::IDLE, idle);
+            it
+        };
+        // CPU1 は前サンプルでオフライン (全ゼロ) → 復帰しても差分が取れない
+        let prev = vec![cpu(100, 900), cpu(100, 900), cpu(0, 0)];
+        let curr = vec![cpu(200, 1_800), cpu(200, 1_800), cpu(50, 50)];
+
+        adopt(&mut blk, &plan, &prev, 0);
+        let text = feed(&mut blk, &plan, &prev, &curr, 1_000, 1_000);
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows.len(), 2, "all と CPU0 だけ: {text}");
+        assert!(rows[1].starts_with("10:00:01          0"), "{text}");
+        // 復帰した CPU1 は `all` の分母にも入らないので CPU0 の割合がそのまま出る
+        assert!(rows[0].contains("     10.00"), "{text}");
+    }
+
+    /// `-z` は対象外 activity の行を消さない (指摘 3)。
+    #[test]
+    fn zero_omit_only_applies_to_seven_activities() {
+        for id in [
+            ActivityId::IRQ,
+            ActivityId::SERIAL,
+            ActivityId::DISK,
+            ActivityId::NET_DEV,
+            ActivityId::NET_EDEV,
+            ActivityId::FS,
+            ActivityId::NET_SOFT,
+        ] {
+            assert!(zero_omit_applies(id), "{id} は -z の対象");
+        }
+        for id in [
+            ActivityId::CPU,
+            ActivityId::MEMORY,
+            ActivityId::QUEUE,
+            ActivityId::KTABLES,
+            ActivityId::PWR_FAN,
+        ] {
+            assert!(!zero_omit_applies(id), "{id} は -z の対象外");
+        }
+
+        let opts = SarTextOptions {
+            zero_omit: true,
+            memory: true,
+            ..Default::default()
+        };
+        // A_MEMORY: 前後で 1 バイトも変わらなくても行は出る
+        let mut mem = block(ActivityId::MEMORY, &opts);
+        let plan = plan_for(ActivityId::MEMORY);
+        mem.plan = Some(plan.clone());
+        let mut item = zeros(&plan);
+        put(&plan, &mut item, mem_col::KBMEMTOTAL, 4_000);
+        put(&plan, &mut item, mem_col::KBMEMFREE, 1_000);
+        let items = vec![item];
+        assert_eq!(
+            mem.build_rows(&plan, &items, &items, 0, 1_000).len(),
+            1,
+            "-z が A_MEMORY の行を消した"
+        );
+
+        // A_NET_DEV: 対象なので同一サンプルの行は消える
+        let mut net = block(ActivityId::NET_DEV, &opts);
+        let nplan = plan_for(ActivityId::NET_DEV);
+        net.plan = Some(nplan.clone());
+        let mut iface = zeros(&nplan);
+        iface.key = Some("eth0".into());
+        put(&nplan, &mut iface, net_dev_col::RXPCK, 100);
+        let nitems = vec![iface];
+        assert!(
+            net.build_rows(&nplan, &nitems, &nitems, 0, 1_000)
+                .is_empty(),
+            "-z が A_NET_DEV の同一行を残した"
+        );
+    }
+
+    /// `-z` で省略した区間も `Average:` の分母に残る (指摘 3 後半)。
+    ///
+    /// 「表示を省略する」ことと「期間の端点を進める」ことは別。
+    #[test]
+    fn zero_omit_still_extends_the_average_interval() {
+        let opts = SarTextOptions {
+            zero_omit: true,
+            ..Default::default()
+        };
+        let mut blk = block(ActivityId::NET_DEV, &opts);
+        let plan = plan_for(ActivityId::NET_DEV);
+        blk.plan = Some(plan.clone());
+
+        let iface = |rxpck: u64| {
+            let mut it = zeros(&plan);
+            it.key = Some("eth0".into());
+            put(&plan, &mut it, net_dev_col::RXPCK, rxpck);
+            it
+        };
+        let base = vec![iface(0)];
+        let moved = vec![iface(100)];
+
+        adopt(&mut blk, &plan, &base, 0);
+        // 1 秒で +100 パケット → 100.00/s
+        let first = feed(&mut blk, &plan, &base, &moved, 100, 100);
+        assert_eq!(&first[TSW + 10..TSW + 20], "    100.00", "{first}");
+        // 次の 1 秒は増分ゼロ → 行は省略されるが区間は 2 秒に伸びる
+        let second = feed(&mut blk, &plan, &moved, &moved, 100, 200);
+        assert!(second.is_empty(), "-z でゼロ行が出た: {second:?}");
+
+        let text = tail(&mut blk);
+        // `-z` では平均ブロックにもヘッダ行が付く (ラベルは `Average:`)
+        let avg = text
+            .lines()
+            .filter(|l| l.starts_with("Average:"))
+            .nth(1)
+            .expect("Average データ行がある");
+        // 100 パケット / 2 秒 = 50.00。端点を進めないと 100.00 になる
+        assert_eq!(&avg[TSW + 10..TSW + 20], "     50.00", "{text}");
+    }
+
+    /// ゲージの `Average:` の分母は activity 共通の `avg_count` (指摘 4)。
+    ///
+    /// 2 回の表示のうち最後だけ現れた 1,000 rpm は、
+    /// item ごとの観測回数で割ると 1,000、本家方式では 500 になる。
+    #[test]
+    fn gauge_average_divides_by_the_activity_wide_count() {
+        let opts = SarTextOptions::default();
+        let mut blk = block(ActivityId::PWR_FAN, &opts);
+        let plan = plan_for(ActivityId::PWR_FAN);
+        blk.plan = Some(plan.clone());
+
+        // `stats_pwr_fan` の `rpm` は double なのでビット列で入れる
+        let fan = |rpm: f64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, fan_col::RPM, rpm.to_bits());
+            it
+        };
+        let one = vec![fan(0.0)];
+        let two = vec![fan(0.0), fan(1_000.0)];
+
+        adopt(&mut blk, &plan, &one, 0);
+        feed(&mut blk, &plan, &one, &one, 100, 100);
+        feed(&mut blk, &plan, &one, &two, 100, 200);
+
+        let text = tail(&mut blk);
+        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("Average:")).collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert_eq!(&rows[0][TSW + 10..TSW + 20], "      0.00", "{text}");
+        assert_eq!(
+            &rows[1][TSW + 10..TSW + 20],
+            "    500.00",
+            "item ごとの観測回数で割ると 1000 になる: {text}"
+        );
+        // 分母は全 item で揃う
+        assert!(
+            blk.items.iter().all(|st| st.accum.count == 2),
+            "avg_count が item ごとにずれている"
+        );
+    }
+
+    /// `-x` は item ごとに `Summary:` / `Minimum:` / `Maximum:` / 平均行を出す (指摘 2)。
+    #[test]
+    fn minmax_block_has_summary_minimum_maximum_average() {
+        let opts = SarTextOptions {
+            minmax: true,
+            ..Default::default()
+        };
+        let mut blk = block(ActivityId::QUEUE, &opts);
+        let plan = plan_for(ActivityId::QUEUE);
+        blk.plan = Some(plan.clone());
+
+        let queue = |runq: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, queue_col::RUNQ_SZ, runq);
+            it
+        };
+        adopt(&mut blk, &plan, &[queue(1)], 0);
+        feed(&mut blk, &plan, &[queue(1)], &[queue(1)], 100, 100);
+        feed(&mut blk, &plan, &[queue(1)], &[queue(3)], 100, 200);
+
+        let text = tail(&mut blk);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5, "{text}");
+        // ヘッダ行の先頭 \n による空行 → Summary: ヘッダ → Minimum: → Maximum: → Average:
+        assert_eq!(lines[0], "", "ブロックの前に空行 1 行");
+        assert!(lines[1].starts_with("Summary:   "), "{text}");
+        assert!(lines[1].contains("runq-sz"), "{text}");
+        assert!(lines[2].starts_with("Minimum:   "), "{text}");
+        assert!(lines[3].starts_with("Maximum:   "), "{text}");
+        assert!(lines[4].starts_with("Average:   "), "{text}");
+        // runq-sz は 1 と 3 を観測 → 最小 1 / 最大 3 / 平均 2
+        // 極値は瞬時値と同じ書式 (整数)、平均だけ小数 0 桁の浮動小数
+        assert_eq!(&lines[2][TSW..TSW + 10], "         1", "{text}");
+        assert_eq!(&lines[3][TSW..TSW + 10], "         3", "{text}");
+        assert_eq!(&lines[4][TSW..TSW + 10], "         2", "{text}");
+    }
+
+    /// `-x` の極値は `LINUX RESTART` ごとに初期化される。
+    #[test]
+    fn minmax_resets_on_restart() {
+        let opts = SarTextOptions {
+            minmax: true,
+            ..Default::default()
+        };
+        let mut blk = block(ActivityId::QUEUE, &opts);
+        let plan = plan_for(ActivityId::QUEUE);
+        blk.plan = Some(plan.clone());
+
+        let queue = |runq: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, queue_col::RUNQ_SZ, runq);
+            it
+        };
+        adopt(&mut blk, &plan, &[queue(9)], 0);
+        feed(&mut blk, &plan, &[queue(9)], &[queue(9)], 100, 100);
+
+        let mut out = Vec::new();
+        blk.event(
+            &mut out,
+            &RecordEvent::Restart {
+                ust_time: 0,
+                hour: 10,
+                minute: 0,
+                second: 1,
+                cpu_count: Some(2),
+            },
+        )
+        .expect("書き出せる");
+        // RESTART 後の区間は 1 だけを観測する
+        adopt(&mut blk, &plan, &[queue(1)], 200);
+        feed(&mut blk, &plan, &[queue(1)], &[queue(1)], 100, 300);
+        let text = tail(&mut blk);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            &lines[3][TSW..TSW + 10],
+            "         1",
+            "前区間の 9 が残った: {text}"
+        );
     }
 
     // ---- 実データによる結合テスト ----

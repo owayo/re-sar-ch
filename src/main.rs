@@ -954,10 +954,22 @@ fn write_segment_text<W: Write>(out: &mut W, seg: &BootSegment) -> anyhow::Resul
         p.broken_intervals
     )?;
     for b in &seg.boundaries {
+        // 引き継いだかどうかを必ず残す (`multi.rs` の方針)
+        let verdict = if b.decision.continuous {
+            "差分を引き継いだ".to_string()
+        } else {
+            format!(
+                "不連続 ({}、空白 {} 秒)",
+                b.decision
+                    .reason
+                    .map_or("理由不明".to_string(), |r| format!("{r:?}")),
+                b.decision.gap_secs
+            )
+        };
         writeln!(
             out,
-            "  ファイル境界 {} → {}: {:?}",
-            b.prev_file, b.next_file, b.decision
+            "  ファイル境界 {} → {}: {verdict}",
+            b.prev_file, b.next_file
         )?;
     }
 

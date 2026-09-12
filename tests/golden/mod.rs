@@ -397,7 +397,7 @@ pub fn compare(expected: &str, actual: &str, masks: &[Mask]) -> Comparison {
     // 食い違いの塊 (期待側だけの行 / 実際側だけの行) を溜めてから突き合わせる
     let mut only_exp: Vec<usize> = Vec::new();
     let mut only_act: Vec<usize> = Vec::new();
-    let mut flush = |cmp: &mut Comparison, only_exp: &mut Vec<usize>, only_act: &mut Vec<usize>| {
+    let flush = |cmp: &mut Comparison, only_exp: &mut Vec<usize>, only_act: &mut Vec<usize>| {
         for k in 0..only_exp.len().max(only_act.len()) {
             let (ei, ai) = (only_exp.get(k).copied(), only_act.get(k).copied());
             let (e, a) = (ei.map(|i| exp[i]), ai.map(|i| act[i]));
@@ -465,7 +465,19 @@ mod tests {
         assert_eq!(c.diffs[0].actual_line, Some(2));
     }
 
-    /// 行数が違う場合も行番号をずらさずに報告する。
+    /// 途中に 1 行増えても、以降の行が全部不一致にならない (共通部分列で揃える)。
+    #[test]
+    fn an_inserted_line_does_not_shift_everything() {
+        let e = "a\nb\nc\nd\n";
+        let a = "a\nb\nX\nc\nd\n";
+        let c = compare(e, a, &[]);
+        assert_eq!(c.diffs.len(), 1, "増えた 1 行だけが差分になる");
+        assert_eq!(c.diffs[0].expected, None);
+        assert_eq!(c.diffs[0].actual.as_deref(), Some("X"));
+        assert_eq!(c.diffs[0].actual_line, Some(3));
+    }
+
+    /// 行数が違う場合も対応づけて報告する。
     #[test]
     fn reports_missing_and_extra_lines() {
         let c = compare("a\n", "a\nb\n", &[]);

@@ -4280,15 +4280,18 @@ mod tests {
         );
         assert_eq!(got, vec![Ok(300.0), Ok(100.0)]);
 
-        // 先頭スロット (= `all` 列) だけ「総数が減ったら 0」のクランプが効く (03 §id=3)
-        let mut dropped = zeros(&plan);
-        put(&plan, &mut dropped, irq_col::COUNT, 900);
+        // 先頭スロット (= `all` 列) だけ「総数が減ったら 0」のクランプが効く (03 §id=3)。
+        // CPU がオフラインになると割り込み総数が減る。
+        let mut high = zeros(&plan);
+        put(&plan, &mut high, irq_col::COUNT, 1_300);
+        let mut low = zeros(&plan);
+        put(&plan, &mut low, irq_col::COUNT, 900);
         let clamped = matrix_row_values(
             ActivityId::IRQ,
             irq_col::COUNT,
             &plan,
-            &[c_cpu0.clone(), c_cpu0.clone()],
-            &[dropped.clone(), dropped],
+            &[high.clone(), high],
+            &[low.clone(), low],
             &ctx,
         );
         assert_eq!(
@@ -4296,9 +4299,11 @@ mod tests {
             Ok(0.0),
             "合計列は CPU オフラインで総数が減っても 0"
         );
+        // 個別 CPU 列にクランプは無いので、本家と同じ符号なし減算の巨大値が出る
+        let per_cpu = clamped[1].unwrap();
         assert!(
-            clamped[1].unwrap() > 1.0e17,
-            "個別 CPU 列にクランプは無い (本家と同じ符号なし減算の値)"
+            per_cpu > 1.0e9,
+            "個別 CPU 列にクランプは無い (03 §id=3): {per_cpu}"
         );
     }
 

@@ -22,9 +22,9 @@ use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Field, Fmt, Group, Shape};
 use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, render, spec};
 use crate::error::Result;
-use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
+use crate::output::time_filter::Admit;
 use crate::series::{IntervalView, Selection, WalkItem, walk_items};
 
 /// `sadf.h` の `XML_DTD_VERSION`。

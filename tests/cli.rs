@@ -426,7 +426,7 @@ fn show_supports_every_format() {
         "sadf-d",
         "sadf-json",
         "sadf-xml",
-        "sadf-r",
+        "sadf-raw",
     ] {
         let out = run_ok(&["show", as_str(&f), "--format", fmt]);
         assert!(!out.trim().is_empty(), "show --format {fmt} が何も出さない");

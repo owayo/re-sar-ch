@@ -409,7 +409,7 @@ mod tests {
     fn unbounded_filter_emits_everything() {
         let f = TimeFilter::default();
         assert!(f.is_unbounded());
-        let mut c = f.cursor();
+        let c = f.cursor();
         assert!(c.is_unbounded());
         assert!(c.event(0, (0, 0, 0)));
         // sample は IntervalView が必要なので、境界なしの早期 return を

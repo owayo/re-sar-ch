@@ -30,8 +30,8 @@ use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::layout::registry::{ActivityDef, ColumnMeta};
 use crate::model::{ActivityId, Availability, ValueKind};
-use crate::series::compute::ComputeIssue;
 use crate::output::time_filter::{Admit, TimeFilter};
+use crate::series::compute::ComputeIssue;
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 公開スキーマの版。

@@ -46,6 +46,7 @@
 mod fixtures;
 mod golden;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,6 +62,7 @@ use re_sar_ch::format::{SaFile, ScanControl, layouts, selfdesc};
 use re_sar_ch::model::ActivityId;
 use re_sar_ch::output::sadf;
 use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
+use re_sar_ch::output::time_filter::TimeFilter;
 use re_sar_ch::series::{Selection, walk};
 
 // ===========================================================================
@@ -373,11 +375,11 @@ const HEADER_ERROR_DATA: &[&str] = &[
 // 期待出力の再現 (ライブラリ API を直接呼ぶ)
 // ===========================================================================
 //
-// `resarch` をプロセスとして起動はしない。CLI (`src/main.rs`) は出力層へ
-// まだ繋がっておらず、また環境変数 (`TZ` / `LC_ALL`) に依存させると
-// 「差分の原因が環境か実装か」を切り分けられなくなる。
-// 代わりに `sar` の引数列を [`parse_sar_args`] へ通し、その結果を
-// 出力層のオプションへ写して [`sar_text::write_report`] を呼ぶ。
+// `resarch` をプロセスとして起動はしない。環境変数 (`TZ` / `LC_ALL`) に
+// 依存させると「差分の原因が環境か実装か」を切り分けられなくなるうえ、
+// CLI 層と出力層のどちらが原因かも分からなくなる。
+// 代わりに `sar` の引数列を [`parse_sar_args`] へ通し (= CLI の解釈も検証し)、
+// その結果を出力層のオプションへ写して [`sar_text::write_report`] を呼ぶ。
 
 /// `sar` 互換テキストを生成する。
 ///
@@ -414,7 +416,22 @@ fn render_sadf_header(file: &SaFile) -> Result<String, String> {
 /// 時刻は [`TimeStyle::Utc`] にする。本家テストは `TZ=GMT` を明示しており、
 /// `sar` 既定のローカル時刻表示は GMT 環境では UTC 表示と一致する。
 /// `-t` (`true_time`) のときだけレコードに焼き込まれた時分秒を使う。
+///
+/// **フィールドは `..Default::default()` で省略せず全て明示する。**
+/// 出力オプションが増えたときにコンパイルエラーで気付けるようにして、
+/// 「新しいオプションが既定値のまま無視され、再現が静かに崩れる」のを防ぐ。
 fn sar_text_options(o: &SarOptions) -> SarTextOptions {
+    // GOLDEN_CASES はいずれも `-s` / `-e` と item リストを使わない。
+    // 使うケースが増えたらここで気付けるようにしておく (黙って無視しない)。
+    assert!(
+        o.tm_start.is_none() && o.tm_end.is_none(),
+        "-s / -e を使うケースは時刻フィルタの写しが必要"
+    );
+    assert!(
+        o.item_lists.is_empty(),
+        "--dev= / --iface= / --fs= / --int= を使うケースは item フィルタの写しが必要"
+    );
+
     let bitmap = &o.cpu_bitmap;
     let cpus = if bitmap.count_bits() == bitmap.capacity_bits() {
         // `-P ALL` / `-A` は全ビットを立てる
@@ -448,10 +465,13 @@ fn sar_text_options(o: &SarOptions) -> SarTextOptions {
             TimeStyle::Utc
         },
         cpus,
+        // 上の assert のとおり、対象ケースは時刻範囲も item リストも使わない
+        time_filter: TimeFilter::default(),
+        item_names: BTreeMap::new(),
     }
 }
 
-/// 不一致ケースの出力全体を `target/golden-actual/` へ書き出す。
+/// 不一致ケースの出力全体を `target/fixtures/golden-actual/` へ書き出す。
 ///
 /// 行単位の要約では追えない食い違い (ブロックの増減・順序) を
 /// `diff -u <expected> <actual>` で追えるようにする。書けなければ諦める

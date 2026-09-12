@@ -35,9 +35,9 @@ use super::{
     ABSENT_TEXT, FileInfo, SadfConfig, Stamp, double_from_bits, render, spec, write_sensor,
 };
 use crate::error::Result;
-use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::{ActivityId, Availability};
+use crate::output::time_filter::Admit;
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 use super::dbppc::{display_cpu_count, scan_blocks, selected_specs};

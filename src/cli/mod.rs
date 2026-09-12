@@ -134,12 +134,28 @@ pub struct CommonArgs {
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     pub activity: Vec<String>,
 
-    /// 開始時刻。
-    #[arg(long, value_name = "TIME")]
+    /// 開始時刻 (`hh:mm[:ss]` または 10 桁の epoch 秒)。
+    ///
+    /// `show` では表示する行、`summarize` / `compare` では**集計期間そのもの**を
+    /// 絞る。範囲外のサンプルは平均・最大 / 最小・p95・差分合計のどれにも
+    /// 入らず、期間の端点 (`first_ust` / `last_ust` / `covered_cs`) も
+    /// 範囲内だけになる。
+    ///
+    /// `sar -s` と同じく、**範囲に最初に合致したサンプルは差分の基準として
+    /// 消費される** (`show` では表示されず、`summarize` では値に数えない)。
+    /// 複数ファイルを渡した場合はファイルごとに引き直すので、
+    /// `--from 09:00 --to 18:00` は「各日の 09:00〜18:00」を意味する。
+    ///
+    /// `detect` の `--from` / `--to` は意味が違う (報告範囲だけを絞り、
+    /// 比較基準の材料は絞らない)。`resarch detect --help` を参照。
+    #[arg(long, value_name = "TIME", verbatim_doc_comment)]
     pub from: Option<String>,
 
-    /// 終了時刻。
-    #[arg(long, value_name = "TIME")]
+    /// 終了時刻 (`hh:mm[:ss]` または 10 桁の epoch 秒)。
+    ///
+    /// 意味は `--from` と対。`hh:mm[:ss]` 形式で `--to` < `--from` のときは
+    /// 翌日までを指す (`sar` と同じ日跨ぎ補正)。
+    #[arg(long, value_name = "TIME", verbatim_doc_comment)]
     pub to: Option<String>,
 
     /// 疑わしいデータをエラーにする (既定)。
@@ -162,6 +178,13 @@ pub struct CommonArgs {
 /// `resarch show` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ShowArgs {
+    // `SummarizeArgs::help` と同じ理由で自前の `--help` を持つ。
+    // `--from` / `--to` の説明が読めないと、基準レコードが表示されない挙動を
+    // 利用者が確かめられない。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
     /// 解析対象の `sa` ファイル。
     #[arg(value_name = "FILE", required = true, num_args = 1..)]
     pub files: Vec<PathBuf>,
@@ -177,6 +200,14 @@ pub struct ShowArgs {
 /// `resarch summarize` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct SummarizeArgs {
+    // ルートの `disable_help_flag` は子コマンドへ伝播するため、自前で
+    // `--help` を定義する ([`DetectArgs::help`] と同じ理由)。
+    // `--from` / `--to` の意味が `detect` と違うので、ヘルプが読めないままに
+    // しておけない。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
     /// 解析対象の `sa` ファイル。
     #[arg(value_name = "FILE", required = true, num_args = 1..)]
     pub files: Vec<PathBuf>,
@@ -293,13 +324,22 @@ pub struct DetectArgs {
 /// `resarch compare` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct CompareArgs {
+    // `SummarizeArgs::help` と同じ理由で自前の `--help` を持つ。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
     /// 比較対象を `NAME=PATH` で指定する (複数回指定可)。
+    ///
+    /// `--from` / `--to` はホストごとの集計期間を絞り、その結果として
+    /// 比較の共通時間窓 (各ホストの観測期間の交差) も絞られる。
     #[arg(
         long = "host",
         value_name = "NAME=PATH",
         required = true,
         action = ArgAction::Append,
-        value_parser = parse_host_spec
+        value_parser = parse_host_spec,
+        verbatim_doc_comment
     )]
     pub hosts: Vec<HostSpec>,
 
@@ -350,8 +390,16 @@ pub struct CompatArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
     /// 独自形式で閲覧する。
+    //
+    // `--help` の扱いは [`Commands::Summarize`] と同じ。
+    #[command(disable_help_flag = true)]
     Show(ShowArgs),
     /// 期間集計とボトルネック判定を出す。
+    //
+    // 自動生成の `--help` を止めて [`SummarizeArgs`] 側で定義する
+    // (理由は [`SummarizeArgs::help`] を参照)。この注記は利用者向けの説明では
+    // ないので、`--help` に出ないよう doc コメントにしない。
+    #[command(disable_help_flag = true)]
     Summarize(SummarizeArgs),
     /// いつ・何に異変があったか当たりを付ける。
     ///
@@ -360,6 +408,9 @@ pub enum Commands {
     #[command(disable_help_flag = true)]
     Detect(DetectArgs),
     /// 複数ホストを比較する。
+    //
+    // `--help` の扱いは [`Commands::Summarize`] と同じ。
+    #[command(disable_help_flag = true)]
     Compare(CompareArgs),
     /// ファイルヘッダ (世代・ABI・activity 一覧) のみ表示する。
     Info(InfoArgs),

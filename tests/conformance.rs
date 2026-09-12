@@ -584,6 +584,13 @@ fn sar_text_options(o: &SarOptions) -> SarTextOptions {
         o.item_lists.is_empty(),
         "--dev= / --iface= / --fs= / --int= を使うケースは item フィルタの写しが必要"
     );
+    // `-i` / positional interval / count も同様。ここは既定 (全レコード) だけを
+    // 再現する経路 (`write_report`) を呼ぶので、指定があれば
+    // `write_report_with` へ `SampleSelect` を渡す必要がある。
+    assert!(
+        !o.flags.interval_set && o.interval.unwrap_or(1) <= 1 && o.count.is_none(),
+        "-i / positional interval / count を使うケースはサンプル選別の写しが必要"
+    );
 
     let bitmap = &o.cpu_bitmap;
     let cpus = if bitmap.count_bits() == bitmap.capacity_bits() {

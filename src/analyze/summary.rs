@@ -190,7 +190,11 @@ pub struct SummarySource {
 /// 期間の範囲。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PeriodBounds {
-    /// 最初のサンプルの時刻 (エポック秒)。
+    /// 集計期間の始点 (エポック秒) = 最初に採った区間の始点。
+    ///
+    /// 系列の先頭サンプルは区間を持たないのでそのサンプルの時刻になる。
+    /// 時刻フィルタで絞った場合は、範囲に最初に合致したサンプル
+    /// (差分の基準として消費したもの) の時刻になる。
     pub first_ust: Option<u64>,
     /// 最後のサンプルの時刻 (エポック秒)。
     pub last_ust: Option<u64>,
@@ -567,6 +571,15 @@ struct ActivityAccum {
 /// 複数ファイル横断では、ファイル境界をまたいだ区間も
 /// [`NativeSummaryBuilder::observe`] へ渡すことで 1 つの系列として集計できる
 /// (`src/multi.rs` がその繋ぎを担う)。**差分をファイル単位で完結させない**。
+///
+/// # 期間を絞るのは呼び出し側
+///
+/// `--from` / `--to` による絞り込みは、**渡す区間を選ぶ**ことで行う
+/// ([`crate::multi::MultiOptions::time_filter`])。この集計器は受け取った区間を
+/// すべて数えるので、範囲外のサンプルが平均や p95 の重みに混ざる余地が無い。
+/// 集計器側で時刻を見る作りにすると、「範囲に最初に合致したレコードを
+/// 差分の起点としてだけ使う」`sar -s` の意味論や、ファイルごとに
+/// フィルタを引き直す必要 (日ごとの時間帯指定) を持ち込むことになる。
 #[derive(Debug)]
 pub struct NativeSummaryBuilder {
     opts: SummaryOptions,
@@ -592,16 +605,24 @@ impl NativeSummaryBuilder {
         }
         self.period.samples += 1;
         let end_ust = view.curr.ust_time;
-        if self.period.first_ust.is_none() {
-            self.period.first_ust = Some(end_ust);
-        }
-        self.period.last_ust = Some(end_ust);
-
         let start_ust = if view.has_prev {
             view.prev.ust_time
         } else {
             end_ust
         };
+        // 期間の始点は**最初に採った区間の始点**。
+        //
+        // 当サンプルの時刻を入れると、時刻フィルタ (`--from`) で絞ったときに
+        // 「基準サンプル → 最初に数えた区間」の長さが `covered_cs` に入るのに
+        // `first_ust` には現れず、`covered_cs` と `last_ust − first_ust` が
+        // 食い違う (レートの分母を読む側が期間を取り違える)。
+        // 系列の先頭サンプルは前サンプルが無く `start_ust == end_ust` なので、
+        // 絞らないときの値は変わらない。
+        if self.period.first_ust.is_none() {
+            self.period.first_ust = Some(start_ust);
+        }
+        self.period.last_ust = Some(end_ust);
+
         // 区間長を重みに使えるのは「前サンプルがあり、かつ連続」な場合だけ。
         // 再起動を挟むと uptime 差分が意味を失うため、重み 0 として扱う。
         let weight_cs = if view.has_prev && view.continuous {

@@ -38,9 +38,10 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::format::file::SaFile;
 use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
-use crate::model::{ActivityId, Aggregation, Availability, CounterBits, Unit, ValueKind};
-use crate::series::compute::{ComputeContext, column_value_strict, tick_total};
-use crate::series::delta::{Delta, DeltaContext, compute_delta};
+use crate::model::{ActivityId, Aggregation, Availability, Unit, ValueKind};
+use crate::series::compute::{
+    ComputeContext, RateSample, column_value_strict, rate_from_totals, rate_sample, tick_total,
+};
 use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
 };
@@ -347,6 +348,13 @@ impl NativePeriodSummary {
 
 #[derive(Debug)]
 struct ColumnAccum {
+    /// どの activity の何列目か。
+    ///
+    /// 「差分合計 ÷ 分母合計」から表示単位のレートを出すには
+    /// [`rate_from_totals`] に列を渡す必要がある (列ごとに保存値のスケールが
+    /// 違う: `rkB/s` は 1/2、`aqu-sz` は 1/1000、`%util` は 1/10)。
+    id: ActivityId,
+    column: usize,
     meta: ColumnMeta,
     method: AggregationMethod,
     rate_denominator: Option<RateDenominator>,
@@ -390,9 +398,11 @@ impl AccumConfig {
 }
 
 impl ColumnAccum {
-    fn new(meta: ColumnMeta, cfg: AccumConfig) -> Self {
+    fn new(id: ActivityId, column: usize, meta: ColumnMeta, cfg: AccumConfig) -> Self {
         let (method, denom) = plan_method(&meta, cfg);
         Self {
+            id,
+            column,
             meta,
             method,
             rate_denominator: denom,
@@ -450,12 +460,21 @@ impl ColumnAccum {
 
     fn mean(&self) -> Option<f64> {
         match self.method {
+            // **保存値 → 表示単位の換算を計算層に委ねる (指摘 2)。**
+            //
+            // ここで `delta_total / denom_total * 100.0` を直接返すと、
+            // 生の差分の単位がそのまま出てしまい、瞬時値から作る
+            // 最大 / 最小 / p95 と平均の単位が食い違う
+            // (`rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
+            // PSI の圧力割合が 10,000 倍)。列ごとの係数は計算層が
+            // [`rate_scale`] に持っているので、換算はそこへ一本化する。
             AggregationMethod::RateOverValidIntervals => {
-                if self.denom_total == 0 {
-                    return None;
-                }
-                Some(self.delta_total as f64 / self.denom_total as f64 * 100.0)
+                rate_from_totals(self.id, self.column, self.delta_total, self.denom_total)
             }
+            // 差分の総量そのもの (`read_ticks` などの内部フィールド)。
+            // レートではないので `rate_scale` は掛けない。掛けてよい列が
+            // `Aggregation::Sum` に現れないことは
+            // `sum_columns_need_no_rate_scale` が機械的に確認する。
             AggregationMethod::DeltaSum => {
                 if self.intervals == 0 {
                     return None;
@@ -672,7 +691,6 @@ impl NativeSummaryBuilder {
 
             let setup = DeltaSetup {
                 normalize_by_ticks,
-                timing,
                 missing_prev: if view.has_prev {
                     // 前サンプルはあるのに同一 item が無い
                     ExclusionReason::ItemReplaced
@@ -696,7 +714,7 @@ impl NativeSummaryBuilder {
                 // `compute` 層の表示値は本家の符号なし減算をそのまま再現するため、
                 // カウンタ逆行時に巨大な値になり得る。集計ではそれを採らない。
                 let strict = (meta.is_direct() && matches!(meta.kind, ValueKind::Counter))
-                    .then(|| counter_delta(plan, column, prev_item, item, &ctx, setup));
+                    .then(|| counter_delta(snap.id, plan, column, prev_item, item, &ctx, setup));
 
                 let outcome = match strict {
                     Some(Err(reason)) => Outcome::Excluded(reason),
@@ -813,6 +831,7 @@ impl NativeSummaryBuilder {
         columns: &'static [ColumnMeta],
         cfg: AccumConfig,
     ) -> usize {
+        let id = self.activities[activity].id;
         let items = &mut self.activities[activity].items;
         if let Some(i) = items.iter().position(|it| it.label == label) {
             return i;
@@ -820,7 +839,11 @@ impl NativeSummaryBuilder {
         items.push(ItemAccum {
             label: label.to_string(),
             key: key.map(|k| k.to_string()),
-            columns: columns.iter().map(|m| ColumnAccum::new(*m, cfg)).collect(),
+            columns: columns
+                .iter()
+                .enumerate()
+                .map(|(column, m)| ColumnAccum::new(id, column, *m, cfg))
+                .collect(),
         });
         items.len() - 1
     }
@@ -921,7 +944,6 @@ static EMPTY_ITEM: ItemSnapshot = ItemSnapshot {
 struct DeltaSetup {
     /// CPU tick 合計で正規化するか。
     normalize_by_ticks: bool,
-    timing: Timing,
     /// 前サンプルの同一 item が無いときの除外理由。
     ///
     /// 系列の先頭なら `FirstSample`、前サンプルはあるのに同一 item が
@@ -929,78 +951,49 @@ struct DeltaSetup {
     missing_prev: ExclusionReason,
 }
 
-/// レート集計の分子と分母。
-#[derive(Debug, Clone, Copy)]
-struct StrictDelta {
-    /// 有効と判定した差分。
-    delta: u64,
-    /// 分母 (区間長または tick 合計)。
-    denominator: u64,
-    /// カウンタのラップを復元して得た差分か。
-    wrapped: bool,
-}
-
 /// カウンタ列の差分と分母を、厳密な不連続判定付きで求める。
 ///
-/// `series::delta::compute_delta` を使うので、
-/// 減少を一律ラップと解釈せず、曖昧な場合は除外する。
+/// 本体は計算層の [`rate_sample`] で、ここは**除外理由を集計側の語彙へ
+/// 翻訳するだけ**の薄い層である。差分の採り方 (減少を一律ラップと解釈しない、
+/// 本家が 0 にクランプする列は区間の寄与を 0 にする) を集計側で書き直すと、
+/// 同じ区間の瞬時値と集計が食い違う。
+///
+/// 計算層が持たない情報だけを先に判定する。
+///
+/// | 先に見る理由 | 集計側の語彙 |
+/// |---|---|
+/// | この世代のファイルにその列が無い | `UnsupportedBySource` (系列の先頭でも「列が無い」と言う) |
+/// | 前サンプルの同一 item が無い | `FirstSample` / `ItemReplaced` の区別 (計算層は前者しか知らない) |
+/// | CPU の tick 合計が 0 | `ZeroDenominator` (区間長 0 の `NonPositiveElapsed` と区別する) |
 fn counter_delta(
+    id: ActivityId,
     plan: &crate::layout::plan::DecodePlan,
     column: usize,
     prev_item: Option<&ItemSnapshot>,
     curr_item: &ItemSnapshot,
     ctx: &ComputeContext,
     setup: DeltaSetup,
-) -> std::result::Result<StrictDelta, ExclusionReason> {
-    let curr_v = match plan.column_value(&curr_item.values, column) {
-        Availability::Present(v) => v,
+) -> std::result::Result<RateSample, ExclusionReason> {
+    // 「列そのものが無い」は前サンプルの有無より先に報告する。
+    // 差分が取れないのは列が無いからであって、系列の先頭だからではない
+    // (先頭サンプルだけ `first_sample` と報告されると理由が揺れる)。
+    match plan.column_value(&curr_item.values, column) {
+        Availability::Present(_) => {}
         Availability::UnsupportedBySource => return Err(ExclusionReason::UnsupportedBySource),
         Availability::MissingInSample => return Err(ExclusionReason::MissingInSample),
-    };
+    }
     // 前サンプルの同一 item が無い理由は呼び出し側が知っている
     // (系列の先頭なのか、item が入れ替わったのか)
     let Some(prev_item) = prev_item else {
         return Err(setup.missing_prev);
     };
-    let prev_v = match plan.column_value(&prev_item.values, column) {
-        Availability::Present(v) => v,
-        Availability::UnsupportedBySource => return Err(ExclusionReason::UnsupportedBySource),
-        Availability::MissingInSample => return Err(ExclusionReason::MissingInSample),
-    };
+    // CPU 割合の分母はその item の tick 合計。0 = その CPU は動いていないので
+    // 0% と報告しない。区間長が 0 の場合と理由を分けるためここで判定する。
+    if setup.normalize_by_ticks && !matches!(ctx.tick_total, Some(t) if t > 0) {
+        return Err(ExclusionReason::ZeroDenominator);
+    }
 
-    let bits = plan.column_bits(column).unwrap_or(CounterBits::B64);
-    let (delta, wrapped) = match compute_delta(
-        prev_v,
-        curr_v,
-        bits,
-        DeltaContext {
-            continuous: ctx.continuous,
-            same_item: true,
-        },
-    ) {
-        Delta::Valid(d) => (d, false),
-        Delta::Wrapped(d) => (d, true),
-        Delta::Unavailable(disc) => return Err(ExclusionReason::from(disc)),
-    };
-
-    // 分母: CPU 割合はその item の tick 合計、それ以外は区間長
-    let denominator = if setup.normalize_by_ticks {
-        match ctx.tick_total {
-            // tick 合計 0 = その CPU は動いていない。0% と報告しない。
-            Some(0) | None => return Err(ExclusionReason::ZeroDenominator),
-            Some(t) => t,
-        }
-    } else if setup.timing.itv_cs == 0 {
-        return Err(ExclusionReason::NonPositiveElapsed);
-    } else {
-        setup.timing.itv_cs
-    };
-
-    Ok(StrictDelta {
-        delta,
-        denominator,
-        wrapped,
-    })
+    rate_sample(plan, id, column, prev_item, curr_item, ctx).map_err(ExclusionReason::from)
 }
 
 /// CPU tick 合計で正規化する activity か。

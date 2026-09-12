@@ -878,6 +878,23 @@ fn upstream_headers_decode_to_the_measured_facts() {
 /// (`sar` 互換が中核価値なので、未達を緑にしない)。
 /// [`Repro::Unsupported`] を宣言したケースだけは「比較不能」として集計し、
 /// 失敗にはしない (実装の誤りではなく、出力形式そのものが無いため)。
+///
+/// # 現在の不一致 (2026-09-12 時点: 全文一致 5 / 不一致 10 / 比較不能 1)
+///
+/// 残っている差分はすべて次の 9 件に帰着する。いずれも**ファイルの中身から
+/// 再現できる**値なのでマスクせず、不一致のまま残してある。直したらこの表も消す。
+///
+/// | # | 症状 | 本家の規則 |
+/// |---|---|---|
+/// | 1 | 先頭イベント (最初の統計レコードより前の `LINUX RESTART` / `COM`) を activity ブロックごとに再出力する | 先頭イベントは activity ループの**外**で 1 回だけ出す (`sar.c: read_stats_from_file()`、03 §2.1) |
+/// | 2 | `magic` が現行と違う activity を表示してしまう (`data-12.0.0` の `A_IRQ` = `0x8b`) | 既知 ID でも magic 不一致なら `id_seq[]` に入れない = 表示しない (`sa_common.c: check_file_actlst()`) |
+/// | 3 | `sa_cpu_nr` を持たない世代 (`0x2171`) で CPU 数が 1 になる | `A_CPU` の `file_activity.nr` を CPU 数として使う (01 §5.x の変換表) |
+/// | 4 | 同世代で `kbavail` が 0 になる | `availablekb` が無い世代は `frmkb` (空きメモリ) で代用する (01 §5.x) |
+/// | 5 | item 数を `file_activity.nr` (割り当て上限) で回し、空スロットまで表示する | `has_nr` の無い世代は番兵で数える (`count_stats_*`、01 §5.9)。`nr[curr] == 0` の activity はブロックごと出さない (03 §3 の平均行の条件) |
+/// | 6 | `A_NET_SOFT` のオフライン CPU 行を出す | 前サンプルの 6 カウンタが全 0 の CPU は出さない (`count.c: get_global_soft_statistics()`) |
+/// | 7 | `sadf -H` の `File date:` がヘッダの `sa_day/month/year` 由来 | `localtime(sa_ust_time)` 由来 (`sa_common.c: get_file_timestamp_struct()`)。ヘッダ日付を使うのは `-t` のときだけ |
+/// | 8 | `sar` のバナー日付が同じ理由でずれる (`data-ukwn` 系は手書きで両者が食い違う) | 同上 |
+/// | 9 | 未知 activity ID に `[Unknown format]` を付ける | 付くのは**既知 ID かつ magic 不一致**のときだけ (`sadf_misc.c: print_hdr_header()`) |
 #[test]
 #[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
 fn golden_outputs_match_upstream() {

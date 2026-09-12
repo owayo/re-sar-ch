@@ -34,6 +34,23 @@
 //! [`wrapping_delta`] / [`s_value_bits`] に幅を渡す
 //! (詳しい理由と本家との関係は [`super::delta`] のモジュールドキュメント)。
 //!
+//! ## 出力経路ごとに計算を持たせない
+//!
+//! 「表示値を出す計算」は 1 区間ぶんだけではない。次の 4 種類があり、
+//! **どれもこの層に置く**。sar 互換出力にしか無い計算があると、
+//! 同じファイルから出した sadf / 独自出力 / 期間集計の値がずれる。
+//!
+//! | 何を出すか | 入口 |
+//! |---|---|
+//! | 1 区間の表示値 | [`column_value`] / [`column_value_strict`] |
+//! | 期間集計の素材と表示単位 | [`rate_sample`] → [`rate_from_totals`] |
+//! | `sadf` だけにある別単位の列 | [`SadfUnitColumn`] / [`sadf_unit_value`] |
+//! | 行列型の 1 行分 (`wghMHz` / `A_IRQ`) | [`matrix_row_values`] |
+//!
+//! `A_CPU` は分母が特殊なので、どの経路も値を出す前に
+//! [`cpu_interval`] (個別 CPU) / [`aggregate_cpu`] (CPU "all") を通す。
+//! ここに「補正済みの前値・分母・オフライン / tickless 判定」がまとまっている。
+//!
 //! ## 欠落の扱いは方針で分ける
 //!
 //! 「その世代のファイルに無いフィールド」を 0 とみなすと、
@@ -43,9 +60,15 @@
 //! そこで [`MissingPolicy`] で 2 つの方針を分ける。
 //!
 //! - [`MissingPolicy::Compat`] — [`column_value`]。本家の挙動 (0 埋め /
-//!   世代別の代替フィールド) を再現する。`sar` / `sadf` 互換出力用。
+//!   世代別の代替フィールド / 符号なし整数の折り返し) を再現する。
+//!   `sar` / `sadf` 互換出力用。
 //! - [`MissingPolicy::Strict`] — [`column_value_strict`]。欠落は
 //!   [`ComputeIssue::UnsupportedBySource`] として返す。独自出力・集計用。
+//!
+//! 方針は「欠落の埋め方」だけでなく「互換のための整数演算をどこまで真似るか」も
+//! 決める。`await` の分子は本家が `unsigned int` で足すので 2³² で折り返すが、
+//! 折り返した値は待ち時間として意味を持たないため、独自出力では折り返さない
+//! (`disk_sum_delta` の `SumWidth`)。
 //!
 //! 典拠: `docs/format/03-output-format.md` 第 I 部 §1.2〜§1.5、第 III 部 §7。
 
@@ -480,6 +503,80 @@ pub fn column_is_present(plan: &DecodePlan, column: usize) -> bool {
 }
 
 // ============================================================================
+// 未使用スロットの判定
+// ============================================================================
+
+/// この item スロットは**未使用**か。
+///
+/// `file_activity.nr` は「採取時に確保した枠数」であって、常に全部が
+/// 埋まっているわけではない。レコードごとの item 数 (`has_nr`) を持たない
+/// 世代では枠数しか手掛かりが無いため、素直に回すと空き枠まで行になる
+/// (`expected.data-10.3.1` は 12 デバイスだが枠は 20 あり、
+/// reSARch は差分の 8 行を `dev0-0` として出していた = golden 比較 ⑤)。
+///
+/// 本家は数を数えるのではなく、各 `print_*_stats()` の先頭で
+/// **その activity 固有の番兵**を見て `continue` する。ここはその表である。
+///
+/// | activity | 未使用の条件 | 由来 |
+/// |---|---|---|
+/// | `A_DISK` | `major + minor == 0` | `print_disk_stats()` |
+/// | `A_FS` | `f_blocks == 0` | `print_filesystem_stats()` |
+/// | `A_NET_DEV` / `A_NET_EDEV` | インターフェース名が空 | `print_net_dev_stats()` |
+/// | `A_NET_FC` | `fchost_name` が空 | `count_stats_fchost()` |
+/// | `A_SERIAL` | `line == 0` | `print_tty_stats()` |
+/// | `A_PWR_USB` | `bus_nr == 0` | `print_pwr_usb_stats()` |
+/// | `A_PWR_CPU` | `cpufreq == 0` (オフライン) | `print_pwr_cpufreq_stats()` |
+/// | `A_NET_SOFT` | CPU ごとの 5 カウンタが全 0 (オフライン) | `print_softnet_stats()` |
+///
+/// `A_NET_SOFT` の `index == 0` は CPU "all" なので常に使用中とする。
+/// `blg_len` はゲージ (オフラインでも 0 以外になり得る) なので判定に入れない。
+///
+/// フィールドがその世代に無い場合は 0 とみなす。**無いフィールドが
+/// スロットを「使用中」にすることはない**ため、判定は保守的に働く。
+///
+/// 独自出力はこれを使わない。空き枠も観測結果として出す方が、
+/// 「本家が表示を省く規則」を独自形式に持ち込むより説明しやすい。
+pub fn is_unused_item(
+    id: ActivityId,
+    index: usize,
+    plan: &DecodePlan,
+    item: &ItemSnapshot,
+) -> bool {
+    /// 欠落・欠測を 0 とみなして生値を取る。
+    #[inline]
+    fn v(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> u64 {
+        raw_column(plan, item, column).unwrap_or(0)
+    }
+    /// 文字列列が空 (または取得できない) か。
+    #[inline]
+    fn text_empty(item: &ItemSnapshot, index: usize) -> bool {
+        item.texts
+            .get(index)
+            .map(|t| t.as_deref().unwrap_or("").is_empty())
+            .unwrap_or(true)
+    }
+
+    match id {
+        ActivityId::DISK => v(plan, item, disk_col::MAJOR) + v(plan, item, disk_col::MINOR) == 0,
+        ActivityId::FS => v(plan, item, fs_col::TOTAL) == 0,
+        // インターフェース名 / FC ホスト名は 1 本目の文字列フィールド
+        ActivityId::NET_DEV | ActivityId::NET_EDEV | ActivityId::NET_FC => text_empty(item, 0),
+        ActivityId::SERIAL => v(plan, item, 0) == 0,
+        ActivityId::PWR_USB => v(plan, item, usb_col::BUS) == 0,
+        ActivityId::PWR_CPU => v(plan, item, pwr_cpu_col::MHZ) == 0,
+        ActivityId::NET_SOFT => {
+            index != 0
+                && v(plan, item, soft_col::TOTAL) == 0
+                && v(plan, item, soft_col::DROPD) == 0
+                && v(plan, item, soft_col::SQUEEZD) == 0
+                && v(plan, item, soft_col::RX_RPS) == 0
+                && v(plan, item, soft_col::FLW_LIM) == 0
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
 // 生値アクセス
 // ============================================================================
 
@@ -909,6 +1006,19 @@ fn special_direct(
         // --- A_PWR_BAT の capacity は signed char (03 §id=43) ---
         ActivityId::PWR_BAT if column == bat_col::CAP_PCT => {
             Some(primary_input(plan, curr, column, policy).map(|v| f64::from(signed_byte(v))))
+        }
+        // --- kbavail は列そのものにも代替規則が要る ---
+        //
+        // `availablekb` が無い世代 (`0x2170` / `0x2171` / 一部の `0x2173`) では、
+        // 派生列 (`kbmemused` / `%memused`) だけでなく **`kbavail` 列自身**も
+        // `frmkb` で代用する。本家の構造体は `availablekb` が存在しないため
+        // `print_memory_stats()` が `frmkb` を読み、`kbmemfree` と同じ値が出る
+        // (`expected.data-10.3.1` の `5646540   5646540`)。
+        //
+        // 汎用経路に落とすと欠落が `Compat` で `0` に埋まり、
+        // 本家が出す値と食い違う (golden 比較 ④)。
+        ActivityId::MEMORY if column == mem_col::KBAVAIL => {
+            Some(memory_available(plan, curr, policy).map(|v| v as f64))
         }
         _ => None,
     }
@@ -2635,14 +2745,6 @@ mod tests {
     use super::*;
     use crate::format::abi::{Endian, LayoutAbi, SourceEncoding};
     use crate::layout::registry::lookup;
-
-    fn item(values: &[u64]) -> ItemSnapshot {
-        ItemSnapshot {
-            key: None,
-            texts: Vec::new(),
-            values: values.iter().map(|v| Availability::Present(*v)).collect(),
-        }
-    }
 
     /// 最新 revision のデコード計画を作る (単体テスト用)。
     fn plan_for(id: ActivityId) -> DecodePlan {
@@ -4612,6 +4714,154 @@ mod tests {
         assert_eq!(
             column_value(ActivityId::PCSW, 0, meta, &plan, &p, &c, &ctx),
             Err(ComputeIssue::MissingInSample)
+        );
+    }
+
+    // ---- 未使用スロットの判定 (golden 比較 ⑤ / ⑥) ----
+
+    /// `A_DISK` は `major + minor == 0` のスロットを未使用とみなす。
+    ///
+    /// `file_activity.nr` は確保枠数なので、枠が余っていると
+    /// 「`dev0-0` が 0.00 を並べる行」が出る。本家はこの番兵で飛ばす。
+    #[test]
+    fn disk_slot_without_major_minor_is_unused() {
+        let plan = plan_for(ActivityId::DISK);
+        let empty = zeros(&plan);
+        assert!(is_unused_item(ActivityId::DISK, 3, &plan, &empty));
+
+        // minor だけでも 0 でなければ使用中 (`dev8-0` は major=8 / minor=0)
+        let mut used = zeros(&plan);
+        put(&plan, &mut used, disk_col::MAJOR, 8);
+        assert!(!is_unused_item(ActivityId::DISK, 3, &plan, &used));
+
+        let mut minor_only = zeros(&plan);
+        put(&plan, &mut minor_only, disk_col::MINOR, 1);
+        assert!(!is_unused_item(ActivityId::DISK, 3, &plan, &minor_only));
+    }
+
+    /// `A_FS` は `f_blocks == 0` のスロットを未使用とみなす。
+    #[test]
+    fn filesystem_slot_without_total_blocks_is_unused() {
+        let plan = plan_for(ActivityId::FS);
+        let empty = zeros(&plan);
+        assert!(is_unused_item(ActivityId::FS, 1, &plan, &empty));
+
+        let mut used = zeros(&plan);
+        put(&plan, &mut used, fs_col::TOTAL, 1 << 30);
+        assert!(!is_unused_item(ActivityId::FS, 1, &plan, &used));
+    }
+
+    /// `A_NET_SOFT` はカウンタが全 0 の CPU をオフラインとみなすが、
+    /// CPU "all" (先頭スロット) は常に表示する。
+    #[test]
+    fn net_soft_offline_cpu_is_unused_but_all_is_kept() {
+        let plan = plan_for(ActivityId::NET_SOFT);
+        let z = zeros(&plan);
+        assert!(
+            !is_unused_item(ActivityId::NET_SOFT, 0, &plan, &z),
+            "index 0 は CPU \"all\" なので値が 0 でも出す"
+        );
+        assert!(is_unused_item(ActivityId::NET_SOFT, 1, &plan, &z));
+
+        // カウンタが 1 本でも動いていればオンライン
+        let mut online = zeros(&plan);
+        put(&plan, &mut online, soft_col::RX_RPS, 1);
+        assert!(!is_unused_item(ActivityId::NET_SOFT, 1, &plan, &online));
+
+        // `blg_len` はゲージなので判定に入れない (オフラインでも 0 以外になり得る)
+        let mut backlog_only = zeros(&plan);
+        put(&plan, &mut backlog_only, soft_col::BLG_LEN, 5);
+        assert!(
+            is_unused_item(ActivityId::NET_SOFT, 1, &plan, &backlog_only),
+            "blg_len だけではオンラインと判定しない"
+        );
+    }
+
+    /// 番兵を持たない activity は常に使用中 (枠を飛ばさない)。
+    #[test]
+    fn activities_without_sentinel_are_never_unused() {
+        for id in [ActivityId::CPU, ActivityId::MEMORY, ActivityId::QUEUE] {
+            let plan = plan_for(id);
+            let z = zeros(&plan);
+            assert!(!is_unused_item(id, 1, &plan, &z), "{id:?}");
+        }
+    }
+
+    /// `kbavail` 列そのものも、持たない世代では `kbmemfree` で代用する
+    /// (golden 比較 ④)。
+    ///
+    /// 派生列 (`kbmemused` / `%memused`) だけを代用しても、
+    /// 表示される `kbavail` 列が 0 になって本家と食い違う。
+    #[test]
+    fn kbavail_column_falls_back_to_free_memory() {
+        let def = lookup(ActivityId::MEMORY).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        // `availablekb` を持たない旧世代を、申告サイズを削って再現する
+        // (`DecodePlan::build` は申告領域に収まらないフィールドを欠落にする)
+        let ctx = ComputeContext::new(100);
+        let meta = &def.columns[mem_col::KBAVAIL];
+
+        let modern = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).unwrap();
+        let mut m = zeros(&modern);
+        put(&modern, &mut m, mem_col::KBMEMFREE, 4_066_192);
+        put(&modern, &mut m, mem_col::KBAVAIL, 5_791_704);
+        assert_eq!(
+            column_value(
+                ActivityId::MEMORY,
+                mem_col::KBAVAIL,
+                meta,
+                &modern,
+                &m,
+                &m,
+                &ctx
+            ),
+            Ok(5_791_704.0),
+            "持っている世代は自分の値を出す"
+        );
+
+        // 旧世代を模したゼロ幅の計画。`availablekb` が欠落する構成を探す。
+        let old = def
+            .revisions
+            .iter()
+            .find(|r| {
+                let p = DecodePlan::build(def, r, r.size_lp64, 1, 1, &enc);
+                p.map(|p| !column_is_present(&p, mem_col::KBAVAIL))
+                    .unwrap_or(false)
+            })
+            .map(|r| DecodePlan::build(def, r, r.size_lp64, 1, 1, &enc).unwrap());
+        let Some(old) = old else {
+            // レジストリに `availablekb` 抜きの revision が無い構成では検証できない
+            return;
+        };
+        let mut o = zeros(&old);
+        put(&old, &mut o, mem_col::KBMEMFREE, 5_646_540);
+        assert_eq!(
+            column_value(
+                ActivityId::MEMORY,
+                mem_col::KBAVAIL,
+                meta,
+                &old,
+                &o,
+                &o,
+                &ctx
+            ),
+            Ok(5_646_540.0),
+            "持たない世代は kbmemfree を出す (本家と同じ値)"
+        );
+        // 独自出力・集計は欠落を欠落として受け取る
+        assert_eq!(
+            column_value_strict(
+                ActivityId::MEMORY,
+                mem_col::KBAVAIL,
+                meta,
+                &old,
+                &o,
+                &o,
+                &ctx
+            ),
+            Err(ComputeIssue::UnsupportedBySource),
+            "厳密モードは代用しない"
         );
     }
 }

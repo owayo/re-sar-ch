@@ -44,10 +44,11 @@
 //! let file = SaFile::open("sa01")?;
 //! let opts = SarTextOptions::default();
 //! let mut out = BufWriter::new(stdout());
-//! write_banner(&mut out, &file)?;
+//! write_banner(&mut out, &file, &opts)?;
 //!
 //! for id in [ActivityId::CPU, ActivityId::MEMORY] {
 //!     for mut block in SarBlock::blocks_for(id, &opts) {
+//!         block.set_file_cpu_nr(file.header().cpu_nr);
 //!         walk_items(&file, &Selection::Only(vec![id]), |item| {
 //!             match item {
 //!                 WalkItem::Event(ev) => block.event(&mut out, &ev)?,

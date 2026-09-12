@@ -156,6 +156,19 @@ pub struct FileActivityEntry {
     pub types_nr: Option<[u32; 3]>,
 }
 
+impl FileActivityEntry {
+    /// 参照する `sar` 版から見た形式の互換性。
+    ///
+    /// `sar` / `sadf` 互換出力が「このブロックを出すか」「`[Unknown format]` を
+    /// 付けるか」の判断に使う (`layout::registry::format_compat`)。
+    /// 独自出力はこれで弾かない (旧 revision も読めるのが reSARch の目的)。
+    pub fn format_compat(&self) -> crate::layout::registry::FormatCompat {
+        // magic を持たない世代は 0 が入っている。
+        let magic = (self.magic != 0).then_some(self.magic);
+        crate::layout::registry::format_compat(self.id, magic)
+    }
+}
+
 /// 1 レコード分の生データ。
 #[derive(Debug)]
 pub struct RawRecord<'a> {
@@ -525,7 +538,7 @@ impl SaFile {
             }
         }
 
-        let header = decode_file_header(&cur, &header_layout, file_header_offset, spec, &magic)
+        let mut header = decode_file_header(&cur, &header_layout, file_header_offset, spec, &magic)
             .map_err(|e| oob(e, "file_header"))?;
 
         if header.act_nr > MAX_NR_ACT {
@@ -610,6 +623,33 @@ impl SaFile {
             activities.push(entry);
         }
         offset += header.act_nr as usize * act_stride;
+
+        // CPU 数を持たない世代は `A_CPU` の item 数で補う。
+        //
+        // `sa_cpu_nr` / `sa_last_cpu_nr` が入ったのは `0x2173` 以降。
+        // それより前 (`0x2170` / `0x2171`) は CPU 数がヘッダに無く、
+        // 本家も `check_file_actlst()` で
+        //
+        //     if (fal->id == A_CPU && !file_hdr->sa_cpu_nr) sa_cpu_nr = fal->nr;
+        //
+        // と補っている。ここで補わないと `sar` のバナーと `LINUX RESTART` 行の
+        // `(N CPU)` が 1 になる (golden 比較 ③)。
+        //
+        // `A_CPU` の `nr` は CPU "all" を含むので値はそのまま使う
+        // (表示側が `nr - 1` を実 CPU 数として扱う)。
+        if header.cpu_nr.is_none_or(|n| n == 0)
+            && let Some(cpu) = activities.iter().find(|a| a.id == ActivityId::CPU)
+            && cpu.nr > 0
+        {
+            header.cpu_nr = Some(cpu.nr as u32);
+            diagnostics.push(Diagnostic {
+                offset: None,
+                message: format!(
+                    "この世代はヘッダに CPU 数を持たないため A_CPU の item 数 ({}) で補った",
+                    cpu.nr
+                ),
+            });
+        }
 
         // `extra_desc` チェーンは **file_activity[] の後**に置かれる。
         //

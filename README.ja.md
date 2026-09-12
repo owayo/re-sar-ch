@@ -91,8 +91,13 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # エージェントやパイプラインへ流す用
 resarch detect sa01                      # いつ・何に異変があったか
 resarch summarize sa01 sa02 --format json
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 各日の 9〜18 時だけを集計
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
+
+`summarize` / `compare` の `--from` / `--to` は**集計期間そのもの**を絞ります。
+範囲外のサンプルは平均・p95・差分合計のどれにも入らず、期間の端点も範囲内だけになります。
+`detect` の `--from` / `--to` は意味が違い、報告範囲だけを絞って比較基準の材料は絞りません。
 
 ### 異変の当たりを付ける
 

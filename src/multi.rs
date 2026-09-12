@@ -566,8 +566,26 @@ pub struct MultiOptions {
     /// # 基準レコードだけ `show` と扱いが違う
     ///
     /// `Reference` を値に数えないのは、その区間 (前サンプル → 当レコード) が
-    /// 範囲の外へはみ出しているからである。**範囲の手前で 1 件も捨てていなければ
-    /// はみ出す区間が無いので、通常どおり数える** (系列の先頭サンプルと同じ扱い)。
+    /// 範囲の外へはみ出しているからである。**はみ出す区間を持たないなら通常どおり
+    /// 数える** (系列の先頭サンプルと同じ扱い)。持たないのは次の場合。
+    ///
+    /// - 前サンプルも範囲内だった (範囲が観測全体を覆っている / 前のファイルから
+    ///   範囲内のまま続いている)
+    /// - 差分の基準が無い (系列の先頭・再起動直後・引き継げないファイル境界)
+    ///
+    /// 判定材料は前サンプルが範囲内だったかで持つ ([`PrevSample::in_window`])。
+    /// 「範囲に入る前にサンプルを捨てたか」をファイルごとに覚える形は誤りで、
+    /// 前ファイルの末尾が範囲外・次ファイルの先頭が範囲内という並びを取りこぼす。
+    ///
+    /// # 採らなかった形: 値の種類ごとに扱いを分ける
+    ///
+    /// 「基準レコードでも**ゲージの瞬時値は数え**、前サンプルとの区間から作る量
+    /// (カウンタ差分・レート・時間重み) だけ捨てる」という細かい分け方もある。
+    /// 範囲の端にあるゲージ 1 点を平均から落とさない利点があるが、
+    /// 同じレコードが「サンプル数には入るが区間数には入らない」状態になり、
+    /// `sar -s` が表示しないレコードを集計が数えることになる。
+    /// **レコード 1 件を数えるか数えないかで揃える**方を採った
+    /// (期間の端点・サンプル数・区間数が 1 つの規則で説明できる)。
     ///
     /// ここだけは `show` と挙動が違う (`show` は基準レコードを必ず表示から落とす)。
     /// 集計で同じにすると、**何も絞られていないのに先頭サンプルが平均・p95 から
@@ -814,6 +832,14 @@ struct PrevSample {
     /// そのサンプルが入っていたファイルの識別材料 (参照のみ。複製しない)。
     identity: Arc<HostIdentity>,
     signature: Arc<PlanSignature>,
+    /// 時刻フィルタの範囲内だったか ([`Admit::Reference`] / [`Admit::Emit`])。
+    ///
+    /// **区間を集計に入れてよいかの判定に使う。** 区間 (前サンプル → 当サンプル)
+    /// が範囲に収まっているかは、前サンプルが範囲内だったかで決まる。
+    /// 「捨てたサンプルがあったか」をファイル単位で覚える形では足りない
+    /// (前ファイルの末尾が範囲外・次ファイルの先頭が範囲内だと、そのファイル内で
+    /// 1 件も捨てていないため、範囲の外から始まる区間を数えてしまう)。
+    in_window: bool,
 }
 
 /// 1 ホスト分の系列を組み立てる。
@@ -929,9 +955,6 @@ impl<'o> GroupMerger<'o> {
         let empty = Snapshot::default();
         // 時刻フィルタはファイルごとに引き直す ([`MultiOptions::time_filter`])。
         let mut cursor = self.opts.time_filter.cursor();
-        // 範囲に入る前にサンプルを捨てたか。`Admit::Reference` を値に数えるかの
-        // 判定に使う (捨てていなければ、その区間は範囲の外へはみ出していない)。
-        let mut dropped_before_window = false;
 
         for sample in &fs.samples {
             if !sample.snapshot.valid {
@@ -1025,18 +1048,22 @@ impl<'o> GroupMerger<'o> {
             // --- 時刻フィルタ ---
             // 範囲外の区間は平均・極値・p95・差分合計のどれにも入れない
             // (集計器へ渡さないので、重みも期間の端点も自動的に範囲内だけになる)。
-            let counted = match cursor.sample(&view) {
+            let admit = cursor.sample(&view);
+            let in_window = matches!(admit, Admit::Reference | Admit::Emit);
+            // 前サンプルが範囲内だったか (区間の始点が範囲に収まっているか)。
+            let origin_in_window = self.prev.as_ref().is_some_and(|p| p.in_window);
+            let counted = match admit {
+                // 範囲に入ったあとのレコード。直前のレコードも範囲内なので、
+                // 区間はまるごと範囲に収まっている。
                 Admit::Emit => true,
-                // 範囲に最初に合致したレコード。手前で捨てたサンプルがあるなら
-                // その区間は範囲の外へはみ出しているので**値には数えず**、
-                // 次の区間の起点 (差分の基準) としてだけ使う。
-                // 1 件も捨てていなければはみ出す区間が無いので、系列の先頭
-                // サンプルと同じに数える (絞らないときと結果を揃えるため)。
-                Admit::Reference => !dropped_before_window,
-                Admit::Skip => {
-                    dropped_before_window = true;
-                    false
-                }
+                // 範囲に最初に合致したレコード。**区間が範囲の外へはみ出す
+                // ときだけ**値に数えず、次の区間の起点 (差分の基準) として使う。
+                // はみ出すのは「範囲外の前サンプルを基準に採っている」ときだけで、
+                // 基準が無ければ (系列やこのファイルの先頭・再起動直後・
+                // 引き継げないファイル境界) 区間が存在しないので、
+                // 絞らないときと同じに数える。
+                Admit::Reference => !view.has_prev || origin_in_window,
+                Admit::Skip => false,
                 // `--to` を超えた。このレコードは入れず、このファイルは打ち切る。
                 Admit::Stop => break,
             };
@@ -1080,6 +1107,7 @@ impl<'o> GroupMerger<'o> {
                 // Arc の参照だけを増やす (ファイル内で不変なものを複製しない)
                 identity: Arc::clone(&fs.identity),
                 signature: Arc::clone(&fs.signature),
+                in_window,
             });
         }
     }
@@ -2643,6 +2671,105 @@ mod tests {
         assert_eq!(c.intervals, 1);
         assert_eq!(c.mean, Some(10.0), "100 / 10 秒");
         assert!(c.exclusions.is_empty(), "{:?}", c.exclusions);
+    }
+
+    /// **差分の基準を持たない基準レコードは値に数える。**
+    ///
+    /// 範囲の始まりが起動区間の先頭 (再起動直後) に当たる場合、そのレコードは
+    /// 「前サンプルとして消費された」わけではない — 消費できる前サンプルが
+    /// そもそも無い。ここを落とすと、範囲外の区間を除いただけのはずの集計から
+    /// 起動区間の先頭サンプルが消え、絞らないときの同じ区間と結果が変わる。
+    #[test]
+    fn a_reference_sample_without_a_delta_origin_is_counted() {
+        let id = ActivityId::SWAP;
+        let samples = vec![
+            (2_000, 100_000, 0),
+            // 再起動。この直後が範囲の始まりになる
+            (2_010, 1_000, 5),
+            (2_020, 2_000, 105),
+        ];
+        let merge = |filter: TimeFilter| {
+            let opts = opts_with_window(filter);
+            let mut m = GroupMerger::new(&opts, &[]);
+            m.push_file(file_samples(0, id, samples.clone(), &[1], 1));
+            m.finish().1
+        };
+
+        let bare = merge(epoch_window(None, None));
+        assert_eq!(bare.len(), 2, "再起動で 2 区間");
+        let narrowed = merge(epoch_window(Some(2_010), None));
+        assert_eq!(narrowed.len(), 1, "再起動前の区間は範囲外");
+        assert_eq!(
+            narrowed[0], bare[1],
+            "起動区間の先頭から始まる範囲なら、その区間の集計は絞らないときと同じ"
+        );
+
+        let p = &narrowed[0].summary.period;
+        assert_eq!(p.samples, 2, "再起動直後のサンプルも数える");
+        assert_eq!(p.first_ust, Some(2_010));
+        assert_eq!(p.last_ust, Some(2_020));
+        assert_eq!(p.covered_cs, 1_000);
+        let c = narrowed[0]
+            .summary
+            .column(id, SINGLE_ITEM, "pswpin")
+            .unwrap();
+        assert_eq!(c.intervals, 1);
+        assert_eq!(c.mean, Some(10.0), "100 / 10 秒");
+        assert!(
+            c.exclusions
+                .iter()
+                .any(|e| e.reason == crate::analyze::timeline::ExclusionReason::FirstSample),
+            "区間の起点が無いことは除外理由として残る: {:?}",
+            c.exclusions
+        );
+    }
+
+    /// **範囲の外から始まる区間は、ファイル境界をまたいでいても集計に入れない。**
+    ///
+    /// 前ファイルの末尾が範囲外・次ファイルの先頭が範囲内という並びでは、
+    /// 次ファイルの中では 1 件も捨てていない。「捨てたか」をファイル単位で
+    /// 覚える作りだと、そこで範囲の外 (前ファイルの末尾) から始まる区間を
+    /// 数えてしまう。判定は前サンプルが範囲内だったかで行う。
+    #[test]
+    fn an_interval_starting_outside_the_window_is_not_counted_across_files() {
+        let id = ActivityId::SWAP;
+        let opts = opts_with_window(epoch_window(Some(2_020), None));
+        let mut m = GroupMerger::new(&opts, &[]);
+        // ファイル 1 は範囲外で終わる (2_000 / 2_010)
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        // ファイル 2 は範囲内で始まる (2_020)。境界は連続だが、
+        // 2_010 → 2_020 の区間は範囲の外から始まっている。
+        m.push_file(file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 400), (2_030, 103_000, 900)],
+            &[],
+            1,
+        ));
+        let segs = m.finish().1;
+        assert_eq!(segs.len(), 1);
+
+        let p = &segs[0].summary.period;
+        assert_eq!(p.samples, 1, "2_020 は基準として消費される");
+        assert_eq!(p.first_ust, Some(2_020));
+        assert_eq!(p.last_ust, Some(2_030));
+        assert_eq!(p.covered_cs, 1_000, "10 秒ぶんだけ覆う");
+
+        let c = segs[0].summary.column(id, SINGLE_ITEM, "pswpin").unwrap();
+        assert_eq!(c.intervals, 1, "境界の区間 (300) は入らない");
+        assert_eq!(c.delta_total.as_deref(), Some("500"));
+        assert_eq!(c.mean, Some(50.0), "500 / 10 秒");
+        assert!(
+            segs[0].boundaries.is_empty(),
+            "集計に入っていない境界は報告しない: {:?}",
+            segs[0].boundaries
+        );
     }
 
     /// 範囲にサンプルが 1 つも入らなければ起動区間は出ない (空の集計を出さない)。

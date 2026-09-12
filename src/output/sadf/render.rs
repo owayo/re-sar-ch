@@ -48,7 +48,7 @@ pub fn item_label(spec: &ActivitySpec, item: &ItemPair<'_>) -> ItemLabel {
         // (§6.2) ので、行の代表スロット (CPU `all`) から引く。
         //
         // `sadf` の `-d`/`-p`/`-j`/`-x`/`-r` は「フィールド名の位置に CPU
-        // ラベルを入れる」逆転構造の専用経路を持つのでここを通らない (§11.1)。
+        // ラベルを入れる」逆転構造の専用経路を持つのでここを通らない (03 §11.1)。
         // 通るのは独自出力と `-dh` で、そこでは行を割り込み名で識別する。
         ItemKind::Irq => match item.key() {
             Some(k) => ItemLabel::named(k),

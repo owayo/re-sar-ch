@@ -92,8 +92,14 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
 resarch detect sa01                      # where and what looks off
 resarch summarize sa01 sa02 --format json
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # only 9am-6pm of each day
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
+
+For `summarize` and `compare`, `--from` / `--to` narrow **the aggregation period itself**:
+samples outside the range enter neither the mean, the p95, nor the delta totals, and the
+period bounds shrink with them. `detect` reads the same two options differently — they
+narrow what gets reported, not the material its comparison basis is built from.
 
 ### Finding what went wrong
 

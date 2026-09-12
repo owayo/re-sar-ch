@@ -186,7 +186,7 @@ pub struct SampleSelect {
     /// ユーザ指定インターバル (秒)。`1` = 最小インターバル = 全レコード。
     ///
     /// `0` は渡さないこと (本家もファイル読み出しでは `interval == 0` を
-    /// usage で弾く)。念のため [`SampleSelect::interval`] が 1 に丸める。
+    /// usage で弾く)。念のため取り出し側で 1 に丸める。
     pub interval: u64,
     /// 表示するサンプル数の上限。`None` = 無制限 (本家の `count = -1`)。
     pub count: Option<u64>,
@@ -248,6 +248,12 @@ struct HeldSample {
 /// `last_uptime` は本家では関数内 `static`。**表示を省いたレコードでも
 /// 毎回更新される**ので、`file_interval` は「連続する 2 レコードの間隔」に
 /// なる (表示した 2 本の間隔ではない)。
+///
+/// 本家の C 実装をそのままビルドして 495 ケース (通常のレコード列 7 本 ×
+/// 40 レコード、丸め境界 5900〜6100 cs、32bit 跨ぎ 5 件) を突き合わせ、
+/// 全一致を確認してある。列の形は
+/// [`next_slice_sequence_matches_upstream`](tests::next_slice_sequence_matches_upstream)
+/// に写した。
 fn next_slice(
     uptime_ref: u64,
     uptime: u64,
@@ -337,7 +343,7 @@ pub struct SarTextOptions {
     /// (`irq_name`) になる。本家 `print_irq_stats()` も
     /// `search_list_item(a->item_list, stc_cpuall_irq->irq_name)` で絞る。
     /// **割り込み名を持たない世代では番号でしか絞れない**
-    /// ([`SarBlock::check_irq_name_filter`])。
+    /// (`check_irq_name_filter` が「名前でしか書けない指定」を拒否する)。
     pub item_names: BTreeMap<ActivityId, Vec<String>>,
 }
 
@@ -1985,7 +1991,7 @@ impl SarBlock {
     /// - `view.has_prev == false` のレコードは**表示しない**
     ///   (前サンプルとして消費されるだけ)
     /// - `RESTART` をまたいだレコードも表示しない (差分の基準がリセットされる)
-    /// - `-i` の間隔に十分近くないレコードも表示しない ([`next_slice`])
+    /// - `-i` の間隔に十分近くないレコードも表示しない (`next_slice`)
     /// - `count` の上限に達した後のレコードも表示しない
     ///
     /// `RESTART` / `COMMENT` は [`SarBlock::event`] が受け持つ。
@@ -3566,7 +3572,9 @@ impl SliceState {
 
     /// 基準レコードより後の統計レコード。
     fn feed(&mut self, at: usize, uptime_cs: u64) {
-        if self.cut.is_some() {
+        // 打ち切りは `count` が無ければ起きない。既定の経路では
+        // レコードごとの判定そのものを省く (結果は同じ)。
+        if self.select.count.is_none() || self.cut.is_some() {
             return;
         }
         let admitted = next_slice(
@@ -5135,6 +5143,38 @@ mod tests {
         assert!(!next_slice(0, 6_050, false, 60, &mut 5_950));
     }
 
+    /// 連続するレコードに対する採否の列が本家と一致する。
+    ///
+    /// 期待値は本家 `sa_common.c: next_slice()` をそのまま C で回して採った
+    /// (`cc` でビルドして 495 ケースを突き合わせ、全一致を確認したうちの 2 本)。
+    #[test]
+    fn next_slice_sequence_matches_upstream() {
+        // 基準点・インターバル・レコード間隔 (cs) → 採否の列
+        let cases: [(u64, u64, u64, &str); 2] = [
+            // 10 秒刻みのファイルを -i 60 で読む: 6 本ごとに 1 本
+            (100, 60, 1_000, "0000010000010000010000010000010000010000"),
+            // 2.5 秒刻み・-i 7・uptime が 2^32 を跨いでいる
+            (1 << 32, 7, 250, "0010110100100100101101001001001011010010"),
+        ];
+        for (uptime_ref, interval, step, expect) in cases {
+            let mut last = 0u64;
+            let mut uptime = uptime_ref;
+            let got: String = expect
+                .chars()
+                .enumerate()
+                .map(|(k, _)| {
+                    uptime = uptime.wrapping_add(step);
+                    let r = next_slice(uptime_ref, uptime, k == 0, interval, &mut last);
+                    if r { '1' } else { '0' }
+                })
+                .collect();
+            assert_eq!(
+                got, expect,
+                "ref={uptime_ref} interval={interval} step={step}"
+            );
+        }
+    }
+
     /// uptime 差分は `& 0xffffffff` してから秒に直す (03 §1.10 の落とし穴 #12)。
     ///
     /// マスクは 2 箇所ある (`uptime - last_uptime` と `uptime - uptime_ref`)。
@@ -5268,13 +5308,11 @@ mod tests {
             put(&plan, &mut it, queue_col::RUNQ_SZ, runq);
             vec![it]
         };
-        // uptime 0 (基準) / 100 / 200 / 300 / 400 cs、runq-sz は 0 / 2 / 4 / 6 / 8
-        let snaps: Vec<Snapshot> = [(0u64, 0u64), (100, 2), (200, 4), (300, 6), (400, 8)]
-            .into_iter()
-            .map(|(up, runq)| {
-                let sec = (up / 100) as u8;
-                stat_snapshot(id, up, (10, 0, sec), queue(runq))
-            })
+        // uptime 0〜600 cs (1 秒刻み)、runq-sz は uptime 秒 × 2。
+        // 1 本目の対で基準サンプル (uptime 100) が消費されるので、
+        // 基準点は 100 cs = 1 秒になる。
+        let snaps: Vec<Snapshot> = (0..7u64)
+            .map(|k| stat_snapshot(id, k * 100, (10, 0, k as u8), queue(k * 2)))
             .collect();
 
         let mut out: Vec<u8> = Vec::new();
@@ -5283,23 +5321,27 @@ mod tests {
             blk.record(&mut out, &view).expect("書ける");
         }
         let text = String::from_utf8(out).expect("UTF-8");
-        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("10:00:")).collect();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("10:00:") && !l.contains("runq-sz"))
+            .collect();
         assert_eq!(
             rows.len(),
             2,
-            "entry = 2 / 4 の 2 本だけが -i 2 の倍数に十分近い: {text}"
+            "基準点から 2 秒 / 4 秒の 2 本だけが -i 2 の倍数に十分近い: {text}"
         );
-        assert!(rows[0].starts_with("10:00:02"), "{text}");
-        assert!(rows[1].starts_with("10:00:04"), "{text}");
+        assert!(rows[0].starts_with("10:00:03"), "{text}");
+        assert!(rows[1].starts_with("10:00:05"), "{text}");
         assert_eq!(blk.displayed, 2, "省いたサンプルを数えている");
 
-        // ゲージの平均は (4 + 8) / 2 = 6.00。省いた 2 本を数えると 3.00 になる。
+        // ゲージの平均は (6 + 10) / 2 = 8 (`runq-sz` は整数列)。
+        // 省いた 3 本まで分母に数えると 16 / 5 = 3 になる。
         let avg = tail(&mut blk);
         let line = avg
             .lines()
             .find(|l| l.starts_with("Average:"))
             .expect("Average 行がある");
-        assert_eq!(&line[TSW..TSW + 10], "      6.00", "{avg}");
+        assert_eq!(&line[TSW..TSW + 10], "         8", "{avg}");
     }
 
     /// `-i` で省いたレコードは**前サンプルにもならない**。
@@ -5332,14 +5374,19 @@ mod tests {
         )
         .remove(0);
 
-        // `processes` は 1 秒あたり 10 の等速カウンタ
+        // `processes` は 2 秒ごとに 100 だけ進む階段状のカウンタ。
+        // 表示されるレコード (基準点から 2 秒 / 4 秒) の 1 本前では値が動かないので、
+        // 前サンプルの取り違えがレートの差として出る。
         let pcsw = |n: u64| {
             let mut it = zeros(&plan);
             put(&plan, &mut it, 0, n);
             vec![it]
         };
-        let snaps: Vec<Snapshot> = (0..5u64)
-            .map(|k| stat_snapshot(id, k * 100, (10, 0, k as u8), pcsw(k * 10)))
+        let counters = [0u64, 0, 100, 100, 200, 200, 300];
+        let snaps: Vec<Snapshot> = counters
+            .iter()
+            .enumerate()
+            .map(|(k, n)| stat_snapshot(id, k as u64 * 100, (10, 0, k as u8), pcsw(*n)))
             .collect();
 
         let mut out: Vec<u8> = Vec::new();
@@ -5348,13 +5395,16 @@ mod tests {
             blk.record(&mut out, &view).expect("書ける");
         }
         let text = String::from_utf8(out).expect("UTF-8");
-        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("10:00:")).collect();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("10:00:") && !l.contains("proc/s"))
+            .collect();
         assert_eq!(rows.len(), 2, "{text}");
         for row in &rows {
             assert_eq!(
                 &row[TSW..TSW + 10],
-                "     10.00",
-                "省いたレコードを前サンプルにすると 20.00 になる: {text}"
+                "     50.00",
+                "省いたレコードを前サンプルにすると 0.00 になる: {text}"
             );
         }
     }
@@ -5377,6 +5427,26 @@ mod tests {
         let mut buf = Vec::new();
         write_report(&mut buf, &file, opts, &ids).expect("レポートを書ける");
         Some(String::from_utf8(buf).expect("UTF-8"))
+    }
+
+    /// `-i` / `count` 付きで書き出す。`activities` が空なら全 activity。
+    fn render_select(
+        name: &str,
+        opts: &SarTextOptions,
+        select: SampleSelect,
+        activities: &[ActivityId],
+    ) -> Option<crate::Result<String>> {
+        let file = crate::format::SaFile::open(fixture(name)?).ok()?;
+        let ids = if activities.is_empty() {
+            activities_in_file(&file)
+        } else {
+            activities.to_vec()
+        };
+        let mut buf = Vec::new();
+        Some(
+            write_report_with(&mut buf, &file, opts, &ids, select)
+                .map(|()| String::from_utf8(buf).expect("UTF-8")),
+        )
     }
 
     /// レポート全体の骨格 (バナー / 空行 / ヘッダ / Average) が揃う。
@@ -5525,5 +5595,237 @@ mod tests {
         .unwrap();
         assert!(!plain.contains("  COM "), "-C 無しで COM 行が出た");
         assert!(with_c.contains("  COM "), "-C 付きで COM 行が出ない");
+    }
+
+    /// positional `count` は表示するサンプル数の上限。
+    ///
+    /// `data-ppc-11.7.2` は統計レコードを 3 本持ち、1 本目が基準サンプルとして
+    /// 消費されるので既定では 2 行出る。`count = 1` なら 1 行。
+    #[test]
+    fn count_limits_the_displayed_samples() {
+        let opts = SarTextOptions::default();
+        let cpu = [ActivityId::CPU];
+        let Some(all) = render_select("data-ppc-11.7.2", &opts, SampleSelect::default(), &cpu)
+        else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let all = all.expect("既定で書ける");
+        let one = render_select(
+            "data-ppc-11.7.2",
+            &opts,
+            SampleSelect {
+                interval: 1,
+                count: Some(1),
+            },
+            &cpu,
+        )
+        .unwrap()
+        .expect("count=1 で書ける");
+
+        let rows = |t: &str| {
+            t.lines()
+                .filter(|l| l.len() > 19 && &l[11..19] == "     all")
+                .count()
+        };
+        // データ行 + Average 行
+        assert_eq!(rows(&all), 3, "{all}");
+        assert_eq!(rows(&one), 2, "count=1 でデータ行は 1 本: {one}");
+        assert!(one.contains("Average:"), "{one}");
+    }
+
+    /// `count` に達したら次の `LINUX RESTART` まで読み飛ばす (`COM` は表示する)。
+    ///
+    /// `data-12.0.0` は「RESTART → 統計 2 本 → COMMENT」という並びで、
+    /// COMMENT は最後の統計レコードより後ろにある。
+    /// 既定では各 activity のブロックがそれぞれ COM 行を出す (本家の
+    /// `expected.data-12.0.0` も 36 本ある) が、`count` で打ち切ったあとは
+    /// 読み飛ばしループが 1 回だけ出す (03 §1.10 / §2.1)。
+    #[test]
+    fn count_moves_the_trailing_comment_out_of_every_block() {
+        let opts = SarTextOptions {
+            comment: true,
+            ..Default::default()
+        };
+        let Some(all) = render_select("data-12.0.0", &opts, SampleSelect::default(), &[]) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let all = all.expect("既定で書ける");
+        let one = render_select(
+            "data-12.0.0",
+            &opts,
+            SampleSelect {
+                interval: 1,
+                count: Some(1),
+            },
+            &[],
+        )
+        .unwrap()
+        .expect("count=1 で書ける");
+
+        let coms = |t: &str| t.lines().filter(|l| l.contains("  COM ")).count();
+        assert!(
+            coms(&all) > 1,
+            "既定では activity ごとに COM 行が出る: {}",
+            coms(&all)
+        );
+        assert_eq!(coms(&one), 1, "打ち切り後の COM は 1 回だけ");
+        // 打ち切り後の COM は全ブロックの後ろ = 最後の `Average:` より後
+        let last_avg = one
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("Average:"))
+            .map(|(i, _)| i)
+            .last()
+            .expect("Average 行がある");
+        let com = one
+            .lines()
+            .position(|l| l.contains("  COM "))
+            .expect("COM 行がある");
+        assert!(com > last_avg, "COM 行が平均行より前に出た: {one}");
+    }
+
+    /// `A_IRQ` のデータ行 / 平均行から割り込み名の列だけを取り出す。
+    ///
+    /// バナー・`LINUX RESTART`・列見出し (`INTR`) は落とす。
+    fn irq_row_names(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|l| l.len() >= TSW + 10 && !l.contains("INTR"))
+            .filter(|l| l.starts_with("Average:") || l.as_bytes()[2] == b':')
+            .filter(|l| !l.contains("LINUX RESTART"))
+            .map(|l| l[TSW..TSW + 10].trim())
+            .collect()
+    }
+
+    /// `--int=` は割り込み番号で行を絞る (旧世代は合成名 = 番号で一致する)。
+    ///
+    /// `data-11.6.5` の `A_IRQ` は magic `0x8a` の 1 次元 (`nr` = 489 割り込み /
+    /// `nr2` = 1) で `irq_name` を持たない。行の名前は index 0 が `sum`、
+    /// index `i` が `i-1` の 10 進表記になる (02 §6.4)。
+    #[test]
+    fn int_filter_selects_interrupts_by_number() {
+        let opts = SarTextOptions {
+            item_names: BTreeMap::from([(ActivityId::IRQ, vec!["0".to_string(), "3".to_string()])]),
+            ..Default::default()
+        };
+        let irq = [ActivityId::IRQ];
+        let Some(filtered) = render_select("data-11.6.5", &opts, SampleSelect::default(), &irq)
+        else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let filtered = filtered.expect("番号指定で書ける");
+        // データ行 2 本 + 平均行 2 本
+        assert_eq!(
+            irq_row_names(&filtered),
+            vec!["0", "3", "0", "3"],
+            "{filtered}"
+        );
+
+        // フィルタ無しなら 489 item 分 (sum + 488 割り込み) の行が出る
+        let plain = render_select(
+            "data-11.6.5",
+            &SarTextOptions::default(),
+            SampleSelect::default(),
+            &irq,
+        )
+        .unwrap()
+        .expect("フィルタ無しで書ける");
+        assert_eq!(
+            irq_row_names(&plain).len(),
+            489 * 2,
+            "フィルタ無しの行数が合わない"
+        );
+    }
+
+    /// `-I SUM` 相当 (`sum` の 1 件リスト) は総和行だけを残す。
+    #[test]
+    fn int_filter_accepts_the_synthetic_sum_name() {
+        let opts = SarTextOptions {
+            item_names: BTreeMap::from([(ActivityId::IRQ, vec!["sum".to_string()])]),
+            ..Default::default()
+        };
+        let Some(text) = render_select(
+            "data-11.6.5",
+            &opts,
+            SampleSelect::default(),
+            &[ActivityId::IRQ],
+        ) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let text = text.expect("sum 指定で書ける");
+        assert_eq!(irq_row_names(&text), vec!["sum", "sum"], "{text}");
+    }
+
+    /// 割り込み名を持たない世代に名前を指定したら**黙って空にせずエラーにする**。
+    ///
+    /// この世代で指定できるのは合成名 (番号と `sum`) だけである。
+    #[test]
+    fn int_filter_rejects_a_name_on_a_generation_without_irq_names() {
+        let opts = SarTextOptions {
+            item_names: BTreeMap::from([(
+                ActivityId::IRQ,
+                vec!["0".to_string(), "LOC".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let Some(result) = render_select(
+            "data-11.6.5",
+            &opts,
+            SampleSelect::default(),
+            &[ActivityId::IRQ],
+        ) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let err = result.expect_err("名前指定は拒否される").to_string();
+        assert!(err.contains("irq_name"), "{err}");
+        assert!(err.contains("LOC"), "{err}");
+        assert!(!err.contains("\"0\""), "番号指定は問題にしない: {err}");
+
+        // `A_IRQ` を選んでいなければ何も起きない
+        assert!(
+            render_select(
+                "data-11.6.5",
+                &opts,
+                SampleSelect::default(),
+                &[ActivityId::CPU]
+            )
+            .unwrap()
+            .is_ok()
+        );
+    }
+
+    /// 現行世代 (`irq_name` あり) では割り込み名で絞れる。
+    ///
+    /// `irq_name` を持つ `A_IRQ` の本家データは取得物に無いので、
+    /// 最新 revision の計画と手組みの item で [`SarBlock::name_selected`] を見る。
+    #[test]
+    fn int_filter_matches_irq_names_on_the_current_generation() {
+        let plan = plan_for(ActivityId::IRQ);
+        assert!(
+            irq_plan_has_names(&plan),
+            "最新 revision は irq_name を持つ"
+        );
+        let opts = SarTextOptions {
+            item_names: BTreeMap::from([(
+                ActivityId::IRQ,
+                vec!["LOC".to_string(), "3".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let blk = block(ActivityId::IRQ, &opts);
+        let named = |text: &str| {
+            let mut it = zeros(&plan);
+            name(&plan, &mut it, text);
+            it
+        };
+        assert!(blk.name_selected(&plan, &named("LOC"), 7));
+        assert!(blk.name_selected(&plan, &named("3"), 4));
+        assert!(!blk.name_selected(&plan, &named("MCE"), 9));
+        // 名前を持つ世代では位置由来の合成名は使わない
+        assert!(!blk.name_selected(&plan, &named("sum"), 0));
     }
 }

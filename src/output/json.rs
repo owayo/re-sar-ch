@@ -285,8 +285,15 @@ pub fn item_out(
 }
 
 /// 生値 1 列。**十進文字列**で出す。
+///
+/// センサ値 (rpm / degC / V) はファイル上で IEEE-754 の `double` として
+/// 書かれているので、ビット列のままでは意味を持たない。
+/// ここで実数として解釈し、`sadf -r` と同じ小数 6 桁で文字列化する。
 fn raw_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
     let (raw, quality) = match item.raw_curr(index) {
+        Availability::Present(v) if is_double_field(col) => {
+            (Some(format!("{:.6}", f64::from_bits(v))), Quality::Ok)
+        }
         Availability::Present(v) => (Some(v.to_string()), Quality::Ok),
         Availability::UnsupportedBySource => (None, Quality::UnsupportedBySource),
         Availability::MissingInSample => (None, Quality::MissingInSample),
@@ -315,6 +322,16 @@ fn rate_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
         value,
         quality,
     }
+}
+
+/// ファイル上で IEEE-754 の `double` として保存される列か。
+///
+/// sysstat のセンサ系構造体 (`stats_pwr_fan` / `_temp` / `_in`) は
+/// `double` でファイルへ書く。`series` 層は整数として読むので、
+/// 生値を出すときはここで解釈する必要がある。
+fn is_double_field(col: &ColumnMeta) -> bool {
+    use crate::model::Unit::*;
+    matches!(col.unit, Rpm | Celsius | Volts)
 }
 
 /// 単位の公開表記。`Unit` の内部名ではなく安定した短い表記を使う。
@@ -376,10 +393,10 @@ impl BootCounter {
 pub fn sample_out(view: &IntervalView<'_>, boot: u32, cfg: &CustomConfig) -> SampleOut {
     let mut activities = Vec::new();
     for id in selected_ids(view, cfg) {
-        if let Some(pair) = ActivityPair::from_view(view, id) {
-            if let Some(a) = activity_out(&pair, cfg) {
-                activities.push(a);
-            }
+        if let Some(pair) = ActivityPair::from_view(view, id)
+            && let Some(a) = activity_out(&pair, cfg)
+        {
+            activities.push(a);
         }
     }
     SampleOut {
@@ -533,6 +550,22 @@ mod tests {
             .find(|c| c.public_name == "kbmemfree")
             .unwrap();
         assert_eq!(unit_name(col), "kB");
+    }
+
+    /// センサ値の生値はビット列ではなく実数として出す。
+    #[test]
+    fn sensor_raw_values_are_decoded_doubles() {
+        let def = crate::layout::registry::lookup(ActivityId::PWR_FAN).unwrap();
+        let rpm = def.columns.iter().find(|c| c.public_name == "rpm").unwrap();
+        assert!(is_double_field(rpm), "rpm は double 保存");
+
+        let user = crate::layout::registry::lookup(ActivityId::CPU)
+            .unwrap()
+            .columns
+            .iter()
+            .find(|c| c.public_name == "user")
+            .unwrap();
+        assert!(!is_double_field(user), "CPU tick は整数");
     }
 
     /// 起動区間は RESTART ごとに 1 増える。

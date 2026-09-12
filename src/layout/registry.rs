@@ -84,6 +84,28 @@ impl ActivityDef {
         self.revisions.iter().find(|r| r.types_nr == types_nr)
     }
 
+    /// activity magic と 1 item の申告サイズの両方が一致する revision を探す。
+    ///
+    /// **同じ magic のまま構造体サイズが変わった版があるため、magic だけでは決まらない。**
+    /// 例: `A_CPU` は magic `0x8a` のまま 144 バイト (v10.1.1 以前) と
+    /// 160 バイト (v10.1.2 以降) の 2 版が存在する。
+    /// サイズを見ずに新しい方を選ぶと、申告サイズを超える位置を読もうとして
+    /// 隣の item やファイル末尾を踏む。
+    pub fn revision_for_magic_and_size(
+        &self,
+        magic: u32,
+        size: usize,
+    ) -> Option<&'static WireRevision> {
+        self.revisions
+            .iter()
+            .find(|r| r.magic == magic && r.size_lp64 == size)
+    }
+
+    /// 申告サイズだけが一致する revision を探す (magic を持たない `0x2170` 世代向け)。
+    pub fn revision_for_size(&self, size: usize) -> Option<&'static WireRevision> {
+        self.revisions.iter().find(|r| r.size_lp64 == size)
+    }
+
     /// 最も新しい revision。
     pub fn latest(&self) -> Option<&'static WireRevision> {
         self.revisions.first()

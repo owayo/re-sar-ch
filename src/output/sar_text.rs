@@ -58,6 +58,17 @@
 //! # }
 //! ```
 //!
+//! [`write_report`] は上の定型を 1 呼び出しにまとめたもの。
+//!
+//! ## 既知の未実装 / 差異
+//!
+//! | 項目 | 状況 |
+//! |---|---|
+//! | `-x` の `Minimum:` / `Maximum:` 行 | 未実装。`Summary:` / `Last:` のラベル切り替えだけ反映する |
+//! | `A_DISK` のデバイス名 | 既定は `dev<major>-<minor>`。**ローカルの `/sys` は引かない** (他ホストのファイルで誤名になる)。`-j SID` 相当の WWN 名だけ再現する |
+//! | `Average:` の `avg_count` | 本家は activity 単位のグローバルカウンタだが、ここでは item 単位に数える。途中で現れた / 消えたデバイスで本家と値が変わり得る (常時存在する item では一致) |
+//! | ヘッダ再表示 | パイプ出力と同じ `rows = 86400` 相当 (ブロック先頭で 1 回)。端末幅による再表示は行わない |
+//!
 //! [`docs/format/03-output-format.md`]: ../../../docs/format/03-output-format.md
 
 use std::io::{self, Write};
@@ -1411,7 +1422,7 @@ pub fn write_banner<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> {
 ///
 /// `FileHeader::month` は既に 1 起点に正規化されている。
 pub fn report_date(year: i32, month: u8, day: u8) -> String {
-    let yy = ((year % 100) + 100) % 100;
+    let yy = year.rem_euclid(100);
     format!("{month:02}/{day:02}/{yy:02}")
 }
 
@@ -1712,8 +1723,8 @@ impl SarBlock {
             self.items.push(ItemState {
                 key: self.item_key(plan, &group.primary, idx),
                 label: self.row_label(plan, &group.primary, idx),
-                tail: self.tail_text(plan, &group.primary),
-                usb_names: self.usb_names(&group.primary),
+                tail: self.tail_text(plan, &group.primary, idx),
+                usb_names: self.usb_names(plan, &group.primary),
                 first: group.primary.clone(),
                 last: group.primary.clone(),
                 first_slots: group.slots.clone(),
@@ -1810,9 +1821,12 @@ impl SarBlock {
                     if !self.opts.cpus.includes(i) {
                         continue;
                     }
-                    // 集約行は個別 CPU の単純和で作り直す
-                    // (ファイル中の cpu 行は使わない。03 §1.4.3)
-                    let primary = if i == 0 && items.len() > 1 {
+                    // 集約行を個別 CPU の単純和で作り直すのは
+                    // `A_CPU` (`get_global_cpu_statistics()`) と
+                    // `A_NET_SOFT` (`get_global_soft_statistics()`) だけ。
+                    // `A_PWR_CPU` / `A_PWR_FREQ` の item 0 は**収集時に
+                    // 平均が入っている**ので、合算すると CPU 数倍になる。
+                    let primary = if i == 0 && items.len() > 1 && self.recomputes_aggregate() {
                         compute::sum_items(width, items.iter().skip(1))
                     } else {
                         items[i].clone()
@@ -1830,6 +1844,23 @@ impl SarBlock {
             Layout::IrqMatrix => {
                 // item 添字 = cpu * nr2 + irq (CPU 主、割り込み副)
                 let nr2 = nr2.max(1) as usize;
+                // `nr2 == 1` は「CPU 次元を持たない世代」(12.5 以前の `stats_irq`)。
+                // nr が割り込み数になるので、1 item = 1 割り込み行 (合計列のみ) になる。
+                if nr2 == 1 {
+                    return items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, it)| {
+                            (
+                                i,
+                                ItemGroup {
+                                    primary: it.clone(),
+                                    slots: vec![it.clone()],
+                                },
+                            )
+                        })
+                        .collect();
+                }
                 let cpus = items.len() / nr2;
                 let mut out = Vec::new();
                 for irq in 0..nr2 {
@@ -1883,9 +1914,18 @@ impl SarBlock {
         }
     }
 
+    /// 集約行 (item 0) を個別行の単純和で作り直す activity か。
+    fn recomputes_aggregate(&self) -> bool {
+        matches!(self.view.id, ActivityId::CPU | ActivityId::NET_SOFT)
+    }
+
     /// `A_IRQ` で表示する CPU 列の item 添字。
     fn irq_columns(&self, items: usize, nr2: u32) -> Vec<usize> {
         let nr2 = nr2.max(1) as usize;
+        // CPU 次元を持たない世代は合計列 (`all`) だけ
+        if nr2 == 1 {
+            return vec![0];
+        }
         let cpus = items / nr2;
         (0..cpus).filter(|c| self.opts.cpus.includes(*c)).collect()
     }
@@ -1904,10 +1944,20 @@ impl SarBlock {
                 compute::raw_column(plan, item, usb_col::VENDOR_ID).unwrap_or(0),
                 compute::raw_column(plan, item, usb_col::PRODUCT_ID).unwrap_or(0),
             ),
-            _ => match &item.key {
-                Some(k) => ItemKey::Name(k.to_string()),
-                None => ItemKey::Index(index),
+            // 名前が item の同一性を表すのはこの 5 つだけ。
+            // `A_PWR_FAN` / `A_PWR_TEMP` / `A_PWR_IN` の `device` は
+            // 「センサチップ名」で**複数のセンサが同じ値を持つ**ため、
+            // 名前でまとめると行が潰れる (位置で対応付ける)。
+            ActivityId::NET_DEV
+            | ActivityId::NET_EDEV
+            | ActivityId::FS
+            | ActivityId::NET_FC
+            | ActivityId::IRQ => match item.key.as_deref() {
+                Some(k) if !k.is_empty() => ItemKey::Name(k.to_string()),
+                // 名前を持たない世代 (12.5 以前の `A_IRQ` など) は位置で対応付ける
+                _ => ItemKey::Index(index),
             },
+            _ => ItemKey::Index(index),
         }
     }
 
@@ -1925,7 +1975,7 @@ impl SarBlock {
                     RowLabel::Number(index as i64 - 1)
                 }
             }
-            HeadItem::Name9 => RowLabel::Name(self.item_name(plan, item)),
+            HeadItem::Name9 => RowLabel::Name(self.item_name(plan, item, index)),
             HeadItem::Line3 => {
                 RowLabel::Number(compute::raw_column(plan, item, 0).unwrap_or(0) as i64)
             }
@@ -1945,27 +1995,48 @@ impl SarBlock {
     }
 
     /// 行末に出すアイテム名。
-    fn tail_text(&self, plan: &DecodePlan, item: &ItemSnapshot) -> Option<String> {
+    fn tail_text(&self, plan: &DecodePlan, item: &ItemSnapshot, index: usize) -> Option<String> {
         match self.view.tail {
-            TailItem::Name => Some(self.item_name(plan, item)),
+            TailItem::Name => Some(self.item_name(plan, item, index)),
             _ => None,
         }
     }
 
-    fn usb_names(&self, item: &ItemSnapshot) -> Option<(String, String)> {
+    /// `A_PWR_USB` の manufacturer / product。
+    ///
+    /// 1 item が 2 本の文字列を持つので `item.key` だけでは足りない。
+    /// [`DecodePlan::text_index`] で位置を引いて [`ItemSnapshot::text`] から取る。
+    fn usb_names(&self, plan: &DecodePlan, item: &ItemSnapshot) -> Option<(String, String)> {
         if self.view.tail != TailItem::UsbNames {
             return None;
         }
-        // manufacturer / product は wire 上の文字列。item_key は product を指す
-        Some((String::new(), item.key.as_deref().unwrap_or("").to_string()))
+        let text = |name: &str| -> String {
+            plan.text_index(name)
+                .and_then(|i| item.text(i))
+                .unwrap_or("")
+                .to_string()
+        };
+        Some((text("manufacturer"), text("product")))
     }
 
     /// アイテム名 (`A_DISK` は名前が wire に無いので合成する)。
-    fn item_name(&self, plan: &DecodePlan, item: &ItemSnapshot) -> String {
+    fn item_name(&self, plan: &DecodePlan, item: &ItemSnapshot, index: usize) -> String {
         if self.view.id == ActivityId::DISK {
             return self.disk_name(plan, item);
         }
-        item.key.as_deref().unwrap_or("").to_string()
+        match item.key.as_deref() {
+            Some(k) if !k.is_empty() => k.to_string(),
+            // `A_IRQ` の `irq_name` は 12.6 で入ったフィールド。
+            // 持たない世代では item 0 が総数 (`sum`)、item n が割り込み `n-1`。
+            _ if self.view.id == ActivityId::IRQ => {
+                if index == 0 {
+                    "sum".to_string()
+                } else {
+                    (index - 1).to_string()
+                }
+            }
+            _ => String::new(),
+        }
     }
 
     /// `A_DISK` のデバイス名。
@@ -2010,6 +2081,7 @@ impl SarBlock {
         let width = plan.fields.len();
         let zero = || ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: vec![Availability::Present(0); width],
         };
 
@@ -2037,16 +2109,9 @@ impl SarBlock {
                 continue;
             }
 
-            let Some(row) = self.make_row(
-                plan,
-                idx,
-                key,
-                &group,
-                &prev_primary,
-                &prev_slots,
-                itv_cs,
-                false,
-            ) else {
+            let Some(row) =
+                self.make_row(plan, idx, key, &group, &prev_primary, &prev_slots, itv_cs)
+            else {
                 continue;
             };
             rows.push(row);
@@ -2090,7 +2155,6 @@ impl SarBlock {
         prev_primary: &ItemSnapshot,
         prev_slots: &[ItemSnapshot],
         itv_cs: u64,
-        average: bool,
     ) -> Option<Row> {
         let curr = &group.primary;
         let mut ctx = ComputeContext::new(itv_cs);
@@ -2142,13 +2206,12 @@ impl SarBlock {
             _ => self.cell_values(plan, prev_primary, curr, &ctx),
         };
 
-        let _ = average;
         Some(Row {
             key,
             label: self.row_label(plan, curr, idx),
             values,
-            tail: self.tail_text(plan, curr),
-            usb_names: self.usb_names(curr),
+            tail: self.tail_text(plan, curr, idx),
+            usb_names: self.usb_names(plan, curr),
             snapshot: curr.clone(),
             slots: group.slots.clone(),
         })
@@ -2294,6 +2357,7 @@ impl SarBlock {
                 // 途中で現れた item。差分の基準は全ゼロ (本家と同じ扱い)
                 let zero = ItemSnapshot {
                     key: None,
+                    texts: Vec::new(),
                     values: vec![Availability::Present(0); row.snapshot.values.len()],
                 };
                 self.items.push(ItemState {
@@ -2333,6 +2397,9 @@ impl SarBlock {
                 state.accum.add(*col, raw, None);
             }
         }
+        // 本家の `avg_count` は activity 単位のグローバル値だが、ここでは item 単位に数える。
+        // 常時存在する item では同じ値になり、途中で現れたデバイスでは
+        // 「観測できた回数」で平均が取れる分こちらの方が素直になる。
         state.accum.count += 1;
     }
 
@@ -2551,8 +2618,10 @@ mod tests {
     /// `--dec=` は `wd == 0` の列には効かない。
     #[test]
     fn dec_does_not_touch_integer_columns() {
-        let mut opts = SarTextOptions::default();
-        opts.dec_places = Some(2);
+        let opts = SarTextOptions {
+            dec_places: Some(2),
+            ..Default::default()
+        };
         assert_eq!(Cell::Int.render(Ok(396.0), &opts), "       396");
         assert_eq!(Cell::F0.render(Ok(396.0), &opts), "       396");
     }
@@ -2571,8 +2640,10 @@ mod tests {
     /// `cprintf_unit` の分母は 1024。既定の小数は 1 桁、`--dec=0` で 0 桁。
     #[test]
     fn human_unit_uses_1024_and_one_decimal() {
-        let mut opts = SarTextOptions::default();
-        opts.human = true;
+        let mut opts = SarTextOptions {
+            human: true,
+            ..Default::default()
+        };
         // 1_437_740 kB → 1.3 G
         assert_eq!(Cell::KB.render(Ok(1_437_740.0), &opts), "      1.4G");
         assert_eq!(Cell::KB.render(Ok(1_023.9), &opts), "   1023.9k");
@@ -2995,6 +3066,7 @@ mod tests {
     fn zeros(plan: &DecodePlan) -> ItemSnapshot {
         ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: vec![Availability::Present(0); plan.fields.len()],
         }
     }
@@ -3027,16 +3099,7 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(
-                &plan,
-                0,
-                ItemKey::Index(0),
-                &group,
-                &prev,
-                &[],
-                10_000,
-                false,
-            )
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 10_000)
             .expect("行が出る");
         let mut s = String::new();
         blk.render_row(&mut s, "09:34:34", &row, false);
@@ -3060,7 +3123,7 @@ mod tests {
             slots: Vec::new(),
         };
         assert!(
-            blk.make_row(&plan, 1, ItemKey::Index(1), &group, &zero, &[], 100, false)
+            blk.make_row(&plan, 1, ItemKey::Index(1), &group, &zero, &[], 100)
                 .is_none()
         );
     }
@@ -3081,7 +3144,7 @@ mod tests {
             slots: Vec::new(),
         };
         let row = blk
-            .make_row(&plan, 1, ItemKey::Index(1), &group, &same, &[], 100, false)
+            .make_row(&plan, 1, ItemKey::Index(1), &group, &same, &[], 100)
             .expect("tickless でも行は出る");
         let mut s = String::new();
         blk.render_row(&mut s, "10:00:01", &row, false);
@@ -3337,7 +3400,6 @@ mod tests {
                 &item,
                 &[],
                 100,
-                false,
             )
             .unwrap();
         let mut s = String::new();
@@ -3352,5 +3414,357 @@ mod tests {
             74,
             "本家の実測 74 バイト (改行を除く)"
         );
+    }
+    /// `A_PWR_BAT` の 1 行 (矢印付き) がバイト単位で揃う。
+    #[test]
+    fn bat_row_is_byte_exact() {
+        let opts = SarTextOptions::default();
+        let mut blk = block(ActivityId::PWR_BAT, &opts);
+        let plan = plan_for(ActivityId::PWR_BAT);
+        blk.plan = Some(plan.clone());
+
+        let mut prev = zeros(&plan);
+        let mut curr = zeros(&plan);
+        put(&plan, &mut prev, bat_col::CAP_PCT, 80);
+        put(&plan, &mut curr, bat_col::ID, 0);
+        put(&plan, &mut curr, bat_col::CAP_PCT, 78);
+        put(&plan, &mut curr, bat_col::STATUS, bat_status::DISCHARGING);
+
+        let group = ItemGroup {
+            primary: curr.clone(),
+            slots: Vec::new(),
+        };
+        // itv = 6000 cs = 60 秒 → -2.00 %/分
+        let row = blk
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 6_000)
+            .unwrap();
+        let mut s = String::new();
+        blk.render_row(&mut s, "10:00:01", &row, false);
+        assert_eq!(
+            s,
+            "10:00:01            0        78     -2.00         \u{2198}\n"
+        );
+        // 11 + 10 (BAT) + 10 (%cap) + 10 (cap/min) + 12 (矢印列 = 空白 9 + 3 バイト)
+        assert_eq!(s.trim_end_matches('\n').len(), 53);
+
+        // 平均行は status を出さず、%cap が 2 桁になる
+        let mut avg = String::new();
+        blk.render_row(&mut avg, "Average:", &row, true);
+        assert_eq!(avg, "Average:            0     78.00     -2.00\n");
+    }
+
+    /// `A_PWR_BAT` の `status` が不明なときは幅 9 で `?` が出る。
+    #[test]
+    fn bat_row_with_unknown_status_is_two_bytes_shorter() {
+        let opts = SarTextOptions::default();
+        let mut blk = block(ActivityId::PWR_BAT, &opts);
+        let plan = plan_for(ActivityId::PWR_BAT);
+        blk.plan = Some(plan.clone());
+        let curr = zeros(&plan);
+        let group = ItemGroup {
+            primary: curr.clone(),
+            slots: Vec::new(),
+        };
+        let row = blk
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &curr, &[], 100)
+            .unwrap();
+        let mut s = String::new();
+        blk.render_row(&mut s, "10:00:01", &row, false);
+        assert_eq!(
+            s.trim_end_matches('\n').len(),
+            51,
+            "矢印行より 2 バイト短い"
+        );
+        assert!(s.ends_with("?\n"), "{s:?}");
+    }
+
+    /// `A_PWR_FREQ` の行は CPU ごとの重み付き平均 1 列。
+    #[test]
+    fn pwr_freq_row_uses_weighted_average() {
+        let opts = SarTextOptions {
+            cpus: CpuSelection::All,
+            ..Default::default()
+        };
+        let mut blk = block(ActivityId::PWR_FREQ, &opts);
+        let plan = plan_for(ActivityId::PWR_FREQ);
+        blk.plan = Some(plan.clone());
+
+        let mut p0 = zeros(&plan);
+        let mut p1 = zeros(&plan);
+        let mut c0 = zeros(&plan);
+        let mut c1 = zeros(&plan);
+        put(&plan, &mut c0, freq_col::FREQ_KHZ, 1_500_000);
+        put(&plan, &mut c0, freq_col::TIME_IN_STATE, 100);
+        put(&plan, &mut p0, freq_col::TIME_IN_STATE, 0);
+        put(&plan, &mut c1, freq_col::FREQ_KHZ, 800_000);
+        put(&plan, &mut c1, freq_col::TIME_IN_STATE, 300);
+        put(&plan, &mut p1, freq_col::TIME_IN_STATE, 0);
+
+        let group = ItemGroup {
+            primary: c0.clone(),
+            slots: vec![c0, c1],
+        };
+        let row = blk
+            .make_row(
+                &plan,
+                1,
+                ItemKey::Index(1),
+                &group,
+                &p0,
+                &[p0.clone(), p1],
+                100,
+            )
+            .unwrap();
+        let mut s = String::new();
+        blk.render_row(&mut s, "10:00:01", &row, false);
+        // (1500 × 100 + 800 × 300) / 400 = 975
+        assert_eq!(s, "10:00:01          0    975.00\n");
+    }
+
+    /// `A_PSI_IO` の 8 列すべてがパーセント書式で出る。
+    #[test]
+    fn psi_io_row_has_eight_percent_columns() {
+        let opts = SarTextOptions::default();
+        let mut blk = block(ActivityId::PSI_IO, &opts);
+        let plan = plan_for(ActivityId::PSI_IO);
+        blk.plan = Some(plan.clone());
+
+        let prev = zeros(&plan);
+        let mut curr = zeros(&plan);
+        put(&plan, &mut curr, psi_col::SOME_10, 1_234);
+        // 10 秒 (1000 cs) のうち 1 秒 (1e6 µs) 停止 → 10.00%
+        put(&plan, &mut curr, psi_col::SOME_TOTAL, 1_000_000);
+        put(&plan, &mut curr, psi_col::FULL_TOTAL, 500_000);
+
+        let group = ItemGroup {
+            primary: curr.clone(),
+            slots: Vec::new(),
+        };
+        let row = blk
+            .make_row(&plan, 0, ItemKey::Index(0), &group, &prev, &[], 1_000)
+            .unwrap();
+        let mut s = String::new();
+        blk.render_row(&mut s, "10:00:01", &row, false);
+        assert_eq!(
+            s,
+            "10:00:01        12.34      0.00      0.00     10.00      0.00      0.00      0.00      5.00\n"
+        );
+        assert_eq!(s.trim_end_matches('\n').len(), 11 + 8 * 10);
+    }
+
+    /// `A_SERIAL` の回線番号列は 10 桁 (`"       %3d"`)。
+    #[test]
+    fn serial_row_uses_three_digit_line_number() {
+        let opts = SarTextOptions::default();
+        let mut blk = block(ActivityId::SERIAL, &opts);
+        let plan = plan_for(ActivityId::SERIAL);
+        blk.plan = Some(plan.clone());
+        let prev = zeros(&plan);
+        let mut curr = zeros(&plan);
+        put(&plan, &mut curr, 0, 64);
+        let group = ItemGroup {
+            primary: curr.clone(),
+            slots: Vec::new(),
+        };
+        let row = blk
+            .make_row(&plan, 0, ItemKey::Line(64), &group, &prev, &[], 100)
+            .unwrap();
+        let mut s = String::new();
+        blk.render_row(&mut s, "10:00:01", &row, false);
+        assert_eq!(
+            s,
+            "10:00:01           64      0.00      0.00      0.00      0.00      0.00      0.00\n"
+        );
+    }
+
+    /// `A_NET_SOFT` の集約行は個別 CPU の単純和で作り直す。
+    #[test]
+    fn net_soft_aggregate_row_is_the_sum_of_cpus() {
+        let opts = SarTextOptions::default();
+        let blk = block(ActivityId::NET_SOFT, &opts);
+        let plan = plan_for(ActivityId::NET_SOFT);
+        let mut cpu0 = zeros(&plan);
+        put(&plan, &mut cpu0, soft_col::TOTAL, 100);
+        let mut cpu1 = zeros(&plan);
+        put(&plan, &mut cpu1, soft_col::TOTAL, 300);
+        let items = vec![zeros(&plan), cpu0, cpu1];
+
+        let groups = blk.iter_groups(&plan, &items, 1);
+        assert_eq!(groups.len(), 1, "既定は集約行のみ");
+        let total = compute::raw_column(&plan, &groups[0].1.primary, soft_col::TOTAL).unwrap();
+        assert_eq!(total, 400, "ファイルの item 0 ではなく個別 CPU の和");
+        assert!(blk.recomputes_aggregate());
+
+        // `A_PWR_CPU` は収集時に平均が入っているので合算しない
+        let pwr = block(ActivityId::PWR_CPU, &opts);
+        assert!(!pwr.recomputes_aggregate());
+    }
+
+    // ---- 実データによる結合テスト ----
+    //
+    // 本家 sysstat のテストデータは GPL なので同梱できない。
+    // `cargo run --bin xtask -- fetch-fixtures` で取得した場合だけ走らせる。
+
+    fn fixture(name: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/fixtures/upstream")
+            .join(name);
+        p.exists().then_some(p)
+    }
+
+    fn render(name: &str, opts: &SarTextOptions) -> Option<String> {
+        let file = crate::format::SaFile::open(fixture(name)?).ok()?;
+        let ids = activities_in_file(&file);
+        let mut buf = Vec::new();
+        write_report(&mut buf, &file, opts, &ids).expect("レポートを書ける");
+        Some(String::from_utf8(buf).expect("UTF-8"))
+    }
+
+    /// レポート全体の骨格 (バナー / 空行 / ヘッダ / Average) が揃う。
+    #[test]
+    fn report_skeleton_from_real_file() {
+        let Some(text) = render("data-12.0.0", &SarTextOptions::default()) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("Linux "), "{:?}", lines[0]);
+        assert!(lines[0].contains('\t'), "バナーの区切りはタブ");
+        assert!(lines[0].ends_with(" CPU)"), "{:?}", lines[0]);
+        // バナー直後は空行 (ヘッダ行の先頭 \n による)
+        assert_eq!(lines[1], "", "バナーの次は空行");
+        assert!(text.contains("\nAverage:"), "Average: 行が出る");
+        // 空行が 2 行連続することはない
+        assert!(!text.contains("\n\n\n"), "空行は 2 行連続しない");
+        // A_PWR_USB 以外に行末空白は出ない
+        for line in &lines {
+            if line.contains("Linux ") || line.len() < TSW {
+                continue;
+            }
+            let is_usb = line.len() > 40 && line[11..].starts_with("  ");
+            if !is_usb {
+                assert_eq!(line.trim_end(), *line, "行末空白: {line:?}");
+            }
+        }
+    }
+
+    /// CPU 行の 6 列は合計 100% になる (tick 合計で正規化されている証拠)。
+    #[test]
+    fn cpu_percentages_sum_to_100_on_real_file() {
+        let Some(text) = render("data-12.0.0", &SarTextOptions::default()) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let mut checked = 0;
+        let mut in_cpu = false;
+        for line in text.lines() {
+            if line.contains("%user") && line.contains("%idle") {
+                in_cpu = true;
+                continue;
+            }
+            if line.is_empty() {
+                in_cpu = false;
+                continue;
+            }
+            if !in_cpu {
+                continue;
+            }
+            // 11 桁ラベル + 8 桁 CPU 列 のあとに 6 列
+            let rest = &line[TSW + 8..];
+            let vals: Vec<f64> = rest
+                .split_whitespace()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect();
+            if vals.len() != 6 {
+                continue;
+            }
+            let sum: f64 = vals.iter().sum();
+            assert!(
+                (sum - 100.0).abs() < 0.05,
+                "CPU の割合合計が 100 でない ({sum}): {line:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "CPU 行が 1 つも見つからない");
+    }
+
+    /// 全列の幅が 10 桁で揃う (`--dec=` / `--human` でも変わらない)。
+    #[test]
+    fn column_width_is_stable_across_options() {
+        let variants = [
+            SarTextOptions::default(),
+            SarTextOptions {
+                dec_places: Some(0),
+                ..Default::default()
+            },
+            SarTextOptions {
+                human: true,
+                ..Default::default()
+            },
+            SarTextOptions {
+                pretty: true,
+                human: true,
+                ..Default::default()
+            },
+        ];
+        let mut widths = Vec::new();
+        for opts in &variants {
+            let Some(text) = render("data-12.0.0", opts) else {
+                eprintln!("fixture 未取得: スキップ");
+                return;
+            };
+            // A_QUEUE ブロックの行長を比べる (6 列固定・pretty の影響も受けない)
+            let w = text
+                .lines()
+                .find(|l| l.contains("ldavg-1"))
+                .map(|l| l.len())
+                .expect("A_QUEUE のヘッダがある");
+            widths.push(w);
+        }
+        assert_eq!(widths[0], 11 + 6 * 10);
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "オプションで列幅が変わった: {widths:?}"
+        );
+    }
+
+    /// `-P ALL` にすると CPU 行が増える。
+    #[test]
+    fn cpu_selection_changes_row_count() {
+        let base = SarTextOptions::default();
+        let all = SarTextOptions {
+            cpus: CpuSelection::All,
+            ..Default::default()
+        };
+        let (Some(a), Some(b)) = (render("data-12.0.0", &base), render("data-12.0.0", &all)) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let count = |t: &str| {
+            t.lines()
+                .filter(|l| l.len() > 19 && &l[11..19] == "     all")
+                .count()
+        };
+        assert!(count(&a) > 0);
+        assert!(b.len() > a.len(), "-P ALL で行が増える");
+    }
+
+    /// `-C` を付けないと `COM` 行は出ない。
+    #[test]
+    fn comments_require_the_c_option() {
+        let Some(plain) = render("data-11.6.5", &SarTextOptions::default()) else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let with_c = render(
+            "data-11.6.5",
+            &SarTextOptions {
+                comment: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!plain.contains("  COM "), "-C 無しで COM 行が出た");
+        assert!(with_c.contains("  COM "), "-C 付きで COM 行が出ない");
     }
 }

@@ -12,6 +12,19 @@
 //! - アイテムを持たない activity はアイテム識別子フィールドが無い。
 //! - **オフライン CPU も必ず出す** (他形式は除外する、§11.3)。
 //! - `hdr_line` に無い直書きフィールド名が多数ある (§14.5-3)。
+//!
+//! # 既知の制約
+//!
+//! `series` 層のスナップショットは item ごとに**文字列を 1 本だけ**
+//! (`ItemSnapshot::key`) 保持する。そのため 1 item に文字列フィールドが 2 つ以上
+//! ある activity では、識別キー以外が空になる。
+//!
+//! | activity | 取れる | 空になる |
+//! |---|---|---|
+//! | `A_PWR_USB` | `product` (識別キー) | `manufact` |
+//!
+//! 0 や適当な値で埋めず**空**にしてある。埋めるには `series` 層が
+//! 複数の文字列フィールドを運べるようにする必要がある。
 
 use std::io::{self, Write};
 
@@ -26,15 +39,21 @@ use crate::format::file::{SaFile, ScanControl};
 use crate::model::{ActivityId, Availability};
 use crate::series::{IntervalView, RecordEvent, Selection, walk};
 
-use super::dbppc::{display_cpu_count, present_specs, scan_restarts};
+use super::dbppc::{display_cpu_count, present_specs, scan_blocks};
 
 /// `-r` の出力。
 pub fn write_raw<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
     let info = FileInfo::from_file(file);
     let specs = present_specs(file);
-    let restarts = scan_restarts(file)?;
+    let blocks = scan_blocks(file)?;
 
-    for block in 0..=restarts.len() {
+    for block in 0..blocks.len() {
+        if !blocks.has_output(block) {
+            if let Some(r) = blocks.restarts.get(block) {
+                write_restart_line(out, cfg, &info, r).map_err(super::wrap_io)?;
+            }
+            continue;
+        }
         for spec in &specs {
             for section in spec.active_sections(&cfg.section) {
                 if cfg.debug {
@@ -43,19 +62,27 @@ pub fn write_raw<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Resu
                 write_activity_block(out, file, cfg, &info, spec, section, block)?;
             }
         }
-        if let Some(r) = restarts.get(block) {
-            let stamp = Stamp::new(cfg.time_base, r.ust_time, r.hms, &info);
-            // RESTART / COMMENT 行は nodename も interval も出さず、`;` の後に空白 1 個
-            writeln!(
-                out,
-                "{}; LINUX-RESTART ({} CPU)",
-                stamp.raw(),
-                display_cpu_count(r.cpu_count)
-            )
-            .map_err(super::wrap_io)?;
+        if let Some(r) = blocks.restarts.get(block) {
+            write_restart_line(out, cfg, &info, r).map_err(super::wrap_io)?;
         }
     }
     Ok(())
+}
+
+/// RESTART 行。nodename も interval も出さず、`;` の後に空白 1 個 (§1.3)。
+fn write_restart_line<W: Write>(
+    out: &mut W,
+    cfg: &SadfConfig,
+    info: &FileInfo,
+    r: &super::dbppc::RestartMark,
+) -> io::Result<()> {
+    let stamp = Stamp::new(cfg.time_base, r.ust_time, r.hms, info);
+    writeln!(
+        out,
+        "{}; LINUX-RESTART ({} CPU)",
+        stamp.raw(),
+        display_cpu_count(r.cpu_count)
+    )
 }
 
 /// `-O debug` のアクティビティヘッダ行 (§4.4-2)。
@@ -170,30 +197,42 @@ fn write_generic<W: Write>(
     let label_at = if spec.id == ActivityId::DISK { 2 } else { 0 };
 
     for item in pair.output_items() {
-        let mut line = String::with_capacity(128);
-        line.push_str(ts);
-
+        let mut tok = vec![ts.to_string()];
         for (i, f) in fields.iter().enumerate() {
             if i == label_at {
-                push_item_label(&mut line, spec, &item, cfg);
+                push_item_label(&mut tok, spec, &item, cfg);
             }
-            push_raw_field(&mut line, spec, &item, f, cfg);
+            push_raw_field(&mut tok, spec, &item, f, cfg);
         }
         if fields.len() <= label_at {
-            push_item_label(&mut line, spec, &item, cfg);
+            push_item_label(&mut tok, spec, &item, cfg);
         }
-
-        line.push('\n');
-        out.write_all(line.as_bytes())?;
+        out.write_all(join_tokens(&tok).as_bytes())?;
     }
     Ok(())
+}
+
+/// トークンを `"; "` でつないで行にする。
+///
+/// raw の 1 行は `<timestr>; <名前>; <値>; …;` の形で、**行末に `;` が付く**
+/// (§4.1)。区切りが一様なのでトークン列として組み立てるのが安全
+/// (`;;` の二重出力のような取り違えが起きない)。
+fn join_tokens(tokens: &[String]) -> String {
+    let mut s = tokens.join("; ");
+    s.push_str(";\n");
+    s
 }
 
 /// アイテム識別子を `; <ラベル>; <値>` の形で足す。
 ///
 /// `A_PWR_USB` は raw ではアイテムを持たない (§4.5)。
 /// `A_FS` のデバイス名だけダブルクォートが付く (§14.5-5)。
-fn push_item_label(line: &mut String, spec: &ActivitySpec, item: &ItemPair<'_>, cfg: &SadfConfig) {
+fn push_item_label(
+    tok: &mut Vec<String>,
+    spec: &ActivitySpec,
+    item: &ItemPair<'_>,
+    cfg: &SadfConfig,
+) {
     if spec.item == ItemKind::None || spec.id == ActivityId::PWR_USB {
         return;
     }
@@ -204,25 +243,22 @@ fn push_item_label(line: &mut String, spec: &ActivitySpec, item: &ItemPair<'_>, 
         .unwrap_or_default();
     let label = item_label(spec, item);
 
-    line.push_str("; ");
-    line.push_str(head);
     // -O debug では A_CPU のオフライン判定を名前の直後に付ける (§4.4-4)
     if cfg.debug && spec.id == ActivityId::CPU && item.ctx.tick_total == Some(0) {
-        line.push_str(" [OFF]");
-    }
-    line.push_str("; ");
-    if spec.id == ActivityId::FS {
-        line.push('"');
-        line.push_str(&label.db);
-        line.push('"');
+        tok.push(format!("{head} [OFF]"));
     } else {
-        line.push_str(&label.db);
+        tok.push(head.to_string());
     }
-    line.push(';');
+    // A_FS のデバイス名だけダブルクォートが付く (§14.5-5)
+    if spec.id == ActivityId::FS {
+        tok.push(format!("\"{}\"", label.db));
+    } else {
+        tok.push(label.db);
+    }
 }
 
 fn push_raw_field(
-    line: &mut String,
+    tok: &mut Vec<String>,
     spec: &ActivitySpec,
     item: &ItemPair<'_>,
     f: &RawField,
@@ -231,87 +267,66 @@ fn push_raw_field(
     match f.style {
         RawStyle::Pval | RawStyle::PvalSum(_) | RawStyle::PvalDiff(_, _) => {
             let (prev, curr) = raw_pair(item, f);
-            line.push_str("; ");
-            line.push_str(f.name);
             // -O debug ではカウンタが減少したフィールド名の直後に [DEC] (§4.4-3)
-            if cfg.debug {
-                if let (Availability::Present(p), Availability::Present(c)) = (prev, curr) {
-                    if c < p {
-                        line.push_str(" [DEC]");
-                    }
-                }
-            }
-            line.push_str("; ");
-            push_u64(line, prev);
-            line.push_str("; ");
-            push_u64(line, curr);
-            line.push(';');
+            let dec = cfg.debug
+                && matches!((prev, curr), (Availability::Present(p), Availability::Present(c)) if c < p);
+            tok.push(if dec {
+                format!("{} [DEC]", f.name)
+            } else {
+                f.name.to_string()
+            });
+            tok.push(u64_token(prev));
+            tok.push(u64_token(curr));
         }
         RawStyle::Int => {
             let v = item.raw_curr_by_name(f.col);
-            line.push_str("; ");
-            line.push_str(f.name);
+            tok.push(f.name.to_string());
             // A_PWR_BAT の status は値の後に名前付きの注記が入る (§4.4-5)
-            line.push_str("; ");
-            push_u64(line, v);
-            if cfg.debug && spec.id == ActivityId::PWR_BAT && f.col == "status" {
-                if let Availability::Present(s) = v {
-                    line.push_str(" [");
-                    line.push_str(render::bat_status(s));
-                    line.push(']');
-                }
+            if cfg.debug
+                && spec.id == ActivityId::PWR_BAT
+                && f.col == "status"
+                && let Availability::Present(sts) = v
+            {
+                tok.push(format!("{} [{}]", u64_token(v), render::bat_status(sts)));
+                return;
             }
-            line.push(';');
+            tok.push(u64_token(v));
         }
         RawStyle::Sensor => {
-            line.push_str("; ");
-            line.push_str(f.name);
-            line.push_str("; ");
-            match item.raw_curr_by_name(f.col) {
-                Availability::Present(bits) => write_sensor(line, double_from_bits(bits)),
-                _ => line.push_str(ABSENT_TEXT),
-            }
-            line.push(';');
+            tok.push(f.name.to_string());
+            tok.push(match item.raw_curr_by_name(f.col) {
+                Availability::Present(bits) => {
+                    let mut s = String::new();
+                    write_sensor(&mut s, double_from_bits(bits));
+                    s
+                }
+                _ => ABSENT_TEXT.to_string(),
+            });
         }
         RawStyle::Text | RawStyle::QuotedText => {
-            let quoted = matches!(f.style, RawStyle::QuotedText);
-            line.push_str("; ");
-            line.push_str(f.name);
-            line.push_str("; ");
+            tok.push(f.name.to_string());
             let text = render::field_text(spec, item, f.col).unwrap_or_default();
-            if quoted {
-                line.push('"');
-                line.push_str(&text);
-                line.push('"');
+            tok.push(if matches!(f.style, RawStyle::QuotedText) {
+                format!("\"{text}\"")
             } else {
-                line.push_str(&text);
-            }
-            line.push(';');
+                text
+            });
         }
         RawStyle::Hex => {
-            line.push_str("; ");
-            line.push_str(f.name);
-            line.push_str("; ");
-            match item.raw_curr_by_name(f.col) {
-                Availability::Present(v) => {
-                    use std::fmt::Write as _;
-                    let _ = write!(line, "{v:x}");
-                }
-                _ => line.push_str(ABSENT_TEXT),
-            }
-            line.push(';');
+            tok.push(f.name.to_string());
+            tok.push(match item.raw_curr_by_name(f.col) {
+                Availability::Present(v) => format!("{v:x}"),
+                _ => ABSENT_TEXT.to_string(),
+            });
         }
     }
 }
 
-fn push_u64(line: &mut String, v: Availability<u64>) {
+/// 生値 1 個のトークン。欠落は空文字 (**0 にはしない**)。
+fn u64_token(v: Availability<u64>) -> String {
     match v {
-        Availability::Present(x) => {
-            use std::fmt::Write as _;
-            let _ = write!(line, "{x}");
-        }
-        // 欠落は空にする。0 を書くと「正常に 0」と区別できない。
-        _ => line.push_str(ABSENT_TEXT),
+        Availability::Present(x) => x.to_string(),
+        _ => ABSENT_TEXT.to_string(),
     }
 }
 
@@ -350,39 +365,51 @@ fn write_irq<W: Write>(out: &mut W, view: &IntervalView<'_>, ts: &str) -> io::Re
     let nr = pair.curr.nr.max(1) as usize;
     let nr2 = pair.curr.nr2.max(1) as usize;
 
+    // v12.5.6 より前の 1 次元レイアウト (`nr` = 割り込み数 / `nr2` = 1) では
+    // CPU 別の内訳を持たない。行列型と混同すると「割り込み 1 本 × 489 CPU」に
+    // 化けるので、ここで分ける (02 §6.4)。
+    if nr2 <= 1 {
+        for irq in 0..pair.len() {
+            let Some(item) = pair.item(irq) else { break };
+            let name = item
+                .key()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| irq.to_string());
+            let mut tok = vec![ts.to_string(), "INTR".to_string(), name, "all".to_string()];
+            tok.push(u64_token(item.raw_prev_by_name("intr")));
+            tok.push(u64_token(item.raw_curr_by_name("intr")));
+            out.write_all(join_tokens(&tok).as_bytes())?;
+        }
+        return Ok(());
+    }
+
     for irq in 0..nr2 {
+        // 割り込み名は CPU "all" 行 (行 0) にのみ書かれている
         let name = pair
             .matrix_item(0, irq)
             .and_then(|i| i.key().map(|s| s.to_string()))
             .unwrap_or_else(|| irq.to_string());
 
-        let mut line = String::with_capacity(128);
-        line.push_str(ts);
-        line.push_str("; INTR; ");
-        line.push_str(&name);
-        line.push(';');
-
+        let mut tok = vec![ts.to_string(), "INTR".to_string(), name];
         for cpu in 0..nr {
-            let field = if cpu == 0 {
+            // フィールド名は `all` (CPU 0) / `CPU0` / `CPU1` … (§4.5)
+            tok.push(if cpu == 0 {
                 "all".to_string()
             } else {
                 format!("CPU{}", cpu - 1)
-            };
-            line.push_str("; ");
-            line.push_str(&field);
-            line.push_str("; ");
+            });
             match pair.matrix_item(cpu, irq) {
                 Some(item) => {
-                    push_u64(&mut line, item.raw_prev_by_name("intr"));
-                    line.push_str("; ");
-                    push_u64(&mut line, item.raw_curr_by_name("intr"));
+                    tok.push(u64_token(item.raw_prev_by_name("intr")));
+                    tok.push(u64_token(item.raw_curr_by_name("intr")));
                 }
-                None => line.push_str("; "),
+                None => {
+                    tok.push(ABSENT_TEXT.to_string());
+                    tok.push(ABSENT_TEXT.to_string());
+                }
             }
-            line.push(';');
         }
-        line.push('\n');
-        out.write_all(line.as_bytes())?;
+        out.write_all(join_tokens(&tok).as_bytes())?;
     }
     Ok(())
 }
@@ -398,16 +425,16 @@ fn write_wghfreq<W: Write>(
     let Some(pair) = ActivityPair::from_view(view, ActivityId::PWR_FREQ) else {
         return Ok(());
     };
-    let nr = pair.curr.nr.max(0) as usize;
+    let nr = pair.curr.nr as usize;
     let nr2 = pair.curr.nr2.max(1) as usize;
+    let spec = pair_spec();
 
     for row in 0..nr {
-        let mut line = String::with_capacity(128);
-        line.push_str(ts);
-        line.push_str("; CPU; ");
-        line.push_str(&super::ItemLabel::cpu(row).db);
-        line.push(';');
-
+        let mut tok = vec![
+            ts.to_string(),
+            "CPU".to_string(),
+            super::ItemLabel::cpu(row).db,
+        ];
         for step in 0..nr2 {
             let Some(item) = pair.item(row * nr2 + step) else {
                 break;
@@ -416,12 +443,11 @@ fn write_wghfreq<W: Write>(
             if matches!(freq, Availability::Present(0)) {
                 break;
             }
-            line.push_str("; freq; ");
-            push_u64(&mut line, freq);
-            line.push(';');
+            tok.push("freq".to_string());
+            tok.push(u64_token(freq));
             push_raw_field(
-                &mut line,
-                pair_spec(),
+                &mut tok,
+                spec,
                 &item,
                 &RawField {
                     col: "time_in_state",
@@ -431,8 +457,7 @@ fn write_wghfreq<W: Write>(
                 cfg,
             );
         }
-        line.push('\n');
-        out.write_all(line.as_bytes())?;
+        out.write_all(join_tokens(&tok).as_bytes())?;
     }
     Ok(())
 }
@@ -500,11 +525,21 @@ mod tests {
     /// 欠落は空トークンになり 0 にはならない。
     #[test]
     fn absent_raw_value_is_empty_not_zero() {
-        let mut line = String::new();
-        push_u64(&mut line, Availability::UnsupportedBySource);
-        assert_eq!(line, "");
-        push_u64(&mut line, Availability::Present(0));
-        assert_eq!(line, "0");
+        assert_eq!(u64_token(Availability::UnsupportedBySource), "");
+        assert_eq!(u64_token(Availability::MissingInSample), "");
+        assert_eq!(u64_token(Availability::Present(0)), "0", "正常な 0 は 0");
+    }
+
+    /// 行は `"; "` 区切りで、末尾に `;` が付く (§4.1)。
+    #[test]
+    fn line_is_semicolon_space_separated_with_trailing_semicolon() {
+        let tok = vec![
+            "13:20:19 UTC".to_string(),
+            "proc/s".to_string(),
+            "46972".to_string(),
+            "47083".to_string(),
+        ];
+        assert_eq!(join_tokens(&tok), "13:20:19 UTC; proc/s; 46972; 47083;\n");
     }
 
     /// センサ値は小数 6 桁固定。

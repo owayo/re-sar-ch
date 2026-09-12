@@ -71,10 +71,13 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
 
     let mut printed_header: BTreeMap<u32, bool> = BTreeMap::new();
     walk(file, &cfg.selection.clone(), |view| {
-        let ts = format!(
-            "{:02}:{:02}:{:02}",
-            view.curr.hour, view.curr.minute, view.curr.second
-        );
+        // 派生値を出すときは先頭レコードを飛ばす。基準となる前サンプルが無く、
+        // 1 行すべてが `-` になって読みにくいだけなので。
+        // 生値だけを見るときは先頭レコードにも意味がある。
+        if !view.has_prev && cfg.values.wants_rates() {
+            return Ok(ScanControl::Continue);
+        }
+        let ts = utc_hms(view.curr.ust_time);
         for id in selected_ids(view, cfg) {
             let Some(w) = widths.get(&id.0) else { continue };
             let Some(pair) = ActivityPair::from_view(view, id) else {
@@ -116,7 +119,8 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
 fn write_block_header<W: Write>(out: &mut W, id: ActivityId, w: &Widths) -> Result<()> {
     let label = id.label().unwrap_or("");
     writeln!(out).map_err(super::sadf::wrap_io)?;
-    writeln!(out, "{} — {label}", id.display_name()).map_err(super::sadf::wrap_io)?;
+    writeln!(out, "{} — {label}  (time は UTC)", id.display_name())
+        .map_err(super::sadf::wrap_io)?;
 
     let mut head = String::from(INDENT);
     push_cell(&mut head, "time", w.time, false);
@@ -139,11 +143,27 @@ fn write_block_header<W: Write>(out: &mut W, id: ActivityId, w: &Widths) -> Resu
     Ok(())
 }
 
+/// 区間終点の UTC 時刻 (`HH:MM:SS`)。
+///
+/// レコードが持つ「収集時ローカルの時分秒」ではなく epoch 秒から作る。
+/// JSON / NDJSON / CSV が出す `end_epoch` と同じ時点を指すようにするため。
+fn utc_hms(ust_time: u64) -> String {
+    use chrono::{TimeZone, Timelike, Utc};
+    let t = Utc
+        .timestamp_opt(ust_time as i64, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second())
+}
+
 /// 1 回目の走査。activity ごとの列幅を決める。
 fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
     let mut widths: BTreeMap<u32, Widths> = BTreeMap::new();
 
     walk(file, &cfg.selection.clone(), |view| {
+        if !view.has_prev && cfg.values.wants_rates() {
+            return Ok(ScanControl::Continue);
+        }
         let ts_len = "00:00:00".len();
         for id in selected_ids(view, cfg) {
             let Some(pair) = ActivityPair::from_view(view, id) else {

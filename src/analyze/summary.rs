@@ -904,6 +904,7 @@ enum Outcome {
 /// 前サンプルが無いときに渡す空 item (派生列の計算は前値の欠落を自分で判定する)。
 static EMPTY_ITEM: ItemSnapshot = ItemSnapshot {
     key: None,
+    texts: Vec::new(),
     values: Vec::new(),
 };
 
@@ -1114,6 +1115,7 @@ mod tests {
         }
         ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: v,
         }
     }

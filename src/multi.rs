@@ -1542,6 +1542,7 @@ mod tests {
         }
         ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: v,
         }
     }

@@ -346,6 +346,8 @@ impl ExampleCounters {
 | `0x2173` の RESTART | ペイロードなし | `sa_vol_act_nr` 個の activity リストが続き、**各エントリの `nr` で以降の item 数が変わる** |
 | 拡張レコード種別 (5〜15) | 未知種別として統計扱い | `0x2175` では統計を伴わない拡張レコード。16 以上は無効。旧世代には存在しないので統計扱いで正しい |
 | item 数の上限 | 汎用上限で十分 | activity 別の `nr_max` が必要 (汎用上限だけでは細工ファイルが通る) |
+| activity revision の選択 | activity magic で決まる | **magic だけでは決まらない。** 同じ magic のまま構造体サイズが変わった版がある (`A_CPU` の magic `0x8a` には 144 バイト版と 160 バイト版)。型別個数 → magic + 申告サイズ → 申告サイズ → magic の順に絞る |
+| 申告サイズを超えるフィールド | 起こらない | 起こる。選んだ revision が申告サイズより大きい場合、超える位置は読まず `UnsupportedBySource` にする (読むと隣の item やファイル末尾を踏む) |
 
 ---
 

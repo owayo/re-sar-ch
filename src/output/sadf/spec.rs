@@ -1113,7 +1113,7 @@ const FS_MOUNT_FIELDS: &[Field] = fs_fields!("mountpoint", "mountp");
 /// `MBfs*` / `%fsused` / `%ufsused` は出さず、直書きの `f_bfree` / `f_blocks` /
 /// `f_bavail` / `f_files` が入る (§4.5)。
 const FS_RAW: &[RawField] = &[
-    rawf!("fs_total", "f_bfree", RawStyle::Int),
+    rawf!("fs_free", "f_bfree", RawStyle::Int),
     rawf!("fs_total", "f_blocks", RawStyle::Int),
     rawf!("fs_available", "f_bavail", RawStyle::Int),
     rawf!("inodes_free", "Ifree", RawStyle::Int),

@@ -42,14 +42,23 @@ pub fn write_ppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Resu
 fn write_dbppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig, isdb: bool) -> Result<()> {
     let info = FileInfo::from_file(file);
     let specs = present_specs(file);
-    let restarts = scan_restarts(file)?;
+    let blocks = scan_blocks(file)?;
 
     // -h は -d のみ有効 (§0.2)。全 activity を 1 行に連ねる別ループになる。
     if isdb && cfg.horizontally {
         return write_horizontal(out, file, cfg, &info, &specs);
     }
 
-    for block in 0..=restarts.len() {
+    for block in 0..blocks.len() {
+        // 統計レコードが 1 本以下のブロックは 1 行も出せない。
+        // フィールド名一覧行もそこには出ない (実測: RESTART が先頭のファイルでは
+        // `LINUX-RESTART` 行が最初に来る)。
+        if !blocks.has_output(block) {
+            if let Some(r) = blocks.restarts.get(block) {
+                write_restart(out, cfg, &info, r, isdb).map_err(super::wrap_io)?;
+            }
+            continue;
+        }
         for spec in &specs {
             for section in spec.active_sections(&cfg.section) {
                 if isdb {
@@ -59,7 +68,7 @@ fn write_dbppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig, isdb: boo
             }
         }
         // ブロックを閉じる RESTART 行 (ブロックごとに 1 回)
-        if let Some(r) = restarts.get(block) {
+        if let Some(r) = blocks.restarts.get(block) {
             write_restart(out, cfg, &info, r, isdb).map_err(super::wrap_io)?;
         }
     }
@@ -391,10 +400,10 @@ pub fn present_specs(file: &SaFile) -> Vec<&'static ActivitySpec> {
         if entry.nr <= 0 {
             continue;
         }
-        if let Some(s) = spec::lookup(entry.id) {
-            if !out.iter().any(|x| x.id == s.id) {
-                out.push(s);
-            }
+        if let Some(s) = spec::lookup(entry.id)
+            && !out.iter().any(|x| x.id == s.id)
+        {
+            out.push(s);
         }
     }
     out.sort_by_key(|s| s.id.0);
@@ -422,6 +431,63 @@ fn count_restarts(events: &[RecordEvent]) -> usize {
         .count()
 }
 
+/// RESTART で区切られたブロックの構成。
+#[derive(Debug, Default)]
+pub struct Blocks {
+    /// ブロックを閉じる RESTART (最後のブロックには対応する要素が無い)。
+    pub restarts: Vec<RestartMark>,
+    /// ブロックごとの統計レコード数。
+    pub stats: Vec<usize>,
+}
+
+impl Blocks {
+    /// ブロック数 (RESTART 数 + 1)。
+    pub fn len(&self) -> usize {
+        self.stats.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stats.is_empty()
+    }
+
+    /// 出力行を持ち得るブロックか。
+    ///
+    /// 先頭のレコードは基準値として消費されるため、統計レコードが 2 本以上
+    /// なければ 1 行も出ない。
+    pub fn has_output(&self, block: usize) -> bool {
+        self.stats.get(block).copied().unwrap_or(0) >= 2
+    }
+}
+
+/// RESTART の位置とブロックごとの統計レコード数を 1 回の走査で数える。
+pub fn scan_blocks(file: &SaFile) -> Result<Blocks> {
+    use crate::format::registry::RecordKind;
+    let mut b = Blocks {
+        restarts: Vec::new(),
+        stats: vec![0],
+    };
+    file.scan(|rec| {
+        match rec.kind {
+            RecordKind::Restart => {
+                b.restarts.push(RestartMark {
+                    ust_time: rec.ust_time,
+                    hms: (rec.hour, rec.minute, rec.second),
+                    cpu_count: rec.cpu_count,
+                });
+                b.stats.push(0);
+            }
+            RecordKind::Stats | RecordKind::LastStats => {
+                if let Some(last) = b.stats.last_mut() {
+                    *last += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(ScanControl::Continue)
+    })?;
+    Ok(b)
+}
+
 /// ファイル内の RESTART を先頭から順に列挙する。
 ///
 /// `walk` は統計レコードだけを訪れるため、末尾の RESTART を取りこぼす。
@@ -442,8 +508,11 @@ pub fn scan_restarts(file: &SaFile) -> Result<Vec<RestartMark>> {
     Ok(marks)
 }
 
+/// COMMENT レコード 1 件分 (エポック秒、時刻、本文)。
+pub type CommentEntry = (u64, (u8, u8, u8), String);
+
 /// ファイル内の COMMENT を先頭から順に列挙する (`-j` / `-x` の `comments` 用)。
-pub fn scan_comments(file: &SaFile) -> Result<Vec<(u64, (u8, u8, u8), String)>> {
+pub fn scan_comments(file: &SaFile) -> Result<Vec<CommentEntry>> {
     use crate::format::registry::RecordKind;
     let mut out = Vec::new();
     file.scan(|rec| {

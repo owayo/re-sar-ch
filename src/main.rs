@@ -154,8 +154,8 @@ fn write_info_table<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> 
     writeln!(out)?;
     writeln!(
         out,
-        "{:>3}  {:<14} {:>6}  {:>7} {:>5} {:>6}  {:>6}  {}",
-        "id", "activity", "magic", "nr", "nr2", "size", "has_nr", "types_nr"
+        "{:>3}  {:<14} {:>6}  {:>7} {:>5} {:>6}  {:>6}  types_nr",
+        "id", "activity", "magic", "nr", "nr2", "size", "has_nr"
     )?;
     for a in file.activities() {
         let types = match a.types_nr {

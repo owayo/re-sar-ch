@@ -17,10 +17,24 @@ use super::delta::interval_cs;
 /// item 1 個分のデコード結果。
 #[derive(Debug, Clone, Default)]
 pub struct ItemSnapshot {
-    /// デバイス名・インターフェース名など。無い activity は `None`。
+    /// 主識別子 (デバイス名・インターフェース名など)。無い activity は `None`。
     pub key: Option<Box<str>>,
+    /// 文字列フィールドの値。順序は [`DecodePlan::text_fields`] と同じ。
+    ///
+    /// `A_PWR_USB` の `manufact` / `product` のように 1 item が複数の文字列を
+    /// 持つ activity があるため、`key` 1 本では足りない。
+    /// 位置は [`DecodePlan::text_index`] で引く。
+    pub texts: Vec<Option<Box<str>>>,
     /// wire フィールドの値 (宣言順)。
     pub values: Vec<Availability<u64>>,
+}
+
+impl ItemSnapshot {
+    /// 文字列フィールドを位置で引く。
+    #[inline]
+    pub fn text(&self, index: usize) -> Option<&str> {
+        self.texts.get(index).and_then(|t| t.as_deref())
+    }
 }
 
 /// activity 1 種分のデコード結果。
@@ -207,11 +221,17 @@ where
             // 未知 activity は読み飛ばす (エラーではない)
             continue;
         };
-        // magic と型別個数の両方で revision を絞る。
-        // 同じ magic のまま構造体が変わった版があるため magic だけでは決まらない。
+        // revision の選択は「型別個数 → magic+サイズ → サイズ → magic → 最新」の順に絞る。
+        //
+        // 同じ magic のまま構造体サイズが変わった版があるため、magic だけでは決まらない
+        // (A_CPU の magic 0x8a には 144 バイト版と 160 バイト版がある)。
+        // サイズを見ずに新しい方を選ぶと、申告サイズを超える位置を読もうとする。
+        let declared = act.size as usize;
         let rev = act
             .types_nr
             .and_then(|t| def.revision_for_types_nr(t))
+            .or_else(|| def.revision_for_magic_and_size(act.magic, declared))
+            .or_else(|| def.revision_for_size(declared))
             .or_else(|| def.revision_for_magic(act.magic))
             .or_else(|| def.latest());
         let Some(rev) = rev else { continue };
@@ -391,6 +411,28 @@ fn decode_activity_into(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned().into_boxed_str());
 
+        // 文字列フィールドを持つ activity は少数なので、無ければ何もしない
+        if plan.text_fields.is_empty() {
+            item.texts.clear();
+        } else {
+            let mut read: Vec<Option<&str>> = Vec::with_capacity(plan.text_fields.len());
+            plan.read_texts_into(cur, base, &mut read).map_err(|e| {
+                crate::error::Error::Other(format!(
+                    "{id} の item {i} の文字列フィールドを読めない (offset={}, need={})",
+                    e.offset, e.need
+                ))
+            })?;
+            if item.texts.len() != read.len() {
+                item.texts.resize(read.len(), None);
+            }
+            for (dst, src) in item.texts.iter_mut().zip(read.iter()) {
+                // 内容が変わらなければ確保し直さない (デバイス名は通常固定)
+                if dst.as_deref() != *src {
+                    *dst = src.map(|s| s.to_owned().into_boxed_str());
+                }
+            }
+        }
+
         filled += 1;
     }
     dest.items.truncate(filled);
@@ -450,10 +492,12 @@ mod tests {
             items: vec![
                 ItemSnapshot {
                     key: Some("eth0".into()),
+                    texts: Vec::new(),
                     values: vec![Availability::Present(1)],
                 },
                 ItemSnapshot {
                     key: Some("lo".into()),
+                    texts: Vec::new(),
                     values: vec![Availability::Present(2)],
                 },
             ],

@@ -417,10 +417,10 @@ fn raw_f64(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> Computed {
 /// (03 §1.3.3 / §1.4.3)。
 #[inline]
 fn set_column(plan: &DecodePlan, item: &mut ItemSnapshot, column: usize, value: u64) {
-    if let Some(Some(id)) = plan.column_fields.get(column) {
-        if let Some(slot) = item.values.get_mut(id.index()) {
-            *slot = Availability::Present(value);
-        }
+    if let Some(Some(id)) = plan.column_fields.get(column)
+        && let Some(slot) = item.values.get_mut(id.index())
+    {
+        *slot = Availability::Present(value);
     }
 }
 
@@ -1066,7 +1066,7 @@ fn bat_derived(
 /// CPU の 1 フィールド分の差分。アンダーフローは 0 に潰す。
 #[inline]
 fn cpu_delta(prev: u64, curr: u64) -> u64 {
-    if curr > prev { curr - prev } else { 0 }
+    curr.saturating_sub(prev)
 }
 
 /// `get_per_cpu_interval()` 相当 (03 §1.4.2)。
@@ -1196,6 +1196,7 @@ pub fn aggregate_cpu(
     let width = curr_items[0].values.len();
     let zero = || ItemSnapshot {
         key: None,
+        texts: Vec::new(),
         values: vec![Availability::Present(0); width],
     };
     let mut agg_prev = zero();
@@ -1252,6 +1253,7 @@ where
 {
     let mut acc = ItemSnapshot {
         key: None,
+        texts: Vec::new(),
         values: vec![Availability::Present(0); width],
     };
     for it in items {
@@ -1479,6 +1481,7 @@ mod tests {
     fn item(values: &[u64]) -> ItemSnapshot {
         ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: values.iter().map(|v| Availability::Present(*v)).collect(),
         }
     }
@@ -1495,6 +1498,7 @@ mod tests {
     fn zeros(plan: &DecodePlan) -> ItemSnapshot {
         ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: vec![Availability::Present(0); plan.fields.len()],
         }
     }
@@ -2309,6 +2313,7 @@ mod tests {
             let plan = DecodePlan::build(def, rev, rev.size_lp64, 2, 2, &enc).unwrap();
             let zero = ItemSnapshot {
                 key: None,
+                texts: Vec::new(),
                 values: vec![Availability::Present(0); plan.fields.len()],
             };
             let ctx = ComputeContext {

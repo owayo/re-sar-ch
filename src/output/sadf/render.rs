@@ -97,9 +97,22 @@ pub fn field_value(
 }
 
 /// 表示値を引く。列を持たないフィールドは「未対応」として返す。
+///
+/// 識別子列 (`ValueKind::Identity`) は `series` 層が数値として扱わない
+/// (`ComputeIssue::NotNumeric`) ので、生値を直接読む。
+/// `A_PWR_USB` の `idvendor` / `idprod` や `A_PWR_BAT` の番号がこれに当たる。
 pub fn value_of(item: &ItemPair<'_>, field: &Field) -> Computed {
     if field.col.is_empty() {
         return Err(ComputeIssue::NotImplemented);
+    }
+    if let Some(i) = item.column_index(field.col)
+        && item.column_meta(i).map(|m| m.kind) == Some(crate::model::ValueKind::Identity)
+    {
+        return match item.raw_curr(i) {
+            Availability::Present(v) => Ok(v as f64),
+            Availability::UnsupportedBySource => Err(ComputeIssue::UnsupportedBySource),
+            Availability::MissingInSample => Err(ComputeIssue::MissingInSample),
+        };
     }
     item.computed_by_name(field.col)
 }

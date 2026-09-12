@@ -73,6 +73,13 @@ pub enum Error {
     #[error("レイアウト定義の不整合: {0}")]
     Layout(#[from] LayoutError),
 
+    /// 出力先への書き込みに失敗した。
+    ///
+    /// 入力ファイルの読み取りエラーは [`Error::Io`] (パス付き) を使う。
+    /// こちらは `stdout` やパイプへの書き込みなど、パスを持たない経路のためのもの。
+    #[error("出力に失敗しました: {0}")]
+    Write(#[from] std::io::Error),
+
     #[error("{0}")]
     Other(String),
 }

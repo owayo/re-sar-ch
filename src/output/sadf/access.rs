@@ -91,7 +91,7 @@ impl<'a> ActivityPair<'a> {
         ctx.continuous = self.continuous && matched;
         // 集約 item (CPU の `all` 行 / A_IRQ の合計列) は逆行クランプの扱いが違う
         ctx.aggregate_item = match self.def.shape {
-            ItemShape::Matrix => index % self.curr.nr2.max(1) as usize == 0,
+            ItemShape::Matrix => index.is_multiple_of(self.curr.nr2.max(1) as usize),
             _ => label_index == 0,
         };
         // A_CPU の割合はグローバル itv ではなく、その CPU の tick 合計で正規化する
@@ -126,7 +126,7 @@ impl<'a> ActivityPair<'a> {
             return Vec::new();
         }
         let nr2 = self.curr.nr2.max(1) as usize;
-        (0..self.curr.nr.max(0) as usize)
+        (0..self.curr.nr as usize)
             .filter_map(|row| self.item_indexed(row * nr2, row))
             .collect()
     }
@@ -287,6 +287,7 @@ mod tests {
     fn item(values: &[u64]) -> ItemSnapshot {
         ItemSnapshot {
             key: None,
+            texts: Vec::new(),
             values: values.iter().map(|v| Availability::Present(*v)).collect(),
         }
     }

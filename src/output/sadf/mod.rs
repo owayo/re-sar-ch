@@ -342,12 +342,12 @@ fn local_tz_name() -> String {
     use chrono::Offset;
     // 略称は chrono-tz 側のトレイト (`OffsetName`) にある
     use chrono_tz::OffsetName;
-    if let Ok(tz) = std::env::var("TZ") {
-        if let Ok(tz) = tz.parse::<chrono_tz::Tz>() {
-            let now = Utc::now().naive_utc();
-            if let Some(abbr) = tz.offset_from_utc_datetime(&now).abbreviation() {
-                return abbr.to_string();
-            }
+    if let Ok(tz) = std::env::var("TZ")
+        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
+    {
+        let now = Utc::now().naive_utc();
+        if let Some(abbr) = tz.offset_from_utc_datetime(&now).abbreviation() {
+            return abbr.to_string();
         }
     }
     chrono::Local::now().offset().fix().to_string()
@@ -771,34 +771,275 @@ mod smoke {
     }
 }
 
+// ===========================================================================
+// ドキュメントに載っている本家の出力例との突合
+// ===========================================================================
+
+/// `docs/format/03-output-format.md` に実測値として載っている行を期待値に固定する。
+///
+/// データは GPL-2.0-or-later なので同梱できない。
+/// `cargo run --bin xtask -- fetch-fixtures` で取得済みのときだけ実行し、
+/// 無ければ**何も失敗させずスキップ**する。
 #[cfg(test)]
-mod zzdump {
+mod golden {
     use super::*;
     use crate::format::file::SaFile;
-    use crate::output::json::{CustomConfig, ValueScope};
     use std::path::PathBuf;
 
+    fn open(name: &str) -> Option<SaFile> {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/fixtures/upstream")
+            .join(name);
+        if !p.exists() {
+            return None;
+        }
+        SaFile::open(&p).ok()
+    }
+
+    fn emit(
+        file: &SaFile,
+        f: fn(&mut Vec<u8>, &SaFile, &SadfConfig) -> crate::Result<()>,
+    ) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf, file, &SadfConfig::default()).expect("出力できること");
+        String::from_utf8(buf).expect("UTF-8")
+    }
+
+    /// テストデータのホスト名。
+    ///
+    /// 期待値にホスト名を直書きせず、読み込んだファイルのヘッダから取る。
+    fn node(file: &SaFile) -> String {
+        FileInfo::from_file(file).nodename
+    }
+
+    /// 断片がそのまま行として現れることを確かめる。
+    fn assert_has_line(text: &str, want: &str) {
+        assert!(
+            text.lines().any(|l| l.trim_start() == want),
+            "次の行が見つからない:\n  {want}"
+        );
+    }
+
+    /// `-d` (§3.1 の `data-11.6.5` 実測)。
     #[test]
-    fn dump() {
-        let dir = PathBuf::from("/tmp/claude-501/-Users-owa-GitHub-re-sar-ch/f36d1cd0-7ca0-4853-8503-c054a06b69af/scratchpad/out");
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["data-12.0.0", "data-11.6.5"] {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/fixtures/upstream").join(name);
-            if !p.exists() { continue; }
-            let file = match SaFile::open(&p) { Ok(f) => f, Err(e) => { eprintln!("{name}: {e}"); continue } };
-            let cfg = SadfConfig::default();
-            let mut b = Vec::new(); header::write_header(&mut b, &file).unwrap(); std::fs::write(dir.join(format!("{name}.H")), &b).unwrap();
-            let mut b = Vec::new(); dbppc::write_db(&mut b, &file, &cfg).unwrap(); std::fs::write(dir.join(format!("{name}.d")), &b).unwrap();
-            let mut b = Vec::new(); dbppc::write_ppc(&mut b, &file, &cfg).unwrap(); std::fs::write(dir.join(format!("{name}.p")), &b).unwrap();
-            let mut b = Vec::new(); raw::write_raw(&mut b, &file, &cfg).unwrap(); std::fs::write(dir.join(format!("{name}.r")), &b).unwrap();
-            let mut b = Vec::new(); json::write_json(&mut b, &file, &cfg).unwrap(); std::fs::write(dir.join(format!("{name}.j")), &b).unwrap();
-            let mut b = Vec::new(); xml::write_xml(&mut b, &file, &cfg).unwrap(); std::fs::write(dir.join(format!("{name}.x")), &b).unwrap();
-            let dbg = SadfConfig { debug: true, ..SadfConfig::default() };
-            let mut b = Vec::new(); raw::write_raw(&mut b, &file, &dbg).unwrap(); std::fs::write(dir.join(format!("{name}.rdebug")), &b).unwrap();
-            let c = CustomConfig { values: ValueScope::Both, ..Default::default() };
-            let mut b = Vec::new(); crate::output::table::write_table(&mut b, &file, &c).unwrap(); std::fs::write(dir.join(format!("{name}.table")), &b).unwrap();
-            let mut b = Vec::new(); crate::output::ndjson::write_ndjson(&mut b, &file, &c).unwrap(); std::fs::write(dir.join(format!("{name}.ndjson")), &b).unwrap();
-            let mut b = Vec::new(); crate::output::csv::write_csv(&mut b, &file, &c).unwrap(); std::fs::write(dir.join(format!("{name}.csv")), &b).unwrap();
+    fn db_output_matches_documented_lines() {
+        let Some(file) = open("data-11.6.5") else {
+            eprintln!("fixture 未取得: スキップ");
+            return;
+        };
+        let out = emit(&file, dbppc::write_db);
+        let n = node(&file);
+
+        // RESTART 行は `;` 区切りだが LINUX-RESTART の直後だけタブ
+        assert_has_line(
+            &out,
+            &format!("{n};-1;2018-08-29 09:33:38 UTC;LINUX-RESTART\t(8 CPU)"),
+        );
+        assert_has_line(&out, "# hostname;interval;timestamp;FAN;DEVICE;rpm;drpm");
+        assert_has_line(
+            &out,
+            &format!("{n};46;2018-08-29 09:34:34 UTC;1;f71858fg-isa-0200;1283.00;1283.00"),
+        );
+        assert_has_line(&out, "# hostname;interval;timestamp;TEMP;DEVICE;degC;%temp");
+        assert_has_line(
+            &out,
+            &format!("{n};46;2018-08-29 09:34:34 UTC;1;f71858fg-isa-0200;34.00;48.57"),
+        );
+        // CPU 集約行のキーは `-1` (文字列 `all` ではない)
+        assert!(
+            out.contains(&format!("{n};46;2018-08-29 09:34:34 UTC;-1;")),
+            "CPU 集約行のキーが -1 でない"
+        );
+    }
+
+    /// `-p` (§2.1 の `data-11.6.5` 実測)。アイテム名は接頭辞 + 1 始まり。
+    #[test]
+    fn ppc_output_matches_documented_lines() {
+        let Some(file) = open("data-11.6.5") else {
+            return;
+        };
+        let out = emit(&file, dbppc::write_ppc);
+        let n = node(&file);
+
+        assert_has_line(
+            &out,
+            &format!("{n}\t-1\t2018-08-29 09:33:38 UTC\tLINUX-RESTART\t(8 CPU)"),
+        );
+        assert_has_line(
+            &out,
+            &format!("{n}\t46\t2018-08-29 09:34:34 UTC\tfan1\tDEVICE\tf71858fg-isa-0200"),
+        );
+        assert_has_line(
+            &out,
+            &format!("{n}\t46\t2018-08-29 09:34:34 UTC\tfan1\trpm\t1283.00"),
+        );
+        assert_has_line(
+            &out,
+            &format!("{n}\t46\t2018-08-29 09:34:34 UTC\tfan1\tdrpm\t1283.00"),
+        );
+        // アイテムを持たない activity はリテラル `-`
+        assert!(
+            out.contains("\t-\tproc/s\t"),
+            "アイテム無しの位置に `-` が入っていない"
+        );
+    }
+
+    /// `-r` (§4.4 の `data-11.6.5` 実測)。センサ値は小数 6 桁、
+    /// `hdr_line` に無い `rpm_min` / `temp_min` / `temp_max` / `in_min` / `in_max` が出る。
+    #[test]
+    fn raw_output_matches_documented_lines() {
+        let Some(file) = open("data-11.6.5") else {
+            return;
+        };
+        let out = emit(&file, raw::write_raw);
+
+        assert_has_line(&out, "09:33:38 UTC; LINUX-RESTART (8 CPU)");
+        assert_has_line(
+            &out,
+            "09:34:34 UTC; FAN; 1; DEVICE; f71858fg-isa-0200; rpm; 1283.000000; rpm_min; 0.000000;",
+        );
+        assert_has_line(
+            &out,
+            "09:34:34 UTC; TEMP; 1; DEVICE; f71858fg-isa-0200; degC; 34.000000; temp_min; 0.000000; temp_max; 70.000000;",
+        );
+        assert_has_line(
+            &out,
+            "09:34:34 UTC; IN; 0; DEVICE; f71858fg-isa-0200; inV; 3.328000; in_min; 0.000000; in_max; 0.000000;",
+        );
+        // A_CPU の集約行のアイテム識別子は -1、`-u ALL` の第 2 変種が使われる
+        assert!(
+            out.contains("09:34:34 UTC; CPU; -1; %usr; "),
+            "A_CPU の raw 行頭が想定と違う"
+        );
+    }
+
+    /// `-j` (§9.8 の `data-11.6.5` 実測)。
+    /// `rpm` / `drpm` は整数、`degC` / `inV` は 2 桁小数、番号の起点が違う。
+    #[test]
+    fn json_output_matches_documented_lines() {
+        let Some(file) = open("data-11.6.5") else {
+            return;
+        };
+        let out = emit(&file, json::write_json);
+
+        for want in [
+            r#"{"number": 1, "rpm": 1283, "drpm": 1283, "device": "f71858fg-isa-0200"},"#,
+            r#"{"number": 1, "degC": 34.00, "percent-temp": 48.57, "device": "f71858fg-isa-0200"},"#,
+            r#"{"number": 0, "inV": 3.33, "percent-in": 0.00, "device": "f71858fg-isa-0200"},"#,
+        ] {
+            assert_has_line(&out, want);
+        }
+        // power-management ラッパの中に入る (tab 6)
+        assert!(
+            out.contains("\t\t\t\t\t\"fan-speed\": ["),
+            "fan-speed の深さが違う"
+        );
+        assert!(out.contains("\t\t\t\t\t\"power-management\": {"));
+    }
+
+    /// `-x` (§10.9 の `data-11.6.5` 実測)。
+    #[test]
+    fn xml_output_matches_documented_lines() {
+        let Some(file) = open("data-11.6.5") else {
+            return;
+        };
+        let out = emit(&file, xml::write_xml);
+
+        for want in [
+            r#"<fan number="1" rpm="1283" drpm="1283" device="f71858fg-isa-0200"/>"#,
+            r#"<temp number="1" degC="34.00" percent-temp="48.57" device="f71858fg-isa-0200"/>"#,
+            r#"<in number="0" inV="3.33" percent-in="0.00" device="f71858fg-isa-0200"/>"#,
+            r#"<fan-speed unit="rpm">"#,
+            r#"<temperature unit="degree Celsius">"#,
+            r#"<voltage-input unit="V">"#,
+            "<power-management>",
+        ] {
+            assert_has_line(&out, want);
+        }
+    }
+
+    /// `-dh` はフィールド名一覧行に `[...]` を挟み、1 サンプル = 1 行になる (§3.2)。
+    #[test]
+    fn horizontal_db_output_packs_a_sample_into_one_line() {
+        let Some(file) = open("data-11.6.5") else {
+            return;
+        };
+        let cfg = SadfConfig {
+            horizontally: true,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        dbppc::write_db(&mut buf, &file, &cfg).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        let mut lines = out.lines();
+        let hdr = lines.next().expect("フィールド名一覧行");
+        assert!(hdr.starts_with("# hostname;interval;timestamp;"));
+        // アイテムが 2 個以上ある activity の後には [...] が入る
+        assert!(hdr.contains("[...]"), "{hdr}");
+        // フィールド名一覧行は 1 回だけ
+        assert_eq!(out.matches("# hostname;interval;timestamp").count(), 1);
+
+        let n = node(&file);
+        let row = lines.next().expect("データ行");
+        assert!(row.starts_with(&format!("{n};")), "{row}");
+        // 全 activity が 1 行に連なるので、activity ごとに行が分かれない
+        assert!(
+            row.split(';').count() > 50,
+            "1 行に全 activity が入っていない: {} 列",
+            row.split(';').count()
+        );
+    }
+
+    /// `-H` は現行 magic でないファイルでは 2 行で打ち切る (§5)。
+    #[test]
+    fn header_output_stops_early_for_old_format() {
+        let Some(file) = open("data-9.1.6") else {
+            return;
+        };
+        let mut buf = Vec::new();
+        header::write_header(&mut buf, &file).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(
+            out.lines()
+                .next()
+                .unwrap()
+                .starts_with("System activity data file: ")
+        );
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("File created by sar/sadc from sysstat version 9.1.6")
+        );
+    }
+
+    /// `-j` / `-x` で `<io>` と `<memory>` の形が違うこと (§10.3 / §9.5)。
+    #[test]
+    fn io_and_memory_shapes_differ_between_json_and_xml() {
+        let Some(file) = open("data-12.0.0") else {
+            return;
+        };
+
+        let x = emit(&file, xml::write_xml);
+        // A_IO は <tps> だけテキスト内容、残り 3 つは属性
+        assert!(x.contains("<tps>"), "A_IO の tps がテキスト内容でない");
+        assert!(x.contains("<io-reads rtps="));
+        // A_MEMORY は全値がテキスト内容
+        assert!(x.contains("<memory unit=\"kB\">"));
+        assert!(x.contains("<memfree>"));
+
+        let j = emit(&file, json::write_json);
+        // JSON の A_IO は入れ子オブジェクト、A_MEMORY はフラット
+        assert!(j.contains("\"io\": {\"tps\": "));
+        assert!(j.contains("\"io-reads\": {\"rtps\": "));
+        assert!(j.contains("\"memory\": {\"memfree\": "));
+        // hugepages は power-management の中ではない (§9.6-14)
+        let pm = j.find("\"power-management\"");
+        let hp = j.find("\"hugepages\"");
+        if let (Some(pm), Some(hp)) = (pm, hp) {
+            assert!(hp < pm, "hugepages が power-management の後に来ている");
         }
     }
 }

@@ -62,7 +62,8 @@
 //! 時刻の情報が消えるので、[`split_standing`] で別枠へ出す。
 //!
 //! **水準変化は対象外。** 前後窓が入力の大半を占めても、水準変化の中身は
-//! 「いつ変わったか」そのものなので、時間的な手がかりを持っている。
+//! 「**前後で水準が違う境目**がどこか」そのものなので、
+//! 時間的な手がかりを持っている。
 //!
 //! # 不連続を跨がない
 //!
@@ -79,7 +80,7 @@
 
 use serde::Serialize;
 
-use super::{DetectRoute, Detection, SeriesKey, TemporalSupport};
+use super::{DetectRoute, Detection, DiscontinuityMark, SeriesKey, TemporalSupport};
 
 /// 近接する検出のまとまり。
 ///
@@ -146,13 +147,17 @@ impl Episode {
     /// 水準変化と他の観点が**同じ系列・重なった時刻**で当たった系列。
     ///
     /// 「絶対水準が高い」と「参照分布から外れている」はほぼ言い換えだが、
-    /// そこへ「**いつ変わったか**」が加わるのは情報が増えている。
+    /// そこへ「**前後で水準が違う境目がどこか**」が加わるのは情報が増えている。
+    ///
+    /// **「その瞬間に変わった」とは言えない。** 連続的な立ち上がりでも
+    /// 前後窓の差は成立するので、指せるのは採用した前後窓の分割時刻だけである
+    /// ([`crate::detect::level_shift`] の doc)。
     ///
     /// **ただし独立な裏付けではない (規律 2′)。** 3 経路は相関するので、
     /// これを理由に優先度を上げてはいけない。示すだけにする。
     ///
     /// 同じ系列であることだけでは足りない。水準変化が朝で逸脱が夜なら
-    /// 「変化した時刻が分かった」ことにならないので、
+    /// 「同じ時刻に別の観点も当たった」ことにならないので、
     /// **時間範囲が重なっていること**も確かめる。
     pub fn series_with_corroborating_viewpoints(&self) -> Vec<SeriesKey> {
         let mut out: Vec<SeriesKey> = Vec::new();
@@ -178,8 +183,8 @@ impl Episode {
 
 /// 2 つの裏付けの時間範囲が重なるか。
 ///
-/// 端点の一致も重なりとみなす。水準変化の後窓はちょうど変化点から始まるので、
-/// 変化点で立った別の観点の検出とは端点で接する。
+/// 端点の一致も重なりとみなす。水準変化の後窓はちょうど境目から始まるので、
+/// その境目で立った別の観点の検出とは端点で接する。
 fn overlaps(a: &TemporalSupport, b: &TemporalSupport) -> bool {
     a.start_ust <= b.end_ust && b.start_ust <= a.end_ust
 }
@@ -257,7 +262,8 @@ pub fn share_of_input_percent(
 /// その検出が「入力のほぼ全体を占める」か。
 ///
 /// **水準変化は常に `false`。** 前後窓が入力の大半を占めても、
-/// 水準変化の中身は「いつ変わったか」なので時間的な手がかりを持っている。
+/// 水準変化の中身は「前後で水準が違う境目がどこか」なので
+/// 時間的な手がかりを持っている。
 ///
 /// 判定に**採取回数の割合ではなく時間範囲の割合**を使うのは、
 /// 採取間隔が一定でない入力で回数割合が密に採取した時間帯へ偏るためである。
@@ -311,7 +317,7 @@ pub fn split_standing(
 pub fn group(
     detections: Vec<Detection>,
     rules: GroupRules,
-    discontinuity_marks: &[u64],
+    discontinuity_marks: &[DiscontinuityMark],
 ) -> Vec<Episode> {
     let mut episodes: Vec<Episode> = Vec::new();
     let mut current: Vec<Detection> = Vec::new();
@@ -323,10 +329,17 @@ pub fn group(
     for d in detections {
         let onset = d.support.start_ust;
         let end = d.support.end_ust;
+        // 結合後のエピソードに関わる系列。**不連続の判定は系列ごと**なので、
+        // 結合しようとしている検出の系列も含めて判定する。
         let joins = !current.is_empty()
             && onset <= last_onset.saturating_add(rules.gap_secs)
             && onset.saturating_sub(first_onset) <= rules.onset_span_cap_secs
-            && !crosses_discontinuity(first_onset, covered_end.max(end), discontinuity_marks);
+            && !crosses_discontinuity(
+                first_onset,
+                covered_end.max(end),
+                discontinuity_marks,
+                &series_of(&current, &d),
+            );
         if !joins && !current.is_empty() {
             episodes.push(finish(episodes.len(), std::mem::take(&mut current)));
         }
@@ -345,12 +358,40 @@ pub fn group(
     episodes
 }
 
-/// `[from_ust, to_ust]` の内側に不連続があるか。
+/// `[from_ust, to_ust]` の内側に、**この系列群に効く**不連続があるか。
 ///
 /// 始点そのものは含めない (そこから観測が再開したのなら、
 /// その不連続をエピソードが跨いだことにはならない)。
-fn crosses_discontinuity(from_ust: u64, to_ust: u64, marks: &[u64]) -> bool {
-    marks.iter().any(|m| *m > from_ust && *m <= to_ust)
+///
+/// **範囲は結合後のエピソード全体**である。ギャップ部分だけを見ると、
+/// 重なる検出を経由して不連続を跨ぐ橋渡しが成立してしまう
+/// (重なり時は `start < current_end` になり、ギャップに入る mark が
+/// そもそも存在できない)。
+///
+/// **及ぶ範囲も見る。** 再起動は全系列に効くが、item の入れ替えは
+/// その系列だけの話である。無関係な系列の着脱でエピソードを分断すると、
+/// 「いつ何が起きたか」が余計に細切れになる
+/// ([`DiscontinuityMark::blocks`])。
+fn crosses_discontinuity(
+    from_ust: u64,
+    to_ust: u64,
+    marks: &[DiscontinuityMark],
+    series: &[SeriesKey],
+) -> bool {
+    marks
+        .iter()
+        .any(|m| m.at_ust > from_ust && m.at_ust <= to_ust && m.blocks(series))
+}
+
+/// 結合済みの検出群と、結合しようとしている検出の系列を集める。
+fn series_of(current: &[Detection], next: &Detection) -> Vec<SeriesKey> {
+    let mut out: Vec<SeriesKey> = Vec::with_capacity(current.len() + 1);
+    for d in current.iter().chain(std::iter::once(next)) {
+        if !out.contains(&d.series) {
+            out.push(d.series.clone());
+        }
+    }
+    out
 }
 
 fn finish(index: usize, detections: Vec<Detection>) -> Episode {
@@ -413,6 +454,32 @@ mod tests {
 
     fn detection(start: u64, end: u64, column: &str, route: DetectRoute) -> Detection {
         detection_of(start, end, 1, column, route)
+    }
+
+    /// 全系列に及ぶ不連続 (再起動・採取の中断)。
+    fn global_mark(at: u64) -> DiscontinuityMark {
+        DiscontinuityMark {
+            at_ust: at,
+            all_series: true,
+            series: series_key("idle"),
+        }
+    }
+
+    /// その系列だけの不連続 (item の入れ替え)。
+    fn series_mark(at: u64, column: &str) -> DiscontinuityMark {
+        DiscontinuityMark {
+            at_ust: at,
+            all_series: false,
+            series: series_key(column),
+        }
+    }
+
+    fn series_key(column: &str) -> SeriesKey {
+        SeriesKey::from_metric(&crate::analyze::timeline::MetricKey::new(
+            ActivityId::CPU,
+            "all",
+            column,
+        ))
     }
 
     fn detection_of(
@@ -570,7 +637,7 @@ mod tests {
             detection(T0 + 1200, T0 + 1800, "idle", DetectRoute::FixedCondition),
         ];
         // ギャップ許容量 (1200 秒) の内側だが、不連続を跨ぐので繋がない
-        let eps = group(ds, rules(1200), &[T0 + 1200]);
+        let eps = group(ds, rules(1200), &[global_mark(T0 + 1200)]);
         assert_eq!(eps.len(), 2, "再起動をまたいで続いた異変にしてはいけない");
 
         // 不連続が無ければ同じ間隔で繋がる
@@ -579,6 +646,53 @@ mod tests {
             detection(T0 + 1200, T0 + 1800, "idle", DetectRoute::FixedCondition),
         ];
         assert_eq!(group(ds2, rules(1200), &[]).len(), 1);
+    }
+
+    /// 無関係な系列の item 入れ替えでエピソードを分断しない (Issue #5 ⑧ の後半)。
+    ///
+    /// 不連続には**及ぶ範囲**がある。再起動はその時刻をまたぐ全系列に効くが、
+    /// item の入れ替え (デバイスの着脱・CPU のオンライン変化) は
+    /// **その系列だけ**の話である。範囲を見ないと、あるデバイスの着脱が
+    /// 無関係な系列の所見まで細切れにする (過剰分割)。
+    ///
+    /// 「いつ何が起きたか」を読ませるのが目的なので、
+    /// 必要のない分断は目的に反する。
+    #[test]
+    fn an_unrelated_series_replacement_does_not_split_an_episode() {
+        let at = T0 + 1200;
+        let ds = vec![
+            detection(T0, T0 + 600, "idle", DetectRoute::FixedCondition),
+            detection(at, at + 600, "idle", DetectRoute::FixedCondition),
+        ];
+        // 別系列 (steal) の item 入れ替え。idle の所見には効かない
+        let eps = group(ds, rules(1200), &[series_mark(at, "steal")]);
+        assert_eq!(
+            eps.len(),
+            1,
+            "無関係な系列の入れ替えで分断してはいけない: {eps:#?}"
+        );
+
+        // 同じ系列の入れ替えなら分断する
+        let ds2 = vec![
+            detection(T0, T0 + 600, "idle", DetectRoute::FixedCondition),
+            detection(at, at + 600, "idle", DetectRoute::FixedCondition),
+        ];
+        assert_eq!(
+            group(ds2, rules(1200), &[series_mark(at, "idle")]).len(),
+            2,
+            "同じ系列の入れ替えは分断する"
+        );
+
+        // 再起動は系列に関わらず分断する
+        let ds3 = vec![
+            detection(T0, T0 + 600, "idle", DetectRoute::FixedCondition),
+            detection(at, at + 600, "idle", DetectRoute::FixedCondition),
+        ];
+        assert_eq!(
+            group(ds3, rules(1200), &[global_mark(at)]).len(),
+            2,
+            "再起動は全系列に及ぶ"
+        );
     }
 
     /// 重なる検出を経由して不連続を跨がない (Issue #5 ⑧)。
@@ -598,12 +712,14 @@ mod tests {
             // B 系列: 入れ替えの後
             detection(mark, mark + 600, "iowait", DetectRoute::FixedCondition),
         ];
-        let eps = group(ds, rules(1200), &[mark]);
+        let marks = [series_mark(mark, "iowait")];
+        let eps = group(ds, rules(1200), &marks);
         assert!(
             eps.iter().all(|e| !crosses_discontinuity(
                 e.support.start_ust,
                 e.support.end_ust,
-                &[mark]
+                &marks,
+                &e.series
             ) || e.detections.len() == 1),
             "不連続を跨ぐエピソードは、それ自体が 1 件の検出である場合だけ許される"
         );
@@ -713,7 +829,7 @@ mod tests {
 
     /// 水準変化は「入力のほぼ全体」でも背景に回さない。
     ///
-    /// 前後窓が入力を覆っても、水準変化の中身は「いつ変わったか」であり
+    /// 前後窓が入力を覆っても、水準変化の中身は「前後で水準が違う境目」であり
     /// 時間的な手がかりを持っている。
     #[test]
     fn a_level_shift_is_never_treated_as_background() {
@@ -754,7 +870,7 @@ mod tests {
         assert!(eps[0].series_with_corroborating_viewpoints().is_empty());
     }
 
-    /// 同じ系列でも時刻が対応していなければ「変化した時刻が分かった」ではない。
+    /// 同じ系列でも時刻が対応していなければ「同じ時刻に別の観点も当たった」ではない。
     #[test]
     fn a_corroborating_viewpoint_must_overlap_in_time() {
         let ds = vec![

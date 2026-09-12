@@ -1132,8 +1132,31 @@ pub struct PreparedSeries {
     pub missing: u64,
     /// 不連続として捨てた区間数。
     pub discontinuities: u64,
-    /// 不連続が起きた時刻 (区間の終点)。エピソードを跨がせないために使う。
-    pub discontinuity_marks: Vec<u64>,
+    /// 不連続が起きた時刻。エピソードを跨がせないために使う。
+    pub discontinuity_marks: Vec<DiscontinuityMark>,
+}
+
+/// 不連続が起きた 1 点。
+///
+/// **及ぶ範囲を持つ。** 再起動はその時刻をまたぐ全系列に効くが、
+/// item の入れ替えはその系列だけの話である。区別しないと、
+/// あるデバイスの着脱が無関係な系列の所見まで分断する
+/// (エピソードの過剰分割)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscontinuityMark {
+    /// 不連続が起きた時刻 (区間の終点)。
+    pub at_ust: u64,
+    /// 全系列に及ぶか (再起動・採取の中断・ファイルの切り替え)。
+    pub all_series: bool,
+    /// 観測した系列。`all_series` が真でも「どこで気づいたか」として持つ。
+    pub series: SeriesKey,
+}
+
+impl DiscontinuityMark {
+    /// この不連続が `series` の所見を分断するか。
+    pub fn blocks(&self, series: &[SeriesKey]) -> bool {
+        self.all_series || series.contains(&self.series)
+    }
 }
 
 impl PreparedSeries {
@@ -1142,7 +1165,7 @@ impl PreparedSeries {
         let origin = ObservationOrigin::of(&t.key, t.kind);
         let mut observations: Vec<Observation> = Vec::new();
         let mut segments: Vec<(usize, usize)> = Vec::new();
-        let mut marks: Vec<u64> = Vec::new();
+        let mut marks: Vec<DiscontinuityMark> = Vec::new();
         let mut open: Option<usize> = None;
         let mut missing = 0u64;
         let mut discontinuities = 0u64;
@@ -1161,7 +1184,17 @@ impl PreparedSeries {
 
             if discontinuous {
                 discontinuities += 1;
-                marks.push(p.end_ust);
+                // 及ぶ範囲を判定する。時刻が繋がらない / 区間長 0 は
+                // レコード列の性質なので全系列に効く。理由が付いている場合は
+                // その分類に従う (item 入れ替えはその系列だけ)。
+                let all_series = p.elapsed_cs == 0
+                    || !adjacent
+                    || p.reason.is_some_and(|r| r.affects_all_series());
+                marks.push(DiscontinuityMark {
+                    at_ust: p.end_ust,
+                    all_series,
+                    series: SeriesKey::from_metric(&t.key),
+                });
                 if let Some(start) = open.take() {
                     segments.push((start, observations.len()));
                 }
@@ -1452,7 +1485,10 @@ pub struct DetectOutcome {
     /// 採取間隔の代表値 (秒)。エピソードの近接判定に使う。
     pub interval_p90_secs: Option<u64>,
     /// 不連続が起きた時刻。**エピソードはここを跨がない。**
-    pub discontinuity_marks: Vec<u64>,
+    ///
+    /// 及ぶ範囲を持つので、無関係な系列の item 入れ替えで
+    /// エピソードが分断されることはない ([`DiscontinuityMark::blocks`])。
+    pub discontinuity_marks: Vec<DiscontinuityMark>,
 }
 
 /// 時系列に 3 経路を独立に走らせる。
@@ -1484,7 +1520,7 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
         }
         for m in &series.discontinuity_marks {
             if !out.discontinuity_marks.contains(m) {
-                out.discontinuity_marks.push(*m);
+                out.discontinuity_marks.push(m.clone());
             }
         }
 
@@ -1530,7 +1566,11 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
             .then_with(|| a.route().cmp(&b.route()))
     });
     out.evaluations.sort_by(|a, b| a.series.cmp(&b.series));
-    out.discontinuity_marks.sort_unstable();
+    out.discontinuity_marks.sort_by(|a, b| {
+        a.at_ust
+            .cmp(&b.at_ust)
+            .then_with(|| a.series.cmp(&b.series))
+    });
 
     intervals.sort_unstable();
     out.interval_p90_secs = intervals.get(intervals.len() / 2).copied();

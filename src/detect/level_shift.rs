@@ -172,6 +172,18 @@ pub fn detect(
     // 「前後窓を実時間で連続して取れた候補が 1 つでもあったか」。
     // 窓が取れても欠測を挟んでいれば評価できていない (規律 7)
     let mut any_evaluable = false;
+    // 「長さは足りたが、欠測を挟むので候補を捨てた」ことがあったか。
+    //
+    // 「取れる窓が無い」という結果は同じでも、読み手が次に打つ手が違う。
+    // 長さ不足なら採取を増やすしかないが、欠測が原因なら**欠測の原因を見る**
+    // のが先である。`NotEvaluated` の 2 variant を使い分けるための材料。
+    let mut skipped_for_gap = false;
+    // 構造的に境目になれなかった端の点数 (前後の合計)。
+    //
+    // 各連続区間の先頭 `w` 点と末尾 `w` 点は、前後窓の片側が足りないので
+    // 分割候補になれない。**「その範囲で変化が無かった」ではなく
+    // 「その範囲は見ていない」**ので、評価の網羅度へ出す (規律 7)。
+    let mut unevaluated_edge_points = 0usize;
 
     for segment in series.iter_segments() {
         let Some(interval) = representative_interval(segment) else {
@@ -179,8 +191,12 @@ pub fn detect(
         };
         let w = window_points(interval, th.shift_window_secs, th.shift_window_min_samples);
         if segment.len() < 2 * w {
+            // 区間の全点が「片側の窓が足りない」範囲になる
+            unevaluated_edge_points += segment.len();
             continue;
         }
+        // 先頭 w 点と末尾 w 点は分割候補になれない (最初の候補は `at = w`)
+        unevaluated_edge_points += 2 * w;
         let plan = WindowPlan {
             points: w,
             requested_secs: th.shift_window_secs,
@@ -192,6 +208,7 @@ pub fn detect(
         for at in w..=segment.len() - w {
             // **欠測を挟む比較は評価しない。** 境目を指す意味が無くなる
             if !is_contiguous(&segment[at - w..at + w]) {
+                skipped_for_gap = true;
                 continue;
             }
             any_evaluable = true;
@@ -240,21 +257,34 @@ pub fn detect(
         if !any_evaluable {
             // 実時間で連続した前後窓が取れなかった。**「検出なし」ではない。**
             //
-            // 長さが足りない場合と、欠測を挟んでいて連続した窓が取れない場合が
-            // ある。どちらも「取れる窓が無い」だが、理由を分けて出せると
-            // 読み手が次に何をすべきか分かる (Issue #5 の 4 / 5。
-            // `NotEvaluated` の variant 追加は `analyze::assessment` 側の担当)
-            return (
-                Vec::new(),
-                RouteStatus::NotEvaluated {
-                    reason: NotEvaluated::NoWindowLongEnough,
-                },
-            );
+            // 理由を 2 つに分ける。どちらも「取れる窓が無い」だが、
+            // **読み手が次に打つ手が違う**。長さ不足なら採取を増やすしかないが、
+            // 欠測が原因なら欠測の原因を見るのが先である (Issue #5 の 4 / 5)。
+            let reason = if skipped_for_gap {
+                NotEvaluated::WindowSpansMissingSamples
+            } else {
+                NotEvaluated::NoWindowLongEnough
+            };
+            return (Vec::new(), RouteStatus::NotEvaluated { reason });
         }
-        return (out, RouteStatus::Evaluated);
+        // 候補は取れたが段差は無かった = 「評価した」。
+        // ただし**端の範囲は見ていない**ので、その量を添える。
+        return (out, evaluated_with_edges(unevaluated_edge_points));
     }
     let count = out.len();
     (out, RouteStatus::Detected { count })
+}
+
+/// 「評価した」状態に、構造的に見ていない端の点数を添える。
+///
+/// 各連続区間の先頭 `w` 点と末尾 `w` 点は前後窓の片側が足りないため、
+/// **分割候補になれない**。「そこで変化が無かった」のではなく
+/// 「そこは見ていない」ので、0 でなければ網羅度へ出す (規律 7)。
+fn evaluated_with_edges(edge_points: usize) -> RouteStatus {
+    if edge_points == 0 {
+        return RouteStatus::Evaluated;
+    }
+    RouteStatus::EvaluatedWithBlindEdges { edge_points }
 }
 
 /// 窓の点数。
@@ -722,7 +752,9 @@ mod tests {
         // 連続区間が 15 点しかなく 2 窓 (各 5 点以上) を取れない場合もある
         assert!(matches!(
             status,
-            RouteStatus::Evaluated | RouteStatus::NotEvaluated { .. }
+            RouteStatus::Evaluated
+                | RouteStatus::EvaluatedWithBlindEdges { .. }
+                | RouteStatus::NotEvaluated { .. }
         ));
     }
 
@@ -866,10 +898,11 @@ mod tests {
             matches!(
                 status,
                 RouteStatus::NotEvaluated {
-                    reason: NotEvaluated::NoWindowLongEnough
+                    // 長さは足りている。原因は欠測なので、読み手が打つ手が違う
+                    reason: NotEvaluated::WindowSpansMissingSamples
                 }
             ),
-            "評価不能として返す (検出なしではない): {status:?}"
+            "欠測が原因であることを理由に出す (長さ不足と混ぜない): {status:?}"
         );
     }
 
@@ -901,7 +934,8 @@ mod tests {
             "傾向を特定時刻の段差として報告してはいけない: {found:#?}"
         );
         // 評価はできている (**評価不能ではない**)
-        assert!(matches!(status, RouteStatus::Evaluated), "{status:?}");
+        // 端の未評価範囲の申告つきでもよい (どちらも「評価はした」)
+        assert!(status.was_evaluated() && found.is_empty(), "{status:?}");
     }
 
     /// 傾向の上に乗った段差は拾う (上の裏返し)。
@@ -1001,7 +1035,8 @@ mod tests {
         }
         let (found, status) = run(runq(&vals(&v)));
         assert!(found.is_empty(), "後窓 5 点のうち 3 点では 0.7 に届かない");
-        assert!(matches!(status, RouteStatus::Evaluated), "{status:?}");
+        // 端の未評価範囲の申告つきでもよい (どちらも「評価はした」)
+        assert!(status.was_evaluated() && found.is_empty(), "{status:?}");
     }
 
     /// 方向の宣言を差し替えても壊れない。

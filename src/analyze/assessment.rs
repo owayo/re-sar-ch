@@ -341,8 +341,19 @@ pub enum NotEvaluated {
     DispersionTooSparse,
     /// 基準を作るサンプルが足りない。
     TooFewBaselineSamples,
-    /// 前後の窓を取れる長さの連続区間が無い。
+    /// 前後の窓を取れる**長さ**の連続区間が無い。
+    ///
+    /// 入力が短い / 連続区間が短いという構造の問題。採取を増やすしかない。
     NoWindowLongEnough,
+    /// 長さは足りるが、前後の窓が**欠測を挟む**ので連続した窓が取れない。
+    ///
+    /// 「取れる窓が無い」という結果は [`NotEvaluated::NoWindowLongEnough`] と
+    /// 同じだが、読み手が次に打つ手が違う (採取を増やすのではなく、
+    /// 欠測の原因を見る)。
+    ///
+    /// **どちらを報告するかは水準変化の経路が決める**
+    /// ([`crate::detect::level_shift`])。この層は語彙と表示だけを持つ。
+    WindowSpansMissingSamples,
 }
 
 impl NotEvaluated {
@@ -356,7 +367,8 @@ impl NotEvaluated {
             NotEvaluated::DispersionNotMeasurable => "MAD が 0 で散らばりが測れない",
             NotEvaluated::DispersionTooSparse => "同値が大半で散らばりが測れない",
             NotEvaluated::TooFewBaselineSamples => "基準を作るサンプルが足りない",
-            NotEvaluated::NoWindowLongEnough => "前後窓を取れる連続区間が無い",
+            NotEvaluated::NoWindowLongEnough => "前後窓を取れる長さの連続区間が無い",
+            NotEvaluated::WindowSpansMissingSamples => "前後窓が欠測を挟むので連続した窓が取れない",
         }
     }
 
@@ -381,6 +393,17 @@ pub enum RouteStatus {
     Detected { count: usize },
     /// 評価できたが検出なし。
     Evaluated,
+    /// 評価できたが、**構造的に見ていない範囲がある**。
+    ///
+    /// 水準変化は前後の窓を必要とするので、連続区間の先頭と末尾の
+    /// `窓の点数` ぶんは分割候補になれない。そこは
+    /// 「変化が無かった」のではなく「**見ていない**」である。
+    /// 検出なしと同一視すると、ファイル端で起きた変化を
+    /// 「無かった」と読ませてしまう (規律 7)。
+    EvaluatedWithBlindEdges {
+        /// 候補になれなかった端の点数 (全連続区間の合計)。
+        edge_points: usize,
+    },
     /// 評価できなかった。**「検出なし」とは別。**
     NotEvaluated { reason: NotEvaluated },
 }
@@ -394,13 +417,21 @@ impl RouteStatus {
     }
 
     pub const fn was_evaluated(self) -> bool {
-        matches!(self, RouteStatus::Detected { .. } | RouteStatus::Evaluated)
+        matches!(
+            self,
+            RouteStatus::Detected { .. }
+                | RouteStatus::Evaluated
+                | RouteStatus::EvaluatedWithBlindEdges { .. }
+        )
     }
 
     pub fn label(self) -> String {
         match self {
             RouteStatus::Detected { count } => format!("検出 {count} 件"),
             RouteStatus::Evaluated => "検出なし".to_string(),
+            RouteStatus::EvaluatedWithBlindEdges { edge_points } => {
+                format!("検出なし (窓を取れない端 {edge_points} 採取は見ていない)")
+            }
             RouteStatus::NotEvaluated { reason } => format!("評価不能 ({})", reason.label()),
         }
     }
@@ -511,6 +542,14 @@ pub struct RouteTally {
     pub not_applicable_series: usize,
     /// 見たかったが見られなかった系列数 (データの制約)。
     pub blocked_series: usize,
+    /// 評価はできたが、**構造的に見ていない端がある**系列数。
+    ///
+    /// 水準変化は前後の窓を要するので、連続区間の先頭と末尾は
+    /// 分割候補になれない。「検出なし」に数えつつ、
+    /// 見ていない範囲があることを別に数える (規律 7)。
+    pub series_with_blind_edges: usize,
+    /// 見ていない端の採取回数 (全系列・全連続区間の合計)。
+    pub blind_edge_samples: usize,
 }
 
 impl RouteTally {
@@ -522,6 +561,11 @@ impl RouteTally {
                 self.detections += count;
             }
             RouteStatus::Evaluated => self.evaluated_series += 1,
+            RouteStatus::EvaluatedWithBlindEdges { edge_points } => {
+                self.evaluated_series += 1;
+                self.series_with_blind_edges += 1;
+                self.blind_edge_samples += edge_points;
+            }
             RouteStatus::NotEvaluated { reason } => {
                 if reason.is_by_design() {
                     self.not_applicable_series += 1;
@@ -1155,22 +1199,28 @@ pub fn describe_detection(d: &Detection) -> String {
             before_median,
             after_median,
             shift,
+            trend_explained_shift,
+            step_shift,
             normalized_shift,
             before,
             after,
             ..
         } => {
+            // **正規化しているのは段差 (`step_shift`) であって観測差ではない。**
             let norm = match normalized_shift {
-                Some(n) => format!("散らばりの {n:.1} 倍"),
+                Some(n) => format!("段差は散らばりの {n:.1} 倍"),
                 None => "散らばりが測れないため正規化なし".to_string(),
             };
             format!(
-                "{} の水準が {:.2}{unit} から {:.2}{unit} へ {:+.2}{unit} 動いた ({norm}。\
+                "{} の水準が前後の窓で {:.2}{unit} から {:.2}{unit} へ {:+.2}{unit} 違う \
+                 (うち窓内の傾向で説明できる差 {:+.2}{unit} / 残る段差 {:+.2}{unit}、{norm}。\
                  前: {} / 後: {})",
                 d.metric_label,
                 before_median,
                 after_median,
                 shift,
+                trend_explained_shift,
+                step_shift,
                 before.describe_span(),
                 after.describe_span()
             )

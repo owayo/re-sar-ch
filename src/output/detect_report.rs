@@ -142,9 +142,13 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
         s.episodes_before_priority_filter,
         s.episodes_excluded_by_priority
     )?;
+    // **窓幅は「要求した幅」であって実効幅ではない。** 実効幅は
+    // 採取間隔と点数の下限で決まるので、検出ごとに根拠へ出す
+    // (600 秒採取では要求 1800 秒に対して実効 3000 秒になる)。
     writeln!(
         out,
-        "検出器: {}  カタログ: {}  逸脱閾値: MAD の {} 倍  水準変化: 窓 {} 秒 / 正規化 {} 倍 / 持続 {:.0}%",
+        "検出器: {}  カタログ: {}  逸脱閾値: MAD の {} 倍  \
+         水準変化: 要求窓 {} 秒 (実効幅は検出ごと) / 正規化 {} 倍 / 持続 {:.0}%",
         a.detector_version,
         a.coverage.catalog_version,
         a.thresholds.deviation_ratio,
@@ -353,6 +357,14 @@ fn write_detection<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
         d.origin.label(),
         d.pattern.label()
     )?;
+    // **平均の取り方を必ず添える。** 瞬時値を区間長で重み付けした平均と
+    // 同じ数字として読まれないようにするため。
+    writeln!(
+        out,
+        "         平均 {:.2} ({})",
+        d.decision.mean,
+        d.decision.mean_basis.label()
+    )?;
     match &d.decision.basis {
         DecisionBasis::FixedCondition {
             condition_id,
@@ -396,6 +408,9 @@ fn write_detection<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
             normalized_threshold,
             persistence_share,
             persistence_threshold,
+            window_samples,
+            window_requested_secs,
+            window_secs,
             ..
         } => {
             writeln!(
@@ -404,6 +419,15 @@ fn write_detection<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
                 pooled_mad.map_or("測れない".to_string(), |m| format!("{m:.2}")),
                 persistence_share * 100.0,
                 persistence_threshold * 100.0
+            )?;
+            // **要求した窓幅と実効の窓幅を書き分ける。**
+            // 点数は採取間隔と下限で決まるので、要求幅をそのまま
+            // 「この幅で判定した」と出すと嘘になる。
+            writeln!(
+                out,
+                "         窓: 前後 {window_samples} 点ずつ / 実効幅 {} (要求 {})",
+                crate::detect::describe_duration(*window_secs),
+                crate::detect::describe_duration(*window_requested_secs)
             )?;
         }
     }
@@ -648,7 +672,17 @@ fn write_tally<W: Write>(out: &mut W, route: DetectRoute, t: &RouteTally) -> io:
         t.evaluated_series,
         t.not_applicable_series,
         t.blocked_series
-    )
+    )?;
+    // 構造的に見ていない端は「検出なし」に数えているので、別行で必ず出す。
+    // 出さないと「ファイル端で起きた変化が無かった」と読まれる (規律 7)。
+    if t.series_with_blind_edges > 0 {
+        writeln!(
+            out,
+            "  {:<20}   うち {} 系列は前後窓を取れない端があり、計 {} 採取を見ていない",
+            "", t.series_with_blind_edges, t.blind_edge_samples
+        )?;
+    }
+    Ok(())
 }
 
 // ===========================================================================

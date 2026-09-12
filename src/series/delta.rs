@@ -1,0 +1,276 @@
+//! カウンタ差分とレート計算。
+//!
+//! `sa` ファイルに入っている値の多くは起動時からの累積カウンタであり、
+//! 表示値は 2 レコード間の差分を経過時間で割って得る。
+//!
+//! ## 本家との一致
+//!
+//! 本家の計算マクロは次の形をしている (経過時間 `p` は 1/100 秒単位)。
+//!
+//! ```text
+//! S_VALUE(m, n, p)  = ((double)(n - m)) / p * 100
+//! SP_VALUE(m, n, p) = ((double)(n - m)) / p * 100
+//! ```
+//!
+//! `S_VALUE` と `SP_VALUE` は式が同一で、名前の違いは「毎秒のレート」と
+//! 「パーセント」という**意図の差**しか表さない。
+//!
+//! 重要なのは **減算が符号なしのまま行われる**点である。
+//! `curr as f64 - prev as f64` と書くとカウンタが逆行した場合に本家と値が食い違う。
+//! ここでは `wrapping_sub` を使って本家の挙動をそのまま再現する。
+
+use crate::model::CounterBits;
+
+/// 経過時間 (1/100 秒単位) を求める。
+///
+/// 本家 `get_interval()` に対応する。0 になった場合は 1 に置き換える
+/// (0 除算で `inf` / `NaN` を出さないための処置で、本家も同じ)。
+#[inline]
+pub fn interval_cs(prev_uptime_cs: u64, curr_uptime_cs: u64) -> u64 {
+    let itv = curr_uptime_cs.wrapping_sub(prev_uptime_cs);
+    if itv == 0 { 1 } else { itv }
+}
+
+/// 本家 `S_VALUE` / `SP_VALUE` 相当。
+///
+/// 経過時間が 1/100 秒単位なので、100 倍して「毎秒あたり」にする。
+#[inline]
+pub fn s_value(prev: u64, curr: u64, itv_cs: u64) -> f64 {
+    (curr.wrapping_sub(prev)) as f64 / itv_cs as f64 * 100.0
+}
+
+/// 本家 `ll_sp_value` 相当。カウンタが逆行したら 0 を返す。
+#[inline]
+pub fn ll_sp_value(prev: u64, curr: u64, itv_cs: u64) -> f64 {
+    if curr < prev {
+        0.0
+    } else {
+        s_value(prev, curr, itv_cs)
+    }
+}
+
+/// 2 点間の差分。
+///
+/// 本家は単純に符号なし減算するだけだが、独自出力や集計では
+/// 「なぜ差分が取れないのか」を区別する必要があるため型で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delta {
+    /// 差分が取れた。
+    Valid(u64),
+    /// カウンタが一周したと判断できた。
+    Wrapped(u64),
+    /// 差分を計算できない。
+    Unavailable(Discontinuity),
+}
+
+impl Delta {
+    /// 差分値。計算できない場合は `None`。
+    #[inline]
+    pub fn value(self) -> Option<u64> {
+        match self {
+            Delta::Valid(v) | Delta::Wrapped(v) => Some(v),
+            Delta::Unavailable(_) => None,
+        }
+    }
+
+    /// 毎秒あたりのレート。
+    #[inline]
+    pub fn rate_per_sec(self, itv_cs: u64) -> Option<f64> {
+        self.value().map(|d| d as f64 / itv_cs as f64 * 100.0)
+    }
+}
+
+/// 差分が取れない理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discontinuity {
+    /// 基準となる前サンプルが無い (系列の先頭)。
+    FirstSample,
+    /// 間に RESTART レコードがある。
+    Restart,
+    /// item の同一性が崩れた (デバイス名の再利用、CPU のオンライン変化など)。
+    ItemReplaced,
+    /// 経過時間が 0 以下。
+    NonPositiveElapsed,
+    /// 値が減少したが、ラップとは断定できない。
+    AmbiguousDecrease,
+}
+
+impl Discontinuity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Discontinuity::FirstSample => "first_sample",
+            Discontinuity::Restart => "restart",
+            Discontinuity::ItemReplaced => "item_replaced",
+            Discontinuity::NonPositiveElapsed => "non_positive_elapsed",
+            Discontinuity::AmbiguousDecrease => "ambiguous_decrease",
+        }
+    }
+}
+
+/// 差分計算の前提条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaContext {
+    /// 前サンプルとの間に RESTART が無いこと。
+    pub continuous: bool,
+    /// item が同一であること。
+    pub same_item: bool,
+}
+
+impl Default for DeltaContext {
+    fn default() -> Self {
+        Self {
+            continuous: true,
+            same_item: true,
+        }
+    }
+}
+
+/// 差分を判定付きで計算する。
+///
+/// カウンタの減少を一律にラップと解釈しない。32bit カウンタの一周として扱うのは、
+/// 起動区間と item の連続性が確認できる場合に限る。
+/// 長い観測間隔で複数回ラップした可能性は 2 点だけからは復元できないため、
+/// 曖昧なケースは `AmbiguousDecrease` として報告する。
+pub fn compute_delta(prev: u64, curr: u64, bits: CounterBits, ctx: DeltaContext) -> Delta {
+    if !ctx.continuous {
+        return Delta::Unavailable(Discontinuity::Restart);
+    }
+    if !ctx.same_item {
+        return Delta::Unavailable(Discontinuity::ItemReplaced);
+    }
+    if curr >= prev {
+        return Delta::Valid(curr - prev);
+    }
+
+    // 減少した場合
+    match bits {
+        CounterBits::B32 => {
+            // 32bit カウンタの一周として解釈できるか。
+            // 一周分を足して妥当な範囲に収まるなら採用する。
+            let modulus = CounterBits::B32.modulus();
+            let wrapped = modulus + curr as u128 - prev as u128;
+            if wrapped < modulus {
+                Delta::Wrapped(wrapped as u64)
+            } else {
+                Delta::Unavailable(Discontinuity::AmbiguousDecrease)
+            }
+        }
+        // 64bit カウンタが一周するのは現実的でないため、減少は異常として扱う
+        CounterBits::B64 => Delta::Unavailable(Discontinuity::AmbiguousDecrease),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_never_returns_zero() {
+        assert_eq!(interval_cs(100, 200), 100);
+        assert_eq!(interval_cs(100, 100), 1, "0 は 1 に置き換える");
+    }
+
+    /// 最初のサンプルでは前サンプルの uptime を 0 として扱うため、
+    /// itv は起動からの経過時間になる。
+    #[test]
+    fn first_sample_interval_is_uptime_since_boot() {
+        assert_eq!(interval_cs(0, 12_345), 12_345);
+    }
+
+    /// 経過時間が 1/100 秒単位なので、100 cs = 1 秒あたりの値になる。
+    #[test]
+    fn s_value_converts_cs_to_per_second() {
+        // 1 秒 (100 cs) の間に 50 増えた → 50/s
+        assert_eq!(s_value(100, 150, 100), 50.0);
+        // 10 秒 (1000 cs) の間に 50 増えた → 5/s
+        assert_eq!(s_value(100, 150, 1000), 5.0);
+    }
+
+    /// 減算は符号なしのまま行う。
+    ///
+    /// `curr as f64 - prev as f64` と書くと逆行時に負値になり、本家と食い違う。
+    #[test]
+    fn subtraction_wraps_like_upstream() {
+        let prev = 10u64;
+        let curr = 5u64;
+        let v = s_value(prev, curr, 100);
+        // 符号なし減算なので巨大な正値になる (本家と同じ)
+        assert!(v > 0.0, "符号なし減算の結果は正: {v}");
+        // 浮動小数で引いた場合との差を明示
+        let naive = (curr as f64 - prev as f64) / 100.0 * 100.0;
+        assert!(naive < 0.0);
+        assert_ne!(v, naive);
+    }
+
+    /// `ll_sp_value` は逆行時に 0 を返す。
+    #[test]
+    fn ll_sp_value_clamps_decrease_to_zero() {
+        assert_eq!(ll_sp_value(10, 5, 100), 0.0);
+        assert_eq!(ll_sp_value(10, 20, 100), 10.0);
+    }
+
+    #[test]
+    fn delta_is_valid_when_increasing() {
+        let d = compute_delta(100, 150, CounterBits::B64, DeltaContext::default());
+        assert_eq!(d, Delta::Valid(50));
+        assert_eq!(d.rate_per_sec(100), Some(50.0));
+    }
+
+    /// 32bit カウンタの一周は復元できる。
+    #[test]
+    fn detects_32bit_wraparound() {
+        let prev = u32::MAX as u64 - 10;
+        let curr = 20u64;
+        let d = compute_delta(prev, curr, CounterBits::B32, DeltaContext::default());
+        assert_eq!(d, Delta::Wrapped(31), "10 + 1 + 20 = 31");
+    }
+
+    /// 64bit カウンタの減少はラップと断定しない。
+    #[test]
+    fn does_not_assume_wrap_for_64bit() {
+        let d = compute_delta(1_000_000, 10, CounterBits::B64, DeltaContext::default());
+        assert_eq!(
+            d,
+            Delta::Unavailable(Discontinuity::AmbiguousDecrease),
+            "64bit カウンタの一周は現実的でない"
+        );
+    }
+
+    /// RESTART を挟んだら差分を作らない。
+    #[test]
+    fn restart_breaks_continuity() {
+        let ctx = DeltaContext {
+            continuous: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_delta(100, 50, CounterBits::B32, ctx),
+            Delta::Unavailable(Discontinuity::Restart),
+            "再起動後の値は前の値と繋がらない"
+        );
+    }
+
+    /// item が入れ替わったら差分を作らない。
+    #[test]
+    fn item_replacement_breaks_continuity() {
+        let ctx = DeltaContext {
+            same_item: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_delta(100, 200, CounterBits::B64, ctx),
+            Delta::Unavailable(Discontinuity::ItemReplaced)
+        );
+    }
+
+    /// カウンタ両端に同じ定数を足しても、オーバーフローが無ければレートは変わらない
+    /// (メタモルフィックテスト)。
+    #[test]
+    fn rate_is_invariant_under_constant_shift() {
+        let (prev, curr, itv) = (1_000u64, 1_500u64, 250u64);
+        let base = s_value(prev, curr, itv);
+        for shift in [0u64, 1, 1_000, 1_000_000, 1 << 40] {
+            assert_eq!(s_value(prev + shift, curr + shift, itv), base);
+        }
+    }
+}

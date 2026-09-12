@@ -1,0 +1,41 @@
+[package]
+name = "re-sar-ch"
+version = "0.1.0"
+edition = "2024"
+authors = ["owayo <yoheiowa@gmail.com>"]
+description = "Standalone parser for sysstat sar binary data files (sa files), independent of sar/sadf"
+license = "MIT"
+repository = "https://github.com/owayo/re-sar-ch"
+keywords = ["cli", "sysstat", "sar", "sadf", "performance"]
+categories = ["command-line-utilities", "parser-implementations"]
+
+[[bin]]
+name = "resarch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+clap = { version = "4.6.6", features = ["derive"] }
+csv = "1.4.0"
+memmap2 = "0.9.11"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[[bench]]
+name = "decode"
+harness = false

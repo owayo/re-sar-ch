@@ -185,9 +185,12 @@ fn representative_interval(segment: &[Observation]) -> Option<u64> {
 
 /// カタログの関心方向に合うか。
 ///
-/// 方向の宣言が無い系列は両方向を見る。
+/// **逸脱 (`deviation`) の宣言ではなく [`CatalogEntry::shift_interest`] を見る。**
+/// 「外れ値として上だけ見たい」と「水準が動いたことを両方向で見たい」は別の関心で、
+/// 前者を流用すると処理量の指標で**停止を検出前に捨てる**ことになる。
 fn accepts(entry: &CatalogEntry, direction: ShiftDirection) -> bool {
-    entry.deviation.is_none() || entry.deviation.accepts(direction)
+    let interest = entry.shift_interest();
+    interest.is_none() || interest.accepts(direction)
 }
 
 fn evaluate(before: &[Observation], after: &[Observation], entry: &CatalogEntry) -> Option<Split> {

@@ -3,7 +3,22 @@
 //! 「ある時刻から高止まりした」という変化は、逸脱検出では拾えない。
 //! 変化後の値が長時間を占めていれば、それが比較基準そのものになるためである。
 //! この経路は**時刻を挟んだ前後の窓を比べる**ので、基準が変化後へ寄っていても
-//! 変化が起きた時刻を指せる。
+//! 水準が違う 2 つの時間帯を指せる。
+//!
+//! # 指せるのは「分割時刻」であって「変化した時刻」ではない
+//!
+//! この経路が返す時刻は**採用した前後窓の境目**である。
+//! 「その瞬間に水準が移った」ことは観測されていない。
+//!
+//! - 採取と採取の間に何が起きていたかは観測されていない (規律 5)。
+//!   境目の前後 1 採取のどこで動いたかは決められない
+//! - 連続的に立ち上がる曲線 (前窓 `[0,0,0,0,1]` / 後窓 `[5,10,10,10,10]`) からも
+//!   前後窓の差は出る。傾向の除去は**一次の傾き**しか説明しないので、
+//!   滑らかな非線形の立ち上がりは残る。段差の存在自体が確定していない
+//!
+//! したがって出力の語は「この時刻に変わった」ではなく
+//! 「この境目の前後で水準が違う」に留める。**時刻を出すこと自体は有用**で、
+//! 調査の起点になる (`--from` / `--to` で周辺を見に行ける)。
 //!
 //! # 窓はサンプル数ではなく時間幅で決める
 //!
@@ -44,10 +59,17 @@
 //! 自己相関のある負荷増加や定時バッチでは常に起こる。
 //!
 //! そこで窓内の傾きから**傾向で説明できる量**を見積もり、引いた残りで判定する
-//! ([`trend_explained_shift`])。傾きは前半・後半の中央値差という記述量で、
-//! 確率でも検定統計量でもない (規律 1)。
-//! **傾向は検出を減らす側にしか使わない** — 粗い推定で段差を大きくできる
-//! 作りにすると、推定誤差が新しい検出を生む。
+//! ([`trend_explained_shift`])。傾きは前半・後半の中央値差を実時間で割った
+//! 記述量で、確率でも検定統計量でもない (規律 1)。
+//! **傾向は合格候補を増やさない側にしか使わない** — 粗い推定で段差を
+//! 大きくできる作りにすると、推定誤差が新しい検出を生む。
+//!
+//! 「合格候補が増えない」は「報告件数が必ず減る」ではない。
+//! 隣接候補を 1 件へ畳む [`collapse`] があるので、候補群の中央だけが落ちれば
+//! 1 件が 2 件へ分かれることがある。
+//!
+//! 除去できるのは**一次の傾き**だけである。滑らかな非線形の立ち上がりは
+//! 残るので、「段差があった」とまでは主張しない (この経路の冒頭を参照)。
 //!
 //! # 判定は 3 条件 + 持続性
 //!
@@ -351,40 +373,72 @@ fn evaluate(before: &[Observation], after: &[Observation], entry: &CatalogEntry)
 
 /// 観測差のうち、窓内の傾きで説明できる量。
 ///
-/// 各窓を前半と後半に割り、中央値の差から 1 サンプルあたりの傾きを取る。
-/// 前後 2 つの窓から得た傾きを平均し、窓の中央値の位置の差 (= 窓の点数) を
-/// 掛けたものが「傾向だけで生じる中央値差」である。
+/// 各窓を前半と後半に割り、**値の中央値と代表時刻の中央値**の差から
+/// 1 秒あたりの傾きを取る。前後 2 つの窓から得た傾きを平均し、
+/// 2 つの窓の代表時刻の差を掛けたものが「傾向だけで生じる中央値差」である。
 ///
-/// **確率でも検定統計量でもない。** 「この窓では 1 採取あたりこれだけ
+/// **サンプル数ではなく実時間で測る。** 採取間隔が窓の中で変わると
+/// (`sadc` の停止・再開、別の採取間隔での追記)、点数あたりの傾きは
+/// 実際の変化率と一致しない。時間に対して一定の率で増える系列でも、
+/// 4 秒間隔の 5 点と 100 秒間隔の 5 点を比べれば「点数あたり」では
+/// 傾向を過小に見積もり、段差が残ってしまう。
+///
+/// **確率でも検定統計量でもない。** 「この窓では 1 秒あたりこれだけ
 /// 動いていた」という記述量である (規律 1)。中央値の差を使うのは、
 /// 単発のスパイクで傾きが跳ねないようにするため。
 ///
 /// 窓が 4 点未満のときは前半・後半に 2 点ずつ取れないので 0 を返す
 /// (傾きを推定しない = 傾向による棄却をしない)。
-fn trend_explained_shift(before: &[f64], after: &[f64]) -> f64 {
+fn trend_explained_shift(before: &[Observation], after: &[Observation]) -> f64 {
     let w = before.len();
     if w < 4 || after.len() != w {
         return 0.0;
     }
     let half = w / 2;
-    // 前半の中央値と後半の中央値の位置の差 (サンプル数)
-    let distance = (w - half) as f64;
-    let slope = |v: &[f64]| -> Option<f64> {
-        let lo = median(&v[..half])?;
-        let hi = median(&v[w - half..])?;
-        Some((hi - lo) / distance)
+    let slope = |win: &[Observation]| -> Option<f64> {
+        let (lo_value, lo_time) = medians_of(&win[..half])?;
+        let (hi_value, hi_time) = medians_of(&win[w - half..])?;
+        let elapsed = hi_time - lo_time;
+        (elapsed > 0.0).then(|| (hi_value - lo_value) / elapsed)
     };
-    match (slope(before), slope(after)) {
-        (Some(sb), Some(sa)) => (sb + sa) / 2.0 * w as f64,
-        _ => 0.0,
+    let (Some(before_slope), Some(after_slope)) = (slope(before), slope(after)) else {
+        return 0.0;
+    };
+    let (Some((_, before_time)), Some((_, after_time))) = (medians_of(before), medians_of(after))
+    else {
+        return 0.0;
+    };
+    let elapsed = after_time - before_time;
+    if elapsed <= 0.0 {
+        return 0.0;
+    }
+    (before_slope + after_slope) / 2.0 * elapsed
+}
+
+/// 観測列の値と代表時刻の中央値。
+fn medians_of(window: &[Observation]) -> Option<(f64, f64)> {
+    let values: Vec<f64> = window.iter().map(|o| o.value).collect();
+    let times: Vec<f64> = window.iter().map(representative_time).collect();
+    Some((median(&values)?, median(&times)?))
+}
+
+/// 観測が代表する時刻 (エポック秒)。
+///
+/// 瞬時値は採取時点そのもの、区間値は区間の中央を代表とする。
+/// 区間値に区間の始点を使うと、傾きの分母が半区間ぶんずれる。
+fn representative_time(o: &Observation) -> f64 {
+    if o.origin.is_instant() {
+        o.end_ust as f64
+    } else {
+        (o.start_ust as f64 + o.end_ust as f64) / 2.0
     }
 }
 
 /// 観測差から傾向で説明できる分を引いた段差。
 ///
-/// **傾向は検出を減らす側にしか使わない。** 傾きの推定は窓内の中央値差という
-/// 粗いものなので、それで段差を大きくできる作りにすると推定誤差が新しい検出を
-/// 生む。したがって結果は
+/// **傾向は合格候補を増やさない側にしか使わない。** 傾きの推定は窓内の
+/// 中央値差という粗いものなので、それで段差を大きくできる作りにすると
+/// 推定誤差が新しい検出を生む。したがって結果は
 ///
 /// - 符号が `shift` と同じ (または 0)
 /// - 大きさが `|shift|` を超えない
@@ -884,13 +938,52 @@ mod tests {
         assert!((step_of(-10.0, -4.0) + 6.0).abs() < 1e-9);
     }
 
+    /// 傾きは**実時間**に対して測る。
+    ///
+    /// 採取間隔が窓の中で変わると、点数あたりの傾きは実際の変化率と
+    /// 一致しない。時間に対して一定の率で増える系列を、前半は短い間隔・
+    /// 後半は長い間隔で採取した場合、点数あたりでは傾向を過小に見積もり
+    /// 段差が残る。
+    #[test]
+    fn the_trend_is_measured_against_real_time() {
+        // 1 秒あたり 1 ずつ増える系列を、10 秒間隔 5 点 + 100 秒間隔 5 点で採取
+        let mut t = 0u64;
+        let mut obs: Vec<Observation> = Vec::new();
+        for i in 0..10 {
+            let step = if i < 5 { 10 } else { 100 };
+            let start = t;
+            t += step;
+            obs.push(Observation {
+                start_ust: T0 + start,
+                end_ust: T0 + t,
+                elapsed_cs: step * 100,
+                value: t as f64,
+                origin: ObservationOrigin::InstantGauge,
+            });
+        }
+        let trend = trend_explained_shift(&obs[..5], &obs[5..]);
+        let shift = median(&obs[5..].iter().map(|o| o.value).collect::<Vec<_>>()).unwrap()
+            - median(&obs[..5].iter().map(|o| o.value).collect::<Vec<_>>()).unwrap();
+        // 傾向がそのまま差を説明する → 段差は残らない
+        assert!(
+            step_of(shift, trend).abs() < 0.5 * shift.abs(),
+            "実時間で測れば傾向が差を説明する: shift={shift} trend={trend}"
+        );
+    }
+
     /// 窓が 4 点未満なら傾きを推定しない (傾向による棄却をしない)。
     #[test]
     fn a_tiny_window_does_not_estimate_a_trend() {
-        assert_eq!(
-            trend_explained_shift(&[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]),
-            0.0
-        );
+        let obs: Vec<Observation> = (0..6u32)
+            .map(|i| Observation {
+                start_ust: T0 + u64::from(i) * 600,
+                end_ust: T0 + u64::from(i + 1) * 600,
+                elapsed_cs: 60_000,
+                value: f64::from(i),
+                origin: ObservationOrigin::InstantGauge,
+            })
+            .collect();
+        assert_eq!(trend_explained_shift(&obs[..3], &obs[3..]), 0.0);
     }
 
     /// 3 点だけの大変動は持続率に届かない。

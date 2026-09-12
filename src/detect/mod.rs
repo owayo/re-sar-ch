@@ -459,7 +459,11 @@ pub enum Pattern {
     Spike,
     /// 周囲より大きく下へ外れた。
     Dip,
-    /// ある時刻から水準が移った。
+    /// **境目の前後で水準が違う。**
+    ///
+    /// 「その時刻に変わった」ではない。指せるのは採用した前後窓の
+    /// 分割時刻であって、採取と採取の間のどこで動いたかは観測されていない
+    /// ([`level_shift`] の doc を参照)。
     LevelShift { direction: ShiftDirection },
     /// 上限に張り付いた (`%util` が 100 付近、`%idle` が 0 付近)。
     Saturation,
@@ -556,6 +560,13 @@ pub enum Dispersion {
     /// MAD が 0。値がほぼ一定なので散らばりを測れない。
     NotMeasurable,
     /// 中央値と異なる値が少なすぎて散らばりの推定材料にならない。
+    ///
+    /// **既定の設定では到達しない。** `MAD` は偏差の中央値なので、
+    /// `MAD > 0` なら中央値と異なる値が少なくとも半数ある。
+    /// [`DetectThresholds::min_off_center_share`] が 0.5 以下である限り
+    /// 割合の条件は必ず満たされる。
+    /// 「0 ではないが極端に小さい MAD」を別に扱いたければ、
+    /// 割合ではない尺度の条件が必要である (割合の閾値を上げて代用しない)。
     TooSparse { off_center: u64, required: u64 },
     /// 基準を作るサンプルが足りない。
     InsufficientSamples { required: u64 },
@@ -1389,15 +1400,27 @@ pub fn build_baseline(
     }
     match dispersion {
         Dispersion::NotMeasurable => {
-            caveats.push("MAD が 0 なので逸脱スコアは出さない (絶対水準と時間的変化に任せる)");
+            caveats.push(
+                "MAD が 0 なので正規化した逸脱評価はできない。\
+                 宣言された最小有意変化量を超える差は絶対差として別に報告する",
+            );
         }
         Dispersion::TooSparse { .. } => {
             caveats.push(
                 "中央値と同じ値が大半を占める。散らばりの推定材料にならないので\
-                 逸脱スコアは出さない",
+                 正規化した逸脱評価はできない。絶対差による観測は別に報告する",
             );
         }
         _ => {}
+    }
+    // **要求当たりの平均は、要求数の重みが無いと期間全体へ合算できない。**
+    // `await` の正しい合算は Σ(Δticks) / Σ(Δ要求数) であり、中央値も
+    // 「要求当たり」ではなく「区間ごとの値の中央値」である
+    if series.origin == ObservationOrigin::PerRequestAverage {
+        caveats.push(
+            "区間の 1 要求あたりの値なので、この基準は「要求当たりの平均」ではなく\
+             「区間ごとの値の分布」である。要求数の重みが検出層へ渡っていない",
+        );
     }
 
     Baseline {

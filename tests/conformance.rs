@@ -25,25 +25,42 @@
 //!    **同じ段・同じエラー分類**で拒否されること
 //!    ([`self_made_and_upstream_error_files_are_rejected_alike`])。
 //!    自作 fixture が本家と同じ検査を突いていることの裏取りになる。
+//! 5. **本家の期待出力との全文比較** ([`golden_outputs_match_upstream`])。
+//!    [`GOLDEN_CASES`] の各ケースについて、入力 `sa` ファイルを [`SaFile`] で開き、
+//!    本家のコマンドラインに相当する出力をライブラリ API 経由で生成して
+//!    `expected*` と 1 行ずつ突き合わせる。これが `sar` 互換の中核検証である。
 //!
-//! # 未了
+//! # 比較の方式
 //!
-//! `resarch` の出力系との**表記比較** (`expected*` との `diff` 相当) は
-//! 後続担当が [`GOLDEN_CASES`] の各ケースに `run_resarch` を差し込んで埋める。
-//! 埋めるべき内容は `docs/format/04-test-data.md` §5 のフェーズ別計画に対応する。
+//! **プロセスは起動しない。**出力層 (`output::sar_text` / `output::sadf`) を
+//! 直接呼ぶ。理由は 2 つある。
+//!
+//! - 差分が出たとき、CLI 層の引数解釈と出力層の書式のどちらが原因かを
+//!   切り分けずに済む (引数は [`parse_sar_args`] に通すので解釈も検証される)
+//! - `TZ` / `LC_ALL` といった環境変数に頼らずに時刻基準を指定できる
+//!   (本家テストの `TZ=GMT` は [`TimeStyle::Utc`] で表現する)
+//!
+//! 再現できない箇所のマスクは [`golden::Mask`] に理由つきで宣言し、
+//! 「どの語を潰したか」を報告に必ず出す (`--nocapture` で読める)。
 
 mod fixtures;
+mod golden;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fixtures::{Corruption, ExpectedError, FixtureAbi};
+use golden::{Comparison, Field, Mask};
 
 use re_sar_ch::Error;
+use re_sar_ch::cli::sar_args::{Activity, OptFlags, SarOptions, parse_sar_args};
 use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::ResolvedLayout;
 use re_sar_ch::format::{SaFile, ScanControl, layouts, selfdesc};
+use re_sar_ch::model::ActivityId;
+use re_sar_ch::output::sadf;
+use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
 use re_sar_ch::series::{Selection, walk};
 
 // ===========================================================================
@@ -117,7 +134,45 @@ struct GoldenCase {
     golden: &'static str,
     /// reSARch 側でこれに対応させるフェーズ (`04-test-data.md` §5)。
     phase: Phase,
+    /// 期待出力を reSARch 側で再現する方法。
+    repro: Repro,
+    /// このケースで許すマスク。空なら全文一致が要求される。
+    masks: &'static [Mask],
 }
+
+/// 期待出力の再現方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repro {
+    /// `sar` 互換テキスト。要素は本家のコマンドラインの引数そのまま
+    /// (`-f <data>` はテスト側で足す)。[`parse_sar_args`] に通してから
+    /// [`sar_text::write_report`] を呼ぶ。
+    Sar(&'static [&'static str]),
+    /// `sadf -H`。本家テストは `| grep -v 0x2175` を通すので、
+    /// reSARch 側の出力からも同じ行を落とす (先頭行が入力パスを含むため)。
+    SadfHeader,
+    /// reSARch にその出力形式が無く、比較できないケース。
+    Unsupported {
+        /// 何が無いのか。報告にそのまま出す。
+        missing: &'static str,
+    },
+}
+
+/// `sadf -H` の 1 行目を落とすための語 (本家テストの `grep -v 0x2175` と同じ)。
+const SADF_H_GREP_V: &str = "0x2175";
+
+/// `Host:` 行の日付は**読み手のタイムゾーンに依存する**。
+///
+/// 本家 (`sa_common.c: get_file_timestamp_struct()`) は `-t` 指定が無い限り
+/// `localtime(sa_ust_time)` で日付を作る。期待出力は `TZ=GMT` (00655) あるいは
+/// 生成環境の `TZ` (00787/00791/00794) で作られており、**ファイルの中身だけからは
+/// 再現できない**。日付の語だけを潰し、区切り (空白 + タブ) と他の語は比較したまま残す。
+const MASK_HOST_DATE: Mask = Mask {
+    line_prefix: "Host: ",
+    // `Host: <sysname> <release> (<nodename>) \t<MM/DD/YY> \t_<machine>_\t(<N> CPU)`
+    // → タブ区切り 1 番目のフィールドの先頭語が日付。
+    field: Field::TabWord { index: 1, word: 0 },
+    reason: "`Host:` 行の日付は localtime(sa_ust_time) 由来で読み手の TZ に依存する",
+};
 
 /// `docs/format/04-test-data.md` §5.1 のフェーズ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +196,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -H <data> | grep -v 0x2175",
         golden: "expected.data-12.0.0-H",
         phase: Phase::Header,
+        repro: Repro::SadfHeader,
+        masks: &[MASK_HOST_DATE],
     },
     GoldenCase {
         upstream_test: "00787",
@@ -148,6 +205,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C sadf -H <data> | grep -v 0x2175",
         golden: "expected.sadf-data-ukwn",
         phase: Phase::Header,
+        repro: Repro::SadfHeader,
+        masks: &[MASK_HOST_DATE],
     },
     GoldenCase {
         upstream_test: "00791",
@@ -155,6 +214,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C sadf -H <data> | grep -v 0x2175",
         golden: "expected.sadf-data-ukwn0",
         phase: Phase::Header,
+        repro: Repro::SadfHeader,
+        masks: &[MASK_HOST_DATE],
     },
     GoldenCase {
         upstream_test: "00794",
@@ -162,6 +223,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C sadf -H <data> | grep -v 0x2175",
         golden: "expected.sadf-data-ukwn1",
         phase: Phase::Header,
+        repro: Repro::SadfHeader,
+        masks: &[MASK_HOST_DATE],
     },
     GoldenCase {
         upstream_test: "00650",
@@ -169,6 +232,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -AC -f <data>",
         golden: "expected.data-12.0.0",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-AC"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00700",
@@ -176,6 +241,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -C -A -f <data>",
         golden: "expected.data-ppc-11.7.2",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-C", "-A"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00740",
@@ -183,6 +250,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -C -f <data>",
         golden: "expected.sar-non-printable",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-C"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00760",
@@ -190,6 +259,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -A -f <data>",
         golden: "expected.data-12.5.6-A_QUEUE_modified",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-A"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00770",
@@ -197,6 +268,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -A -f <data>",
         golden: "expected.data-extra-12.1.7",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-A"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00780",
@@ -204,6 +277,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -P ALL -f <data>",
         golden: "expected.sar-data-ukwn",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-P", "ALL"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00784",
@@ -211,6 +286,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -w -f <data>",
         golden: "expected2.sar-data-ukwn",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-w"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00793",
@@ -218,6 +295,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sar -uq -f <data>",
         golden: "expected3.sar-data-ukwn",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-uq"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "01405",
@@ -225,15 +304,23 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -g <data> -- -A",
         golden: "expected.sadf-g-trunc",
         phase: Phase::RawValues,
+        // `-g` は SVG グラフ。reSARch には対応する出力形式が無い。
+        repro: Repro::Unsupported {
+            missing: "sadf -g (SVG) 相当の出力形式",
+        },
+        masks: &[],
     },
     // 旧世代 (0x2171 / 0x2173) の golden は「sadf -c で変換したファイル」に対するもの。
-    // reSARch は直読するので、§5.7 の自己整合性検証と組み合わせて使う。
+    // reSARch は直読するので、変換を挟まず同じ引数を元ファイルへ当てる
+    // (`04-test-data.md` §4.3: `sadf -c` は構造体の移動と型拡張だけで値を変えない)。
     GoldenCase {
         upstream_test: "00605",
         data: "data-9.1.6",
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -c <data> > tmp && sar -C -A -f tmp",
         golden: "expected.data-9.1.6",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-C", "-A"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00615",
@@ -241,6 +328,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -c <data> > tmp && sar -C -A -f tmp",
         golden: "expected.data-10.3.1",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-C", "-A"]),
+        masks: &[],
     },
     GoldenCase {
         upstream_test: "00625",
@@ -248,6 +337,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -c <data> > tmp && sar -C -A -f tmp",
         golden: "expected.data-11.6.5",
         phase: Phase::SarText,
+        repro: Repro::Sar(&["-C", "-A"]),
+        masks: &[],
     },
 ];
 
@@ -308,30 +399,97 @@ const HEADER_ERROR_DATA: &[&str] = &[
 ];
 
 // ===========================================================================
-// resarch の起動
+// 期待出力の再現 (ライブラリ API を直接呼ぶ)
 // ===========================================================================
+//
+// `resarch` をプロセスとして起動はしない。CLI (`src/main.rs`) は出力層へ
+// まだ繋がっておらず、また環境変数 (`TZ` / `LC_ALL`) に依存させると
+// 「差分の原因が環境か実装か」を切り分けられなくなる。
+// 代わりに `sar` の引数列を [`parse_sar_args`] へ通し、その結果を
+// 出力層のオプションへ写して [`sar_text::write_report`] を呼ぶ。
 
-/// ビルド済み `resarch` のパス。cargo がテスト時に渡してくる。
-fn resarch_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_resarch"))
+/// `sar` 互換テキストを生成する。
+///
+/// `args` は本家のコマンドライン (`-AC` など) そのまま。`-f <path>` は
+/// ここで補う (`parse_sar_args` は入力先が決まらないと `finalize` を通らない)。
+fn render_sar_text(file: &SaFile, path: &Path, args: &[&str]) -> Result<String, String> {
+    let mut argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    argv.push("-f".to_string());
+    argv.push(path.display().to_string());
+    let parsed = parse_sar_args(&argv).map_err(|e| format!("引数 {args:?} を解析できない: {e}"))?;
+
+    let opts = sar_text_options(&parsed);
+    let acts = selected_activities(file, &parsed);
+    let mut buf: Vec<u8> = Vec::new();
+    sar_text::write_report(&mut buf, file, &opts, &acts)
+        .map_err(|e| format!("sar テキストを書けない: {e}"))?;
+    String::from_utf8(buf).map_err(|e| format!("出力が UTF-8 でない: {e}"))
 }
 
-/// 表記比較のために環境を固定して `resarch` を起動する (§7.3 の表)。
+/// `sadf -H` 相当を生成し、本家テストの `grep -v 0x2175` と同じ行を落とす。
+fn render_sadf_header(file: &SaFile) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    sadf::header::write_header(&mut buf, file).map_err(|e| format!("sadf -H を書けない: {e}"))?;
+    let text = String::from_utf8(buf).map_err(|e| format!("出力が UTF-8 でない: {e}"))?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.contains(SADF_H_GREP_V))
+        .map(|l| format!("{l}\n"))
+        .collect())
+}
+
+/// [`SarOptions`] (CLI 層) を [`SarTextOptions`] (出力層) へ写す。
 ///
-/// 後続担当はこの関数に引数を渡して出力を取り、`expected*` と比較する。
-#[allow(dead_code)]
-fn run_resarch(args: &[&str]) -> std::process::Output {
-    Command::new(resarch_bin())
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .env("S_COLORS", "never")
-        .env_remove("S_TIME_FORMAT")
-        .env_remove("S_REPEAT_HEADER")
-        .env_remove("S_COLORS_SGR")
-        .env_remove("S_COLORS_PALETTE")
-        .output()
-        .expect("resarch を起動できない")
+/// 時刻は [`TimeStyle::Utc`] にする。本家テストは `TZ=GMT` を明示しており、
+/// `sar` 既定のローカル時刻表示は GMT 環境では UTC 表示と一致する。
+/// `-t` (`true_time`) のときだけレコードに焼き込まれた時分秒を使う。
+fn sar_text_options(o: &SarOptions) -> SarTextOptions {
+    let bitmap = &o.cpu_bitmap;
+    let cpus = if bitmap.count_bits() == bitmap.capacity_bits() {
+        // `-P ALL` / `-A` は全ビットを立てる
+        CpuSelection::All
+    } else if bitmap.aggregate_selected() && bitmap.selected_cpus().next().is_none() {
+        CpuSelection::Aggregate
+    } else {
+        CpuSelection::Listed {
+            aggregate: bitmap.aggregate_selected(),
+            cpus: bitmap.selected_cpus().collect(),
+        }
+    };
+
+    let mem = o.opt_flags(Activity::Memory);
+    SarTextOptions {
+        pretty: o.flags.pretty,
+        human: o.flags.human,
+        dec_places: o.dec_places,
+        comment: o.flags.comment,
+        minmax: o.flags.minmax,
+        zero_omit: o.flags.zero_omit,
+        cpu_all: o.opt_flags(Activity::Cpu).contains(OptFlags::CPU_ALL),
+        memory: mem.contains(OptFlags::MEMORY),
+        mem_all: mem.contains(OptFlags::MEM_ALL),
+        swap: mem.contains(OptFlags::SWAP),
+        mount: o.opt_flags(Activity::Fs).contains(OptFlags::MOUNT),
+        dev_sid: o.flags.dev_sid,
+        time: if o.flags.true_time {
+            TimeStyle::Recorded
+        } else {
+            TimeStyle::Utc
+        },
+        cpus,
+    }
+}
+
+/// 選択された activity を**ファイル記載順**で返す (本家の `id_seq[]` と同じ順序)。
+fn selected_activities(file: &SaFile, o: &SarOptions) -> Vec<ActivityId> {
+    let selected: Vec<ActivityId> = o
+        .selected_activities()
+        .map(|a| ActivityId(u32::from(a.id())))
+        .collect();
+    sar_text::activities_in_file(file)
+        .into_iter()
+        .filter(|id| selected.contains(id))
+        .collect()
 }
 
 // ===========================================================================

@@ -48,7 +48,7 @@ use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptio
 use re_sar_ch::output::detect_report;
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
-use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
+use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
 use re_sar_ch::output::{csv, ndjson, table};
 use re_sar_ch::series::Selection;
@@ -329,10 +329,10 @@ fn cpu_selection(opts: &SarOptions) -> CpuSelection {
     }
 }
 
-/// `--dev=` / `--iface=` / `--fs=` のアイテム名フィルタ。
+/// `--dev=` / `--iface=` / `--fs=` / `--int=` / `-I SUM` のアイテム名フィルタ。
 ///
-/// `--int=` (`A_IRQ`) は行ではなく列が CPU に対応する行列レイアウトなので
-/// ここでは渡さない (未対応)。
+/// `--int=` (`A_IRQ`) は行 = 割り込みなので、絞るのは行で、
+/// 列 (CPU) は `-P` のビットマップの担当 (03 §8.6)。
 fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
     let mut map = BTreeMap::new();
     for act in [
@@ -340,6 +340,7 @@ fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
         Activity::NetDev,
         Activity::NetEdev,
         Activity::Fs,
+        Activity::Irq,
     ] {
         let list = opts.item_list(act);
         if !list.is_empty() {
@@ -347,6 +348,17 @@ fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
         }
     }
     map
+}
+
+/// `-i <interval>` と positional の `interval` / `count` を出力層へ写す。
+///
+/// 本家はファイル読み出しに入る直前で `interval < 0` を 1 に補正する (03 §5.3)。
+/// `interval == 0` は `-f` / `-o` 併用として引数解析が弾いているのでここには来ない。
+fn sar_sample_select(opts: &SarOptions) -> SampleSelect {
+    SampleSelect {
+        interval: opts.interval.unwrap_or(1).max(1),
+        count: opts.count,
+    }
 }
 
 /// [`SarOptions`] を `sar` テキスト出力の設定へ写す。
@@ -449,7 +461,13 @@ fn run_sar(opts: SarOptions) -> anyhow::Result<ExitCode> {
     let activities = sar_activities(&opts, &file);
 
     let mut out = stdout_writer();
-    let result = sar_text::write_report(&mut out, &file, &text, &activities);
+    let result = sar_text::write_report_with(
+        &mut out,
+        &file,
+        &text,
+        &activities,
+        sar_sample_select(&opts),
+    );
     out.flush()?;
     result?;
     Ok(ExitCode::SUCCESS)
@@ -1047,14 +1065,37 @@ fn min_priority(arg: PriorityArg) -> Priority {
 // `resarch summarize`
 // ===========================================================================
 
+/// 集計結果が空で、かつ時刻範囲を指定していたときに理由を `stderr` へ出す。
+///
+/// 「範囲外だったので集計が空」と「そもそも読めるデータが無かった」は別の話だが、
+/// 出力はどちらも `segments: []` になる。**黙って空を返さない**
+/// (`docs/design.md` §11 の「欠落を欠落として出す」と同じ方針)。
+///
+/// `-s` / `--from` に最初に一致したレコードは**前サンプルとして消費され、
+/// 値には数えない** (`sar` と同じ)。したがって範囲内のレコードが 1 本しか
+/// 無い場合も区間が作れず空になる。これが一番踏みやすい。
+fn report_empty_window(analysis: &multi::MultiFileAnalysis, common: &CommonArgs) {
+    if common.from.is_none() && common.to.is_none() {
+        return;
+    }
+    if analysis.hosts.iter().any(|h| !h.segments.is_empty()) {
+        return;
+    }
+    eprintln!(
+        "resarch: 指定した時刻範囲に集計できる区間がありません \
+         (--from に最初に一致したレコードは前サンプルとして消費されるので、\
+         範囲内のレコードが 1 本だけでは区間が作れません)"
+    );
+}
+
 fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
-    reject_time_window(common, "summarize")?;
     let mopts = multi_options(common)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
     for s in &analysis.skipped {
         eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
     }
+    report_empty_window(&analysis, common);
 
     let mut out = stdout_writer();
     match common.format {
@@ -1097,18 +1138,12 @@ fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
             FileErrorPolicy::Fail
         },
         max_concurrent_files: common.jobs.unwrap_or(4).max(1),
+        // `--from` / `--to` は集計期間そのものを絞る。
+        // `detect` の報告範囲とは意味が違う (`MultiOptions::time_filter` の doc /
+        // `docs/design.md` §9.0)。
+        time_filter: custom_time_filter(common)?,
         ..Default::default()
     })
-}
-
-/// `--from` / `--to` は集計経路 (`multi`) に受け口が無いので明示的に拒否する。
-fn reject_time_window(common: &CommonArgs, what: &str) -> anyhow::Result<()> {
-    if common.from.is_some() || common.to.is_some() {
-        bail!(
-            "--from / --to は {what} では未対応です (期間を絞るには `resarch show` を使ってください)"
-        );
-    }
-    Ok(())
 }
 
 fn write_summarize_text<W: Write>(
@@ -1266,7 +1301,6 @@ fn format_epoch(ust: u64) -> String {
 
 fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
-    reject_time_window(common, "compare")?;
     let mopts = multi_options(common)?;
 
     // ホストごとに解析し、代表となる起動区間 (最もサンプル数の多い区間) を採る。
@@ -1295,7 +1329,14 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             .into_iter()
             .max_by_key(|s| s.summary.period.samples)
         else {
-            eprintln!("resarch: --host {}: 起動区間が無い", spec.name);
+            // 時刻範囲を指定しているなら、それが原因であることが多い
+            // (`--from` に最初に一致したレコードは前サンプルとして消費される)。
+            let hint = if common.from.is_some() || common.to.is_some() {
+                " (指定した時刻範囲に集計できる区間が無いのかもしれません)"
+            } else {
+                ""
+            };
+            eprintln!("resarch: --host {}: 起動区間が無い{hint}", spec.name);
             partial = true;
             continue;
         };

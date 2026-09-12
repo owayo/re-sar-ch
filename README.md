@@ -76,6 +76,8 @@ resarch -u -f sa01                       # CPU utilisation
 resarch -r -f sa01                       # memory
 resarch -n DEV,EDEV -f sa01              # network interfaces
 resarch -u -P ALL -s 09:00:00 -e 18:00:00 -f sa01
+resarch -u -i 600 -f sa01                # thin the samples to ~10-minute steps
+resarch -I --int=0,LOC -f sa01           # pick interrupts by number or name
 resarch sar -A -f sa01                   # explicit compatibility entry point
 resarch sadf -j sa01                     # sadf-compatible JSON
 ```
@@ -185,8 +187,7 @@ Options that are parsed but not yet acted upon are rejected at run time with a r
 |---|---|
 | `sar -o` / `--sadc` | Collection is out of scope — rejected explicitly |
 | `sadf -g` / `-l` | SVG and PCP output are not implemented |
-| `sar -i`, positional `interval` / `count` | Not implemented (every record is emitted) |
-| `--int=` | Not implemented (`A_IRQ` uses a matrix layout) |
+| `sadf --dev=` / `--iface=` / `--fs=` / `--int=` | Item-name filters reach `sar` but not `sadf` yet |
 | `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
 
 ## Design notes

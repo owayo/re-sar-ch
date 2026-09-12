@@ -75,6 +75,8 @@ resarch -u -f sa01                       # CPU 使用率
 resarch -r -f sa01                       # メモリ
 resarch -n DEV,EDEV -f sa01              # ネットワークインターフェース
 resarch -u -P ALL -s 09:00:00 -e 18:00:00 -f sa01
+resarch -u -i 600 -f sa01                # 10 分刻みに間引く
+resarch -I --int=0,LOC -f sa01           # 割り込みを番号か名前で選ぶ
 resarch sar -A -f sa01                   # 明示的な互換入口
 resarch sadf -j sa01                     # sadf 互換 JSON
 ```
@@ -176,8 +178,7 @@ v10 のファイルを v12 の `sar` 書式で出すこともその逆もでき�
 |---|---|
 | `sar -o` / `--sadc` | 採取は対象外なので明示的にエラー |
 | `sadf -g` / `-l` | SVG・PCP は未対応 |
-| `sar -i` / positional の `interval` `count` | 未対応 (全レコードを出す) |
-| `--int=` | 未対応 (`A_IRQ` は行列レイアウトのため) |
+| `sadf` の `--dev=` / `--iface=` / `--fs=` / `--int=` | item 名フィルタは `sar` 側にしか効かない |
 | `sadf -H` と他形式の併用 | 未対応 (`resarch sadf -H <file>` を使う) |
 
 ## 設計上の要点

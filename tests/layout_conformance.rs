@@ -1427,6 +1427,21 @@ fn walk_reaches_the_declared_statistics() {
         );
         assert_eq!(got, want, "{label}: 統計値が fixture の書き込み値と違う");
 
+        // 絶対値の固定。期待値ヘルパ ([`fixtures::expected_stat`]) が
+        // 生成側と読み出し側の両方に効くので、ヘルパ自体が壊れると差が出ない。
+        // 1 点だけリテラルで押さえて相殺を防ぐ。
+        // stat_value(act_id, record_seq, item, field) = id<<24 | seq<<16 | item<<8 | field+1
+        assert_eq!(
+            got[0][&1][0][0],
+            Some(0x0101_0001),
+            "{label}: A_CPU の 1 件目 (id=1, seq=1, item=0, field=0)"
+        );
+        assert_eq!(
+            got[0][&2][0][1],
+            Some(0x0201_0002),
+            "{label}: A_PCSW.processes (id=2, seq=1, item=0, field=1)"
+        );
+
         // 自己検査: 期待値が空 (何も検証していない) ことを許さない
         assert!(!want.is_empty(), "{label}: STATS レコードが無い");
         for per_act in &want {

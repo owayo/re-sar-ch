@@ -215,6 +215,11 @@ impl std::fmt::Display for Incompatible {
 /// 160 バイト版がある) は、型別個数の完全一致 → 申告サイズ一致 → 同 magic の最新
 /// の順に絞る。最後の経路では [`DecodePlan::build_for`] が申告された型別個数から
 /// 配置を組み立て直す。
+///
+/// 「サイズも一致しなければ読み飛ばす」まで厳しくしてはいけない。
+/// 旧 `A_HUGE` は本家が別構造体のサイズ (136) を書き込んでいるため
+/// (`docs/format/02-activities.md` §9.5)、正常なファイルでもサイズが一致しない。
+/// 実データ (v9.1.6 / v10.3.1 / v11.6.5) で確認済み。
 pub fn select_revision(
     def: &ActivityDef,
     shape: &DeclaredShape,

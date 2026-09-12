@@ -1,4 +1,4 @@
-//! 本家 sysstat との突合テスト (骨格)。
+//! 本家 sysstat との突合テスト。
 //!
 //! # 位置づけ
 //!
@@ -14,12 +14,22 @@
 //! `cargo test` (既定) では `#[ignore]` により実行されないので、
 //! ネットワークが無い環境でもテスト全体は成功する。
 //!
-//! # 現状
+//! # 何を検証しているか
 //!
-//! `resarch` の出力系がまだ無いため、ここにあるのは
-//! **データ発見・スキップ判定・比較の枠**までである。
-//! 実際の出力比較 (`expected*` との `diff` 相当) は後続担当が
-//! [`GOLDEN_CASES`] の各ケースに `run_resarch` を差し込んで埋める。
+//! 1. 取得物が揃っていること (素性の記録つき)
+//! 2. 本家データのヘッダが `04-test-data.md` §2.1 の実測値どおりに読めること
+//! 3. **本家データを本体 (`SaFile` / `SaFile::scan` / `series::walk`) に読ませて**、
+//!    正常系は末尾まで余りなく読め、異常系は期待した分類のエラーで拒否されること
+//!    ([`upstream_files_are_read_or_rejected_as_expected`])
+//! 4. 自作 fixture (`tests/fixtures`) と本家の異常系ファイルが、
+//!    **同じ段・同じエラー分類**で拒否されること
+//!    ([`self_made_and_upstream_error_files_are_rejected_alike`])。
+//!    自作 fixture が本家と同じ検査を突いていることの裏取りになる。
+//!
+//! # 未了
+//!
+//! `resarch` の出力系との**表記比較** (`expected*` との `diff` 相当) は
+//! 後続担当が [`GOLDEN_CASES`] の各ケースに `run_resarch` を差し込んで埋める。
 //! 埋めるべき内容は `docs/format/04-test-data.md` §5 のフェーズ別計画に対応する。
 
 mod fixtures;

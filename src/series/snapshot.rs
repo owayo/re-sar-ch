@@ -554,15 +554,12 @@ fn decode_activity_into(
                 ))
             })?;
 
-        // 名前が変わらなければ確保し直さない (デバイス名は通常固定。texts 側と同じ扱い)
-        let key = plan
+        item.key = plan
             .read_item_key(&view)
             .ok()
             .flatten()
-            .filter(|s| !s.is_empty());
-        if item.key.as_deref() != key {
-            item.key = key.map(|s| s.to_owned().into_boxed_str());
-        }
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned().into_boxed_str());
 
         // 文字列フィールドを持つ activity は少数なので、無ければ何もしない
         if plan.text_fields.is_empty() {
@@ -1309,7 +1306,16 @@ mod tmp_probe {
         for p in names {
             match SaFile::open(&p) {
                 Ok(f) => {
-                    let planned = plan_activities(&f, &Selection::All).unwrap();
+                    let planned = match plan_activities(&f, &Selection::All) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!(
+                                "{:40} plan error: {e}",
+                                p.file_name().unwrap().to_string_lossy()
+                            );
+                            continue;
+                        }
+                    };
                     println!(
                         "{:40} acts={:2} planned={:2} skipped={:2} {:?}",
                         p.file_name().unwrap().to_string_lossy(),
@@ -1323,7 +1329,10 @@ mod tmp_probe {
                             .collect::<Vec<_>>()
                     );
                 }
-                Err(e) => println!("{:40} open error: {e}", p.file_name().unwrap().to_string_lossy()),
+                Err(e) => println!(
+                    "{:40} open error: {e}",
+                    p.file_name().unwrap().to_string_lossy()
+                ),
             }
         }
     }

@@ -30,7 +30,7 @@ use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
-use crate::series::{RecordEvent, walk};
+use crate::series::{RecordEvent, WalkItem, walk_items};
 
 /// NDJSON の 1 行。
 ///
@@ -93,18 +93,20 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
     let host = HostOut::new(file);
     let mut boot = BootCounter::default();
 
-    walk(file, &cfg.selection.clone(), |view| {
-        // 起動区間の境界と注記を先に出す。順序が保たれるので
-        // 「どのサンプルが再起動の直後か」が行の並びから読める。
-        for e in view.events {
-            match e {
-                RecordEvent::Restart {
-                    ust_time,
-                    cpu_count,
-                    ..
-                } => {
-                    boot.advance(std::slice::from_ref(e));
-                    let row = EventRow {
+    walk_items(file, &cfg.selection.clone(), |item| {
+        // 起動区間の境界と注記は**読んだ時点で**出す。行の並びがファイル上の
+        // 順序と一致するので「どのサンプルが再起動の直後か」が読める。
+        // 最後の統計レコードより後ろにある COMMENT もここで出る。
+        let view = match item {
+            WalkItem::Event(ev) => {
+                // RESTART なら起動区間を進める (COMMENT では増えない)
+                boot.advance(std::slice::from_ref(&ev));
+                let row = match &ev {
+                    RecordEvent::Restart {
+                        ust_time,
+                        cpu_count,
+                        ..
+                    } => EventRow {
                         schema_version: SCHEMA_VERSION,
                         record: "restart",
                         host: &host,
@@ -112,11 +114,8 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                         epoch: *ust_time,
                         cpu_count: *cpu_count,
                         comment: None,
-                    };
-                    write_line(out, &row)?;
-                }
-                RecordEvent::Comment { ust_time, text, .. } => {
-                    let row = EventRow {
+                    },
+                    RecordEvent::Comment { ust_time, text, .. } => EventRow {
                         schema_version: SCHEMA_VERSION,
                         record: "comment",
                         host: &host,
@@ -124,11 +123,13 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                         epoch: *ust_time,
                         cpu_count: None,
                         comment: Some(text.as_str()),
-                    };
-                    write_line(out, &row)?;
-                }
+                    },
+                };
+                write_line(out, &row)?;
+                return Ok(ScanControl::Continue);
             }
-        }
+            WalkItem::Sample(view) => view,
+        };
 
         let start_epoch = if view.has_prev {
             view.prev.ust_time

@@ -31,7 +31,7 @@ use crate::format::file::{SaFile, ScanControl};
 use crate::layout::registry::{ActivityDef, ColumnMeta};
 use crate::model::{ActivityId, Availability, ValueKind};
 use crate::series::compute::ComputeIssue;
-use crate::series::{IntervalView, RecordEvent, Selection, walk};
+use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 公開スキーマの版。
 ///
@@ -506,8 +506,15 @@ pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> R
 
     let mut boot = BootCounter::default();
     let mut first = true;
-    walk(file, &cfg.selection.clone(), |view| {
-        boot.advance(view.events);
+    walk_items(file, &cfg.selection.clone(), |item| {
+        // `samples` しか持たない形式なので、イベントは起動区間の番号にだけ効かせる。
+        let view = match item {
+            WalkItem::Event(ev) => {
+                boot.advance(std::slice::from_ref(&ev));
+                return Ok(ScanControl::Continue);
+            }
+            WalkItem::Sample(view) => view,
+        };
         let sample = sample_out(view, boot.get(), cfg);
         if sample.activities.is_empty() {
             return Ok(ScanControl::Continue);

@@ -30,7 +30,7 @@ use super::sadf::spec;
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
-use crate::series::{Selection, walk};
+use crate::series::{Selection, WalkItem, walk_items};
 
 /// 値が無いことを示す表記。
 pub const ABSENT: &str = "-";
@@ -70,7 +70,11 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
     writeln!(out, "source: {}", host.source).map_err(super::sadf::wrap_io)?;
 
     let mut printed_header: BTreeMap<u32, bool> = BTreeMap::new();
-    walk(file, &cfg.selection.clone(), |view| {
+    walk_items(file, &cfg.selection.clone(), |item| {
+        // 表には統計行しか並べないので、イベントは読み飛ばす。
+        let WalkItem::Sample(view) = item else {
+            return Ok(ScanControl::Continue);
+        };
         // 派生値を出すときは先頭レコードを飛ばす。基準となる前サンプルが無く、
         // 1 行すべてが `-` になって読みにくいだけなので。
         // 生値だけを見るときは先頭レコードにも意味がある。
@@ -160,7 +164,11 @@ fn utc_hms(ust_time: u64) -> String {
 fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
     let mut widths: BTreeMap<u32, Widths> = BTreeMap::new();
 
-    walk(file, &cfg.selection.clone(), |view| {
+    walk_items(file, &cfg.selection.clone(), |item| {
+        // 幅の計測も統計行だけを見る (イベント行は表に並ばない)。
+        let WalkItem::Sample(view) = item else {
+            return Ok(ScanControl::Continue);
+        };
         if !view.has_prev && cfg.values.wants_rates() {
             return Ok(ScanControl::Continue);
         }

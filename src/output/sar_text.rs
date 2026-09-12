@@ -29,15 +29,16 @@
 //! ## 使い方
 //!
 //! activity ごとにファイルを読み直す本家の構造をそのまま再現できるよう、
-//! 「1 出力ブロック = 1 [`SarBlock`]」とし、[`SarBlock::record`] を
-//! [`crate::series::walk`] のコールバックから呼ぶ。レコードは溜めない。
+//! 「1 出力ブロック = 1 [`SarBlock`]」とし、[`SarBlock::record`] /
+//! [`SarBlock::event`] を [`crate::series::walk_items`] のコールバックから呼ぶ。
+//! レコードは溜めない。
 //!
 //! ```no_run
 //! use std::io::{BufWriter, stdout};
 //! use re_sar_ch::format::{SaFile, file::ScanControl};
 //! use re_sar_ch::model::ActivityId;
 //! use re_sar_ch::output::sar_text::{SarBlock, SarTextOptions, write_banner};
-//! use re_sar_ch::series::{Selection, walk};
+//! use re_sar_ch::series::{Selection, WalkItem, walk_items};
 //!
 //! # fn main() -> re_sar_ch::Result<()> {
 //! let file = SaFile::open("sa01")?;
@@ -47,8 +48,11 @@
 //!
 //! for id in [ActivityId::CPU, ActivityId::MEMORY] {
 //!     for mut block in SarBlock::blocks_for(id, &opts) {
-//!         walk(&file, &Selection::Only(vec![id]), |view| {
-//!             block.record(&mut out, view)?;
+//!         walk_items(&file, &Selection::Only(vec![id]), |item| {
+//!             match item {
+//!                 WalkItem::Event(ev) => block.event(&mut out, &ev)?,
+//!                 WalkItem::Sample(view) => block.record(&mut out, view)?,
+//!             }
 //!             Ok(ScanControl::Continue)
 //!         })?;
 //!         block.finish(&mut out)?;
@@ -1625,34 +1629,37 @@ impl SarBlock {
         self.view.id
     }
 
-    /// 1 レコードを処理する。
+    /// `RESTART` / `COMMENT` を 1 件処理する。
     ///
-    /// - `view.events` の `RESTART` / `COMMENT` を先に出す
-    /// - `view.has_prev == false` のレコードは**表示しない**
-    ///   (前サンプルとして消費されるだけ)
-    /// - `RESTART` をまたいだレコードも表示しない (差分の基準がリセットされる)
-    pub fn record<W: Write>(&mut self, out: &mut W, view: &IntervalView<'_>) -> io::Result<()> {
-        let mut restarted = false;
-        for ev in view.events {
-            let ts = event_timestamp(ev, self.opts.time);
-            match ev {
-                RecordEvent::Restart { cpu_count, .. } => {
-                    // 区間が終わるので平均を先に出す
-                    self.flush_average(out)?;
-                    write_restart(out, &ts, real_cpu_count(*cpu_count))?;
-                    restarted = true;
-                }
-                RecordEvent::Comment { text, .. } => {
-                    if self.opts.comment {
-                        write_comment(out, &ts, text)?;
-                    }
+    /// 走査が**イベントを読んだ時点で**呼ばれる。統計レコードに束ねないので、
+    /// 最後の統計レコードより後ろにあるイベントもここに届く
+    /// (本家も読んだ順に `COM` / `LINUX RESTART` 行を出す。03 §1.10 の内側ループ)。
+    pub fn event<W: Write>(&mut self, out: &mut W, ev: &RecordEvent) -> io::Result<()> {
+        let ts = event_timestamp(ev, self.opts.time);
+        match ev {
+            RecordEvent::Restart { cpu_count, .. } => {
+                // 区間が終わるので平均を先に出す
+                self.flush_average(out)?;
+                write_restart(out, &ts, real_cpu_count(*cpu_count))?;
+                self.reset_region();
+            }
+            RecordEvent::Comment { text, .. } => {
+                if self.opts.comment {
+                    write_comment(out, &ts, text)?;
                 }
             }
         }
-        if restarted {
-            self.reset_region();
-        }
+        Ok(())
+    }
 
+    /// 統計レコード 1 件を処理する。
+    ///
+    /// - `view.has_prev == false` のレコードは**表示しない**
+    ///   (前サンプルとして消費されるだけ)
+    /// - `RESTART` をまたいだレコードも表示しない (差分の基準がリセットされる)
+    ///
+    /// `RESTART` / `COMMENT` は [`SarBlock::event`] が受け持つ。
+    pub fn record<W: Write>(&mut self, out: &mut W, view: &IntervalView<'_>) -> io::Result<()> {
         let Some(plan) = view.plan_for(self.view.id) else {
             return Ok(());
         };
@@ -2534,7 +2541,7 @@ pub fn activities_in_file(file: &SaFile) -> Vec<ActivityId> {
 
 /// バナー + 指定 activity のブロックを順に書き出す。
 ///
-/// activity ごとに [`walk`](crate::series::walk) を 1 回ずつ回す
+/// activity ごとに [`walk_items`](crate::series::walk_items) を 1 回ずつ回す
 /// (本家がファイルを activity ごとに読み直すのと同じ構造)。
 /// レコードは溜めないので、`out` に [`std::io::BufWriter`] を渡せば
 /// そのままストリーミング出力になる。
@@ -2545,7 +2552,7 @@ pub fn write_report<W: Write>(
     activities: &[ActivityId],
 ) -> crate::Result<()> {
     use crate::format::file::ScanControl;
-    use crate::series::{Selection, walk};
+    use crate::series::{Selection, WalkItem, walk_items};
 
     let io = |e: io::Error| crate::Error::Io {
         path: file.path().to_path_buf(),
@@ -2555,8 +2562,13 @@ pub fn write_report<W: Write>(
     write_banner(out, file).map_err(io)?;
     for id in activities {
         for mut block in SarBlock::blocks_for(*id, opts) {
-            walk(file, &Selection::Only(vec![*id]), |view| {
-                block.record(out, view).map_err(io)?;
+            // イベントは読んだ順にその場で渡す。最後の統計レコードより後ろにある
+            // `COM` / `LINUX RESTART` 行も、`Average:` 行の前に出る。
+            walk_items(file, &Selection::Only(vec![*id]), |item| {
+                match item {
+                    WalkItem::Event(ev) => block.event(out, &ev).map_err(io)?,
+                    WalkItem::Sample(view) => block.record(out, view).map_err(io)?,
+                }
                 Ok(ScanControl::Continue)
             })?;
             block.finish(out).map_err(io)?;

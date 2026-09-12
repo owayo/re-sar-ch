@@ -24,7 +24,7 @@ use super::{
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
-use crate::series::{IntervalView, RecordEvent, Selection, walk};
+use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 区切り文字。`seps[isdb]` (`rndr_stats.c`)。
 const SEPS: [&str; 2] = ["\t", ";"];
@@ -106,15 +106,49 @@ fn write_activity_block<W: Write>(
 ) -> Result<()> {
     let mut current_block = 0usize;
 
-    walk(file, &Selection::Only(vec![spec.id]), |view| {
-        current_block += count_restarts(view.events);
-        if current_block != block {
-            return Ok(ScanControl::Continue);
+    walk_items(file, &Selection::Only(vec![spec.id]), |item| {
+        match item {
+            // RESTART がブロックの境界 (`logic2`)。読んだ時点で次のブロックへ移る。
+            WalkItem::Event(RecordEvent::Restart { .. }) => current_block += 1,
+            // COMMENT は読んだ時点で出す。最後の統計レコードより後ろにあっても届く。
+            WalkItem::Event(ev) => {
+                if cfg.comments && current_block == block {
+                    emit_comment(out, &ev, cfg, info, isdb).map_err(super::wrap_io)?;
+                }
+            }
+            WalkItem::Sample(view) => {
+                if current_block == block {
+                    emit_sample(out, view, cfg, info, spec, section, isdb)
+                        .map_err(super::wrap_io)?;
+                }
+            }
         }
-        emit_sample(out, view, cfg, info, spec, section, isdb).map_err(super::wrap_io)?;
         Ok(ScanControl::Continue)
     })?;
     Ok(())
+}
+
+/// COMMENT の 1 行 (`COM <本文>`)。
+///
+/// 区間は `EVENT_INTERVAL` 固定。activity ごとに (= ブロック内で何度も) 出る (§0.3)。
+fn emit_comment<W: Write>(
+    out: &mut W,
+    ev: &RecordEvent,
+    cfg: &SadfConfig,
+    info: &FileInfo,
+    isdb: bool,
+) -> io::Result<()> {
+    let RecordEvent::Comment { ust_time, text, .. } = ev else {
+        return Ok(());
+    };
+    let sep = SEPS[usize::from(isdb)];
+    let stamp = Stamp::new(cfg.time_base, *ust_time, ev.time(), info);
+    writeln!(
+        out,
+        "{}{sep}{EVENT_INTERVAL}{sep}{}{sep}COM {text}",
+        info.nodename,
+        stamp.dbppc()
+    )
 }
 
 /// 1 レコード分を書き出す。
@@ -132,20 +166,7 @@ fn emit_sample<W: Write>(
 ) -> io::Result<()> {
     let sep = SEPS[usize::from(isdb)];
 
-    // COMMENT は activity ごとに (= ブロック内で何度も) 出る (§0.3)
-    if cfg.comments {
-        for e in view.events {
-            if let RecordEvent::Comment { ust_time, text, .. } = e {
-                let stamp = Stamp::new(cfg.time_base, *ust_time, e.time(), info);
-                writeln!(
-                    out,
-                    "{}{sep}{EVENT_INTERVAL}{sep}{}{sep}COM {text}",
-                    info.nodename,
-                    stamp.dbppc()
-                )?;
-            }
-        }
-    }
+    // COMMENT はここでは出さない (走査で読んだ時点に [`emit_comment`] が出す)。
     // 先頭レコードは基準値として消費するだけ。レートが作れないので出さない。
     if !view.has_prev || !view.continuous {
         return Ok(());
@@ -289,7 +310,11 @@ fn write_horizontal<W: Write>(
     writeln!(out, "{hdr}").map_err(super::wrap_io)?;
 
     let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
-    walk(file, &Selection::Only(ids), |view| {
+    walk_items(file, &Selection::Only(ids), |item| {
+        // `-dh` は 1 サンプル = 1 行。イベント行は持たない。
+        let WalkItem::Sample(view) = item else {
+            return Ok(ScanControl::Continue);
+        };
         if !view.has_prev || !view.continuous {
             return Ok(ScanControl::Continue);
         }
@@ -422,13 +447,6 @@ fn multi_item(file: &SaFile, id: ActivityId) -> bool {
 /// 現サンプルの「収集時ローカル時分秒」。`-t` の日付復元に使う。
 fn curr_hms(view: &IntervalView<'_>) -> (u8, u8, u8) {
     (view.curr.hour, view.curr.minute, view.curr.second)
-}
-
-fn count_restarts(events: &[RecordEvent]) -> usize {
-    events
-        .iter()
-        .filter(|e| matches!(e, RecordEvent::Restart { .. }))
-        .count()
 }
 
 /// RESTART で区切られたブロックの構成。

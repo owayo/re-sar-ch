@@ -41,7 +41,9 @@ use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
 use crate::model::{ActivityId, Aggregation, Availability, CounterBits, Unit, ValueKind};
 use crate::series::compute::{ComputeContext, column_value, tick_total};
 use crate::series::delta::{Delta, DeltaContext, compute_delta};
-use crate::series::snapshot::{ActivitySnapshot, IntervalView, ItemSnapshot, Selection, walk};
+use crate::series::snapshot::{
+    ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
+};
 
 use super::percentile::{PercentileResult, PercentileSpec, PercentileUnavailable, WeightedSamples};
 use super::timeline::{
@@ -1054,8 +1056,11 @@ pub fn summarize_file(
     opts: SummaryOptions,
 ) -> Result<NativePeriodSummary> {
     let mut builder = NativeSummaryBuilder::new(opts);
-    walk(file, selection, |view| {
-        builder.observe(view);
+    walk_items(file, selection, |item| {
+        // 集計は統計レコードだけを見る (不連続は `view.continuous` で判定できる)。
+        if let WalkItem::Sample(view) = item {
+            builder.observe(view);
+        }
         Ok(crate::format::file::ScanControl::Continue)
     })?;
     let h = file.header();

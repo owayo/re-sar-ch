@@ -24,7 +24,7 @@ use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
-use crate::series::{RecordEvent, walk};
+use crate::series::{RecordEvent, WalkItem, walk_items};
 
 /// CSV のヘッダ (この順で固定)。
 pub const HEADER: &[&str] = &[
@@ -58,12 +58,17 @@ pub fn write_csv<W: Write>(out: W, file: &SaFile, cfg: &CustomConfig) -> Result<
     w.write_record(HEADER).map_err(csv_err)?;
 
     let mut boot: u32 = 0;
-    walk(file, &cfg.selection.clone(), |view| {
-        for e in view.events {
-            if matches!(e, RecordEvent::Restart { .. }) {
-                boot += 1;
+    walk_items(file, &cfg.selection.clone(), |item| {
+        // 縦持ちの統計行しか持たない形式なので、イベントは起動区間の番号にだけ効かせる。
+        let view = match item {
+            WalkItem::Event(ev) => {
+                if matches!(ev, RecordEvent::Restart { .. }) {
+                    boot += 1;
+                }
+                return Ok(ScanControl::Continue);
             }
-        }
+            WalkItem::Sample(view) => view,
+        };
         let start_epoch = if view.has_prev {
             view.prev.ust_time
         } else {

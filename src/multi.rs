@@ -64,7 +64,9 @@ use crate::format::file::{FileHeader, OpenOptions, SaFile, ScanControl};
 use crate::layout::plan::DecodePlan;
 use crate::model::{ActivityId, ValueKind};
 use crate::series::delta::interval_cs;
-use crate::series::snapshot::{ActivityPlan, IntervalView, RecordEvent, Selection, Snapshot, walk};
+use crate::series::snapshot::{
+    ActivityPlan, IntervalView, RecordEvent, Selection, Snapshot, WalkItem, walk_items,
+};
 
 /// 複数ファイル横断の出力スキーマ版。
 pub const MULTI_SCHEMA_VERSION: &str = "1";
@@ -636,15 +638,21 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
     let signature = signature_of(&file, &plans);
 
     let mut samples: Vec<SampleRecord> = Vec::new();
-    walk(&file, &opts.selection, |view| {
-        let restart_before = view
-            .events
-            .iter()
-            .any(|e| matches!(e, RecordEvent::Restart { .. }));
-        samples.push(SampleRecord {
-            snapshot: view.curr.clone(),
-            restart_before,
-        });
+    // 直前に RESTART を読んだか。次の統計レコードへ持ち越す
+    // (走査はイベントを束ねずに読んだ順で渡すため、ここで覚えておく)。
+    let mut restart_pending = false;
+    walk_items(&file, &opts.selection, |item| {
+        match item {
+            WalkItem::Event(ev) => {
+                if matches!(ev, RecordEvent::Restart { .. }) {
+                    restart_pending = true;
+                }
+            }
+            WalkItem::Sample(view) => samples.push(SampleRecord {
+                snapshot: view.curr.clone(),
+                restart_before: std::mem::take(&mut restart_pending),
+            }),
+        }
         Ok(ScanControl::Continue)
     })?;
 

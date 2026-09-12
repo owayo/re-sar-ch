@@ -11,7 +11,7 @@ use re_sar_ch::format::SaFile;
 use re_sar_ch::format::file::ScanControl;
 use re_sar_ch::layout;
 use re_sar_ch::model::{ActivityId, Availability};
-use re_sar_ch::series::{Selection, walk};
+use re_sar_ch::series::{Selection, WalkItem, walk_items};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("usage: rates <FILE>")?;
@@ -34,7 +34,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let mut shown = 0usize;
-    walk(&f, &Selection::Only(vec![ActivityId::CPU]), |view| {
+    walk_items(&f, &Selection::Only(vec![ActivityId::CPU]), |item| {
+        // ここでは使用率だけを見るので RESTART / COMMENT は読み飛ばす
+        let WalkItem::Sample(view) = item else {
+            return Ok(ScanControl::Continue);
+        };
         if !view.has_prev || shown >= 5 {
             return Ok(ScanControl::Continue);
         }

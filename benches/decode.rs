@@ -19,7 +19,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use re_sar_ch::format::file::ScanControl;
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile};
 use re_sar_ch::model::ActivityId;
-use re_sar_ch::series::{Selection, walk};
+use re_sar_ch::series::{Selection, WalkItem, walk_items};
 
 /// 計測対象のファイルを決める。
 fn bench_target() -> Option<PathBuf> {
@@ -40,6 +40,10 @@ fn bench_target() -> Option<PathBuf> {
         let name = path.file_name()?.to_string_lossy().to_string();
         // 異常系データは計測に使わない
         if !name.starts_with("data-") || name.contains("err") || name.contains("trunc") {
+            continue;
+        }
+        // `data-*.xml` のような付随データが混ざるので、読めるものだけを候補にする
+        if SaFile::open(&path).is_err() {
             continue;
         }
         let len = entry.metadata().ok()?.len();
@@ -121,8 +125,10 @@ fn bench_decode(c: &mut Criterion) {
     // 全 activity をデコード
     group.bench_function("walk_all_activities", |b| {
         b.iter(|| {
-            let s = walk(&file, &Selection::All, |view| {
-                black_box(view.curr.activities.len());
+            let s = walk_items(&file, &Selection::All, |item| {
+                if let WalkItem::Sample(view) = item {
+                    black_box(view.curr.activities.len());
+                }
                 Ok(ScanControl::Continue)
             })
             .expect("walk");
@@ -133,8 +139,10 @@ fn bench_decode(c: &mut Criterion) {
     // CPU だけを選択 (選択外 activity をスキップする最適化の効果)
     group.bench_function("walk_cpu_only", |b| {
         b.iter(|| {
-            let s = walk(&file, &Selection::Only(vec![ActivityId::CPU]), |view| {
-                black_box(view.curr.activities.len());
+            let s = walk_items(&file, &Selection::Only(vec![ActivityId::CPU]), |item| {
+                if let WalkItem::Sample(view) = item {
+                    black_box(view.curr.activities.len());
+                }
                 Ok(ScanControl::Continue)
             })
             .expect("walk");

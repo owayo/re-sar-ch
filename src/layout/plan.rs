@@ -151,6 +151,17 @@ pub struct DecodePlan {
     pub text_fields: Box<[FieldId]>,
     /// 解決した配置のサイズ。申告値との差を診断に使う。
     pub derived_size: usize,
+
+    // --- ここから下はホットパス用の事前計算 ---
+    //
+    // デコードは「レコード数 × activity 数 × item 数」回まわる。
+    // フィールドごとに「読むのか / 文字列なのか / このファイルには無いのか」を
+    // 毎回分岐すると、その判定だけで無視できない時間を使う。
+    // 計画の段階で結果が決まっているので、ここで畳んでおく。
+    /// デコード結果の初期値。読まないフィールドの値が既に入っている。
+    value_template: ValueTemplate,
+    /// 実際に読むフィールド (結果配列での位置, 読み取り位置)。
+    numeric_reads: NumericReads,
 }
 
 /// `file_activity` が申告した統計構造体の形。
@@ -370,6 +381,9 @@ impl DecodePlan {
             .map(|(i, _)| FieldId(i as u16))
             .collect();
 
+        // ホットパス用に「読まないフィールドの結果」を先に確定させる
+        let (value_template, numeric_reads) = fold_field_plans(&fields);
+
         Ok(Self {
             // ストライドは常に申告値。導出値との差は診断で報告する。
             stride: shape.size,
@@ -381,6 +395,8 @@ impl DecodePlan {
             item_key,
             text_fields: text_fields.into_boxed_slice(),
             derived_size: resolved.size,
+            value_template,
+            numeric_reads,
         })
     }
 
@@ -430,22 +446,13 @@ impl DecodePlan {
         item: &ItemView<'_>,
         out: &mut Vec<Availability<u64>>,
     ) -> ReadResult<()> {
+        // 読まないフィールドの結果は計画時に確定しているので、まとめて写す。
+        // 「読むのか / 文字列か / 無いのか」の分岐をループの中に残さない。
         out.clear();
-        out.reserve(self.fields.len());
-        for f in self.fields.iter() {
-            match &f.read {
-                // このファイルに存在しないフィールド。0 で埋めると
-                // 「正常な 0」と区別できなくなり、平均や閾値判定が静かに誤る。
-                None => out.push(Availability::UnsupportedBySource),
-                // 文字列は数値として保持しない (texts / item_key 経由で読む)
-                Some(_) if matches!(f.ty, FieldTy::Bytes(_)) => {
-                    out.push(Availability::MissingInSample)
-                }
-                Some(p) => {
-                    let v = item.cur.read_unsigned(0, p)?;
-                    out.push(Availability::Present(v));
-                }
-            }
+        out.extend_from_slice(&self.value_template);
+        for (index, placed) in self.numeric_reads.iter() {
+            let v = item.cur.read_unsigned(0, placed)?;
+            out[*index as usize] = Availability::Present(v);
         }
         Ok(())
     }
@@ -606,6 +613,39 @@ fn remap_to_declared(
     resolve_fields(rev.layout.name, &fields, AlignSpec::Natural, enc).map(Some)
 }
 
+/// フィールド計画を「初期値テンプレート」と「実際に読む位置」へ畳む。
+///
+/// デコードは「レコード数 × activity 数 × item 数」回まわるため、
+/// 「読むのか / 文字列なのか / このファイルには無いのか」の判定は
+/// 計画の段階で 1 度だけ行い、ホットループには残さない。
+/// デコード結果の初期値テンプレート。読まないフィールドの値が入っている。
+type ValueTemplate = Box<[Availability<u64>]>;
+
+/// 実際に読むフィールド (結果配列での位置, 読み取り位置) の表。
+type NumericReads = Box<[(u16, PlacedField)]>;
+
+fn fold_field_plans(fields: &[FieldPlan]) -> (ValueTemplate, NumericReads) {
+    let mut template: Vec<Availability<u64>> = Vec::with_capacity(fields.len());
+    let mut reads: Vec<(u16, PlacedField)> = Vec::new();
+    for (i, f) in fields.iter().enumerate() {
+        match &f.read {
+            // このファイルに存在しないフィールド。0 で埋めると
+            // 「正常な 0」と区別できなくなり、平均や閾値判定が静かに誤る。
+            None => template.push(Availability::UnsupportedBySource),
+            // 文字列は数値として保持しない (texts / item_key 経由で読む)
+            Some(_) if matches!(f.ty, FieldTy::Bytes(_)) => {
+                template.push(Availability::MissingInSample)
+            }
+            Some(p) => {
+                // 読むフィールド。テンプレート上の値は毎回上書きされる
+                template.push(Availability::MissingInSample);
+                reads.push((i as u16, *p));
+            }
+        }
+    }
+    (template.into_boxed_slice(), reads.into_boxed_slice())
+}
+
 /// item 1 個分のデコード結果。
 #[derive(Debug, Clone)]
 pub struct ItemValues<'a> {
@@ -661,6 +701,8 @@ mod tests {
             item_key: None,
             text_fields: Box::new([]),
             derived_size: 1024,
+            value_template: Box::new([]),
+            numeric_reads: Box::new([]),
         };
         // 8193 * 4096 * 1024 = 34,359,869,440 > u32::MAX
         assert_eq!(
@@ -682,6 +724,8 @@ mod tests {
             item_key: None,
             text_fields: Box::new([]),
             derived_size: 64,
+            value_template: Box::new([]),
+            numeric_reads: Box::new([]),
         };
         assert_eq!(plan.payload_bytes(), Some(576));
     }
@@ -700,6 +744,8 @@ mod tests {
             item_key: None,
             text_fields: Box::new([]),
             derived_size: 16,
+            value_template: Box::new([]),
+            numeric_reads: Box::new([]),
         };
         assert_eq!(plan.payload_bytes(), Some(136));
         assert!(!plan.overflows_declared_size());
@@ -717,6 +763,8 @@ mod tests {
             item_key: None,
             text_fields: Box::new([]),
             derived_size: 64,
+            value_template: Box::new([]),
+            numeric_reads: Box::new([]),
         };
         assert!(plan.overflows_declared_size());
     }

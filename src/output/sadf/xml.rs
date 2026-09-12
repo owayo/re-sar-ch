@@ -24,7 +24,7 @@ use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, r
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
-use crate::series::{IntervalView, Selection, walk};
+use crate::series::{IntervalView, Selection, WalkItem, walk_items};
 
 /// `sadf.h` の `XML_DTD_VERSION`。
 pub const XML_DTD_VERSION: &str = "3.18";
@@ -37,7 +37,12 @@ pub fn write_xml<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Resu
     write_prologue(out, &info).map_err(super::wrap_io)?;
 
     let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
-    walk(file, &Selection::Only(ids), |view| {
+    walk_items(file, &Selection::Only(ids), |item| {
+        // `logic1` の統計ループは RESTART / COMMENT を見ない。
+        // `<restarts>` / `<comments>` は後段の別走査が出す。
+        let WalkItem::Sample(view) = item else {
+            return Ok(ScanControl::Continue);
+        };
         if !view.has_prev || !view.continuous {
             return Ok(ScanControl::Continue);
         }

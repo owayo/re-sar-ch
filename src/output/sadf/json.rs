@@ -24,7 +24,7 @@ use super::{ABSENT_JSON, FileInfo, SadfConfig, Stamp, interval_secs, render, spe
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
-use crate::series::{IntervalView, Selection, walk};
+use crate::series::{IntervalView, Selection, WalkItem, walk_items};
 
 /// `-j` の出力。
 pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
@@ -36,7 +36,12 @@ pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Res
     // ---- statistics (時刻順に 1 回走査) ----
     let mut first = true;
     let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
-    walk(file, &Selection::Only(ids), |view| {
+    walk_items(file, &Selection::Only(ids), |item| {
+        // `logic1` の統計ループは RESTART / COMMENT を見ない。
+        // `restarts` / `comments` は後段の別走査 (scan_restarts / scan_comments) が出す。
+        let WalkItem::Sample(view) = item else {
+            return Ok(ScanControl::Continue);
+        };
         if !view.has_prev || !view.continuous {
             return Ok(ScanControl::Continue);
         }

@@ -13,5 +13,6 @@ pub use delta::{
     Delta, DeltaContext, Discontinuity, compute_delta, interval_cs, ll_sp_value, s_value,
 };
 pub use snapshot::{
-    ActivitySnapshot, IntervalView, ItemSnapshot, RecordEvent, Selection, Snapshot, walk,
+    ActivitySnapshot, IntervalView, ItemSnapshot, RecordEvent, Selection, Snapshot, WalkItem, walk,
+    walk_items,
 };

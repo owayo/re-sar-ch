@@ -36,7 +36,8 @@ impl Agent {
             "claude" | "claude-code" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             other => Err(Error::Other(format!(
-                "不明なインストール先です: \"{other}\" (指定できるのは claude / codex)"
+                "不明なインストール先です: \"{other}\" (指定できるのは {})",
+                Self::ALL.join(" / ")
             ))),
         }
     }
@@ -58,7 +59,10 @@ impl Agent {
         }
     }
 
-    /// 指定できる値の一覧 (ヘルプとエラーで使う)。
+    /// 指定できる値の一覧。
+    ///
+    /// **エラーメッセージはここから作る。** [`Agent::parse`] の分岐と
+    /// 別に文字列を持つと、エージェントを足したときに案内だけ古くなる。
     pub const ALL: [&'static str; 2] = ["claude", "codex"];
 }
 
@@ -123,8 +127,20 @@ mod tests {
     fn an_unknown_agent_is_rejected_with_the_choices() {
         let err = Agent::parse("cursor").unwrap_err().to_string();
         assert!(err.contains("cursor"), "{err}");
-        assert!(err.contains("claude"), "{err}");
-        assert!(err.contains("codex"), "{err}");
+        for name in Agent::ALL {
+            assert!(err.contains(name), "候補 {name} が案内に無い: {err}");
+        }
+    }
+
+    /// 案内する候補が**すべて実際に受け付けられる**こと。
+    ///
+    /// 分岐と一覧を別に持つので、エージェントを足したときに
+    /// 片方だけ更新される事故を止める。
+    #[test]
+    fn every_advertised_agent_is_actually_accepted() {
+        for name in Agent::ALL {
+            Agent::parse(name).unwrap_or_else(|e| panic!("{name} を受け付けない: {e}"));
+        }
     }
 
     #[test]

@@ -23,10 +23,7 @@
 
 use std::path::PathBuf;
 
-use super::sar_args::{
-    self, Activity, Caller, CpuBitmap, MAX_DEV_LEN, MAX_FS_LEN, MAX_IFACE_LEN, MAX_SA_IRQ_LEN,
-    NO_RANGE, NR_IRQS, SarArgError, SarOptions,
-};
+use super::sar_args::{self, Activity, Caller, CpuBitmap, SarArgError, SarOptions};
 
 // ============================================================================
 // 出力形式
@@ -517,26 +514,7 @@ pub fn parse_sadf_args(argv: &[String]) -> Result<SadfOptions, SadfArgError> {
         if arg == "--" {
             sar_options = true;
             opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--dev=") {
-            sar_args::parse_sa_devices(&mut o.sar, Activity::Disk, value, MAX_DEV_LEN, NO_RANGE);
-            opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--fs=") {
-            sar_args::parse_sa_devices(&mut o.sar, Activity::Fs, value, MAX_FS_LEN, NO_RANGE);
-            opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--iface=") {
-            sar_args::parse_sa_devices(
-                &mut o.sar,
-                Activity::NetDev,
-                value,
-                MAX_IFACE_LEN,
-                NO_RANGE,
-            );
-            if let Some(list) = o.sar.item_lists.get(&Activity::NetDev).cloned() {
-                o.sar.item_lists.insert(Activity::NetEdev, list);
-            }
-            opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--int=") {
-            sar_args::parse_sa_devices(&mut o.sar, Activity::Irq, value, MAX_SA_IRQ_LEN, NR_IRQS);
+        } else if sar_args::parse_item_filter(&arg, &mut o.sar) {
             opt += 1;
         } else if arg == "-P" {
             opt += 1;
@@ -582,22 +560,7 @@ pub fn parse_sadf_args(argv: &[String]) -> Result<SadfOptions, SadfArgError> {
             if !sar_options {
                 return Err(SadfArgError::KeywordBeforeDashDash { opt: "-q" });
             }
-            match argv.get(opt + 1).cloned() {
-                Some(value) => {
-                    if sar_args::parse_sar_q_opt(&value, &mut o.sar).is_err() {
-                        o.sar.select(Activity::Queue);
-                        let truncated = value.split(',').next().unwrap_or_default().to_string();
-                        argv[opt + 1] = truncated;
-                        opt += 1;
-                    } else {
-                        opt += 2;
-                    }
-                }
-                None => {
-                    o.sar.select(Activity::Queue);
-                    opt += 1;
-                }
-            }
+            sar_args::parse_queue_option(&mut argv, &mut opt, &mut o.sar);
         } else if sar_args::is_day_offset(&arg) {
             if o.data_file.is_some() || o.day_offset != 0 {
                 return Err(SadfArgError::DuplicateDataFile { value: arg });
@@ -1210,6 +1173,107 @@ mod tests {
         assert_eq!(o.sar.opt_flags(Activity::Fs), OptFlags::FILESYSTEM);
         assert!(o.sar.is_selected(Activity::Disk));
         assert!(o.sar.flags.pretty);
+    }
+
+    #[test]
+    fn item_filters_share_sar_semantics_on_both_sides_of_dash_dash() {
+        let cases: &[(&str, Activity, &[&str])] = &[
+            ("--dev=sda,sda,1-3", Activity::Disk, &["sda", "1-3"]),
+            (
+                "--fs=/dev/sda1,,/home",
+                Activity::Fs,
+                &["/dev/sda1", "/home"],
+            ),
+            (
+                "--iface=0123456789abcdefghij",
+                Activity::NetDev,
+                &["0123456789abcde"],
+            ),
+            (
+                "--int=3-5,4,4095-,MCE-XXX,ABCDEFXYZ",
+                Activity::Irq,
+                &["3", "4", "5", "4095", "MCE-XXX", "ABCDEFX"],
+            ),
+        ];
+        for &(arg, activity, expected) in cases {
+            let sar = sar_args::parse_sar_args(&argv(&[arg, "-f", "sa01"])).unwrap();
+            for sadf_args in [[arg, "sa01", "--"], ["sa01", "--", arg]] {
+                let sadf = parse(&sadf_args);
+                assert_eq!(sar.item_list(activity), expected, "{arg}");
+                assert_eq!(sadf.sar.item_list(activity), expected, "{sadf_args:?}");
+                assert!(sadf.sar.list_on_cmdline(activity));
+                // 絞り込みだけでは activity 自体は選択されない。
+                assert_eq!(selected(&sadf), vec![Activity::Cpu]);
+                if activity == Activity::NetDev {
+                    assert_eq!(sadf.sar.item_list(Activity::NetEdev), expected);
+                    assert!(sadf.sar.list_on_cmdline(Activity::NetEdev));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_repeated_item_filters_preserve_accumulated_items() {
+        let empty = parse(&["--dev=", "--fs=", "--iface=", "--int=", "sa01"]);
+        for activity in [
+            Activity::Disk,
+            Activity::Fs,
+            Activity::NetDev,
+            Activity::NetEdev,
+            Activity::Irq,
+        ] {
+            assert!(!empty.sar.list_on_cmdline(activity));
+        }
+        let repeated = parse(&[
+            "--iface=eth0",
+            "--fs=/home",
+            "sa01",
+            "--",
+            "--iface=eth1,eth0",
+            "--iface=",
+            "--fs=",
+        ]);
+        assert_eq!(repeated.sar.item_list(Activity::NetDev), ["eth0", "eth1"]);
+        assert_eq!(repeated.sar.item_list(Activity::NetEdev), ["eth0", "eth1"]);
+        assert_eq!(repeated.sar.item_list(Activity::Fs), ["/home"]);
+    }
+
+    #[test]
+    fn queue_fallback_reparses_the_truncated_token_without_changing_input() {
+        let args = argv(&["-d", "sa01", "--", "-q", "2,5", "3"]);
+        let original = args.clone();
+        let o = parse_sadf_args(&args).unwrap();
+        assert_eq!(selected(&o), vec![Activity::Queue]);
+        assert_eq!(o.interval, Some(2));
+        assert_eq!(o.count, Some(3));
+        assert_eq!(args, original);
+
+        // 失敗前の選択は残り、先頭キーワードはファイル名として再解析される。
+        let partial = parse(&["--", "-q", "CPU,invalid"]);
+        assert_eq!(selected(&partial), vec![Activity::Queue, Activity::PsiCpu]);
+        assert_eq!(partial.data_file, Some(PathBuf::from("CPU")));
+    }
+
+    #[test]
+    fn queue_keywords_and_missing_argument_keep_their_consumption_rules() {
+        for (args, expected) in [
+            (vec!["--", "-q"], vec![Activity::Queue]),
+            (
+                vec!["sa01", "--", "-q", "-u"],
+                vec![Activity::Cpu, Activity::Queue],
+            ),
+            (
+                vec!["sa01", "--", "-q", "CPU,IO", "2", "3"],
+                vec![Activity::PsiCpu, Activity::PsiIo],
+            ),
+        ] {
+            let o = parse(&args);
+            assert_eq!(selected(&o), expected, "{args:?}");
+            if args.last() == Some(&"3") {
+                assert_eq!(o.interval, Some(2));
+                assert_eq!(o.count, Some(3));
+            }
+        }
     }
 
     #[test]

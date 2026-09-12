@@ -39,12 +39,13 @@ pub use sar_args::{
 /// ルートが受け付けるサブコマンド名。
 ///
 /// 先頭引数がこのいずれでもなければ `sar` 互換として解釈する。
-pub const SUBCOMMAND_NAMES: [&str; 7] = [
+pub const SUBCOMMAND_NAMES: [&str; 8] = [
     "show",
     "summarize",
     "detect",
     "compare",
     "info",
+    "skill-install",
     "sar",
     "sadf",
 ];
@@ -350,6 +351,11 @@ pub struct CompareArgs {
 /// `resarch info` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InfoArgs {
+    // `SummarizeArgs::help` と同じ理由で自前の `--help` を持つ。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
     /// 解析対象の `sa` ファイル。
     #[arg(value_name = "FILE", required = true, num_args = 1..)]
     pub files: Vec<PathBuf>,
@@ -369,6 +375,27 @@ pub struct InfoArgs {
     /// mmap を使わず BufReader で読む。
     #[arg(long)]
     pub no_mmap: bool,
+}
+
+/// `resarch skill-install` の引数。
+///
+/// AI エージェントへ「この CLI の使い方」を渡すためのサブコマンド。
+/// スキル本文はバイナリに埋め込んであるので、リリースバイナリ 1 本で完結する。
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SkillArgs {
+    // `SummarizeArgs::help` と同じ理由で自前の `--help` を持つ。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
+    /// インストール先のエージェント。
+    ///
+    /// `claude` は `~/.claude/skills/resarch/SKILL.md`、
+    /// `codex` は `~/.codex/skills/resarch/SKILL.md` へ書く。
+    /// 既にあれば**上書きする** (古い本文が残ると、存在しないオプションを
+    /// エージェントが案内してしまう)。
+    #[arg(value_name = "AGENT", required = true)]
+    pub agent: String,
 }
 
 /// 互換入口に渡す生の引数列。
@@ -413,7 +440,15 @@ pub enum Commands {
     #[command(disable_help_flag = true)]
     Compare(CompareArgs),
     /// ファイルヘッダ (世代・ABI・activity 一覧) のみ表示する。
+    //
+    // `--help` の扱いは [`Commands::Summarize`] と同じ。
+    #[command(disable_help_flag = true)]
     Info(InfoArgs),
+    /// AI エージェント向けのスキルをインストールする。
+    //
+    // `--help` の扱いは [`Commands::Summarize`] と同じ。
+    #[command(disable_help_flag = true, name = "skill-install")]
+    SkillInstall(SkillArgs),
     /// sar 互換入口 (サブコマンドを省略した場合もこちらへ委譲される)。
     #[command(disable_help_flag = true)]
     Sar(CompatArgs),

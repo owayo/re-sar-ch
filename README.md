@@ -140,6 +140,24 @@ machine runs the conversion — so the same input produces different output else
 reSARch estimates it from the file's own `uptime` counters instead, never pairing samples
 across a restart, and reports which value it used and how it got there.
 
+## Use it from an AI agent
+
+`resarch` ships a skill describing its own commands, so an agent knows when to reach for it
+and — more importantly — how to read what comes back.
+
+```bash
+resarch skill-install claude    # ~/.claude/skills/resarch/SKILL.md
+resarch skill-install codex     # ~/.codex/skills/resarch/SKILL.md
+```
+
+`make install` does both alongside the binary. The skill text is embedded in the binary, so
+a release download is enough — no checkout, no network.
+
+The skill spends most of its length on how to read `detect` output, because that is where an
+agent is most likely to overclaim: the caveats are load-bearing. It also states the property
+that matters most for any analysis built on top — **an empty value in reSARch's own formats
+is not a zero** — and lists which `--from` / `--to` means what in which subcommand.
+
 ## How the output is verified
 
 Every expected-output file that `sysstat` keeps in its own test suite is compared
@@ -213,6 +231,9 @@ make test         # unit and integration tests
 make check        # clippy + fmt
 make fixtures     # fetch upstream test data (see below)
 make release      # optimised build
+make install      # install the binary and the agent skill (claude + codex)
+make install-bin  # binary only
+make uninstall    # remove both
 ```
 
 Upstream `sysstat` is GPL-licensed, so **none of its test data or expected output is

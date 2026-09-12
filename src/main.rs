@@ -38,7 +38,7 @@ use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
     DetectFormat, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg, SadfFormat,
     SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate, SarInput, SarOptions,
-    SarOutput, ShowArgs, SummarizeArgs, TimeSpec, ValueKind,
+    SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
@@ -90,6 +90,7 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
     match invocation {
         Invocation::Native(cmd) => match *cmd {
             Commands::Info(args) => run_info(args),
+            Commands::SkillInstall(args) => run_skill_install(args),
             Commands::Show(args) => run_show(args),
             Commands::Summarize(args) => run_summarize(args),
             Commands::Detect(args) => run_detect(args),
@@ -738,6 +739,25 @@ fn value_scope(kind: ValueKind) -> ValueScope {
         ValueKind::Derived => ValueScope::Rates,
         ValueKind::Both => ValueScope::Both,
     }
+}
+
+// ===========================================================================
+// `resarch skill-install`
+// ===========================================================================
+
+/// AI エージェント向けのスキルをインストールする。
+///
+/// 書き出した場所は `stderr` へ報告する。**`stdout` には何も出さない**
+/// (他のサブコマンドと同じ規約。パイプへ混ぜない)。
+fn run_skill_install(args: SkillArgs) -> anyhow::Result<ExitCode> {
+    let path = re_sar_ch::skill::install(&args.agent)?;
+    let agent = re_sar_ch::skill::Agent::parse(&args.agent)?;
+    eprintln!(
+        "{} 用のスキルを書き出しました: {}",
+        agent.display_name(),
+        path.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 // ===========================================================================

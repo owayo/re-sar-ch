@@ -13,5 +13,6 @@ pub mod model;
 pub mod multi;
 pub mod output;
 pub mod series;
+pub mod skill;
 
 pub use error::{Error, Result};

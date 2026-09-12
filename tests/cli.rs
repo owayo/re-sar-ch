@@ -731,3 +731,76 @@ fn sar_help_prints_the_compat_usage() {
     assert!(out.contains("sar 互換入口"), "{out:.200}");
     assert!(out.contains("-P"), "{out:.400}");
 }
+
+// ===========================================================================
+// `skill-install`
+// ===========================================================================
+
+/// AI エージェント向けスキルを書き出す。
+///
+/// **`HOME` を差し替えて隔離する。** 実際のホームへ書いてしまうと、
+/// テストが利用者のスキルを上書きする。
+#[test]
+fn skill_install_writes_the_skill_under_the_agents_directory() {
+    let home = tempfile::tempdir().expect("一時ディレクトリ");
+
+    for (agent, dir) in [("claude", ".claude"), ("codex", ".codex")] {
+        let out = resarch()
+            .env("HOME", home.path())
+            // Windows では HOME が無く USERPROFILE が使われるため両方差し替える
+            .env("USERPROFILE", home.path())
+            .args(["skill-install", agent])
+            .output()
+            .expect("起動できること");
+        assert!(
+            out.status.success(),
+            "skill-install {agent} が失敗した:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // データは stdout、報告は stderr (他のサブコマンドと同じ規約)
+        assert!(
+            out.stdout.is_empty(),
+            "stdout には何も出さないこと: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !out.stderr.is_empty(),
+            "書き出した場所を stderr へ報告すること"
+        );
+
+        let path = home.path().join(dir).join("skills/resarch/SKILL.md");
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} が読めない: {e}", path.display()));
+        assert!(body.starts_with("---\n"), "frontmatter で始まること");
+        assert!(body.contains("name: resarch"), "name が揃っていること");
+    }
+}
+
+/// 既にあるスキルは上書きする (古い本文を残さない)。
+#[test]
+fn skill_install_overwrites_an_existing_skill() {
+    let home = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = home.path().join(".claude/skills/resarch/SKILL.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "古い本文").unwrap();
+
+    resarch()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["skill-install", "claude"])
+        .output()
+        .expect("起動できること");
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert_ne!(body, "古い本文", "上書きすること");
+    assert!(body.contains("name: resarch"));
+}
+
+/// 未知のエージェントは候補を添えて拒否する (黙って既定を選ばない)。
+#[test]
+fn skill_install_rejects_an_unknown_agent() {
+    let err = run_err(&["skill-install", "cursor"]);
+    assert!(err.contains("cursor"), "{err:.200}");
+    assert!(err.contains("claude"), "{err:.200}");
+    assert!(err.contains("codex"), "{err:.200}");
+}

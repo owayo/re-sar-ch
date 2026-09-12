@@ -1,4 +1,4 @@
-.PHONY: build release install uninstall clean test fmt check fixtures help
+.PHONY: build release install install-bin uninstall skill-install clean test fmt check fixtures help
 
 # Default target
 .DEFAULT_GOAL := help
@@ -6,6 +6,8 @@
 # Variables
 BINARY_NAME := resarch
 INSTALL_PATH := /usr/local/bin
+# AI エージェント側のスキルディレクトリ名 (skills/SKILL.md の frontmatter の name と揃える)
+SKILL_NAME := resarch
 
 ## Build Commands
 
@@ -17,11 +19,21 @@ release: ## Build release version
 
 ## Installation
 
-install: release ## Build release and install the binary
+install: release ## Build release, install binary, and install skills (claude + codex)
+	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
+	$(INSTALL_PATH)/$(BINARY_NAME) skill-install claude
+	$(INSTALL_PATH)/$(BINARY_NAME) skill-install codex
+
+install-bin: release ## Build release and install the binary only (no skills)
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
 
-uninstall: ## Remove the installed binary
+skill-install: ## Install the AI agent skill from the installed binary (claude + codex)
+	$(INSTALL_PATH)/$(BINARY_NAME) skill-install claude
+	$(INSTALL_PATH)/$(BINARY_NAME) skill-install codex
+
+uninstall: ## Remove the installed binary and the installed skills
 	rm -f $(INSTALL_PATH)/$(BINARY_NAME)
+	rm -rf $(HOME)/.claude/skills/$(SKILL_NAME) $(HOME)/.codex/skills/$(SKILL_NAME)
 
 ## Development
 

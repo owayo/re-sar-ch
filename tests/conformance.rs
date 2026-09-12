@@ -841,50 +841,120 @@ fn upstream_headers_decode_to_the_measured_facts() {
     assert_eq!(checked, 8, "実測値を突合したファイル数");
 }
 
-/// golden 比較の枠。
+/// **本家の期待出力との全文比較**。
 ///
-/// TODO(後続担当): `resarch` の出力系が入ったら、`phase` ごとに
-/// 対応するサブコマンドを `run_resarch` で叩き、`golden` と比較する。
-/// - [`Phase::Header`] → `resarch info` 相当 (`sadf -H` の 13 項目書式。§5.2)
-/// - [`Phase::RawValues`] → `sadf -r -O debug` 相当 (§5.3)
-/// - [`Phase::SarText`] → `sar` 互換テキスト (§5.4)
+/// [`GOLDEN_CASES`] の各ケースについて
 ///
-/// 比較は 2 段階で行う (`docs/design.md` §8):
-/// 意味比較 (JSON/XML を解析して値・単位・item 対応) → 表記比較 (列順・丸め・空白まで)。
+/// 1. 入力 `sa` ファイルを [`SaFile`] で開く
+/// 2. 本家のコマンドラインに相当する出力をライブラリ API で生成する
+///    ([`render_sar_text`] / [`render_sadf_header`])
+/// 3. `expected*` と 1 行ずつ突き合わせる ([`golden::compare`])
+/// 4. 「全文一致 / N 行マスクして一致 / 不一致」をケースごとに出す
+///
+/// マスクは [`GoldenCase::masks`] に宣言したものだけが効く。
+/// 対象は「ファイルの中身からは原理的に再現できない値」に限り、理由を必ず添える。
+///
+/// 差分の一覧は `--nocapture` で読める。1 件でも不一致が残っていれば失敗する
+/// (`sar` 互換が中核価値なので、未達を緑にしない)。
 #[test]
 #[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
-fn golden_cases_are_enumerable() {
-    let Some(dir) = upstream_or_skip("golden_cases_are_enumerable") else {
+fn golden_outputs_match_upstream() {
+    let Some(dir) = upstream_or_skip("golden_outputs_match_upstream") else {
         return;
     };
 
-    let mut ready = 0usize;
+    let mut exact = 0usize;
+    let mut masked = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+
+    eprintln!(
+        "\n=== 本家期待出力との全文比較 ({} 件) ===",
+        GOLDEN_CASES.len()
+    );
     for case in GOLDEN_CASES {
         let (Some(data), Some(golden)) = (
             upstream_file(&dir, case.data),
             upstream_file(&dir, case.golden),
         ) else {
+            failures.push(format!(
+                "[{}] {} -> {}: 入力または期待出力が無い",
+                case.upstream_test, case.data, case.golden
+            ));
             continue;
         };
-        let golden_text = std::fs::read(&golden).expect("期待出力が読めない");
-        assert!(!golden_text.is_empty(), "{}: 期待出力が空", case.golden);
-        assert!(data.is_file());
-        ready += 1;
+        let expected = std::fs::read_to_string(&golden).expect("期待出力が読めない");
+        assert!(!expected.is_empty(), "{}: 期待出力が空", case.golden);
 
-        eprintln!(
-            "pending [{}] {:?} {} -> {} ({})",
-            case.upstream_test, case.phase, case.data, case.golden, case.upstream_cmd
+        let head = format!(
+            "[{}] {:?} {} -> {}",
+            case.upstream_test, case.phase, case.data, case.golden
         );
+
+        // 未実装の出力形式は「比較できなかった」として明示する (緑にしない)
+        if let Repro::Unsupported { missing } = case.repro {
+            eprintln!(
+                "  比較不能  {head}\n            {missing} が無い ({})",
+                case.upstream_cmd
+            );
+            failures.push(format!("{head}: {missing} が無いため比較できない"));
+            continue;
+        }
+
+        let actual = match SaFile::open(&data) {
+            Ok(file) => match case.repro {
+                Repro::Sar(args) => render_sar_text(&file, &data, args),
+                Repro::SadfHeader => render_sadf_header(&file),
+                Repro::Unsupported { .. } => unreachable!("上で処理済み"),
+            },
+            Err(e) => Err(format!("ファイルを開けない: {e}")),
+        };
+        let actual = match actual {
+            Ok(t) => t,
+            Err(detail) => {
+                eprintln!("  生成失敗  {head}\n            {detail}");
+                failures.push(format!("{head}: {detail}"));
+                continue;
+            }
+        };
+
+        compared += 1;
+        let cmp: Comparison = golden::compare(&expected, &actual, case.masks);
+        let label = if cmp.is_match() {
+            if cmp.masked.is_empty() {
+                exact += 1;
+                "全文一致  "
+            } else {
+                masked += 1;
+                "マスク一致"
+            }
+        } else {
+            "不一致    "
+        };
+        eprintln!("  {label}{head}\n            {}", cmp.verdict());
+        if !cmp.masked.is_empty() {
+            eprint!("{}", cmp.mask_report());
+        }
+        if !cmp.is_match() {
+            eprint!("{}", cmp.diff_report(6));
+            failures.push(format!("{head}: {}\n{}", cmp.verdict(), cmp.diff_report(6)));
+        }
     }
 
-    assert_eq!(
-        ready,
-        GOLDEN_CASES.len(),
-        "golden 比較ケースの入力が揃っていない"
-    );
     eprintln!(
-        "TODO: {} 件の出力比較は resarch の出力系が入ってから埋める",
-        GOLDEN_CASES.len()
+        "\n--- 集計: 全文一致 {} / マスク一致 {} / 不一致・比較不能 {} (全 {} 件, 比較実行 {} 件) ---",
+        exact,
+        masked,
+        failures.len(),
+        GOLDEN_CASES.len(),
+        compared
+    );
+
+    assert!(
+        failures.is_empty(),
+        "本家の期待出力と一致しないケースが {} 件ある:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }
 

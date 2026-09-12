@@ -4067,38 +4067,50 @@ mod tests {
         let mut mismatched: Vec<String> = Vec::new();
         let mut checked = 0usize;
 
-        for def in crate::layout::registry::all() {
-            let Some(rev) = def.latest() else { continue };
-            let plan = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).unwrap();
-            let prev = zeros(&plan);
-            let mut curr = zeros(&plan);
-            // 全フィールドを別々の正の値で増加させる (逆行クランプに触らない)
-            for (i, slot) in curr.values.iter_mut().enumerate() {
-                *slot = Availability::Present(1_000 + 37 * i as u64);
-            }
-            let mut ctx = ComputeContext::new(250);
-            if def.id == ActivityId::CPU {
-                ctx.tick_total = Some(tick_total(&plan, &prev, &curr));
-            }
-
-            for (column, meta) in def.columns.iter().enumerate() {
-                if !meta.is_direct() || meta.kind != ValueKind::Counter {
-                    continue;
+        // 増加する区間と、逆行する区間の両方を見る。
+        // 逆行側は「本家が 0 にクランプする列」で集計と瞬時値が揃うことの確認
+        // (クランプはサンプル単位なので、集計も区間ごとに 0 を足す必要がある)。
+        for increasing in [true, false] {
+            for def in crate::layout::registry::all() {
+                let Some(rev) = def.latest() else { continue };
+                let plan = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).unwrap();
+                let mut lo = zeros(&plan);
+                let mut hi = zeros(&plan);
+                // 全フィールドを別々の値にして、列の取り違えを検出できるようにする
+                for (i, slot) in hi.values.iter_mut().enumerate() {
+                    *slot = Availability::Present(1_000 + 37 * i as u64);
                 }
-                let Ok(sample) = rate_sample(&plan, def.id, column, &prev, &curr, &ctx) else {
-                    continue;
-                };
-                let Some(aggregated) = sample.display(def.id, column) else {
-                    continue;
-                };
-                let instant = column_value(def.id, column, meta, &plan, &prev, &curr, &ctx)
-                    .expect("全フィールドを埋めてあるので計算できる");
-                checked += 1;
-                if (aggregated - instant).abs() > instant.abs() * 1e-9 + 1e-12 {
-                    mismatched.push(format!(
-                        "{} {}: 集計 {aggregated} vs 瞬時 {instant}",
-                        def.id, meta.public_name
-                    ));
+                for (i, slot) in lo.values.iter_mut().enumerate() {
+                    *slot = Availability::Present(100 + 7 * i as u64);
+                }
+                let (prev, curr) = if increasing { (&lo, &hi) } else { (&hi, &lo) };
+
+                let mut ctx = ComputeContext::new(250);
+                if def.id == ActivityId::CPU {
+                    ctx.tick_total = Some(tick_total(&plan, prev, curr));
+                }
+
+                for (column, meta) in def.columns.iter().enumerate() {
+                    if !meta.is_direct() || meta.kind != ValueKind::Counter {
+                        continue;
+                    }
+                    // 集計が値を作らない区間 (説明できない逆行など) は比較対象外。
+                    // 「集計が値を出したなら瞬時値と一致する」が守りたい不変量。
+                    let Ok(sample) = rate_sample(&plan, def.id, column, prev, curr, &ctx) else {
+                        continue;
+                    };
+                    let Some(aggregated) = sample.display(def.id, column) else {
+                        continue;
+                    };
+                    let instant = column_value(def.id, column, meta, &plan, prev, curr, &ctx)
+                        .expect("全フィールドを埋めてあるので計算できる");
+                    checked += 1;
+                    if (aggregated - instant).abs() > instant.abs() * 1e-9 + 1e-12 {
+                        mismatched.push(format!(
+                            "{} {} (increasing={increasing}): 集計 {aggregated} vs 瞬時 {instant}",
+                            def.id, meta.public_name
+                        ));
+                    }
                 }
             }
         }
@@ -4108,6 +4120,44 @@ mod tests {
             "1 区間の集計と瞬時値が食い違う列がある (スケーリング漏れ): {mismatched:?}"
         );
         assert!(checked > 50, "検査した列が少なすぎる: {checked}");
+    }
+
+    /// 逆行クランプはサンプル単位で効く (集計も区間ごとに 0 を足す)。
+    #[test]
+    fn rate_sample_clamps_decrease_per_interval() {
+        let plan = plan_for(ActivityId::IO);
+        let col = column_of(ActivityId::IO, "tps");
+        let meta = &lookup(ActivityId::IO).unwrap().columns[col];
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, col, 5_000);
+        put(&plan, &mut c, col, 4_000);
+        let ctx = ComputeContext::new(100);
+
+        // `A_IO` は 7 列すべてに明示クランプがある (03 §id=6)
+        assert_eq!(
+            column_value(ActivityId::IO, col, meta, &plan, &p, &c, &ctx),
+            Ok(0.0)
+        );
+        let sample = rate_sample(&plan, ActivityId::IO, col, &p, &c, &ctx).unwrap();
+        assert_eq!(sample.delta, 0, "その区間の寄与を 0 にして次へ進む");
+        assert_eq!(sample.display(ActivityId::IO, col), Some(0.0));
+        assert!(!sample.wrapped);
+    }
+
+    /// ゼロ補完かどうかは値からは判らないので、列の有無で確かめる (指摘 5)。
+    #[test]
+    fn column_presence_tells_zero_fill_from_observed_zero() {
+        // discard 統計を持たない世代
+        let old = plan_for_revision(ActivityId::IO, 0x8b, 40, LayoutAbi::LP64);
+        let dtps = column_of(ActivityId::IO, "dtps");
+        let tps = column_of(ActivityId::IO, "tps");
+        assert!(!column_is_present(&old, dtps), "この世代には無い列");
+        assert!(column_is_present(&old, tps));
+
+        // 現行世代なら両方ある
+        let modern = plan_for(ActivityId::IO);
+        assert!(column_is_present(&modern, dtps));
     }
 
     /// 保存値のスケールが必要な代表列で、集計経路の値が区間値と一致する。

@@ -302,7 +302,7 @@ fn evaluate(before: &[Observation], after: &[Observation], entry: &CatalogEntry)
     let shift = after_median - before_median;
 
     // 窓をまたぐ傾向は窓ごとの中心化では消えない。引いた残りで判定する
-    let trend = trend_explained_shift(&bv, &av);
+    let trend = trend_explained_shift(before, after);
     let step = step_of(shift, trend);
 
     // 各窓を自身の中央値で中心化した残差を束ねる。

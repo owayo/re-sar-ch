@@ -12,7 +12,7 @@ pub mod selfdesc;
 pub mod wire;
 
 pub use abi::{Endian, LayoutAbi, SourceEncoding};
-pub use file::{OpenOptions, RawRecord, SaFile, ScanControl, ScanSummary, Tolerance};
+pub use file::{MmapPolicy, OpenOptions, RawRecord, SaFile, ScanControl, ScanSummary, Tolerance};
 pub use reader::{Cursor, OutOfBounds, ReadResult};
 pub use registry::{FormatSpec, RecordKind, RestartPayload};
 pub use wire::{

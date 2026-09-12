@@ -25,6 +25,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
+use re_sar_ch::format::reader::Cursor;
+use re_sar_ch::format::wire::ResolvedLayout;
+use re_sar_ch::format::{layouts, selfdesc};
+
 // ===========================================================================
 // 取得物の発見
 // ===========================================================================
@@ -313,6 +318,162 @@ fn run_resarch(args: &[&str]) -> std::process::Output {
         .expect("resarch を起動できない")
 }
 
+// ===========================================================================
+// 本家データのヘッダを、本体のレイアウト層だけで読む
+// ===========================================================================
+
+/// 本家データから読み出したヘッダの主要値。
+#[derive(Debug, PartialEq, Eq)]
+struct UpstreamHeader {
+    endian: Endian,
+    format_magic: u16,
+    /// `file_magic` が申告する `header_size` (持たない世代は `None`)。
+    header_size: Option<u32>,
+    upgraded: u32,
+    hdr_types_nr: Option<[u32; 3]>,
+    act_types_nr: Option<[u32; 3]>,
+    rec_types_nr: Option<[u32; 3]>,
+    act_size: Option<u32>,
+    rec_size: Option<u32>,
+    ust_time: u64,
+    /// `sa_hz`。自己記述世代のみ。**`unsigned long` なので ABI 差が出る**。
+    hz: Option<u64>,
+    cpu_nr: Option<u32>,
+    act_nr: u32,
+    vol_act_nr: Option<u32>,
+    day: u8,
+    month: u8,
+    year: i64,
+    sizeof_long: i64,
+    machine: String,
+    tzname: Option<String>,
+}
+
+/// `file_magic` を読んでバイト順と世代を決め、`file_header` を読む。
+///
+/// オフセットは ABI に依存しないので、まず暫定 ABI で解決して
+/// `sa_machine` / `sa_sizeof_long` を読み、本当の ABI で解決し直す
+/// (`docs/format/01-file-format.md` §1.4 の流れ)。
+fn read_upstream_header(bytes: &[u8]) -> UpstreamHeader {
+    // ① 先頭 2 バイトでバイト順を決める (§7.1)
+    let endian = match u16::from_le_bytes([bytes[0], bytes[1]]) {
+        0xd596 => Endian::Little,
+        0x96d5 => Endian::Big,
+        other => panic!("sysstat のファイルではない: 0x{other:04x}"),
+    };
+
+    let probe = SourceEncoding::new(endian, LayoutAbi::LP64);
+    let magic_layout = {
+        let c = Cursor::new(bytes, endian);
+        let format_magic = c.u16_at(2).unwrap();
+        match format_magic {
+            0x2170 | 0x2171 => layouts::FILE_MAGIC_G1,
+            0x2173 => layouts::FILE_MAGIC_G2,
+            0x2175 => layouts::FILE_MAGIC_G3,
+            other => panic!("未対応の format_magic: 0x{other:04x}"),
+        }
+    };
+    let magic = magic_layout.resolve(&probe).expect("file_magic の解決");
+    let c = Cursor::new(bytes, endian);
+    let format_magic = c
+        .read_unsigned(0, magic.field("format_magic").unwrap())
+        .unwrap() as u16;
+    let header_size = magic
+        .field("header_size")
+        .map(|f| c.read_unsigned(0, f).unwrap() as u32);
+    let upgraded = magic
+        .field("upgraded")
+        .map(|f| c.read_unsigned(0, f).unwrap() as u32)
+        .unwrap_or(0);
+    let hdr_types_nr = magic.field("hdr_types_nr_0").map(|_| {
+        [
+            c.read_unsigned(0, magic.field("hdr_types_nr_0").unwrap())
+                .unwrap() as u32,
+            c.read_unsigned(0, magic.field("hdr_types_nr_1").unwrap())
+                .unwrap() as u32,
+            c.read_unsigned(0, magic.field("hdr_types_nr_2").unwrap())
+                .unwrap() as u32,
+        ]
+    });
+
+    let fh_off = magic.size;
+    let resolve_header = |enc: &SourceEncoding| -> ResolvedLayout {
+        match format_magic {
+            0x2170 | 0x2171 => layouts::FILE_HEADER_G1.resolve(enc).unwrap(),
+            0x2173 => layouts::FILE_HEADER_G2.resolve(enc).unwrap(),
+            _ => selfdesc::resolve_file_header(
+                selfdesc::TypesNr(hdr_types_nr.expect("0x2175 は hdr_types_nr を持つ")),
+                header_size.expect("0x2175 は header_size を持つ") as usize,
+                enc,
+            )
+            .unwrap(),
+        }
+    };
+
+    // ② 暫定 ABI で解決して sa_sizeof_long / sa_machine を読む (オフセットは ABI 非依存)
+    let provisional = resolve_header(&probe);
+    let sizeof_long = c
+        .read_signed(fh_off, provisional.field("sa_sizeof_long").unwrap())
+        .unwrap();
+    let machine = c
+        .read_str(fh_off, provisional.field("sa_machine").unwrap())
+        .unwrap()
+        .to_string();
+
+    // ③ 本当の ABI で解決し直す
+    let abi = LayoutAbi::infer(&machine, sizeof_long as u8)
+        .unwrap_or_else(|| panic!("ABI を推定できない: machine={machine} szl={sizeof_long}"));
+    let enc = SourceEncoding::new(endian, abi);
+    let fh = resolve_header(&enc);
+
+    let get_u32 = |name: &str| {
+        fh.field(name)
+            .map(|f| c.read_unsigned(fh_off, f).unwrap() as u32)
+    };
+    let triple = |p: &str| -> Option<[u32; 3]> {
+        Some([
+            get_u32(&format!("{p}_0"))?,
+            get_u32(&format!("{p}_1"))?,
+            get_u32(&format!("{p}_2"))?,
+        ])
+    };
+
+    UpstreamHeader {
+        endian,
+        format_magic,
+        header_size,
+        upgraded,
+        hdr_types_nr,
+        act_types_nr: triple("act_types_nr"),
+        rec_types_nr: triple("rec_types_nr"),
+        act_size: get_u32("act_size"),
+        rec_size: get_u32("rec_size"),
+        ust_time: c
+            .read_unsigned(fh_off, fh.field("sa_ust_time").unwrap())
+            .unwrap(),
+        hz: fh
+            .field("sa_hz")
+            .map(|f| c.read_unsigned(fh_off, f).unwrap()),
+        cpu_nr: get_u32("sa_cpu_nr").or_else(|| get_u32("sa_last_cpu_nr")),
+        act_nr: get_u32("sa_act_nr")
+            .or_else(|| get_u32("sa_nr_act"))
+            .expect("activity 数が読めない"),
+        vol_act_nr: get_u32("sa_vol_act_nr"),
+        day: c
+            .read_unsigned(fh_off, fh.field("sa_day").unwrap())
+            .unwrap() as u8,
+        month: c
+            .read_unsigned(fh_off, fh.field("sa_month").unwrap())
+            .unwrap() as u8,
+        year: c.read_signed(fh_off, fh.field("sa_year").unwrap()).unwrap(),
+        sizeof_long,
+        machine,
+        tzname: fh
+            .field("sa_tzname")
+            .map(|f| c.read_str(fh_off, f).unwrap().to_string()),
+    }
+}
+
 /// `sar` / `sadf` が使えるか。案 C (実 sysstat との突合) のスキップ判定。
 fn sysstat_version() -> Option<String> {
     let out = Command::new("sar")
@@ -379,6 +540,131 @@ fn upstream_fixtures_are_present_and_recorded() {
     missing.sort_unstable();
     missing.dedup();
     assert!(missing.is_empty(), "取得物に不足がある: {missing:?}");
+}
+
+/// 本家データのヘッダが、`docs/format/04-test-data.md` §2.1 の**実測値**どおりに読めること。
+///
+/// これは出力系を待たずに今すぐ回せる実質的な突合である。
+/// 自作 fixture は「ドキュメントのオフセット表から独立に書き下ろしたバイト列」だが、
+/// このテストは「本家が実際に書いたバイト列」を本体のレイアウト層で読む。
+/// 両方が通って初めてレイアウト定義が正しいと言える (`docs/design.md` §8)。
+///
+/// **ホスト名 (`sa_nodename`) と `sa_release` は検証対象にしない。**
+/// 本家データには実ホスト名が入っており、公開リポジトリに持ち込まないため
+/// (`docs/design.md` §8.1)。`sa_machine` は汎用のアーキテクチャ名なので検証する。
+#[test]
+#[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
+fn upstream_headers_decode_to_the_measured_facts() {
+    let Some(dir) = upstream_or_skip("upstream_headers_decode_to_the_measured_facts") else {
+        return;
+    };
+
+    // 取得物が欠けていると検証が空振りするので、実際に読めた件数を数えて最後に確かめる。
+    let mut checked = 0usize;
+    let mut read = |name: &str| -> Option<UpstreamHeader> {
+        let path = upstream_file(&dir, name)?;
+        let bytes = std::fs::read(path).expect("本家データが読めない");
+        checked += 1;
+        Some(read_upstream_header(&bytes))
+    };
+
+    // --- 0x2170 (変換不能な最古世代) ---
+    if let Some(h) = read("data-9.1.5") {
+        assert_eq!(h.format_magic, 0x2170);
+        assert_eq!(h.endian, Endian::Little);
+        assert_eq!(h.header_size, None, "この世代は header_size を持たない");
+        assert_eq!(h.ust_time, 1_623_329_128);
+        assert_eq!(h.act_nr, 13);
+        assert_eq!(h.sizeof_long, 8);
+        assert_eq!(h.machine, "x86_64");
+    }
+
+    // --- 0x2171 ---
+    if let Some(h) = read("data-9.1.6") {
+        assert_eq!(h.format_magic, 0x2171);
+        assert_eq!(h.ust_time, 1_484_986_571);
+        assert_eq!(h.act_nr, 32);
+        assert_eq!(h.sizeof_long, 8);
+        // sa_month は 0 起点、sa_year は 1900 起点 (2017-01-21)
+        assert_eq!((h.day, h.month, h.year), (21, 0, 117));
+        assert_eq!(h.hz, None, "この世代に sa_hz は無い");
+    }
+
+    // --- 0x2173 (RESTART 後に volatile activity リストが付く世代) ---
+    if let Some(h) = read("data-10.3.1") {
+        assert_eq!(h.format_magic, 0x2173);
+        assert_eq!(h.header_size, Some(288));
+        assert_eq!(h.ust_time, 1_484_986_496);
+        assert_eq!(h.act_nr, 34);
+        assert_eq!(h.vol_act_nr, Some(2));
+        assert_eq!(h.cpu_nr, Some(9));
+    }
+    if let Some(h) = read("data-11.6.5") {
+        assert_eq!(h.format_magic, 0x2173);
+        assert_eq!(h.header_size, Some(288));
+        assert_eq!(h.ust_time, 1_535_535_218);
+        assert_eq!(h.act_nr, 36);
+        assert_eq!(h.vol_act_nr, Some(2));
+        assert_eq!((h.day, h.month, h.year), (29, 7, 118));
+    }
+
+    // --- 0x2175 初出形 (hdr_types_nr = (1,1,11) / header_size = 328) ---
+    if let Some(h) = read("data-12.0.0") {
+        assert_eq!(h.format_magic, 0x2175);
+        assert_eq!(h.header_size, Some(328));
+        assert_eq!(h.hdr_types_nr, Some([1, 1, 11]));
+        assert_eq!(h.act_types_nr, Some([0, 0, 9]));
+        assert_eq!(h.rec_types_nr, Some([2, 0, 0]));
+        assert_eq!((h.act_size, h.rec_size), (Some(36), Some(24)));
+        assert_eq!(h.upgraded, 0, "生のファイル (sadf -c 未通過)");
+        assert_eq!(h.ust_time, 1_561_873_161);
+        assert_eq!(h.hz, Some(100));
+        assert_eq!(h.cpu_nr, Some(9));
+        assert_eq!(h.act_nr, 36);
+        assert_eq!((h.day, h.month, h.year), (30, 5, 119), "2019-06-30");
+        assert_eq!(h.sizeof_long, 8);
+        assert_eq!(h.tzname, None, "この世代に sa_tzname は無い");
+    }
+
+    // --- big endian + sizeof(long) = 4。ABI 吸収層の最重要ケース ---
+    if let Some(h) = read("data-ppc-11.7.2") {
+        assert_eq!(h.endian, Endian::Big);
+        assert_eq!(h.format_magic, 0x2175);
+        assert_eq!(h.header_size, Some(328));
+        assert_eq!(h.hdr_types_nr, Some([1, 1, 11]));
+        assert_eq!(h.sizeof_long, 4);
+        assert_eq!(h.machine, "ppc");
+        // upgraded = 0x703 = (7 << 8) + 2 + 1 → 11.7.2 の sadf -c で変換済み
+        assert_eq!(h.upgraded, 0x703);
+        assert_eq!(h.ust_time, 1_493_324_675);
+        // sa_hz は unsigned long。BE かつ 32bit なので「スロット 8 バイトの先頭 4 バイトを
+        // BE で読む」が正しい。8 バイト全部を読むと 100 * 2^32 になる。
+        assert_eq!(h.hz, Some(100), "BE + 32bit の unsigned long スロット");
+        assert_eq!(h.cpu_nr, Some(17));
+        assert_eq!(h.act_nr, 15);
+        assert_eq!((h.day, h.month, h.year), (27, 3, 117), "2017-04-27");
+        assert_eq!((h.act_size, h.rec_size), (Some(36), Some(24)));
+    }
+
+    // --- 0x2175 現行形 (header_size = 336 / sa_tzname あり) ---
+    if let Some(h) = read("data-non-printable") {
+        assert_eq!(h.header_size, Some(336));
+        assert_eq!(h.hdr_types_nr, Some([1, 1, 12]));
+        assert_eq!(h.rec_types_nr, Some([2, 0, 1]));
+        assert_eq!(h.act_nr, 1);
+        assert_eq!(h.tzname.as_deref(), Some("CET"));
+    }
+
+    // --- 異常系の基準構成: 自作 fixture (448 バイト) と同じであること ---
+    if let Some(h) = read("data-12.6.0-file_act-nr-nr_max-err") {
+        assert_eq!(h.header_size, Some(336));
+        assert_eq!(h.hdr_types_nr, Some([1, 1, 12]));
+        assert_eq!(h.act_nr, 1);
+        assert_eq!((h.act_size, h.rec_size), (Some(36), Some(24)));
+        assert_eq!(h.cpu_nr, Some(9));
+    }
+
+    assert_eq!(checked, 8, "実測値を突合したファイル数");
 }
 
 /// golden 比較の枠。

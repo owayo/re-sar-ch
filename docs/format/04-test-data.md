@@ -186,7 +186,7 @@ data-12.0.0      96 d5 75 21 0c 00 00 00 | 48 01 00 00 | 00 00 00 00 |
 | `tests/data-ukwn0` | 612 | 12.1.7 | 0x2175 | `A_PCSW[0xff]`, `id=255[8a]` のみ (既知形式の activity ゼロ) | **表示可能な activity が 1 つも無い**ケース |
 | `tests/data-ukwn1` | 2872 | 12.5.6 | 0x2175 | `A_CPU[8b]`, `A_QUEUE[**0x8d**]` (未知 magic)。STATS 3 件 | 未知 magic の activity を挟んだときの後続 activity のオフセット維持 |
 | `tests/data-12.5.6-A_QUEUE_modified` | 1472 | 12.5.6 | 0x2175 | `A_PCSW`, `A_QUEUE[**0x9e**] types_nr=[2,0,4] size=32`, `A_NET_DEV` | **ull 個数が減り u 個数が増えた**構造体。`remap_struct` で救えないので UNKNOWN 扱いにし、他の activity は読めること |
-| `tests/data-12.7.1-A_IRQ_overflow` | 448 | 12.7.1 | 0x2175 | activity 1 件のみ、**レコードは 0 件**。`A_IRQ: nr=8193, nr2=4096, size=1024` | **`nr × nr2 × size` の乗算オーバーフロー**。8193×4096×1024 = 34,359,738,368 バイト。`sadf -H` は成功し、`sar -A` は `Aborting` で落ちる |
+| `tests/data-12.7.1-A_IRQ_overflow` | 448 | 12.7.1 | 0x2175 | activity 1 件のみ、**レコードは 0 件**。`A_IRQ: nr=8193, nr2=4096, size=1024` | **`nr × nr2 × size` の乗算オーバーフロー**。8193×4096×1024 = 34,363,932,672 バイト (= 0x8_0020_0000、`UINT_MAX` の約 8 倍)。`sadf -H` は成功し、`sar -A` は `Aborting` で落ちる |
 | `tests/data-extra-12.1.7` | 1448 | 12.1.7 | 0x2175 | `file_header.extra_next = 1`。activity 2 件 (`A_CPU`, `A_PCSW`)。レコード 4 件: RESTART(extra あり) / **R_EXTRA (type=8)** / STATS(extra あり) / STATS | **extra 構造体**の全パターン。生成元は `tests/create_data-extra.c` |
 | `tests/data-12.6.0-file_hdr-sa_act_nr-err` | 448 | 12.6.0 | 0x2175 | `sa_act_nr = 257` | `sa_act_nr > MAX_NR_ACT (256)` |
 | `…-file_hdr-MAP_SIZE_act_types_nr-err` | 448 | 12.6.0 | 0x2175 | `act_types_nr = [1,1,10]` | `MAP_SIZE(act_types_nr) = 56 > act_size = 36` |

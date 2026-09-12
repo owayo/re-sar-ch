@@ -382,12 +382,12 @@ impl GenFacts {
     ///
     /// G4 / G5 は `extra_next` が末尾の穴を埋めるため、どちらの ABI でも 24 になる。
     pub fn record_header_size(&self, abi: FixtureAbi) -> usize {
-        let members_end = match self.rec_types_nr {
+        let members_end: usize = match self.rec_types_nr {
             // G3: ull 2 個 + 時刻 4 バイト = 20
             Some([2, 0, 0]) => 20,
             _ => return self.record_header_size_align8,
         };
-        let align = abi.u64_align();
+        let align: usize = abi.u64_align();
         members_end.div_ceil(align) * align
     }
 }
@@ -903,6 +903,20 @@ impl RecordSpec {
         )
     }
 
+    /// `R_EXTRA_MIN`〜`R_EXTRA_MAX` のレコード。統計を持たないので読み側は黙って次へ進む。
+    ///
+    /// 本家 `data-extra-12.1.7` が `record_type = 8` のこのレコードを含む。
+    pub fn extra_record(record_type: u8, ust_time: u64, hour: u8, minute: u8, second: u8) -> Self {
+        debug_assert!((R_EXTRA_MIN..=15).contains(&record_type));
+        Self::new(
+            RecordKind::Extra { record_type },
+            ust_time,
+            hour,
+            minute,
+            second,
+        )
+    }
+
     pub fn with_volatile(mut self, volatile: Vec<ActivitySpec>) -> Self {
         if let RecordKind::Restart { volatile: v, .. } = &mut self.kind {
             *v = volatile;
@@ -1116,12 +1130,16 @@ pub fn with_extra_chains(generation: Generation, abi: FixtureAbi) -> Fixture {
         Generation::G2175V1217 | Generation::G2175Current
     );
     if has_extra_field {
+        // ファイルヘッダ由来の連鎖は 2 段にして extra_next の連結も踏む
         spec.file_extra = vec![ExtraSpec::sample(), ExtraSpec::sample()];
         for rec in &mut spec.records {
-            if !matches!(rec.kind, RecordKind::Comment { .. }) {
-                rec.extra = vec![ExtraSpec::sample()];
-            }
+            rec.extra = vec![ExtraSpec::sample()];
         }
+        // R_EXTRA レコード (統計なし) も混ぜる。本家 data-extra-12.1.7 と同じ record_type。
+        spec.records.push(
+            RecordSpec::extra_record(8, 1_600_000_041, 12, 27, 21)
+                .with_extra(vec![ExtraSpec::sample()]),
+        );
     }
     build(spec)
 }
@@ -1791,7 +1809,7 @@ pub fn corrupted(abi: FixtureAbi, corruption: Corruption) -> Corrupted {
     b.buf = base.clone();
 
     let mut patched = Vec::new();
-    let mut patch_u32 = |b: &mut Bytes, patched: &mut Vec<(usize, usize)>, off: usize, v: u32| {
+    let patch_u32 = |b: &mut Bytes, patched: &mut Vec<(usize, usize)>, off: usize, v: u32| {
         b.u32(off, v);
         patched.push((off, 4));
     };

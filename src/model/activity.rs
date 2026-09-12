@@ -7,7 +7,9 @@
 use serde::Serialize;
 
 /// activity の識別子 (`file_activity.id`)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+///
+/// `Default` は `0` (本家が空スロットに使う値) で、未知 activity として扱われる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize)]
 #[serde(transparent)]
 pub struct ActivityId(pub u32);
 
@@ -113,6 +115,28 @@ impl ActivityId {
         self.symbol().is_some()
     }
 
+    /// この activity の item 数上限。
+    ///
+    /// 本家の `nr_max` に対応する。壊れたファイルが巨大な item 数を申告した場合、
+    /// 汎用上限 (`NR_MAX`) では通ってしまうため、activity 別の上限で弾く必要がある。
+    /// 未知 activity は汎用上限を返す。
+    pub const fn nr_max(self) -> u32 {
+        match self.0 {
+            // CPU 数由来 (NR_CPUS + 1)
+            1 | 3 | 30 | 35 | 39 => 8193,
+            // シリアル回線 / ネットワークインターフェース / USB / FC ホスト
+            10 | 12 | 13 | 36 | 38 => 65_536,
+            // ブロックデバイス / ファイルシステム
+            11 | 37 => 268_435_456,
+            // 各種センサ / バッテリ
+            31..=33 | 43 => 4096,
+            // 単一値の activity
+            2 | 4..=9 | 14..=29 | 34 | 40..=42 => 1,
+            // 未知 activity は汎用上限
+            _ => 268_435_456,
+        }
+    }
+
     /// 診断表示用。未知の場合は ID を含む文字列になる。
     pub fn display_name(self) -> String {
         match self.symbol() {
@@ -168,7 +192,7 @@ mod tests {
     /// 43 で打ち切ると、未知 activity を持つ新しいファイルが読めなくなる。
     #[test]
     fn act_nr_limit_allows_future_activities() {
-        assert!(MAX_NR_ACT > NR_ACT);
+        const { assert!(MAX_NR_ACT > NR_ACT) };
         assert_eq!(MAX_NR_ACT, 256);
     }
 }

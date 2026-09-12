@@ -42,7 +42,11 @@ jobs:
   conformance:
     name: Conformance (vs upstream sysstat)
     needs: test
-    runs-on: ubuntu-latest
+    # ubuntu-latest は使わない。現在は Ubuntu 24.04 (sysstat 12.6.1) を指すが、
+    # 切り替え時期が告知されないまま 26.04 (sysstat 12.7.7) に移ると
+    # 比較基準が無言で変わり golden が壊れる (docs/format/04-test-data.md §7.1 / §7.4)。
+    # 22.04 は 2026-09-17 から非推奨開始なので足場にしない。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -61,14 +65,35 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install sysstat (provides sar / sadf for cross-checking)
+        # ランナーには sysstat はプリインストールされていないので必ず入れる。
         run: |
           sudo apt-get update
-          sudo apt-get install -y sysstat
-          sar -V | head -2
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sysstat
+
+      - name: Record sysstat version
+        # 「どの版と比較したのか」を後から追えるようにテストレポートへ残す
+        # (docs/format/04-test-data.md §7.4)。ランナーイメージの更新で
+        # 比較基準が動いたことに気づけるようにするための記録である。
+        run: |
+          os_name=$(. /etc/os-release; echo "$PRETTY_NAME")
+          sar_version=$(LC_ALL=C sar -V 2>&1 | head -1)
+          sadf_version=$(LC_ALL=C sadf -V 2>&1 | head -1)
+          pkg_version=$(dpkg-query -W -f='${Version}' sysstat)
+          {
+            echo '### Conformance environment'
+            echo
+            echo '| item | value |'
+            echo '| --- | --- |'
+            echo "| runner | ${os_name} (${{ runner.arch }}) |"
+            echo "| sar | ${sar_version} |"
+            echo "| sadf | ${sadf_version} |"
+            echo "| sysstat package | ${pkg_version} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "sysstat: ${sar_version} (package ${pkg_version}) on ${os_name}"
 
       - name: Fetch upstream test fixtures
         # sysstat のテストデータは GPL のため本リポジトリには同梱せず、
-        # CI 実行時に取得する。
+        # CI 実行時に固定タグから取得する (SHA-256 照合つき)。
         run: cargo run --quiet --bin xtask -- fetch-fixtures
 
       - name: Run conformance tests

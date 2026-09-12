@@ -13,6 +13,11 @@ categories = ["command-line-utilities", "parser-implementations"]
 name = "resarch"
 path = "src/main.rs"
 
+# 開発用タスクランナー (本家テストデータの取得など)。配布対象ではない。
+[[bin]]
+name = "xtask"
+path = "src/bin/xtask.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"

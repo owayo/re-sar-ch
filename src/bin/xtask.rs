@@ -719,23 +719,21 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in padded.chunks_exact(64) {
+    for block in padded.as_chunks::<64>().0 {
         sha256_compress(&mut h, block);
     }
 
     let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(h.iter()) {
-        chunk.copy_from_slice(&word.to_be_bytes());
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h.iter()) {
+        *chunk = word.to_be_bytes();
     }
     out
 }
 
-fn sha256_compress(h: &mut [u32; 8], block: &[u8]) {
-    debug_assert_eq!(block.len(), 64);
-
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (slot, bytes) in w.iter_mut().take(16).zip(block.chunks_exact(4)) {
-        *slot = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (slot, bytes) in w.iter_mut().take(16).zip(block.as_chunks::<4>().0) {
+        *slot = u32::from_be_bytes(*bytes);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -821,15 +819,15 @@ mod tests {
         );
         // 長さ 55 / 56 / 57 はパディング分岐の境界。
         assert_eq!(
-            hex(&sha256(&vec![b'a'; 55])),
+            hex(&sha256(&[b'a'; 55])),
             "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
         );
         assert_eq!(
-            hex(&sha256(&vec![b'a'; 56])),
+            hex(&sha256(&[b'a'; 56])),
             "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
         );
         assert_eq!(
-            hex(&sha256(&vec![b'a'; 57])),
+            hex(&sha256(&[b'a'; 57])),
             "f13b2d724659eb3bf47f2dd6af1accc87b81f09f59f2b75e5c0bed6589dfe8c6"
         );
     }

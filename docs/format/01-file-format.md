@@ -32,14 +32,28 @@
 
 ### 1.1 要素の並び (現行フォーマット = FORMAT_MAGIC 0x2175)
 
+> **`extra_desc` チェーンの位置 (実測で訂正)**
+>
+> ファイルヘッダに付随する `extra_desc` チェーンは **`file_activity[]` の後**に置かれる。
+> 根拠は 2 つ:
+>
+> 1. 本家のテストデータ生成ソースの書き込み順が
+>    `file_magic` → `file_header` → `file_activity[]` → `extra_desc` チェーン である。
+> 2. `extra_next = 1` が立っている実データで、`file_header` の直後に現れるのは
+>    `extra_desc` ではなく `file_activity` (id=1, magic=0x8b, nr=3, size=80) である。
+>
+> チェーンは「`extra_desc` (24 バイト固定) + `extra_nr × extra_size` の本体」を 1 段とし、
+> `extra_next` が 0 の段まで続く。終端の段は `extra_nr = 0` で本体を持たない。
+
+
 ```mermaid
 flowchart TD
     FM["file_magic<br/>固定 76 bytes"] --> FH["file_header<br/>file_magic.header_size bytes"]
-    FH --> FHX{"file_header.extra_next<br/>≠ 0 ?"}
+    FH --> FA["file_activity[] × file_header.sa_act_nr<br/>各 file_header.act_size bytes"]
+    FA --> FHX{"file_header.extra_next<br/>≠ 0 ?"}
     FHX -->|yes| XD1["extra_desc チェーン<br/>(未知拡張: skip 対象)"]
-    FHX -->|no| FA
-    XD1 --> FA["file_activity[] × file_header.sa_act_nr<br/>各 file_header.act_size bytes"]
-    FA --> REC["レコード列 (EOF まで繰り返し)"]
+    FHX -->|no| REC
+    XD1 --> REC["レコード列 (EOF まで繰り返し)"]
     REC --> RH["record_header<br/>file_header.rec_size bytes"]
     RH --> RT{"record_type"}
     RT -->|"R_STATS(1) / R_LAST_STATS(3)"| ST["activity ごとの統計ブロック<br/>(必要なら先頭に __nr_t)"]
@@ -445,7 +459,7 @@ G3 に対して **オフセット 60 に `extra_next` (`unsigned int`, 4 バイ�
 | # | フィールド | オフセット (共通) | 備考 |
 |---|---|---|---|
 | 1〜13 | (G3 と同一) | 0x00〜0x38 / 0〜56 | ただし `rec_types_nr[2]` は **1** |
-| 14 | `extra_next` (`unsigned int`) | **0x3C / 60** | 非 0 なら `file_activity[]` の**前**に `extra_desc` チェーンが挟まる |
+| 14 | `extra_next` (`unsigned int`) | **0x3C / 60** | 非 0 なら `file_activity[]` の**後**に `extra_desc` チェーンが挟まる (実測で確認。§1.1 の図を参照) |
 | 15 | `sa_day` (`unsigned char`) | 0x40 / 64 | |
 | 16 | `sa_month` (`unsigned char`) | 0x41 / 65 | |
 | 17 | `sa_sizeof_long` (`char`) | 0x42 / 66 | |
@@ -542,6 +556,16 @@ G4 に対して **末尾に `sa_tzname[8]` が追加**されただけ。
 各レコード内の統計ブロックの並び順になる。**ID 昇順とは限らない**ので、配列の順序を保持すること。
 
 ---
+
+> **ABI でサイズが変わる唯一の構造体 (実測で判明)**
+>
+> 「統計構造体のサイズは 32bit / 64bit で一致する」という原則には例外が 1 つある。
+> `0x2175` 世代で `rec_types_nr = (2, 0, 0)` (v12.0.x) の `record_header` は
+> アラインメント属性を持たないため、i386 System V では **20 バイト**になる
+> (LP64 / ARM32 / PPC32 では 24 バイト)。
+> `rec_types_nr = (2, 0, 1)` (v12.1 以降) では `extra_next` が入って
+> どの ABI でも 24 バイトになるため、この差は v12.0.x の 32bit ファイルだけに現れる。
+> reSARch の配置解決エンジンは i386 で 20 を返し、回帰テストで固定してある。
 
 ### 3.5 extra_desc (v12.1.7 以降。全世代でレイアウト不変と規定)
 

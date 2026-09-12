@@ -278,6 +278,61 @@ fn same_declared_size_but_different_layout_is_distinguished() {
     assert_eq!(rb.field("record_type").unwrap().offset, 20);
 }
 
+/// **サイズが ABI で変わる唯一の構造体**: G3 (`rec_types_nr = (2,0,0)`) の `record_header`。
+///
+/// この世代の `record_header` には alignment 属性が無く、メンバの終端が 20 バイト目になる。
+/// 構造体アラインメントは 8 バイト整数の自然アラインメントで決まるので
+///
+/// - `long long` を 8 境界に置く ABI (LP64 / ARM EABI / PowerPC) → 24
+/// - `long long` を 4 境界に置く i386 System V → 20
+///
+/// となる。`docs/format/01-file-format.md` §3.0 は「全構造体が 32bit / 64bit で
+/// サイズもオフセットも一致する」と書いているが、**ここだけは例外**である
+/// (他は `aligned(8)` / `aligned(16)` が付いているため一致する)。
+///
+/// 実データでの裏取り: 本家 `data-ppc-11.7.2` は 32bit big endian の G3 ファイルで
+/// `rec_size = 24` を申告している (PowerPC は 8 境界)。i386 で作られた G3 ファイルは
+/// `rec_size = 20` を申告するはずで、レイアウトを `rec_size` から決め打ちすると破綻する。
+#[test]
+fn g3_record_header_size_is_the_only_abi_dependent_size() {
+    let facts = Generation::G2175V120.facts();
+    for abi in FixtureAbi::ALL {
+        let f = fixtures::minimal(Generation::G2175V120, abi);
+        let enc = encoding(&f);
+        let r = resolve_record_header(f.generation(), facts, &enc);
+
+        let want = if abi == FixtureAbi::Le32 { 20 } else { 24 };
+        assert_eq!(r.size, want, "{}: G3 record_header のサイズ", f.label());
+        assert_eq!(f.record_header_size(), want, "{}: fixture 側", f.label());
+
+        // オフセットは ABI で動かない
+        assert_eq!(r.field("uptime_cs").unwrap().offset, 0);
+        assert_eq!(r.field("ust_time").unwrap().offset, 8);
+        assert_eq!(r.field("record_type").unwrap().offset, 16);
+
+        // 申告値 (rec_size) が解決結果と一致すること
+        let fh = resolve_file_header(f.generation(), facts, &enc);
+        let c = cursor(&f);
+        assert_eq!(
+            c.read_unsigned(f.file_header_off, fh.field("rec_size").unwrap())
+                .unwrap() as usize,
+            r.size,
+            "{}: rec_size の申告値",
+            f.label()
+        );
+    }
+
+    // G4 / G5 は extra_next が末尾の穴を埋めるので、どの ABI でも 24 に揃う。
+    for generation in [Generation::G2175V1217, Generation::G2175Current] {
+        for abi in FixtureAbi::ALL {
+            let f = fixtures::minimal(generation, abi);
+            let enc = encoding(&f);
+            let r = resolve_record_header(generation, generation.facts(), &enc);
+            assert_eq!(r.size, 24, "{}: G4/G5 は常に 24", f.label());
+        }
+    }
+}
+
 /// `sa_tzname` は `header_size` 336 の世代にしか無い。
 #[test]
 fn tzname_exists_only_in_the_336_byte_variant() {
@@ -523,12 +578,24 @@ fn unsigned_long_slot_is_eight_bytes_with_four_effective_on_32bit() {
         if abi.long_bytes() == 4 {
             let tail = &f.bytes[base + hz.offset + 4..base + hz.offset + 8];
             assert_eq!(tail, [0, 0, 0, 0], "{label}: スロット後半はゼロ");
-            // 誤って 8 バイト全部を読むと値が壊れることを明示する
+
+            // 誤ってスロット全体を 8 バイトとして読むと、big endian では値が 2^32 倍に化ける。
+            // little endian は後半がゼロなので偶然一致してしまい、この誤りを検出できない。
+            // BE + 32bit (本家 `data-ppc-11.7.2` と同じ条件) だけが捕まえられる。
             let whole = c.u64_at(base + hz.offset).unwrap();
-            assert_ne!(
-                whole, f.spec.hz,
-                "{label}: 8 バイト読みは一致してはならない"
-            );
+            if abi.is_big_endian() {
+                assert_eq!(
+                    whole,
+                    f.spec.hz << 32,
+                    "{label}: BE の 8 バイト読みは 2^32 倍になる"
+                );
+                assert_ne!(
+                    whole, f.spec.hz,
+                    "{label}: 8 バイト読みは一致してはならない"
+                );
+            } else {
+                assert_eq!(whole, f.spec.hz, "{label}: LE では偶然一致する");
+            }
         }
     }
 }
@@ -761,6 +828,22 @@ fn record_walk_lands_exactly_on_eof_with_extra_chains() {
                 "{}: extra 連鎖が入っていない",
                 f.label()
             );
+            // 統計を持たない R_EXTRA レコード (record_type 5〜15) も含まれること
+            let extra_record = f
+                .spec
+                .records
+                .iter()
+                .position(|r| matches!(r.kind, RecordKind::Extra { .. }))
+                .expect("R_EXTRA レコードが入っていない");
+            let (off, len) = f.record_offsets[extra_record];
+            let expect = f.record_header_size() + fixtures::ExtraSpec::sample().byte_len();
+            assert_eq!(
+                len,
+                expect,
+                "{}: R_EXTRA は record_header + extra 連鎖だけで、統計を持たない",
+                f.label()
+            );
+            assert!(off + len <= f.bytes.len());
             assert_eq!(
                 walk_records(&f, &enc),
                 f.bytes.len(),
@@ -1016,7 +1099,7 @@ fn truncated_fixtures_end_in_the_middle_of_a_structure() {
     let list_start = 76 + facts.file_header_size;
     assert!(c.bytes.len() > list_start, "activity リストの途中");
     assert!(
-        (c.bytes.len() - list_start) % facts.file_activity_size != 0,
+        !(c.bytes.len() - list_start).is_multiple_of(facts.file_activity_size),
         "activity 境界に揃っていないこと"
     );
 
@@ -1052,7 +1135,11 @@ fn irq_overflow_fixture_passes_every_limit_check() {
         product > u64::from(u32::MAX),
         "積が u32 に収まってしまっている: {product}"
     );
-    assert_eq!(product, 34_359_738_368, "本家と同じ積になること");
+    // 8193 × 4096 × 1024 = 34,363,932,672 (= 約 32 GiB)。
+    // `docs/format/04-test-data.md` §2.2 はこれを 34,359,738,368 (= 2^35) と書いているが、
+    // それは 8192 × 4096 × 1024 の値である。nr は NR_CPUS + 1 = 8193 なので上の値が正しい。
+    // いずれにせよ u32 (4,294,967,295) を大きく超える。
+    assert_eq!(product, 34_363_932_672, "nr × nr2 × size の積");
     assert!(!Corruption::IrqOverflow.fails_header_only_mode());
     assert_eq!(c.bytes.len(), 448);
 }

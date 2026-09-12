@@ -14,7 +14,8 @@
 //!
 //! ## 性能上の設計
 //!
-//! - 既定は `mmap`。`read` の往復とバッファコピーを避ける。
+//! - 読み方はファイルサイズで選ぶ。小さいファイルでは `read` が `mmap` より速い
+//!   (実測 979 KB で 66 µs 対 179 µs)。閾値は [`MMAP_THRESHOLD_BYTES`]。
 //! - [`SaFile::scan`] は内部バッファを再利用し、レコードごとの確保を行わない。
 //! - 選択されていない activity は `nr × nr2 × size` を加算するだけでデコードしない。
 
@@ -208,11 +209,32 @@ pub enum Tolerance {
     Lenient,
 }
 
+/// `mmap` を使うかどうかの方針。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MmapPolicy {
+    /// ファイルサイズで判断する (既定)。
+    #[default]
+    Auto,
+    /// 常に `mmap` する。
+    Always,
+    /// 常に `read` する。採取進行中のファイルや切り詰めの懸念がある場合に使う。
+    Never,
+}
+
+/// `mmap` を選ぶファイルサイズの下限。
+///
+/// 実測 (979 KB のファイル、macOS / Apple Silicon) では
+/// `mmap` が 173 µs、`read` が 64 µs で **`read` の方が 2.7 倍速い**。
+/// 小さいファイルでは `mmap` のセットアップ (システムコール + ページフォルト) が
+/// 1 回の `read` より高くつく。逆に十分大きいファイルでは
+/// バッファへのコピーが無い `mmap` が有利になる。
+pub const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
 /// オープン時の設定。
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
-    /// `mmap` を使うか。
-    pub mmap: bool,
+    /// `mmap` を使うかどうか。
+    pub mmap: MmapPolicy,
     /// 破損への対応方針。
     pub tolerance: Tolerance,
     /// 旧世代で HZ が不明なときに仮定する値。
@@ -222,7 +244,7 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
-            mmap: true,
+            mmap: MmapPolicy::Auto,
             tolerance: Tolerance::Strict,
             assumed_hz: DEFAULT_ASSUMED_HZ,
         }
@@ -270,10 +292,19 @@ impl SaFile {
             source,
         })?;
 
-        let source = if options.mmap {
+        let use_mmap = match options.mmap {
+            MmapPolicy::Always => true,
+            MmapPolicy::Never => false,
+            MmapPolicy::Auto => file
+                .metadata()
+                .map(|m| m.len() >= MMAP_THRESHOLD_BYTES)
+                .unwrap_or(false),
+        };
+
+        let source = if use_mmap {
             // SAFETY: 読み取り専用でマップする。マップ中に他プロセスがファイルを
             // 切り詰めると SIGBUS になり得るため、その懸念がある環境では
-            // `mmap: false` (read 方式) を使う。
+            // `MmapPolicy::Never` を使う。
             match unsafe { Mmap::map(&file) } {
                 Ok(m) => Source::Mapped(m),
                 Err(_) => Source::Owned(read_all(&file, &path)?),
@@ -961,20 +992,21 @@ fn validate_activity_entry(
         )?;
     }
 
-    // item 数: 0 と負値は不可
+    // item 数: 0 と負値は不可。上限は activity 別 (汎用上限だけでは緩すぎる)
+    let nr_max = e.id.nr_max().min(NR_MAX);
     if e.nr <= 0 {
         reject(
             format!("nr = {}", e.nr),
             "file_activity.nr",
             e.nr.max(0) as u64,
-            NR_MAX as u64,
+            nr_max as u64,
         )?;
-    } else if e.nr as u32 > NR_MAX {
+    } else if e.nr as u32 > nr_max {
         reject(
-            format!("nr = {}", e.nr),
+            format!("nr = {} (この activity の上限は {nr_max})", e.nr),
             "file_activity.nr",
             e.nr as u64,
-            NR_MAX as u64,
+            nr_max as u64,
         )?;
     }
 

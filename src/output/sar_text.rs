@@ -68,19 +68,20 @@
 //!
 //! | 項目 | 状況 |
 //! |---|---|
-//! | `-x` の `Minimum:` / `Maximum:` 行 | 未実装。`Summary:` / `Last:` のラベル切り替えだけ反映する |
 //! | `A_DISK` のデバイス名 | 既定は `dev<major>-<minor>`。**ローカルの `/sys` は引かない** (他ホストのファイルで誤名になる)。`-j SID` 相当の WWN 名だけ再現する |
-//! | `Average:` の `avg_count` | 本家は activity 単位のグローバルカウンタだが、ここでは item 単位に数える。途中で現れた / 消えたデバイスで本家と値が変わり得る (常時存在する item では一致) |
 //! | ヘッダ再表示 | パイプ出力と同じ `rows = 86400` 相当 (ブロック先頭で 1 回)。端末幅による再表示は行わない |
+//! | 個別 CPU の `Average:` が tickless | 区間全体の tick 差分が 0 の CPU も分母 1 で割る (本家は `%idle = 100.00` の固定行)。実データでは「区間中ずっと完全アイドル」でしか起きない |
 //!
 //! [`docs/format/03-output-format.md`]: ../../../docs/format/03-output-format.md
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::format::SaFile;
 use crate::layout::plan::DecodePlan;
 use crate::layout::registry::{ActivityDef, lookup};
 use crate::model::{ActivityId, Availability, ValueKind};
+use crate::output::time_filter::{Admit, TimeFilter};
 use crate::series::compute::{
     self, ComputeContext, ComputeIssue, Computed, ItemAccum, bat_col, bat_status, cpu_col,
     disk_col, fan_col, freq_col, fs_col, huge_col, in_col, irq_col, mem_col, net_dev_col, psi_col,
@@ -204,6 +205,14 @@ pub struct SarTextOptions {
     pub time: TimeStyle,
     /// `-P` の CPU 選択。
     pub cpus: CpuSelection,
+    /// `-s` / `-e` の時刻フィルタ。既定は無効 (全レコードを出す)。
+    pub time_filter: TimeFilter,
+    /// `--dev=` / `--iface=` / `--fs=` のアイテム名フィルタ。
+    ///
+    /// キーは activity。エントリが無い activity は絞り込まない。
+    /// 比較対象は**表示されるアイテム名**そのもので、本家の
+    /// `search_list_item()` と同じ (`-F MOUNT` ならマウントポイントと比べる)。
+    pub item_names: BTreeMap<ActivityId, Vec<String>>,
 }
 
 impl SarTextOptions {
@@ -1526,6 +1535,10 @@ enum ItemKey {
 #[derive(Debug, Clone)]
 struct Row {
     key: ItemKey,
+    /// item 添字 ([`SarBlock::iter_groups`] のループ変数 `i`)。
+    ///
+    /// CPU 系では 0 = 集約行。`-P` で行が間引かれても本家の `i` と一致する。
+    index: usize,
     label: RowLabel,
     /// 値列。`view.cells` と同順 (`A_IRQ` だけは CPU 列ぶん並ぶ)。
     values: Vec<Computed>,
@@ -1537,6 +1550,21 @@ struct Row {
     snapshot: ItemSnapshot,
     /// 行列型の付随スロット。
     slots: Vec<ItemSnapshot>,
+}
+
+/// 行の書式モード。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowMode {
+    /// 通常のデータ行 (`f_print`、瞬時値の `cprintf_*`)。
+    Instant,
+    /// `Average:` / `Summary:` / `Last:` 行 (`f_print_avg`)。
+    Average,
+    /// `-x` の `Minimum:` / `Maximum:` 行。
+    ///
+    /// 本家の `print_*_xstats()` は**瞬時値と同じ `cprintf_*` 呼び出し**で出す
+    /// (03 §8.3)。列の取捨だけは平均行と揃える (`A_PWR_BAT` の `status` は
+    /// 矢印なので極値を持たない)。
+    Extreme,
 }
 
 /// item 1 個とその付随スロット (行列型)。
@@ -1552,6 +1580,8 @@ struct ItemGroup {
 #[derive(Debug, Clone)]
 struct ItemState {
     key: ItemKey,
+    /// item 添字 (本家のループ変数 `i`)。CPU 系では 0 = 集約行。
+    index: usize,
     label: RowLabel,
     tail: Option<String>,
     usb_names: Option<(String, String)>,
@@ -1565,6 +1595,54 @@ struct ItemState {
     accum: ItemAccum,
     /// このブロックで 1 度でも表示されたか。
     displayed: bool,
+    /// `-x` の最小値 (列ごと)。未更新は `f64::MAX` (本家の `spmin` 初期値)。
+    min: Vec<f64>,
+    /// `-x` の最大値 (列ごと)。未更新は `f64::MIN` (本家の `-DBL_MAX`)。
+    max: Vec<f64>,
+}
+
+impl ItemState {
+    /// 極値を 1 度でも更新したか。
+    ///
+    /// 本家は `spmin == DBL_MAX` の item について `Minimum:` / `Maximum:` の
+    /// ブロックを出さない (03 §2.6.4)。
+    fn has_extrema(&self) -> bool {
+        self.min.iter().any(|v| *v != f64::MAX)
+    }
+
+    /// 表示した行の値で極値を更新する (`save_extrema()` 相当、03 §1.6.3)。
+    ///
+    /// 記録するのは**表示した瞬時値そのもの**。本家も `S_VALUE()` と
+    /// 0 クランプを通した後の値を保存する。
+    fn update_extrema(&mut self, values: &[Computed]) {
+        if self.min.len() < values.len() {
+            self.min.resize(values.len(), f64::MAX);
+            self.max.resize(values.len(), f64::MIN);
+        }
+        for (slot, v) in self.min.iter_mut().zip(values.iter()) {
+            if let Ok(v) = v {
+                *slot = slot.min(*v);
+            }
+        }
+        for (slot, v) in self.max.iter_mut().zip(values.iter()) {
+            if let Ok(v) = v {
+                *slot = slot.max(*v);
+            }
+        }
+    }
+}
+
+/// 極値の保存領域を表示用の値列へ変換する。
+///
+/// 一度も更新されていない列は 0 ではなく「計算できなかった」扱いにする
+/// (本家はそこに `DBL_MAX` / `-DBL_MAX` を出してしまうが、0 と混同させない)。
+fn extrema_values(store: &[f64], len: usize, unset: f64) -> Vec<Computed> {
+    (0..len)
+        .map(|i| match store.get(i) {
+            Some(v) if *v != unset => Ok(*v),
+            _ => Err(ComputeIssue::MissingInSample),
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -1594,6 +1672,14 @@ pub struct SarBlock {
     displayed: u64,
     /// `A_IRQ` のヘッダで展開する CPU 列 (item 添字。0 = 集約列)。
     irq_cpu_cols: Vec<usize>,
+    /// `A_CPU` の区間始点の**生** item 配列 (本家の `buf[2]` 相当)。
+    ///
+    /// CPU "all" は個別 CPU の合算で作り直すため、平均行でも
+    /// [`compute::aggregate_cpu`] を通し直す必要がある (03 §1.4.3 / §8.1)。
+    /// 集約済みの値だけを持っていると offline 補正をやり直せない。
+    cpu_first: Vec<ItemSnapshot>,
+    /// `A_CPU` の区間終点の生 item 配列 (最後に表示したレコード)。
+    cpu_last: Vec<ItemSnapshot>,
     items: Vec<ItemState>,
 }
 
@@ -1619,6 +1705,8 @@ impl SarBlock {
                 last_uptime: 0,
                 displayed: 0,
                 irq_cpu_cols: Vec::new(),
+                cpu_first: Vec::new(),
+                cpu_last: Vec::new(),
                 items: Vec::new(),
             })
             .collect()
@@ -1677,34 +1765,65 @@ impl SarBlock {
             return Ok(());
         }
 
+        let ts = timestamp_of(view.curr, self.opts.time);
+
+        // 本家は `act[i].nr[curr] > 0` のときだけ `f_print` を呼ぶ。
+        // item が 1 つも無いレコードはヘッダも `avg_count` も動かさない (03 §8.1)。
+        if curr_act.items.is_empty() {
+            self.prev_ts = ts;
+            return Ok(());
+        }
+
         let prev_items: &[ItemSnapshot] = view
             .prev
             .activity(self.view.id)
             .map(|a| a.items.as_slice())
             .unwrap_or(&[]);
 
-        let ts = timestamp_of(view.curr, self.opts.time);
         let rows = self.build_rows(plan, prev_items, &curr_act.items, nr2, view.itv_cs);
-        if rows.is_empty() {
-            self.prev_ts = ts;
-            return Ok(());
+        if !rows.is_empty() {
+            self.write_header(out)?;
+            let mut buf = String::new();
+            for row in &rows {
+                buf.clear();
+                self.render_row(&mut buf, &ts, row, RowMode::Instant);
+                out.write_all(buf.as_bytes())?;
+            }
         }
+        self.commit_record(rows, &curr_act.items, view.curr.uptime_cs, ts);
+        Ok(())
+    }
 
-        self.write_header(out)?;
-        let mut buf = String::new();
-        for row in &rows {
-            buf.clear();
-            self.render_row(&mut buf, &ts, row, false);
-            out.write_all(buf.as_bytes())?;
+    /// 表示後の区間管理。**行を 1 本も出せなくても必ず通す。**
+    ///
+    /// 本家の `avg_count` と全期間 `itv` はレコード単位で進む。`-z` の省略は
+    /// item ごとの `continue` なので、行が消えてもレコード自体は
+    /// 「表示した」扱いになる (03 §2.7 / §8.1)。ここを飛ばすと末尾の
+    /// ゼロ区間が `Average:` の分母から落ちる。
+    fn commit_record(
+        &mut self,
+        rows: Vec<Row>,
+        curr_items: &[ItemSnapshot],
+        uptime_cs: u64,
+        ts: String,
+    ) {
+        self.displayed += 1;
+        self.last_uptime = uptime_cs;
+        self.prev_ts = ts;
+        // 平均行で集約をやり直すため、CPU は生の item 配列も控える
+        if self.view.id == ActivityId::CPU {
+            self.cpu_last = curr_items.to_vec();
         }
         for row in rows {
             self.accumulate(row);
         }
-
-        self.displayed += 1;
-        self.last_uptime = view.curr.uptime_cs;
-        self.prev_ts = ts;
-        Ok(())
+        // 本家の `avg_count` は **activity 単位のグローバルカウンタ**なので、
+        // 全 item で分母を揃える (03 §8.1)。item ごとの観測回数で割ると、
+        // 途中から現れたデバイス / センサの平均が本家より大きく出る
+        // (2 回表示のうち最後だけ現れた 1000 rpm は本家では 500)。
+        for state in &mut self.items {
+            state.accum.count = self.displayed;
+        }
     }
 
     /// ブロックを閉じ、`Average:` / `Summary:` / `Last:` 行を出す。
@@ -1726,9 +1845,17 @@ impl SarBlock {
         self.last_uptime = snap.uptime_cs;
         self.prev_ts = timestamp_of(snap, self.opts.time);
         self.items.clear();
-        for (idx, group) in self.iter_groups(plan, items, nr2) {
+        // 集約行は前後 2 サンプルが揃って初めて作れるので、基準サンプルでは
+        // ファイルの item 0 をそのまま控えるだけにする (平均行では
+        // `cpu_first` / `cpu_last` から集約をやり直す)。
+        if self.view.id == ActivityId::CPU {
+            self.cpu_first = items.to_vec();
+            self.cpu_last = items.to_vec();
+        }
+        for (idx, group) in self.iter_groups(plan, items, nr2, None) {
             self.items.push(ItemState {
                 key: self.item_key(plan, &group.primary, idx),
+                index: idx,
                 label: self.row_label(plan, &group.primary, idx),
                 tail: self.tail_text(plan, &group.primary, idx),
                 usb_names: self.usb_names(plan, &group.primary),
@@ -1738,13 +1865,20 @@ impl SarBlock {
                 last_slots: group.slots,
                 accum: ItemAccum::new(self.def.columns.len()),
                 displayed: false,
+                min: Vec::new(),
+                max: Vec::new(),
             });
         }
     }
 
     /// RESTART をまたいだので区間状態を捨てる。
+    ///
+    /// `-x` の極値も [`ItemState`] ごと落ちる = **RESTART 区間ごとに初期化**される
+    /// (本家の `xinit` → `init_extrema_values()`、03 §1.6.3)。
     fn reset_region(&mut self) {
         self.items.clear();
+        self.cpu_first.clear();
+        self.cpu_last.clear();
         self.displayed = 0;
         self.first_uptime = None;
         self.header_done = false;
@@ -1796,11 +1930,16 @@ impl SarBlock {
     ///
     /// 戻り値の添字は本家のループ変数 `i` に対応する
     /// (CPU 系では 0 = 集約行、`n` = CPU `n-1`)。
+    ///
+    /// `aggregate` を渡すと CPU 系の item 0 をその値で差し替える。
+    /// `A_CPU` の集約行は前後 2 サンプルを一緒に見ないと作れないため
+    /// ([`compute::aggregate_cpu`])、この関数の中では計算しない。
     fn iter_groups(
         &self,
         plan: &DecodePlan,
         items: &[ItemSnapshot],
         nr2: u32,
+        aggregate: Option<&ItemSnapshot>,
     ) -> Vec<(usize, ItemGroup)> {
         let width = plan.fields.len();
         let plain = |i: usize, it: &ItemSnapshot| {
@@ -1828,15 +1967,20 @@ impl SarBlock {
                     if !self.opts.cpus.includes(i) {
                         continue;
                     }
-                    // 集約行を個別 CPU の単純和で作り直すのは
+                    // 集約行を個別 CPU から作り直すのは
                     // `A_CPU` (`get_global_cpu_statistics()`) と
                     // `A_NET_SOFT` (`get_global_soft_statistics()`) だけ。
                     // `A_PWR_CPU` / `A_PWR_FREQ` の item 0 は**収集時に
                     // 平均が入っている**ので、合算すると CPU 数倍になる。
-                    let primary = if i == 0 && items.len() > 1 && self.recomputes_aggregate() {
-                        compute::sum_items(width, items.iter().skip(1))
-                    } else {
-                        items[i].clone()
+                    //
+                    // `A_CPU` は offline 判定と前値補正を挟むため単純和では
+                    // 足りず、呼び出し側が `aggregate` を渡してくる (03 §1.4.3)。
+                    let primary = match aggregate {
+                        Some(agg) if i == 0 => agg.clone(),
+                        _ if i == 0 && items.len() > 1 && self.recomputes_aggregate() => {
+                            compute::sum_items(width, items.iter().skip(1))
+                        }
+                        _ => items[i].clone(),
                     };
                     out.push((
                         i,
@@ -1921,9 +2065,13 @@ impl SarBlock {
         }
     }
 
-    /// 集約行 (item 0) を個別行の単純和で作り直す activity か。
+    /// 集約行 (item 0) を個別行の**単純和**で作り直す activity か。
+    ///
+    /// `A_CPU` はここに入らない。オフライン CPU の現値をそのまま足すと
+    /// 「0 になった減少」が他 CPU の増加を相殺するため、
+    /// [`compute::aggregate_cpu`] で offline 補正込みに合算する (03 §1.4.3)。
     fn recomputes_aggregate(&self) -> bool {
-        matches!(self.view.id, ActivityId::CPU | ActivityId::NET_SOFT)
+        matches!(self.view.id, ActivityId::NET_SOFT)
     }
 
     /// `A_IRQ` で表示する CPU 列の item 添字。
@@ -2092,10 +2240,29 @@ impl SarBlock {
             values: vec![Availability::Present(0); width],
         };
 
-        let prev_groups = self.iter_groups(plan, prev_items, nr2);
+        // `A_CPU` の集約行 (`all`) は、前後のサンプルを**一緒に**見て
+        // 「CPU ごとに offline 判定 → 前値補正 → 合算」した値を使う (03 §1.4.3)。
+        // 前後を別々に単純合計してから差分を取ると、オフラインで現値が 0 に
+        // なった CPU の減少が他 CPU の増加を相殺してしまう。
+        let cpu_agg = if self.view.id == ActivityId::CPU {
+            compute::aggregate_cpu(plan, prev_items, curr_items, false)
+        } else {
+            None
+        };
+
+        let prev_groups =
+            self.iter_groups(plan, prev_items, nr2, cpu_agg.as_ref().map(|a| &a.prev));
         let mut rows = Vec::new();
 
-        for (idx, group) in self.iter_groups(plan, curr_items, nr2) {
+        for (idx, group) in
+            self.iter_groups(plan, curr_items, nr2, cpu_agg.as_ref().map(|a| &a.curr))
+        {
+            // オフライン CPU は行そのものを出さない (本家の `offline_cpu_bitmap`)。
+            // 「現在オフライン」だけでなく「前サンプルでオフライン = 差分の
+            // 基準値が無い」CPU も対象になる (03 §1.4.3)。
+            if cpu_agg.as_ref().is_some_and(|a| a.is_offline(idx)) {
+                continue;
+            }
             let key = self.item_key(plan, &group.primary, idx);
             // 前サンプルは**位置ではなく識別子で**対応付ける。
             // 見つからない (新規登録) 場合は全ゼロ構造体を前値にする
@@ -2108,22 +2275,60 @@ impl SarBlock {
                 None => (zero(), vec![zero(); group.slots.len()]),
             };
 
-            // -z: 前サンプルと同一なら行を出さない
+            // --dev= / --iface= / --fs=: 名前が一致しないアイテムは出さない
+            if !self.name_selected(plan, &group.primary, idx) {
+                continue;
+            }
+
+            // -z: 前サンプルと同一なら行を出さない (対象 activity のみ)
             if self.opts.zero_omit
+                && zero_omit_applies(self.view.id)
                 && matched.is_some()
                 && self.same_sample(plan, &prev_primary, &group.primary)
             {
                 continue;
             }
 
-            let Some(row) =
-                self.make_row(plan, idx, key, &group, &prev_primary, &prev_slots, itv_cs)
-            else {
+            // 集約行だけは合算済みの端点と `deltot_jiffies` で計算する
+            let cpu_all = cpu_agg.as_ref().filter(|_| idx == 0);
+            let Some(row) = self.make_row(
+                plan,
+                idx,
+                key,
+                &group,
+                &prev_primary,
+                &prev_slots,
+                itv_cs,
+                cpu_all,
+            ) else {
                 continue;
             };
             rows.push(row);
         }
         rows
+    }
+
+    /// `--dev=` / `--iface=` / `--fs=` のアイテム名フィルタ (`search_list_item()`)。
+    ///
+    /// フィルタが無い activity では常に真。名前で同一性が決まる 4 activity
+    /// (`A_DISK` / `A_NET_DEV` / `A_NET_EDEV` / `A_FS`) だけを対象にする。
+    /// `A_IRQ` (`--int=`) は行ではなく列が CPU に対応する行列レイアウトなので
+    /// ここでは扱わない。
+    fn name_selected(&self, plan: &DecodePlan, item: &ItemSnapshot, index: usize) -> bool {
+        let Some(list) = self.opts.item_names.get(&self.view.id) else {
+            return true;
+        };
+        if list.is_empty() {
+            return true;
+        }
+        if !matches!(
+            self.view.id,
+            ActivityId::DISK | ActivityId::NET_DEV | ActivityId::NET_EDEV | ActivityId::FS
+        ) {
+            return true;
+        }
+        let name = self.item_name(plan, item, index);
+        list.iter().any(|n| n == &name)
     }
 
     /// `-z` の同一判定。
@@ -2152,6 +2357,9 @@ impl SarBlock {
     }
 
     /// 1 行分の値を計算する。`None` なら行を出さない (オフライン CPU など)。
+    ///
+    /// `cpu_total` は `A_CPU` 集約行の分母 (`deltot_jiffies`)。
+    /// [`compute::aggregate_cpu`] が返した値をそのまま使う。
     #[allow(clippy::too_many_arguments)]
     fn make_row(
         &self,
@@ -2162,6 +2370,7 @@ impl SarBlock {
         prev_primary: &ItemSnapshot,
         prev_slots: &[ItemSnapshot],
         itv_cs: u64,
+        cpu_total: Option<u64>,
     ) -> Option<Row> {
         let curr = &group.primary;
         let mut ctx = ComputeContext::new(itv_cs);
@@ -2185,36 +2394,48 @@ impl SarBlock {
             Layout::FreqMatrix => {
                 vec![compute::weighted_mhz(plan, prev_slots, &group.slots)]
             }
-            // --- A_CPU: オフライン / tickless の特別扱い ---
+            // --- A_CPU: 集約行 / オフライン / tickless の特別扱い ---
             Layout::Cpu if self.view.id == ActivityId::CPU => {
-                if compute::cpu_is_offline(plan, curr) {
-                    // オフライン CPU は行そのものを出さない
-                    return None;
+                if let Some(total) = cpu_total {
+                    // 集約行 (SMP)。`prev_primary` / `curr` は既に
+                    // offline 補正込みで合算済み、`total` はその合算に使った
+                    // CPU の tick 合計。CPU "all" が tickless になることは
+                    // ない前提で 0 は 1 に差し替える (03 §1.4.3 / §1.4.5)。
+                    ctx.tick_total = Some(total.max(1));
+                    self.cell_values(plan, prev_primary, curr, &ctx)
+                } else {
+                    if compute::cpu_is_offline(plan, curr) {
+                        // オフライン CPU は行そのものを出さない
+                        return None;
+                    }
+                    let (fixed_prev, mut total) =
+                        compute::per_cpu_interval(plan, prev_primary, curr);
+                    if idx == 0 {
+                        // UP 機 (個別 CPU が無い) の CPU "all"
+                        total = total.max(1);
+                    } else if total == 0 {
+                        // tickless CPU: 計算せず 0.00 × n + %idle = 100.00
+                        return Some(Row {
+                            key,
+                            index: idx,
+                            label: self.row_label(plan, curr, idx),
+                            values: self.tickless_cpu_values(),
+                            tail: None,
+                            usb_names: None,
+                            snapshot: curr.clone(),
+                            slots: Vec::new(),
+                        });
+                    }
+                    ctx.tick_total = Some(total);
+                    self.cell_values(plan, &fixed_prev, curr, &ctx)
                 }
-                let (fixed_prev, mut total) = compute::per_cpu_interval(plan, prev_primary, curr);
-                if idx == 0 {
-                    // CPU "all" が tickless になることはない前提で 1 に補正する
-                    total = total.max(1);
-                } else if total == 0 {
-                    // tickless CPU: 計算せず 0.00 × n + %idle = 100.00
-                    return Some(Row {
-                        key,
-                        label: self.row_label(plan, curr, idx),
-                        values: self.tickless_cpu_values(),
-                        tail: None,
-                        usb_names: None,
-                        snapshot: curr.clone(),
-                        slots: Vec::new(),
-                    });
-                }
-                ctx.tick_total = Some(total);
-                self.cell_values(plan, &fixed_prev, curr, &ctx)
             }
             _ => self.cell_values(plan, prev_primary, curr, &ctx),
         };
 
         Some(Row {
             key,
+            index: idx,
             label: self.row_label(plan, curr, idx),
             values,
             tail: self.tail_text(plan, curr, idx),
@@ -2274,7 +2495,7 @@ impl SarBlock {
 
     // ---- 行の書式化 ----
 
-    fn render_row(&self, out: &mut String, label: &str, row: &Row, average: bool) {
+    fn render_row(&self, out: &mut String, label: &str, row: &Row, mode: RowMode) {
         out.push_str(&pad_right(label, TSW));
         self.render_head(out, row);
         for (i, v) in row.values.iter().enumerate() {
@@ -2285,10 +2506,14 @@ impl SarBlock {
                 .or_else(|| self.view.cells.last())
                 .copied();
             let Some(spec) = spec else { continue };
-            if average && !spec.in_average {
+            if mode != RowMode::Instant && !spec.in_average {
                 continue;
             }
-            let cell = if average { spec.avg_cell } else { spec.cell };
+            let cell = if mode == RowMode::Average {
+                spec.avg_cell
+            } else {
+                spec.cell
+            };
             out.push_str(&cell.render(*v, &self.opts));
         }
         self.render_tail(out, row);
@@ -2369,6 +2594,7 @@ impl SarBlock {
                 };
                 self.items.push(ItemState {
                     key: row.key.clone(),
+                    index: row.index,
                     label: row.label.clone(),
                     tail: row.tail.clone(),
                     usb_names: row.usb_names.clone(),
@@ -2378,13 +2604,17 @@ impl SarBlock {
                     last_slots: row.slots.clone(),
                     accum: ItemAccum::new(columns),
                     displayed: false,
+                    min: Vec::new(),
+                    max: Vec::new(),
                 });
                 self.items.len() - 1
             }
         };
 
         let plan = self.plan.clone();
+        let minmax = self.opts.minmax;
         let state = &mut self.items[idx];
+        state.index = row.index;
         state.label = row.label.clone();
         state.tail = row.tail.clone();
         state.usb_names = row.usb_names.clone();
@@ -2404,10 +2634,11 @@ impl SarBlock {
                 state.accum.add(*col, raw, None);
             }
         }
-        // 本家の `avg_count` は activity 単位のグローバル値だが、ここでは item 単位に数える。
-        // 常時存在する item では同じ値になり、途中で現れたデバイスでは
-        // 「観測できた回数」で平均が取れる分こちらの方が素直になる。
-        state.accum.count += 1;
+        // `-x` の極値はレコードごとに更新する (03 §1.6.3)。
+        // 分母 (`avg_count`) は [`SarBlock::commit_record`] が activity 単位で入れる。
+        if minmax {
+            state.update_extrema(&row.values);
+        }
     }
 
     // ---- 平均行 ----
@@ -2427,37 +2658,117 @@ impl SarBlock {
                 }
             }
         };
-        // `-x` 併用時のヘッダ行ラベルは `Summary:`
-        if self.view.header == HeaderPolicy::EverySample {
-            let hdr_label = if self.opts.minmax { "Summary:" } else { label };
-            out.write_all(self.header_for(hdr_label).as_bytes())?;
-        }
-
         let itv = interval_cs(self.first_uptime.unwrap_or(0), self.last_uptime);
         let rows = self.average_rows(itv);
+        if self.opts.minmax {
+            self.write_minmax_average(out, label, &rows)?;
+            self.displayed = 0;
+            return Ok(());
+        }
+
+        // `-x` 無しのヘッダ行ラベルは平均行と同じ
+        if self.view.header == HeaderPolicy::EverySample {
+            out.write_all(self.header_for(label).as_bytes())?;
+        }
+
         let mut buf = String::new();
-        for row in &rows {
+        for (_, row) in &rows {
             buf.clear();
-            self.render_row(&mut buf, label, row, true);
+            self.render_row(&mut buf, label, row, RowMode::Average);
             out.write_all(buf.as_bytes())?;
         }
         self.displayed = 0;
         Ok(())
     }
 
-    fn average_rows(&self, itv: u64) -> Vec<Row> {
+    /// `-x` の平均ブロック (03 §2.6.4 / §8.3)。
+    ///
+    /// item ごとに
+    /// 「`Summary:` ヘッダ → `Minimum:` → `Maximum:` → 平均行」
+    /// の 4 行組を繰り返す。ヘッダ行の先頭 `\n` で各組の前に空行が 1 行入る。
+    ///
+    /// 本家は `print_*_xstats()` が item ごとにヘッダを出し直すため、
+    /// ブロック先頭の 1 回だけのヘッダ (`dish` 由来) は出さない。
+    fn write_minmax_average<W: Write>(
+        &self,
+        out: &mut W,
+        label: &str,
+        rows: &[(usize, Row)],
+    ) -> io::Result<()> {
+        let mut buf = String::new();
+        for (pos, row) in rows {
+            let width = row.values.len();
+            // 極値が 1 度も更新されていない item は min/max を出さない
+            let extrema = self
+                .items
+                .get(*pos)
+                .filter(|st| st.has_extrema())
+                .map(|st| {
+                    (
+                        extrema_values(&st.min, width, f64::MAX),
+                        extrema_values(&st.max, width, f64::MIN),
+                    )
+                });
+            if let Some((min, max)) = extrema {
+                out.write_all(self.header_for("Summary:").as_bytes())?;
+                for (lbl, values) in [("Minimum:", min), ("Maximum:", max)] {
+                    let extreme = Row {
+                        values,
+                        ..row.clone()
+                    };
+                    buf.clear();
+                    self.render_row(&mut buf, lbl, &extreme, RowMode::Extreme);
+                    out.write_all(buf.as_bytes())?;
+                }
+            }
+            buf.clear();
+            self.render_row(&mut buf, label, row, RowMode::Average);
+            out.write_all(buf.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// 平均行を組み立てる。戻り値の `usize` は [`SarBlock::items`] の位置
+    /// (`-x` の極値を引くのに使う)。
+    fn average_rows(&self, itv: u64) -> Vec<(usize, Row)> {
         let Some(plan) = self.plan.as_ref() else {
             return Vec::new();
         };
+        // `A_CPU` の `f_print_avg` は `f_print` と同じ関数なので、平均行でも
+        // `get_global_cpu_statistics()` を通り直す。つまり集約値・分母・
+        // オフライン判定は「最初のサンプル」と「最後に表示したサンプル」の
+        // 2 点から作り直される (03 §1.4.3 / §8.1)。
+        let cpu_agg = if self.view.id == ActivityId::CPU {
+            compute::aggregate_cpu(plan, &self.cpu_first, &self.cpu_last, false)
+        } else {
+            None
+        };
+
         let mut rows = Vec::new();
-        for (idx, state) in self.items.iter().enumerate() {
+        for (pos, state) in self.items.iter().enumerate() {
             if !state.displayed {
                 continue;
             }
+            // 区間の端点でオフラインだった CPU は平均行も出さない
+            if cpu_agg
+                .as_ref()
+                .is_some_and(|a| a.offline.contains(&state.index))
+            {
+                continue;
+            }
             let mut ctx = ComputeContext::new(itv);
-            ctx.aggregate_item = idx == 0;
+            ctx.aggregate_item = state.index == 0;
+            // 集約行だけは合算済みの端点と `deltot_jiffies` に差し替える
+            let aggregated = cpu_agg.as_ref().filter(|_| state.index == 0);
+            let (first, last) = match aggregated {
+                Some(agg) => (&agg.prev, &agg.curr),
+                None => (&state.first, &state.last),
+            };
             if self.view.id == ActivityId::CPU {
-                let (_, total) = compute::per_cpu_interval(plan, &state.first, &state.last);
+                let total = match aggregated {
+                    Some(agg) => agg.tick_total,
+                    None => compute::per_cpu_interval(plan, first, last).1,
+                };
                 ctx.tick_total = Some(total.max(1));
             }
 
@@ -2478,44 +2789,46 @@ impl SarBlock {
                         &state.last_slots,
                     )]
                 }
-                _ => self
-                    .view
-                    .cells
-                    .iter()
-                    .map(|spec| match spec.avg {
-                        AvgKind::Rate => {
-                            let prev = if self.view.id == ActivityId::CPU {
-                                compute::per_cpu_interval(plan, &state.first, &state.last).0
-                            } else {
-                                state.first.clone()
-                            };
-                            self.value_of(plan, spec.col, &prev, &state.last, &ctx)
-                        }
-                        AvgKind::Mean => state.accum.mean(spec.col),
-                        AvgKind::MeanRatio => compute::average_ratio(
-                            self.view.id,
-                            spec.col,
-                            plan,
-                            &state.accum,
-                            &state.last,
-                        ),
-                        // 方式 C: 最後に観測した値をそのまま再掲する
-                        AvgKind::Last => {
-                            self.value_of(plan, spec.col, &state.last, &state.last, &ctx)
-                        }
-                    })
-                    .collect(),
+                _ => {
+                    // 方式 A の差分基準。`A_CPU` は `iowait` / `idle` の
+                    // 前値補正後を使う (集約行は既に補正済みの合算値)。
+                    let rate_prev = match (self.view.id, aggregated) {
+                        (ActivityId::CPU, None) => compute::per_cpu_interval(plan, first, last).0,
+                        _ => first.clone(),
+                    };
+                    self.view
+                        .cells
+                        .iter()
+                        .map(|spec| match spec.avg {
+                            AvgKind::Rate => self.value_of(plan, spec.col, &rate_prev, last, &ctx),
+                            AvgKind::Mean => state.accum.mean(spec.col),
+                            AvgKind::MeanRatio => compute::average_ratio(
+                                self.view.id,
+                                spec.col,
+                                plan,
+                                &state.accum,
+                                last,
+                            ),
+                            // 方式 C: 最後に観測した値をそのまま再掲する
+                            AvgKind::Last => self.value_of(plan, spec.col, last, last, &ctx),
+                        })
+                        .collect()
+                }
             };
 
-            rows.push(Row {
-                key: state.key.clone(),
-                label: state.label.clone(),
-                values,
-                tail: state.tail.clone(),
-                usb_names: state.usb_names.clone(),
-                snapshot: state.last.clone(),
-                slots: state.last_slots.clone(),
-            });
+            rows.push((
+                pos,
+                Row {
+                    key: state.key.clone(),
+                    index: state.index,
+                    label: state.label.clone(),
+                    values,
+                    tail: state.tail.clone(),
+                    usb_names: state.usb_names.clone(),
+                    snapshot: last.clone(),
+                    slots: state.last_slots.clone(),
+                },
+            ));
         }
         rows
     }
@@ -2562,12 +2875,28 @@ pub fn write_report<W: Write>(
     write_banner(out, file).map_err(io)?;
     for id in activities {
         for mut block in SarBlock::blocks_for(*id, opts) {
+            // 本家はアクティビティごとにファイルを巻き戻して読み直し、そのたびに
+            // `cross_day` を戻す。走査ごとに cursor を作れば同じ状態になる。
+            let mut cursor = opts.time_filter.cursor();
             // イベントは読んだ順にその場で渡す。最後の統計レコードより後ろにある
             // `COM` / `LINUX RESTART` 行も、`Average:` 行の前に出る。
             walk_items(file, &Selection::Only(vec![*id]), |item| {
                 match item {
-                    WalkItem::Event(ev) => block.event(out, &ev).map_err(io)?,
-                    WalkItem::Sample(view) => block.record(out, view).map_err(io)?,
+                    WalkItem::Event(ev) => {
+                        // 範囲外の特殊レコードは表示しない (`print_special_record()`)
+                        if cursor.event(ev.ust_time(), ev.time()) {
+                            block.event(out, &ev).map_err(io)?;
+                        }
+                    }
+                    WalkItem::Sample(view) => match cursor.sample(view) {
+                        Admit::Skip => {}
+                        // `Reference` は `-s` に最初に合致したレコード。
+                        // `SarBlock` 側が「前サンプルが無い区間の基準」として
+                        // 表示せずに採る (`adopt_reference`)。
+                        Admit::Reference | Admit::Emit => block.record(out, view).map_err(io)?,
+                        // `-e` 超過。このレコードは出さずに打ち切る。
+                        Admit::Stop => return Ok(ScanControl::Stop),
+                    },
                 }
                 Ok(ScanControl::Continue)
             })?;
@@ -2584,6 +2913,24 @@ fn ratio_inputs(id: ActivityId) -> &'static [usize] {
         ActivityId::HUGE => &[huge_col::KBHUGTOTAL],
         _ => &[],
     }
+}
+
+/// `-z` がアイテム行を省略する activity か (03 §2.7)。
+///
+/// 本家で同一判定 (`memcmp` / `irq_nr` 比較) を持つのはこの 7 つだけ。
+/// 全 activity に同じ判定をかけると、値が変わらない `A_MEMORY` /
+/// `A_QUEUE` の行や tickless CPU の行まで消える。
+fn zero_omit_applies(id: ActivityId) -> bool {
+    matches!(
+        id,
+        ActivityId::IRQ
+            | ActivityId::SERIAL
+            | ActivityId::DISK
+            | ActivityId::NET_DEV
+            | ActivityId::NET_EDEV
+            | ActivityId::FS
+            | ActivityId::NET_SOFT
+    )
 }
 
 #[cfg(test)]

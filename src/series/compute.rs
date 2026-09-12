@@ -398,13 +398,68 @@ pub type Computed = Result<f64, ComputeIssue>;
 ///   ものもある (`availablekb` ← `frmkb`、02 §8)。
 /// - 独自出力・集計では「欠落」と「0」を混同してはいけない (`docs/design.md` §4)。
 ///   欠落を 0 とみなした結果が値の意味を変える箇所では、計算せずに理由を返す。
+///
+/// ## ゼロ補完は「計算層の責務」である (指摘 5)
+///
+/// 以前は直接列の欠落を [`ComputeIssue::UnsupportedBySource`] として返し、
+/// **出力層がそれを 0.0 に読み替えていた**。その結果 `sar` 互換テキストは
+/// `0.00` を出すのに `sadf` は空欄 / `null` を出すという、
+/// 互換出力どうしの不統一が生まれていた。
+///
+/// 本家は「足りないフィールドを 0 埋めした構造体」で計算を完了するので、
+/// ゼロ補完は書式化ではなく**計算の一部**である。よって
+/// [`MissingPolicy::Compat`] では計算層が `Ok(0.0)` まで出し、
+/// [`MissingPolicy::Strict`] だけが欠落を返す。
+/// 呼び出し側が欠落の種類で分岐したい場合は [`missing_kind`] を使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MissingPolicy {
-    /// 本家互換: その世代の `sar` が表示した値を再現する。
+    /// 本家互換: その世代の `sar` が表示した値を再現する (欠落は 0 埋め)。
     #[default]
     Compat,
     /// 厳密: 欠落を代替値で埋めず、[`ComputeIssue`] として報告する。
     Strict,
+}
+
+/// 欠落の種類 (指摘 5)。
+///
+/// 互換出力は [`MissingKind::ZeroFilled`] を `0.00` として出し、
+/// 独自出力は欠落のまま残す、という使い分けを呼び出し側でできるようにする。
+///
+/// [`MissingPolicy::Compat`] で計算した場合、`ZeroFilled` 相当の欠落は
+/// 計算層の中で 0 に埋められるのでここには現れない。
+/// この分類が要るのは [`MissingPolicy::Strict`] の結果を
+/// 互換出力へ流し込むときと、欠落理由を出力へ書き出すときである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingKind {
+    /// 本家がゼロ補完して表示する欠落 (03 §1.9-1)。
+    ///
+    /// 「その世代のファイルにフィールドが無い」だけで、
+    /// 本家は 0 埋めした構造体で計算を完了する。
+    ZeroFilled,
+    /// ゼロ補完してはいけない欠落。
+    ///
+    /// レコードに値が無い / 差分が取れない / 数値ではない / 未実装。
+    /// 0 を与えると「正常に 0」と区別できなくなる。
+    Absent,
+}
+
+/// [`ComputeIssue`] を「本家がゼロ補完する欠落」かどうかで分類する (指摘 5)。
+///
+/// 典拠: 03 §1.9-1。本家は期待する型別本数よりファイル側が少なければ
+/// 足りない分を 0 埋めした構造体で計算するため、
+/// discard 統計を持たない旧 `A_IO` の `dtps` / `bdscd` は `0.00` と表示される。
+/// 一方 `MissingInSample` や不連続は本家でも値が出ない (行そのものが無い)。
+#[inline]
+pub fn missing_kind(issue: ComputeIssue) -> MissingKind {
+    match issue {
+        // その世代のファイルにフィールドが無いだけ = 本家は 0 埋めして計算する
+        ComputeIssue::UnsupportedBySource => MissingKind::ZeroFilled,
+        ComputeIssue::MissingInSample
+        | ComputeIssue::Discontinuous(_)
+        | ComputeIssue::NotNumeric
+        | ComputeIssue::NeedsItemGroup
+        | ComputeIssue::NotImplemented => MissingKind::Absent,
+    }
 }
 
 // ============================================================================
@@ -446,13 +501,14 @@ fn raw_or_zero(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> Result<
     }
 }
 
-/// 派生計算の**主要項** (分子・分母・被減数) を取り出す。
+/// 方針に従って生値を取り出す。
 ///
-/// 欠落を 0 で埋めると値そのものが嘘になる位置で使う。
-/// 「総量 - 欠落」は総量に等しくなり使用率 100% を、
-/// 「欠落 / 総量」は 0% を、静かに作り出す。
+/// 派生計算の**主要項** (分子・分母・被減数) と直接列の読み出しに使う。
+/// この位置で欠落を無条件に 0 で埋めると値そのものが嘘になる
+/// (「総量 - 欠落」は総量に等しくなり使用率 100% を、
+/// 「欠落 / 総量」は 0% を、静かに作り出す)。
 ///
-/// [`MissingPolicy::Compat`] では本家と同じ 0 埋めを行い、
+/// [`MissingPolicy::Compat`] では本家と同じ 0 埋めを行い (03 §1.9-1)、
 /// [`MissingPolicy::Strict`] では計算せずに理由を返す。
 #[inline]
 fn primary_input(
@@ -487,9 +543,17 @@ fn counter_bits(plan: &DecodePlan, column: usize) -> CounterBits {
 /// `A_PWR_FAN` / `A_PWR_TEMP` / `A_PWR_IN` の値は C の `double` であり、
 /// レイアウト層は 8 バイトを `u64` として読み出している。ビットパターンを
 /// そのまま `f64` に読み替える (整数として解釈してはいけない)。
+///
+/// 欠落時は方針に従う。`Compat` では 0 埋めした構造体の `double` = `0.0` になる
+/// (ビットパターン 0 は IEEE-754 の `+0.0` なので、そのまま読み替えてよい)。
 #[inline]
-fn raw_f64(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> Computed {
-    raw_column(plan, item, column).map(f64::from_bits)
+fn raw_f64(
+    plan: &DecodePlan,
+    item: &ItemSnapshot,
+    column: usize,
+    policy: MissingPolicy,
+) -> Computed {
+    primary_input(plan, item, column, policy).map(f64::from_bits)
 }
 
 /// 列の生値を書き戻す。
@@ -506,23 +570,27 @@ fn set_column(plan: &DecodePlan, item: &mut ItemSnapshot, column: usize, value: 
     }
 }
 
-/// `A_CPU` などで使う tick 合計差分を求める。
+/// `A_CPU` の割合の分母になる tick 合計差分 (`deltot_jiffies`、03 §1.4.2)。
 ///
-/// 全フィールドの差分を合計する。オフライン CPU は全フィールドが 0 になるため
-/// 合計も 0 になり、そこから「この CPU は動いていない」と判定できる。
+/// **`plan` を取る形に変更した (指摘 1)。**
+/// 以前は「item の全フィールドの差分を単純合計する」実装だったため、
+/// `user` に内包される `guest` と `nice` に内包される `guest_nice` を
+/// 二重に計上していた。Δuser=100 / Δguest=50 / 他 0 のとき `%user` は
+/// 本来 100% だが、分母が 150 になり約 66.67% になっていた
+/// (仮想マシン稼働中の使用率が過小に出る)。
 ///
-/// **`A_CPU` では [`per_cpu_interval`] を使うこと。** この関数は
-/// 「全フィールドを単純に合計する」素朴な版で、`guest` の内包補正や
-/// 逆行クランプを行わないため CPU 使用率の分母には使えない。
-pub fn tick_total(prev: &ItemSnapshot, curr: &ItemSnapshot) -> u64 {
-    curr.values
-        .iter()
-        .zip(prev.values.iter())
-        .filter_map(|(c, p)| match (c, p) {
-            (Availability::Present(c), Availability::Present(p)) => Some(c.wrapping_sub(*p)),
-            _ => None,
-        })
-        .sum()
+/// 仕様の `get_per_cpu_interval()` は
+///
+/// - `user, nice, sys, iowait, idle, steal, hardirq, softirq` の **8 フィールドだけ**を足す
+///   (`guest` / `guest_nice` は足さない、03 §1.10-4)
+/// - 前サンプルの `iowait` / `idle` を補正してから差分を取る (03 §1.3.3)
+/// - `guest` が `user` を上回る誤差を `ishift` で足し戻す
+///
+/// より詳しい情報 (オフライン / tickless の判定、補正後の前値) が必要な場合は
+/// [`cpu_interval`] を使う。この関数はその `tick_total` だけを返す薄い入口で、
+/// 前サンプルの clone を作らない。
+pub fn tick_total(plan: &DecodePlan, prev: &ItemSnapshot, curr: &ItemSnapshot) -> u64 {
+    cpu_fix(plan, prev, curr).interval
 }
 
 // ============================================================================
@@ -604,11 +672,14 @@ fn column_value_with(
     }
 
     // 保存形式が特殊な直接列を先に処理する
-    if let Some(v) = special_direct(id, column, plan, prev, curr, ctx) {
+    if let Some(v) = special_direct(id, column, plan, prev, curr, ctx, policy) {
         return v;
     }
 
-    let curr_v = raw_column(plan, curr, column)?;
+    // その世代のファイルに無いフィールドは方針に従う。
+    // 本家は 0 埋めした構造体で計算を完了するので、互換では `Ok(0.0)` まで出す
+    // (以前は出力層が `Err` を 0.0 に読み替えていて sar と sadf で不統一だった)。
+    let curr_v = primary_input(plan, curr, column, policy)?;
 
     match meta.kind {
         // ゲージは差分化しない
@@ -622,7 +693,7 @@ fn column_value_with(
             if !ctx.continuous {
                 return Err(ComputeIssue::Discontinuous(Discontinuity::Restart));
             }
-            let prev_v = raw_column(plan, prev, column)?;
+            let prev_v = primary_input(plan, prev, column, policy)?;
 
             // 逆行クランプ (`ll_sp_value` / 各 print 関数の明示クランプ)。
             // ラップの復元より先に判定する: クランプ対象の列は本家が
@@ -665,15 +736,17 @@ fn column_value_with(
                 None => ctx.itv_cs,
             };
             let rate = delta as f64 / denominator as f64 * 100.0;
-            Ok(rate * counter_scale(id, column))
+            Ok(rate * rate_scale(id, column))
         }
     }
 }
 
-/// ゲージ列に掛けるスケール。
+/// ゲージ列に掛けるスケール (**保存値 → 表示単位**)。
 ///
 /// カーネル / sysstat が固定小数で保存している値を実単位に戻す。
-fn gauge_scale(id: ActivityId, column: usize) -> f64 {
+/// 期間集計でゲージ列を平均する場合、区間値 ([`column_value`]) には
+/// この係数が既に掛かっているので二重に掛けてはいけない。
+pub fn gauge_scale(id: ActivityId, column: usize) -> f64 {
     match id {
         // load_avg_* は 100 倍固定小数 (03 §1.5.4)
         ActivityId::QUEUE
@@ -698,8 +771,17 @@ fn gauge_scale(id: ActivityId, column: usize) -> f64 {
     }
 }
 
-/// カウンタ列のレートに掛けるスケール。
-fn counter_scale(id: ActivityId, column: usize) -> f64 {
+/// カウンタ列の「生のレート」に掛けるスケール (**保存値 → 表示単位**)。
+///
+/// 生のレートとは `S_VALUE(prev, curr, 分母)` = `Δ / 分母 × 100` のこと。
+/// この関数の戻り値を掛けたものが [`ColumnMeta::unit`] の単位になる。
+///
+/// **期間集計はこの係数を必ず掛ける。** 掛け忘れると平均 `rkB/s` が 2 倍、
+/// `aqu-sz` が 1,000 倍、`%util` が 10 倍、PSI が 10,000 倍になる (指摘 2)。
+/// 「差分合計 ÷ 分母合計」から表示値を出す入口は [`rate_from_totals`]。
+///
+/// 典拠: 03 §id=11 (ディスク列の式) / §1.5.3 (PSI) / §1.10-11 / §1.10-15。
+pub fn rate_scale(id: ActivityId, column: usize) -> f64 {
     match id {
         ActivityId::DISK => match column {
             // セクタ (512 B) → kB
@@ -710,8 +792,36 @@ fn counter_scale(id: ActivityId, column: usize) -> f64 {
             disk_col::UTIL_PCT => 0.1,
             _ => 1.0,
         },
+        // PSI の累積 µs 列は本家が `Δµs / (100 × itv)` を出す (03 §1.5.3)。
+        // 生のレート `Δ/itv×100` からは 1/10000 で一致する。
+        // この係数があるので、集計は PSI も他のカウンタと同じ経路で扱える。
+        ActivityId::PSI_CPU | ActivityId::PSI_IO | ActivityId::PSI_MEM if is_psi_total(column) => {
+            1.0e-4
+        }
         _ => 1.0,
     }
+}
+
+/// 期間集計の「差分合計 ÷ 分母合計」を**表示単位のレート**に直す (指摘 2)。
+///
+/// 集計側は区間ごとの [`RateSample`] を足し込むだけでよく、
+/// 単位換算をこちらに寄せることで「出力形式ごとにスケーリングが抜ける」事故を防ぐ。
+///
+/// 1 区間だけを足し込んだ場合、結果はその区間の [`column_value`] と一致する
+/// (テスト `single_interval_aggregate_matches_instant_value` がそれを固定している)。
+///
+/// 分母の合計が 0 のときは `None` (「0% だった」と報告してはいけない)。
+pub fn rate_from_totals(
+    id: ActivityId,
+    column: usize,
+    delta_total: u128,
+    denom_total: u128,
+) -> Option<f64> {
+    if denom_total == 0 {
+        return None;
+    }
+    let rate = delta_total as f64 / denom_total as f64 * 100.0;
+    Some(rate * rate_scale(id, column))
 }
 
 /// カウンタ逆行を 0.0 にクランプする列か。
@@ -751,6 +861,7 @@ fn is_psi_total(column: usize) -> bool {
 /// 保存形式が特殊で汎用経路に乗らない直接列。
 ///
 /// `Some` を返した場合はそれが最終値。`None` なら汎用経路に進む。
+#[allow(clippy::too_many_arguments)]
 fn special_direct(
     id: ActivityId,
     column: usize,
@@ -758,27 +869,28 @@ fn special_direct(
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Option<Computed> {
     match id {
         // --- PSI: 累積マイクロ秒。S_VALUE は使わない (03 §1.5.3) ---
         ActivityId::PSI_CPU | ActivityId::PSI_IO | ActivityId::PSI_MEM if is_psi_total(column) => {
-            Some(psi_pressure(plan, prev, curr, column, ctx))
+            Some(psi_pressure(plan, prev, curr, column, ctx, policy))
         }
         // --- IEEE-754 double で保存されているセンサ値 ---
         ActivityId::PWR_FAN if matches!(column, fan_col::RPM | fan_col::RPM_MIN) => {
-            Some(raw_f64(plan, curr, column))
+            Some(raw_f64(plan, curr, column, policy))
         }
         ActivityId::PWR_TEMP
             if matches!(column, temp_col::DEGC | temp_col::MIN | temp_col::MAX) =>
         {
-            Some(raw_f64(plan, curr, column))
+            Some(raw_f64(plan, curr, column, policy))
         }
         ActivityId::PWR_IN if matches!(column, in_col::VOLTS | in_col::MIN | in_col::MAX) => {
-            Some(raw_f64(plan, curr, column))
+            Some(raw_f64(plan, curr, column, policy))
         }
         // --- A_PWR_BAT の capacity は signed char (03 §id=43) ---
         ActivityId::PWR_BAT if column == bat_col::CAP_PCT => {
-            Some(raw_column(plan, curr, column).map(|v| f64::from(signed_byte(v))))
+            Some(primary_input(plan, curr, column, policy).map(|v| f64::from(signed_byte(v))))
         }
         _ => None,
     }
@@ -797,6 +909,7 @@ fn psi_pressure(
     curr: &ItemSnapshot,
     column: usize,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Computed {
     if !ctx.has_prev {
         return Err(ComputeIssue::Discontinuous(Discontinuity::FirstSample));
@@ -804,8 +917,8 @@ fn psi_pressure(
     if !ctx.continuous {
         return Err(ComputeIssue::Discontinuous(Discontinuity::Restart));
     }
-    let c = raw_column(plan, curr, column)?;
-    let p = raw_column(plan, prev, column)?;
+    let c = primary_input(plan, curr, column, policy)?;
+    let p = primary_input(plan, prev, column, policy)?;
     Ok((c as f64 - p as f64) / (100.0 * ctx.itv_cs as f64))
 }
 
@@ -847,17 +960,17 @@ pub fn derived_value(
     }
 
     match id {
-        ActivityId::CPU => cpu_derived(column, plan, prev, curr, ctx),
+        ActivityId::CPU => cpu_derived(column, plan, prev, curr, ctx, policy),
         ActivityId::MEMORY => memory_derived(column, plan, curr, policy),
-        ActivityId::HUGE => huge_derived(column, plan, curr),
-        ActivityId::DISK => disk_derived(column, plan, prev, curr, ctx),
-        ActivityId::FS => fs_derived(column, plan, curr),
+        ActivityId::HUGE => huge_derived(column, plan, curr, policy),
+        ActivityId::DISK => disk_derived(column, plan, prev, curr, ctx, policy),
+        ActivityId::FS => fs_derived(column, plan, curr, policy),
         ActivityId::NET_DEV => net_dev_derived(column, plan, prev, curr, ctx, policy),
-        ActivityId::PWR_FAN => fan_derived(column, plan, curr),
-        ActivityId::PWR_TEMP => temp_derived(column, plan, curr),
-        ActivityId::PWR_IN => in_derived(column, plan, curr),
+        ActivityId::PWR_FAN => fan_derived(column, plan, curr, policy),
+        ActivityId::PWR_TEMP => temp_derived(column, plan, curr, policy),
+        ActivityId::PWR_IN => in_derived(column, plan, curr, policy),
         ActivityId::PWR_FREQ if column == freq_col::WGH_MHZ => Err(ComputeIssue::NeedsItemGroup),
-        ActivityId::PWR_BAT => bat_derived(column, plan, prev, curr, ctx),
+        ActivityId::PWR_BAT => bat_derived(column, plan, prev, curr, ctx, policy),
         _ => Err(ComputeIssue::NotImplemented),
     }
 }
@@ -869,6 +982,7 @@ fn cpu_derived(
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Computed {
     if !ctx.has_prev {
         return Err(ComputeIssue::Discontinuous(Discontinuity::FirstSample));
@@ -902,22 +1016,22 @@ fn cpu_derived(
     match column {
         // %system = sys + hardirq + softirq (`-u`)
         cpu_col::SYSTEM => {
-            let p = raw_column(plan, prev, cpu_col::SYS)?
+            let p = primary_input(plan, prev, cpu_col::SYS, policy)?
                 .wrapping_add(raw_or_zero(plan, prev, cpu_col::IRQ)?)
                 .wrapping_add(raw_or_zero(plan, prev, cpu_col::SOFT)?);
-            let c = raw_column(plan, curr, cpu_col::SYS)?
+            let c = primary_input(plan, curr, cpu_col::SYS, policy)?
                 .wrapping_add(raw_or_zero(plan, curr, cpu_col::IRQ)?)
                 .wrapping_add(raw_or_zero(plan, curr, cpu_col::SOFT)?);
             Ok(llsp(p, c))
         }
         // %usr = user - guest (`-u ALL`)
         cpu_col::USR => {
-            let p = raw_column(plan, prev, cpu_col::USER)?.wrapping_sub(raw_or_zero(
+            let p = primary_input(plan, prev, cpu_col::USER, policy)?.wrapping_sub(raw_or_zero(
                 plan,
                 prev,
                 cpu_col::GUEST,
             )?);
-            let c = raw_column(plan, curr, cpu_col::USER)?.wrapping_sub(raw_or_zero(
+            let c = primary_input(plan, curr, cpu_col::USER, policy)?.wrapping_sub(raw_or_zero(
                 plan,
                 curr,
                 cpu_col::GUEST,
@@ -926,12 +1040,12 @@ fn cpu_derived(
         }
         // %nice = nice - guest_nice (`-u ALL`)
         cpu_col::NICE_EXCL_GNICE => {
-            let p = raw_column(plan, prev, cpu_col::NICE)?.wrapping_sub(raw_or_zero(
+            let p = primary_input(plan, prev, cpu_col::NICE, policy)?.wrapping_sub(raw_or_zero(
                 plan,
                 prev,
                 cpu_col::GNICE,
             )?);
-            let c = raw_column(plan, curr, cpu_col::NICE)?.wrapping_sub(raw_or_zero(
+            let c = primary_input(plan, curr, cpu_col::NICE, policy)?.wrapping_sub(raw_or_zero(
                 plan,
                 curr,
                 cpu_col::GNICE,
@@ -995,12 +1109,12 @@ fn memory_derived(
     match column {
         // kbmemused = tlmkb - availablekb (frmkb ではない)
         mem_col::KBMEMUSED => {
-            let total = raw_column(plan, curr, mem_col::KBMEMTOTAL)?;
+            let total = primary_input(plan, curr, mem_col::KBMEMTOTAL, policy)?;
             let avail = memory_available(plan, curr, policy)?;
             Ok(total.wrapping_sub(avail) as f64)
         }
         mem_col::MEMUSED_PCT => {
-            let total = raw_column(plan, curr, mem_col::KBMEMTOTAL)?;
+            let total = primary_input(plan, curr, mem_col::KBMEMTOTAL, policy)?;
             let avail = memory_available(plan, curr, policy)?;
             Ok(if total != 0 {
                 sp_value(avail, total, total)
@@ -1011,11 +1125,8 @@ fn memory_derived(
         mem_col::COMMIT_PCT => {
             // tlskb は分母の加算項。swap を持たない世代では 0 でよい
             // (RAM だけが分母になる = その世代の sar と同じ)。
-            let total = raw_column(plan, curr, mem_col::KBMEMTOTAL)?.wrapping_add(raw_or_zero(
-                plan,
-                curr,
-                mem_col::KBSWPTOTAL,
-            )?);
+            let total = primary_input(plan, curr, mem_col::KBMEMTOTAL, policy)?
+                .wrapping_add(raw_or_zero(plan, curr, mem_col::KBSWPTOTAL)?);
             // comkb は分子そのもの。欠落を 0 にすると %commit が常に 0% になる
             let com = primary_input(plan, curr, mem_col::KBCOMMIT, policy)?;
             Ok(if total != 0 {
@@ -1025,13 +1136,13 @@ fn memory_derived(
             })
         }
         mem_col::KBSWPUSED => {
-            let total = raw_column(plan, curr, mem_col::KBSWPTOTAL)?;
-            let free = raw_column(plan, curr, mem_col::KBSWPFREE)?;
+            let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             Ok(total.wrapping_sub(free) as f64)
         }
         mem_col::SWPUSED_PCT => {
-            let total = raw_column(plan, curr, mem_col::KBSWPTOTAL)?;
-            let free = raw_column(plan, curr, mem_col::KBSWPFREE)?;
+            let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             Ok(if total != 0 {
                 sp_value(free, total, total)
             } else {
@@ -1039,8 +1150,8 @@ fn memory_derived(
             })
         }
         mem_col::SWPCAD_PCT => {
-            let total = raw_column(plan, curr, mem_col::KBSWPTOTAL)?;
-            let free = raw_column(plan, curr, mem_col::KBSWPFREE)?;
+            let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             // caskb は分子そのもの。欠落を 0 にすると %swpcad が常に 0% になる
             let cad = primary_input(plan, curr, mem_col::KBSWPCAD, policy)?;
             let used = total.wrapping_sub(free);
@@ -1055,9 +1166,14 @@ fn memory_derived(
 }
 
 /// `A_HUGE` の派生列。
-fn huge_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed {
-    let total = raw_column(plan, curr, huge_col::KBHUGTOTAL)?;
-    let free = raw_column(plan, curr, huge_col::KBHUGFREE)?;
+fn huge_derived(
+    column: usize,
+    plan: &DecodePlan,
+    curr: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Computed {
+    let total = primary_input(plan, curr, huge_col::KBHUGTOTAL, policy)?;
+    let free = primary_input(plan, curr, huge_col::KBHUGFREE, policy)?;
     match column {
         huge_col::KBHUGUSED => Ok(total.wrapping_sub(free) as f64),
         huge_col::HUGUSED_PCT => Ok(if total != 0 {
@@ -1076,6 +1192,7 @@ fn disk_derived(
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Computed {
     if !ctx.has_prev {
         return Err(ComputeIssue::Discontinuous(Discontinuity::FirstSample));
@@ -1084,8 +1201,8 @@ fn disk_derived(
         return Err(ComputeIssue::Discontinuous(Discontinuity::Restart));
     }
 
-    let ios_p = raw_column(plan, prev, disk_col::TPS)?;
-    let ios_c = raw_column(plan, curr, disk_col::TPS)?;
+    let ios_p = primary_input(plan, prev, disk_col::TPS, policy)?;
+    let ios_c = primary_input(plan, curr, disk_col::TPS, policy)?;
     // 完了 I/O が増えていないときは 0 (0 除算回避も兼ねる)。
     // 本家も `nr_ios_c > nr_ios_p` を素の比較で行い、偽なら 0.0 を返す (03 §5.1)。
     if ios_c <= ios_p {
@@ -1093,52 +1210,112 @@ fn disk_derived(
     }
     let d_ios = (ios_c - ios_p) as f64;
 
-    // 各入力列の差分は**その列の幅**で取る。
-    //
-    // `rd_ticks` / `wr_ticks` / `dc_ticks` は全世代で `unsigned int` (02 §7)。
-    // 64bit のまま引くと、tick カウンタが一周した区間で差分が 1.84e19 になり、
-    // `await` が 10¹⁸ ms という値になる。本家は `unsigned int` 同士の減算なので
-    // 32bit で一周が畳まれ、正しい ms が出る。ここを合わせる。
-    //
-    // 3 本の和は f64 で取る。本家は `unsigned int` の和なので 2^32 ms
-    // (約 49 日分の tick) を超えると本家側だけが一周するが、
-    // 1 区間でそこまで積み上がる入力は現実には無い。
-    let sum_delta = |cols: [usize; 3]| -> Result<f64, ComputeIssue> {
-        let mut acc = 0.0;
-        for c in cols {
-            let p = raw_or_zero(plan, prev, c)?;
-            let n = raw_or_zero(plan, curr, c)?;
-            acc += wrapping_delta(p, n, counter_bits(plan, c)) as f64;
-        }
-        Ok(acc)
-    };
-
     match column {
         // areq-sz = Σ(Δsect) / Δnr_ios / 2 (セクタ → kB)
         disk_col::AREQ_SZ => {
-            let sect = sum_delta([disk_col::RKB, disk_col::WKB, disk_col::DKB])?;
+            let sect = disk_sum_delta(
+                plan,
+                prev,
+                curr,
+                [disk_col::RKB, disk_col::WKB, disk_col::DKB],
+                SumWidth::Bits64,
+            )?;
             Ok(sect / d_ios / 2.0)
         }
         // await = Σ(Δticks) / Δnr_ios (ミリ秒、追加スケーリングなし)
         disk_col::AWAIT => {
-            let ticks = sum_delta([disk_col::RD_TICKS, disk_col::WR_TICKS, disk_col::DC_TICKS])?;
+            let ticks = disk_sum_delta(
+                plan,
+                prev,
+                curr,
+                [disk_col::RD_TICKS, disk_col::WR_TICKS, disk_col::DC_TICKS],
+                // 本家は `unsigned int` 同士を足すので和も 32bit で折り返す
+                match policy {
+                    MissingPolicy::Compat => SumWidth::Bits32,
+                    MissingPolicy::Strict => SumWidth::Bits64,
+                },
+            )?;
             Ok(ticks / d_ios)
         }
         _ => Err(ComputeIssue::NotImplemented),
     }
 }
 
+/// 差分の**和**を取る幅 (指摘 4)。
+///
+/// 本家の `compute_ext_disk_stats()` は C の整数式なので、和の型は
+/// フィールドの型で決まる (02 §7 の `stats_disk`)。
+///
+/// | 分子 | フィールドの型 | 和の型 |
+/// |---|---|---|
+/// | `await` | `rd_ticks` / `wr_ticks` / `dc_ticks` = `unsigned int` | `unsigned int` (mod 2³²) |
+/// | `arqsz` | `rd_sect` / `wr_sect` / `dc_sect` = `unsigned long` | `unsigned long` (読み手で 64bit) |
+///
+/// つまり `await` の分子だけが 2³² で折り返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SumWidth {
+    /// `unsigned int` の和 (mod 2³²)。
+    Bits32,
+    /// `unsigned long` / `unsigned long long` の和 (mod 2⁶⁴)。
+    Bits64,
+}
+
+/// ディスク派生列の分子 (複数列の差分の和) を求める。
+///
+/// 各列の差分は**その列の幅**で取る。`rd_ticks` などは全世代で `unsigned int`
+/// (02 §7) なので、64bit のまま引くと一周した区間で差分が 1.84e19 になり
+/// `await` が 10¹⁸ ms になる。本家は `unsigned int` 同士の減算なので
+/// 32bit で一周が畳まれる。
+///
+/// **和の幅は [`SumWidth`] で分ける (指摘 4)。** 互換出力の `await` は
+/// 本家と同じく `unsigned int` で足すため、分子が 2³² を超えると折り返す
+/// (Δ = 3,000,000,000 と 2,000,000,000 なら本家は 705,032,704)。
+/// 和を f64 で取ると 5,000,000,000 になり本家と食い違う。
+///
+/// 一方 [`MissingPolicy::Strict`] (独自出力・集計) では折り返しを再現しない。
+/// 「本家がそう出す」ことと「その値が正しい」ことは別で、
+/// 折り返した分子は待ち時間として意味を持たないため、
+/// 独自出力では 64bit で足して実際の合計を保つ。
+fn disk_sum_delta(
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    cols: [usize; 3],
+    width: SumWidth,
+) -> Result<f64, ComputeIssue> {
+    let mut acc: u64 = 0;
+    for c in cols {
+        // 欠落は加算項なので 0 でよい (discard 統計を持たない世代の `dc_ticks`)。
+        // 本家も 0 埋めした構造体で足している (03 §1.9-1)。
+        let p = raw_or_zero(plan, prev, c)?;
+        let n = raw_or_zero(plan, curr, c)?;
+        let d = wrapping_delta(p, n, counter_bits(plan, c));
+        acc = match width {
+            // `unsigned int` の加算 = mod 2^32
+            SumWidth::Bits32 => u64::from((acc as u32).wrapping_add(d as u32)),
+            SumWidth::Bits64 => acc.wrapping_add(d),
+        };
+    }
+    // f64 化は加算を終えた後。先に f64 にすると折り返しが再現できない。
+    Ok(acc as f64)
+}
+
 /// `A_FS` の派生列。`f_*` はバイト単位のゲージ (03 §id=37)。
-fn fs_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed {
+fn fs_derived(
+    column: usize,
+    plan: &DecodePlan,
+    curr: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Computed {
     match column {
         fs_col::MB_USED => {
-            let blocks = raw_column(plan, curr, fs_col::TOTAL)?;
-            let free = raw_column(plan, curr, fs_col::MB_FREE)?;
+            let blocks = primary_input(plan, curr, fs_col::TOTAL, policy)?;
+            let free = primary_input(plan, curr, fs_col::MB_FREE, policy)?;
             Ok(blocks.wrapping_sub(free) as f64)
         }
         fs_col::USED_PCT => {
-            let blocks = raw_column(plan, curr, fs_col::TOTAL)?;
-            let free = raw_column(plan, curr, fs_col::MB_FREE)?;
+            let blocks = primary_input(plan, curr, fs_col::TOTAL, policy)?;
+            let free = primary_input(plan, curr, fs_col::MB_FREE, policy)?;
             Ok(if blocks != 0 {
                 sp_value(free, blocks, blocks)
             } else {
@@ -1146,8 +1323,8 @@ fn fs_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed
             })
         }
         fs_col::UNPRIV_USED_PCT => {
-            let blocks = raw_column(plan, curr, fs_col::TOTAL)?;
-            let avail = raw_column(plan, curr, fs_col::AVAILABLE)?;
+            let blocks = primary_input(plan, curr, fs_col::TOTAL, policy)?;
+            let avail = primary_input(plan, curr, fs_col::AVAILABLE, policy)?;
             Ok(if blocks != 0 {
                 sp_value(avail, blocks, blocks)
             } else {
@@ -1155,13 +1332,13 @@ fn fs_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed
             })
         }
         fs_col::IUSED => {
-            let files = raw_column(plan, curr, fs_col::INODES_TOTAL)?;
-            let ffree = raw_column(plan, curr, fs_col::IFREE)?;
+            let files = primary_input(plan, curr, fs_col::INODES_TOTAL, policy)?;
+            let ffree = primary_input(plan, curr, fs_col::IFREE, policy)?;
             Ok(files.wrapping_sub(ffree) as f64)
         }
         fs_col::IUSED_PCT => {
-            let files = raw_column(plan, curr, fs_col::INODES_TOTAL)?;
-            let ffree = raw_column(plan, curr, fs_col::IFREE)?;
+            let files = primary_input(plan, curr, fs_col::INODES_TOTAL, policy)?;
+            let ffree = primary_input(plan, curr, fs_col::IFREE, policy)?;
             Ok(if files != 0 {
                 sp_value(ffree, files, files)
             } else {
@@ -1195,14 +1372,14 @@ fn net_dev_derived(
     // 差分は列の幅で取る (旧世代の `rx_bytes` は `unsigned long`。
     // 32bit ライタのファイルでは一周が 2^32 で起きる)。
     let rx = s_value_bits(
-        raw_column(plan, prev, net_dev_col::RXKB)?,
-        raw_column(plan, curr, net_dev_col::RXKB)?,
+        primary_input(plan, prev, net_dev_col::RXKB, policy)?,
+        primary_input(plan, curr, net_dev_col::RXKB, policy)?,
         ctx.itv_cs,
         counter_bits(plan, net_dev_col::RXKB),
     );
     let tx = s_value_bits(
-        raw_column(plan, prev, net_dev_col::TXKB)?,
-        raw_column(plan, curr, net_dev_col::TXKB)?,
+        primary_input(plan, prev, net_dev_col::TXKB, policy)?,
+        primary_input(plan, curr, net_dev_col::TXKB, policy)?,
         ctx.itv_cs,
         counter_bits(plan, net_dev_col::TXKB),
     );
@@ -1232,12 +1409,17 @@ pub fn ifutil(rx: f64, tx: f64, speed: u64, duplex_value: u64) -> f64 {
 }
 
 /// `A_PWR_FAN` の派生列 (`drpm` = rpm - rpm_min)。
-fn fan_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed {
+fn fan_derived(
+    column: usize,
+    plan: &DecodePlan,
+    curr: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Computed {
     if column != fan_col::DRPM {
         return Err(ComputeIssue::NotImplemented);
     }
-    let rpm = raw_f64(plan, curr, fan_col::RPM)?;
-    let rpm_min = raw_f64(plan, curr, fan_col::RPM_MIN)?;
+    let rpm = raw_f64(plan, curr, fan_col::RPM, policy)?;
+    let rpm_min = raw_f64(plan, curr, fan_col::RPM_MIN, policy)?;
     Ok(rpm - rpm_min)
 }
 
@@ -1252,26 +1434,36 @@ fn range_pct(value: f64, min: f64, max: f64) -> f64 {
 }
 
 /// `A_PWR_TEMP` の派生列 (`%temp`)。
-fn temp_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed {
+fn temp_derived(
+    column: usize,
+    plan: &DecodePlan,
+    curr: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Computed {
     if column != temp_col::PCT {
         return Err(ComputeIssue::NotImplemented);
     }
     Ok(range_pct(
-        raw_f64(plan, curr, temp_col::DEGC)?,
-        raw_f64(plan, curr, temp_col::MIN)?,
-        raw_f64(plan, curr, temp_col::MAX)?,
+        raw_f64(plan, curr, temp_col::DEGC, policy)?,
+        raw_f64(plan, curr, temp_col::MIN, policy)?,
+        raw_f64(plan, curr, temp_col::MAX, policy)?,
     ))
 }
 
 /// `A_PWR_IN` の派生列 (`%in`)。
-fn in_derived(column: usize, plan: &DecodePlan, curr: &ItemSnapshot) -> Computed {
+fn in_derived(
+    column: usize,
+    plan: &DecodePlan,
+    curr: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Computed {
     if column != in_col::PCT {
         return Err(ComputeIssue::NotImplemented);
     }
     Ok(range_pct(
-        raw_f64(plan, curr, in_col::VOLTS)?,
-        raw_f64(plan, curr, in_col::MIN)?,
-        raw_f64(plan, curr, in_col::MAX)?,
+        raw_f64(plan, curr, in_col::VOLTS, policy)?,
+        raw_f64(plan, curr, in_col::MIN, policy)?,
+        raw_f64(plan, curr, in_col::MAX, policy)?,
     ))
 }
 
@@ -1285,6 +1477,7 @@ fn bat_derived(
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     ctx: &ComputeContext,
+    policy: MissingPolicy,
 ) -> Computed {
     if column != bat_col::CAP_PER_MIN {
         return Err(ComputeIssue::NotImplemented);
@@ -1295,53 +1488,90 @@ fn bat_derived(
     if !ctx.continuous {
         return Err(ComputeIssue::Discontinuous(Discontinuity::Restart));
     }
-    let p = i32::from(signed_byte(raw_column(plan, prev, bat_col::CAP_PCT)?));
-    let c = i32::from(signed_byte(raw_column(plan, curr, bat_col::CAP_PCT)?));
+    let p = i32::from(signed_byte(primary_input(
+        plan,
+        prev,
+        bat_col::CAP_PCT,
+        policy,
+    )?));
+    let c = i32::from(signed_byte(primary_input(
+        plan,
+        curr,
+        bat_col::CAP_PCT,
+        policy,
+    )?));
     Ok(f64::from(c - p) * 6000.0 / ctx.itv_cs as f64)
 }
 
 // ============================================================================
-// A_CPU の tick 合計と CPU "all" の再合算
+// A_CPU の区間前処理 (tick 合計 / 前値補正 / オフライン・tickless 判定)
+//
+// **この前処理は sar 互換出力の専有物ではない (指摘 1)。**
+// 以前は `per_cpu_interval()` を sar 互換テキストだけが呼び、sadf・独自出力・
+// 集計は素の `tick_total()` を使っていた。その結果、同じファイルでも
+// 出力形式によって CPU 使用率の分母が変わり、オフライン / tickless の
+// 判定も形式ごとに違っていた。
+//
+// そこで「1 CPU 分の区間をどう解釈するか」を [`CpuInterval`] に一本化し、
+// どの経路からも同じ判定・同じ分母を得られるようにする。
+// 集約 (`all` 行) は [`aggregate_cpu`] が CPU ごとに補正してから合算する。
 // ============================================================================
 
 /// CPU の 1 フィールド分の差分。アンダーフローは 0 に潰す。
+///
+/// 12.8.0 で追加された修正 (03 §1.4.2)。これがないと 1 フィールドだけ
+/// 逆行したときに巨大な interval になり、**全パーセントが 0.00 に丸められる**。
 #[inline]
 fn cpu_delta(prev: u64, curr: u64) -> u64 {
     curr.saturating_sub(prev)
 }
 
-/// `get_per_cpu_interval()` 相当 (03 §1.4.2)。
+/// この item がその列を持っていれば値を、無ければ 0 を返す。
 ///
-/// 戻り値は「補正済みの前サンプル」と tick 合計 (jiffies)。
-/// 前サンプルの `iowait` / `idle` は CPU 復帰・トラッキング誤差の補正で
-/// 書き換わるため、CPU "all" の合算には**補正後の値**を使う必要がある。
-pub fn per_cpu_interval(
-    plan: &DecodePlan,
-    prev: &ItemSnapshot,
-    curr: &ItemSnapshot,
-) -> (ItemSnapshot, u64) {
-    let mut fixed = prev.clone();
-    let get = |item: &ItemSnapshot, col: usize| -> u64 {
-        match plan.column_value(&item.values, col) {
-            Availability::Present(v) => v,
-            _ => 0,
-        }
-    };
+/// CPU の tick フィールドは「無い世代」があり (`steal` / `guest` など)、
+/// 本家はそこを 0 埋めした構造体で計算する (03 §1.9-1)。
+#[inline]
+fn cpu_field(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> u64 {
+    match plan.column_value(&item.values, column) {
+        Availability::Present(v) => v,
+        _ => 0,
+    }
+}
 
+/// `get_per_cpu_interval()` の計算結果 (snapshot を作らない内部表現)。
+struct CpuFix {
+    /// 補正後の前サンプルの `iowait` (書き換えが起きたときだけ `Some`)。
+    iowait: Option<u64>,
+    /// 補正後の前サンプルの `idle` (書き換えが起きたときだけ `Some`)。
+    idle: Option<u64>,
+    /// tick 合計 (`ishift` 込み) = 割合の分母。
+    interval: u64,
+    /// 現サンプルの tick 8 フィールドの絶対和 (オフライン判定用)。
+    curr_sum: u64,
+    /// 前サンプルの tick 8 フィールドの絶対和 (基準値の有無の判定用)。
+    prev_sum: u64,
+}
+
+/// `get_per_cpu_interval()` 本体 (03 §1.4.2)。
+///
+/// 前サンプルを clone せずに「補正値」と「tick 合計」を求める。
+/// snapshot が必要な経路 ([`per_cpu_interval`] / [`cpu_interval`]) だけが
+/// clone を作る。
+fn cpu_fix(plan: &DecodePlan, prev: &ItemSnapshot, curr: &ItemSnapshot) -> CpuFix {
     let (cu, cn, cg, cgn) = (
-        get(curr, cpu_col::USER),
-        get(curr, cpu_col::NICE),
-        get(curr, cpu_col::GUEST),
-        get(curr, cpu_col::GNICE),
+        cpu_field(plan, curr, cpu_col::USER),
+        cpu_field(plan, curr, cpu_col::NICE),
+        cpu_field(plan, curr, cpu_col::GUEST),
+        cpu_field(plan, curr, cpu_col::GNICE),
     );
     let (pu, pn, pg, pgn) = (
-        get(prev, cpu_col::USER),
-        get(prev, cpu_col::NICE),
-        get(prev, cpu_col::GUEST),
-        get(prev, cpu_col::GNICE),
+        cpu_field(plan, prev, cpu_col::USER),
+        cpu_field(plan, prev, cpu_col::NICE),
+        cpu_field(plan, prev, cpu_col::GUEST),
+        cpu_field(plan, prev, cpu_col::GNICE),
     );
 
-    // guest が user に含まれる分の補正
+    // guest が user に含まれる分の補正 (`ishift`)
     let mut ishift: u64 = 0;
     if cu >= pu && cu.wrapping_sub(cg) < pu.wrapping_sub(pg) {
         ishift = ishift.wrapping_add(pu.wrapping_sub(pg).wrapping_sub(cu.wrapping_sub(cg)));
@@ -1351,35 +1581,223 @@ pub fn per_cpu_interval(
     }
 
     // CPU 復帰 / iowait 誤差の補正 (03 §1.3.3)
-    let (c_iowait, p_iowait) = (get(curr, cpu_col::IOWAIT), get(prev, cpu_col::IOWAIT));
-    let (c_idle, p_idle) = (get(curr, cpu_col::IDLE), get(prev, cpu_col::IDLE));
-    let mut fixed_iowait = p_iowait;
-    let mut fixed_idle = p_idle;
+    let (c_iowait, p_iowait) = (
+        cpu_field(plan, curr, cpu_col::IOWAIT),
+        cpu_field(plan, prev, cpu_col::IOWAIT),
+    );
+    let (c_idle, p_idle) = (
+        cpu_field(plan, curr, cpu_col::IDLE),
+        cpu_field(plan, prev, cpu_col::IDLE),
+    );
+    let mut iowait = None;
+    let mut idle = None;
     if c_iowait < p_iowait && p_iowait < CPU_OVERFLOW_THRESHOLD {
-        fixed_iowait = if c_idle > p_idle || p_idle >= CPU_OVERFLOW_THRESHOLD {
+        iowait = Some(if c_idle > p_idle || p_idle >= CPU_OVERFLOW_THRESHOLD {
             c_iowait
         } else {
             0
-        };
-        set_column(plan, &mut fixed, cpu_col::IOWAIT, fixed_iowait);
+        });
     }
     if c_idle < p_idle && p_idle < CPU_OVERFLOW_THRESHOLD {
-        fixed_idle = 0;
-        set_column(plan, &mut fixed, cpu_col::IDLE, 0);
+        idle = Some(0);
     }
 
-    // guest / guest_nice は user / nice に内包されるので足さない
+    // guest / guest_nice は user / nice に内包されるので足さない (03 §1.10-4)
     let mut interval: u64 = 0;
+    let mut curr_sum: u64 = 0;
+    let mut prev_sum: u64 = 0;
     for col in cpu_col::TICK_FIELDS {
-        let (p, c) = match col {
-            cpu_col::IOWAIT => (fixed_iowait, c_iowait),
-            cpu_col::IDLE => (fixed_idle, c_idle),
-            _ => (get(prev, col), get(curr, col)),
+        let c = match col {
+            cpu_col::IOWAIT => c_iowait,
+            cpu_col::IDLE => c_idle,
+            _ => cpu_field(plan, curr, col),
+        };
+        let raw_p = match col {
+            cpu_col::IOWAIT => p_iowait,
+            cpu_col::IDLE => p_idle,
+            _ => cpu_field(plan, prev, col),
+        };
+        // 差分は補正後の前値で取る。オフライン判定の絶対和は補正前の値で取る
+        // (本家も `tot_jiffies_p` を `get_per_cpu_interval()` の前に数える)。
+        let p = match col {
+            cpu_col::IOWAIT => iowait.unwrap_or(raw_p),
+            cpu_col::IDLE => idle.unwrap_or(raw_p),
+            _ => raw_p,
         };
         interval = interval.wrapping_add(cpu_delta(p, c));
+        curr_sum = curr_sum.wrapping_add(c);
+        prev_sum = prev_sum.wrapping_add(raw_p);
     }
 
-    (fixed, interval.wrapping_add(ishift))
+    CpuFix {
+        iowait,
+        idle,
+        interval: interval.wrapping_add(ishift),
+        curr_sum,
+        prev_sum,
+    }
+}
+
+/// `get_per_cpu_interval()` 相当 (03 §1.4.2)。
+///
+/// 戻り値は「補正済みの前サンプル」と tick 合計 (jiffies)。
+/// 前サンプルの `iowait` / `idle` は CPU 復帰・トラッキング誤差の補正で
+/// 書き換わるため、CPU "all" の合算には**補正後の値**を使う必要がある
+/// (03 §1.10-6)。
+///
+/// オフライン / tickless の判定まで含めて欲しい場合は [`cpu_interval`] を使う。
+pub fn per_cpu_interval(
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+) -> (ItemSnapshot, u64) {
+    let fix = cpu_fix(plan, prev, curr);
+    (apply_cpu_fix(plan, prev, &fix), fix.interval)
+}
+
+/// 補正値を前サンプルの clone に書き戻す。
+fn apply_cpu_fix(plan: &DecodePlan, prev: &ItemSnapshot, fix: &CpuFix) -> ItemSnapshot {
+    let mut fixed = prev.clone();
+    if let Some(v) = fix.iowait {
+        set_column(plan, &mut fixed, cpu_col::IOWAIT, v);
+    }
+    if let Some(v) = fix.idle {
+        set_column(plan, &mut fixed, cpu_col::IDLE, v);
+    }
+    fixed
+}
+
+/// この item が CPU "all" (集約行) か個別 CPU かを表す。
+///
+/// 分母と tickless の扱いが変わる (03 §1.4.5)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuRole {
+    /// CPU "all" (item 添字 0)。
+    ///
+    /// 「CPU all が tickless になることはない」という前提で、
+    /// tick 合計が 0 のときは **1 に差し替える**。
+    Aggregate,
+    /// 個別 CPU。tick 合計 0 は tickless CPU を意味する。
+    Single,
+}
+
+/// 1 CPU 分の区間の状態 (03 §1.4.3 / §1.4.5)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuState {
+    /// 通常。[`CpuInterval::tick_total`] を分母にして各列を計算する。
+    Online,
+    /// オフライン。`/proc/stat` から当該 CPU 行が消えている
+    /// (現サンプルの tick 8 フィールドの和が 0)。
+    ///
+    /// **行そのものを出力しない。** tickless と混同すると
+    /// 「ずっと 100% idle の CPU」が並ぶ嘘の出力になる。
+    Offline,
+    /// tickless。オンラインだが tick が発生していない (`CONFIG_NO_HZ_FULL`)。
+    ///
+    /// 計算せずに固定値を出す ([`CpuInterval::tickless_value`])。
+    Tickless,
+}
+
+/// 1 CPU 分の区間前処理の結果 (指摘 1)。
+///
+/// sar / sadf / 独自出力 / 集計のどの経路も、`A_CPU` の値を出す前に
+/// これを通すことで同じ分母・同じ判定になる。
+#[derive(Debug, Clone)]
+pub struct CpuInterval {
+    /// 補正済みの前サンプル。`iowait` / `idle` が書き換わっている場合がある。
+    ///
+    /// **列の計算にはこちらを渡す** (元の前サンプルではない)。
+    pub prev: ItemSnapshot,
+    /// 割合の分母 (`deltot_jiffies`)。[`CpuRole::Aggregate`] では 1 以上。
+    pub tick_total: u64,
+    pub state: CpuState,
+    role: CpuRole,
+}
+
+impl CpuInterval {
+    /// 行を出力してはいけない CPU か。
+    #[inline]
+    pub fn is_offline(&self) -> bool {
+        self.state == CpuState::Offline
+    }
+
+    /// 固定値を出す CPU か。
+    #[inline]
+    pub fn is_tickless(&self) -> bool {
+        self.state == CpuState::Tickless
+    }
+
+    #[inline]
+    pub fn role(&self) -> CpuRole {
+        self.role
+    }
+
+    /// この CPU の計算文脈。
+    ///
+    /// 分母 (`tick_total`) と集約フラグを設定済みの [`ComputeContext`] を返す。
+    /// 呼び出し側が `tick_total` を自分で詰める必要はない。
+    pub fn context(&self, itv_cs: u64) -> ComputeContext {
+        ComputeContext {
+            itv_cs,
+            tick_total: Some(self.tick_total),
+            continuous: true,
+            has_prev: true,
+            aggregate_item: self.role == CpuRole::Aggregate,
+        }
+    }
+
+    /// tickless CPU の固定値 (03 §1.4.5)。
+    ///
+    /// `%idle` は `100.00`、他の割合列は `0.00`。
+    /// tickless でない場合は `None` を返すので、
+    /// `interval.tickless_value(col).unwrap_or_else(|| 計算)` と書ける。
+    ///
+    /// `%guest` / `%gnice` / `%irq` / `%soft` も 0 になる
+    /// (本家は 5 個ずつ 2 回に分けて出力しており、2 回目の最後が `100.00`)。
+    pub fn tickless_value(&self, column: usize) -> Option<f64> {
+        if !self.is_tickless() {
+            return None;
+        }
+        Some(if column == cpu_col::IDLE { 100.0 } else { 0.0 })
+    }
+}
+
+/// 1 CPU 分の区間前処理 (指摘 1)。
+///
+/// `get_per_cpu_interval()` (03 §1.4.2) に、オフライン判定 (§1.4.3) と
+/// tickless 判定 (§1.4.5) を合わせた入口。
+///
+/// - 現サンプルの tick 8 フィールドの和が 0 → [`CpuState::Offline`]
+///   (行を出さない)
+/// - tick 合計差分が 0 で個別 CPU → [`CpuState::Tickless`] (固定値)
+/// - [`CpuRole::Aggregate`] では tick 合計を 1 以上に補正する
+pub fn cpu_interval(
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    role: CpuRole,
+) -> CpuInterval {
+    let fix = cpu_fix(plan, prev, curr);
+    let state = if fix.curr_sum == 0 {
+        // `/proc/stat` から行が消えている = オフライン。
+        // tickless (差分 0) とは**現サンプルの絶対値**で区別する。
+        CpuState::Offline
+    } else if fix.interval == 0 && role == CpuRole::Single {
+        CpuState::Tickless
+    } else {
+        CpuState::Online
+    };
+    let tick_total = match role {
+        // 「CPU all が tickless になることはない」前提で 0 を 1 に差し替える
+        CpuRole::Aggregate => fix.interval.max(1),
+        CpuRole::Single => fix.interval,
+    };
+    CpuInterval {
+        prev: apply_cpu_fix(plan, prev, &fix),
+        tick_total,
+        state,
+        role,
+    }
 }
 
 /// CPU がオフラインか (`tot_jiffies_c == 0`、03 §1.4.3)。
@@ -1394,10 +1812,7 @@ pub fn cpu_is_offline(plan: &DecodePlan, item: &ItemSnapshot) -> bool {
 fn cpu_tick_sum(plan: &DecodePlan, item: &ItemSnapshot) -> u64 {
     cpu_col::TICK_FIELDS
         .iter()
-        .map(|c| match plan.column_value(&item.values, *c) {
-            Availability::Present(v) => v,
-            _ => 0,
-        })
+        .map(|c| cpu_field(plan, item, *c))
         .fold(0u64, |a, b| a.wrapping_add(b))
 }
 
@@ -1414,6 +1829,29 @@ pub struct CpuAggregate {
     pub offline: Vec<usize>,
 }
 
+impl CpuAggregate {
+    /// CPU "all" 行の計算文脈 (指摘 1)。
+    ///
+    /// 分母は「オンラインだった CPU の tick 合計」なので、
+    /// `%user + … + %idle` は常に 100% になる (オフライン時間は分母に入らない)。
+    /// `CPU all が tickless になることはない`前提で 1 以上に補正する (03 §1.4.5)。
+    pub fn context(&self, itv_cs: u64) -> ComputeContext {
+        ComputeContext {
+            itv_cs,
+            tick_total: Some(self.tick_total.max(1)),
+            continuous: true,
+            has_prev: true,
+            aggregate_item: true,
+        }
+    }
+
+    /// その item 添字 (1 起点) がオフラインとしてマークされたか。
+    #[inline]
+    pub fn is_offline(&self, item_index: usize) -> bool {
+        self.offline.contains(&item_index)
+    }
+}
+
 /// `get_global_cpu_statistics()` 相当 (03 §1.4.3)。
 ///
 /// SMP では CPU "all" を `/proc/stat` の `cpu` 行ではなく
@@ -1425,6 +1863,10 @@ pub struct CpuAggregate {
 ///
 /// `since_boot` は本家の `WANT_SINCE_BOOT`。真のとき前サンプルは全ゼロが正常なので、
 /// 「前サンプルでもオフライン」によるスキップを行わない。
+///
+/// **CPU ごとに補正してから合算する (指摘 1 / 03 §1.10-6)。**
+/// `get_per_cpu_interval()` が前サンプルを書き換えるため、
+/// 補正前の値を足し込むと CPU "all" の割合がずれる。
 pub fn aggregate_cpu(
     plan: &DecodePlan,
     prev_items: &[ItemSnapshot],
@@ -1469,6 +1911,7 @@ pub fn aggregate_cpu(
             continue;
         }
 
+        // CPU ごとに補正 → その CPU の tick 合計を足す → 補正後の前値を足し込む
         let (fixed_prev, itv) = per_cpu_interval(plan, scp, &scc_owned);
         total = total.wrapping_add(itv);
         add_into(&mut agg_prev, &fixed_prev);
@@ -1511,7 +1954,6 @@ fn add_into(acc: &mut ItemSnapshot, src: &ItemSnapshot) {
         }
     }
 }
-
 // ============================================================================
 // A_PWR_FREQ の重み付き平均周波数
 // ============================================================================
@@ -1725,13 +2167,13 @@ pub fn average_ratio(
         // %temp / %in は min/max を**累積せず最終値で代入**する (03 §id=32 / §id=33)
         (ActivityId::PWR_TEMP, temp_col::PCT) => Ok(range_pct(
             acc.mean(temp_col::DEGC)?,
-            raw_f64(plan, last, temp_col::MIN)?,
-            raw_f64(plan, last, temp_col::MAX)?,
+            raw_f64(plan, last, temp_col::MIN, MissingPolicy::Compat)?,
+            raw_f64(plan, last, temp_col::MAX, MissingPolicy::Compat)?,
         )),
         (ActivityId::PWR_IN, in_col::PCT) => Ok(range_pct(
             acc.mean(in_col::VOLTS)?,
-            raw_f64(plan, last, in_col::MIN)?,
-            raw_f64(plan, last, in_col::MAX)?,
+            raw_f64(plan, last, in_col::MIN, MissingPolicy::Compat)?,
+            raw_f64(plan, last, in_col::MAX, MissingPolicy::Compat)?,
         )),
         _ => Err(ComputeIssue::NotImplemented),
     }

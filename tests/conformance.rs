@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fixtures::{Corruption, ExpectedError, FixtureAbi};
-use golden::{Comparison, Field, Mask};
+use golden::{Comparison, Mask};
 
 use re_sar_ch::Error;
 use re_sar_ch::cli::sar_args::{Activity, OptFlags, SarOptions, parse_sar_args};
@@ -160,35 +160,6 @@ enum Repro {
 /// `sadf -H` の 1 行目を落とすための語 (本家テストの `grep -v 0x2175` と同じ)。
 const SADF_H_GREP_V: &str = "0x2175";
 
-/// `Host:` 行の日付は**読み手のタイムゾーンに依存する**。
-///
-/// 本家 (`sa_common.c: get_file_timestamp_struct()`) は `-t` 指定が無い限り
-/// `localtime(sa_ust_time)` で日付を作る。期待出力は `TZ=GMT` (00655) あるいは
-/// 生成環境の `TZ` (00787/00791/00794) で作られており、**ファイルの中身だけからは
-/// 再現できない**。日付の語だけを潰し、区切り (空白 + タブ) と他の語は比較したまま残す。
-const MASK_HOST_DATE: Mask = Mask {
-    line_prefix: "Host: ",
-    // `Host: <sysname> <release> (<nodename>) \t<MM/DD/YY> \t_<machine>_\t(<N> CPU)`
-    // → タブ区切り 1 番目のフィールドの先頭語が日付。
-    field: Field::TabWord { index: 1, word: 0 },
-    reason: "`Host:` 行の日付は localtime(sa_ust_time) 由来で読み手の TZ に依存する",
-};
-
-/// `docs/format/04-test-data.md` §5.1 のフェーズ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// ヘッダ解析のみ (`sadf -H` 相当)。
-    Header,
-    /// 生値デコード (`sadf -r -O debug` 相当)。
-    RawValues,
-    /// `sar` テキスト出力。
-    SarText,
-}
-
-/// 同梱バイナリ由来の golden (全件)。
-///
-/// コマンドラインは本家テストのものをそのまま記録してある。
-/// 環境変数の固定 (`LC_ALL=C` / `TZ=GMT`) は再現性のために必須 (§7.3)。
 const GOLDEN_CASES: &[GoldenCase] = &[
     GoldenCase {
         upstream_test: "00655",
@@ -197,7 +168,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.data-12.0.0-H",
         phase: Phase::Header,
         repro: Repro::SadfHeader,
-        masks: &[MASK_HOST_DATE],
+        masks: &[Mask::HostLineDate],
     },
     GoldenCase {
         upstream_test: "00787",
@@ -206,7 +177,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.sadf-data-ukwn",
         phase: Phase::Header,
         repro: Repro::SadfHeader,
-        masks: &[MASK_HOST_DATE],
+        masks: &[Mask::HostLineDate],
     },
     GoldenCase {
         upstream_test: "00791",
@@ -215,7 +186,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.sadf-data-ukwn0",
         phase: Phase::Header,
         repro: Repro::SadfHeader,
-        masks: &[MASK_HOST_DATE],
+        masks: &[Mask::HostLineDate],
     },
     GoldenCase {
         upstream_test: "00794",
@@ -224,7 +195,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.sadf-data-ukwn1",
         phase: Phase::Header,
         repro: Repro::SadfHeader,
-        masks: &[MASK_HOST_DATE],
+        masks: &[Mask::HostLineDate],
     },
     GoldenCase {
         upstream_test: "00650",
@@ -233,7 +204,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.data-12.0.0",
         phase: Phase::SarText,
         repro: Repro::Sar(&["-AC"]),
-        masks: &[],
+        masks: &[Mask::DiskDeviceName],
     },
     GoldenCase {
         upstream_test: "00700",
@@ -320,7 +291,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.data-9.1.6",
         phase: Phase::SarText,
         repro: Repro::Sar(&["-C", "-A"]),
-        masks: &[],
+        masks: &[Mask::DiskDeviceName],
     },
     GoldenCase {
         upstream_test: "00615",
@@ -329,7 +300,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.data-10.3.1",
         phase: Phase::SarText,
         repro: Repro::Sar(&["-C", "-A"]),
-        masks: &[],
+        masks: &[Mask::DiskDeviceName],
     },
     GoldenCase {
         upstream_test: "00625",
@@ -338,7 +309,7 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         golden: "expected.data-11.6.5",
         phase: Phase::SarText,
         repro: Repro::Sar(&["-C", "-A"]),
-        masks: &[],
+        masks: &[Mask::DiskDeviceName],
     },
 ];
 
@@ -478,6 +449,19 @@ fn sar_text_options(o: &SarOptions) -> SarTextOptions {
         },
         cpus,
     }
+}
+
+/// 不一致ケースの出力全体を `target/golden-actual/` へ書き出す。
+///
+/// 行単位の要約では追えない食い違い (ブロックの増減・順序) を
+/// `diff -u <expected> <actual>` で追えるようにする。書けなければ諦める
+/// (診断の補助なので、失敗をテストの失敗にしない)。
+fn dump_actual(case: &GoldenCase, actual: &str) -> Option<PathBuf> {
+    let dir = upstream_dir()?.parent()?.join("golden-actual");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.{}", case.golden, case.upstream_test));
+    std::fs::write(&path, actual).ok()?;
+    Some(path)
 }
 
 /// 選択された activity を**ファイル記載順**で返す (本家の `id_seq[]` と同じ順序)。
@@ -920,6 +904,14 @@ fn golden_outputs_match_upstream() {
 
         compared += 1;
         let cmp: Comparison = golden::compare(&expected, &actual, case.masks);
+        // 差分が出たケースは出力全体をファイルへ落とす。
+        // 行単位の要約だけでは追えない食い違い (行の増減・ブロック順) を
+        // `diff -u` で追えるようにするため。
+        if !cmp.is_match() {
+            if let Some(path) = dump_actual(case, &actual) {
+                eprintln!("            実際の出力: {}", path.display());
+            }
+        }
         let label = if cmp.is_match() {
             if cmp.masked.is_empty() {
                 exact += 1;

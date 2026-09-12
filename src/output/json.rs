@@ -31,6 +31,7 @@ use crate::format::file::{SaFile, ScanControl};
 use crate::layout::registry::{ActivityDef, ColumnMeta};
 use crate::model::{ActivityId, Availability, ValueKind};
 use crate::series::compute::ComputeIssue;
+use crate::output::time_filter::{Admit, TimeFilter};
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 公開スキーマの版。
@@ -69,6 +70,12 @@ pub struct CustomConfig {
     /// 対象 activity。
     pub selection: Selection,
     pub values: ValueScope,
+    /// `--from` / `--to` の時刻フィルタ。既定は無効 (全レコードを出す)。
+    ///
+    /// 意味論は `sar -s` / `-e` と同じで、範囲に最初に合致したレコードは
+    /// 差分の基準として消費されるだけで行にならない
+    /// (`crate::output::time_filter` 参照)。
+    pub time_filter: TimeFilter,
 }
 
 // ===========================================================================
@@ -506,6 +513,7 @@ pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> R
 
     let mut boot = BootCounter::default();
     let mut first = true;
+    let mut cursor = cfg.time_filter.cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // `samples` しか持たない形式なので、イベントは起動区間の番号にだけ効かせる。
         let view = match item {
@@ -515,6 +523,11 @@ pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> R
             }
             WalkItem::Sample(view) => view,
         };
+        match cursor.sample(view) {
+            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
+            Admit::Stop => return Ok(ScanControl::Stop),
+            Admit::Emit => {}
+        }
         let sample = sample_out(view, boot.get(), cfg);
         if sample.activities.is_empty() {
             return Ok(ScanControl::Continue);

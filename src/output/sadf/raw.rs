@@ -35,16 +35,17 @@ use super::{
     ABSENT_TEXT, FileInfo, SadfConfig, Stamp, double_from_bits, render, spec, write_sensor,
 };
 use crate::error::Result;
+use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::{ActivityId, Availability};
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
-use super::dbppc::{display_cpu_count, present_specs, scan_blocks};
+use super::dbppc::{display_cpu_count, scan_blocks, selected_specs};
 
 /// `-r` の出力。
 pub fn write_raw<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
     let info = FileInfo::from_file(file);
-    let specs = present_specs(file);
+    let specs = selected_specs(file, cfg);
     let blocks = scan_blocks(file)?;
 
     for block in 0..blocks.len() {
@@ -115,6 +116,7 @@ fn write_activity_block<W: Write>(
     block: usize,
 ) -> Result<()> {
     let mut current_block = 0usize;
+    let mut cursor = cfg.time_filter.cursor();
 
     walk_items(file, &Selection::Only(vec![spec.id]), |item| {
         match item {
@@ -122,15 +124,20 @@ fn write_activity_block<W: Write>(
             WalkItem::Event(RecordEvent::Restart { .. }) => current_block += 1,
             // COMMENT は読んだ時点で出す。最後の統計レコードより後ろにあっても届く。
             WalkItem::Event(ev) => {
-                if cfg.comments && current_block == block {
+                if cfg.comments && current_block == block && cursor.event(ev.ust_time(), ev.time())
+                {
                     emit_comment(out, &ev, cfg, info).map_err(super::wrap_io)?;
                 }
             }
-            WalkItem::Sample(view) => {
-                if current_block == block {
-                    emit_sample(out, view, cfg, info, spec, section).map_err(super::wrap_io)?;
+            WalkItem::Sample(view) => match cursor.sample(view) {
+                Admit::Skip | Admit::Reference => {}
+                Admit::Stop => return Ok(ScanControl::Stop),
+                Admit::Emit => {
+                    if current_block == block {
+                        emit_sample(out, view, cfg, info, spec, section).map_err(super::wrap_io)?;
+                    }
                 }
-            }
+            },
         }
         Ok(ScanControl::Continue)
     })?;

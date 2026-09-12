@@ -24,6 +24,7 @@ use super::{
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
+use crate::output::time_filter::Admit;
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 区切り文字。`seps[isdb]` (`rndr_stats.c`)。
@@ -41,7 +42,7 @@ pub fn write_ppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Resu
 
 fn write_dbppc<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig, isdb: bool) -> Result<()> {
     let info = FileInfo::from_file(file);
-    let specs = present_specs(file);
+    let specs = selected_specs(file, cfg);
     let blocks = scan_blocks(file)?;
 
     // -h は -d のみ有効 (§0.2)。全 activity を 1 行に連ねる別ループになる。
@@ -105,6 +106,7 @@ fn write_activity_block<W: Write>(
     block: usize,
 ) -> Result<()> {
     let mut current_block = 0usize;
+    let mut cursor = cfg.time_filter.cursor();
 
     walk_items(file, &Selection::Only(vec![spec.id]), |item| {
         match item {
@@ -112,14 +114,22 @@ fn write_activity_block<W: Write>(
             WalkItem::Event(RecordEvent::Restart { .. }) => current_block += 1,
             // COMMENT は読んだ時点で出す。最後の統計レコードより後ろにあっても届く。
             WalkItem::Event(ev) => {
-                if cfg.comments && current_block == block {
+                if cfg.comments && current_block == block && cursor.event(ev.ust_time(), ev.time())
+                {
                     emit_comment(out, &ev, cfg, info, isdb).map_err(super::wrap_io)?;
                 }
             }
             WalkItem::Sample(view) => {
-                if current_block == block {
-                    emit_sample(out, view, cfg, info, spec, section, isdb)
-                        .map_err(super::wrap_io)?;
+                // `-s` / `-e` は基準レコードの採り方まで決める (`time_filter` 参照)。
+                match cursor.sample(view) {
+                    Admit::Skip | Admit::Reference => {}
+                    Admit::Stop => return Ok(ScanControl::Stop),
+                    Admit::Emit => {
+                        if current_block == block {
+                            emit_sample(out, view, cfg, info, spec, section, isdb)
+                                .map_err(super::wrap_io)?;
+                        }
+                    }
                 }
             }
         }
@@ -310,11 +320,17 @@ fn write_horizontal<W: Write>(
     writeln!(out, "{hdr}").map_err(super::wrap_io)?;
 
     let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
+    let mut cursor = cfg.time_filter.cursor();
     walk_items(file, &Selection::Only(ids), |item| {
         // `-dh` は 1 サンプル = 1 行。イベント行は持たない。
         let WalkItem::Sample(view) = item else {
             return Ok(ScanControl::Continue);
         };
+        match cursor.sample(view) {
+            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
+            Admit::Stop => return Ok(ScanControl::Stop),
+            Admit::Emit => {}
+        }
         if !view.has_prev || !view.continuous {
             return Ok(ScanControl::Continue);
         }
@@ -433,6 +449,17 @@ pub fn present_specs(file: &SaFile) -> Vec<&'static ActivitySpec> {
     }
     out.sort_by_key(|s| s.id.0);
     out
+}
+
+/// [`present_specs`] の結果を [`SadfConfig::activities`] で絞る。
+///
+/// `cfg.activities` が `None` なら絞らない (`-- -A` 相当)。
+pub fn selected_specs(file: &SaFile, cfg: &SadfConfig) -> Vec<&'static ActivitySpec> {
+    let specs = present_specs(file);
+    match &cfg.activities {
+        None => specs,
+        Some(ids) => specs.into_iter().filter(|s| ids.contains(&s.id)).collect(),
+    }
 }
 
 /// アイテムが 2 個以上ある activity か (`-dh` の `[...]` 判定)。

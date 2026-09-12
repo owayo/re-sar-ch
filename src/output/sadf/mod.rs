@@ -33,6 +33,8 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
 use crate::format::file::SaFile;
+use crate::model::ActivityId;
+use crate::output::time_filter::TimeFilter;
 use crate::series::compute::{ComputeIssue, Computed};
 
 pub use spec::{ActivitySpec, Fmt, Group, ItemKind, SectionConfig, Shape};
@@ -67,6 +69,13 @@ pub struct SadfConfig {
     pub horizontally: bool,
     /// セクション選択 (`-u ALL` / `-r ALL` / `-F MOUNT` など)。
     pub section: SectionConfig,
+    /// 出力対象 activity (`-- <sar オプション>` による選択)。
+    ///
+    /// `None` = ファイルに含まれる既知 activity すべて (`-- -A` 相当)。
+    /// 既定は `None` なので、この項目を渡さない呼び出し側の出力は変わらない。
+    pub activities: Option<Vec<ActivityId>>,
+    /// `-s` / `-e` の時刻フィルタ。既定は無効 (全レコードを出す)。
+    pub time_filter: TimeFilter,
 }
 
 // ===========================================================================

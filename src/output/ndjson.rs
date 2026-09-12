@@ -30,6 +30,7 @@ use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
+use crate::output::time_filter::Admit;
 use crate::series::{RecordEvent, WalkItem, walk_items};
 
 /// NDJSON の 1 行。
@@ -92,6 +93,7 @@ pub struct EventRow<'a> {
 pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> Result<()> {
     let host = HostOut::new(file);
     let mut boot = BootCounter::default();
+    let mut cursor = cfg.time_filter.cursor();
 
     walk_items(file, &cfg.selection.clone(), |item| {
         // 起動区間の境界と注記は**読んだ時点で**出す。行の並びがファイル上の
@@ -125,11 +127,19 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                         comment: Some(text.as_str()),
                     },
                 };
-                write_line(out, &row)?;
+                // 範囲外のイベント行は出さない
+                if cursor.event(ev.ust_time(), ev.time()) {
+                    write_line(out, &row)?;
+                }
                 return Ok(ScanControl::Continue);
             }
             WalkItem::Sample(view) => view,
         };
+        match cursor.sample(view) {
+            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
+            Admit::Stop => return Ok(ScanControl::Stop),
+            Admit::Emit => {}
+        }
 
         let start_epoch = if view.has_prev {
             view.prev.ust_time

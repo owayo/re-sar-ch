@@ -3,12 +3,58 @@
 //! 引数はサブコマンド (`show` / `summarize` / `compare` / `info`) と
 //! `sar` / `sadf` 互換の 2 系統を受け付ける。サブコマンド名を省略した場合は
 //! `sar` 互換として解釈するため、`resarch -u -f sa01` がそのまま動く。
+//!
+//! # この層の責務
+//!
+//! CLI 解析結果 ([`Invocation`]) を**出力層の設定へ写して呼ぶだけ**。
+//! 値の計算も書式化もここではしない (`docs/design.md` §2)。
+//!
+//! | 変換 | 行き先 |
+//! |---|---|
+//! | [`SarOptions`] → [`SarTextOptions`] + activity 列 | [`sar_text::write_report`] |
+//! | [`SadfOptions`] → [`SadfConfig`] | `output::sadf::*` |
+//! | `show` / `summarize` / `compare` の引数 → [`CustomConfig`] / [`MultiOptions`] | 独自出力・`multi` |
+//!
+//! # 出力先と終了コード (`docs/design.md` §7)
+//!
+//! - データは `stdout` ([`BufWriter`] で包み、ロックは 1 回だけ取る)、診断は `stderr`
+//! - 部分結果 (読めなかったファイルを飛ばした / 途中で書き出しに失敗した) は非ゼロ終了
+//! - 互換出力に独自の警告フィールドを混ぜない (診断は必ず `stderr`)
 
-use std::io::{self, Write};
+use std::collections::BTreeMap;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use re_sar_ch::cli::{self, CliError, Commands, InfoArgs, Invocation, OutputFormat};
+use anyhow::{Context, bail};
+
+use re_sar_ch::analyze::{
+    ColumnSummary, Finding, MetricKey, NativePeriodSummary, PercentileOutcome, RetainTimelines,
+    SummaryOptions, Verdict, rule_inputs,
+};
+use re_sar_ch::cli::{
+    self, Activity, CliError, Commands, CommonArgs, CompareArgs, InfoArgs, Invocation, OptFlags,
+    OutputFormat, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate,
+    SarInput, SarOptions, SarOutput, ShowArgs, SummarizeArgs, TimeSpec, ValueKind,
+};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
+use re_sar_ch::model::{ActivityId, KNOWN_ACTIVITIES};
+use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
+use re_sar_ch::output::json::{CustomConfig, ValueScope};
+use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
+use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
+use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
+use re_sar_ch::output::{csv, ndjson, table};
+use re_sar_ch::series::Selection;
+
+/// 既定の日次データファイルを置くディレクトリ (`SA_DIR`)。
+///
+/// 本家はビルド時に `configure --with-sa-dir=` で決める。ここでは同名の
+/// 環境変数で上書きできるようにし、未設定なら本家の既定値を使う。
+const DEFAULT_SA_DIR: &str = "/var/log/sa";
+
+/// ホスト比較の既定の区間長 (秒)。
+const COMPARE_STEP_SECS: u64 = 60;
 
 fn main() -> ExitCode {
     let invocation = match cli::dispatch_from_env() {
@@ -26,6 +72,9 @@ fn main() -> ExitCode {
         Err(e) => {
             // データは stdout、診断は stderr
             eprintln!("resarch: {e}");
+            for cause in e.chain().skip(1) {
+                eprintln!("  原因: {cause}");
+            }
             ExitCode::from(1)
         }
     }
@@ -35,39 +84,1141 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
     match invocation {
         Invocation::Native(cmd) => match *cmd {
             Commands::Info(args) => run_info(args),
-            Commands::Show(_) => not_yet("show"),
-            Commands::Summarize(_) => not_yet("summarize"),
-            Commands::Compare(_) => not_yet("compare"),
-            Commands::Sar(_) => not_yet("sar"),
-            Commands::Sadf(_) => not_yet("sadf"),
+            Commands::Show(args) => run_show(args),
+            Commands::Summarize(args) => run_summarize(args),
+            Commands::Compare(args) => run_compare(args),
+            // `dispatch` は互換入口を直接互換パーサへ回すので通常ここには来ない。
+            // ルート経由で来た場合も同じ結果になるよう解析し直す。
+            Commands::Sar(args) => run_sar(cli::parse_sar_args(&args.args)?),
+            Commands::Sadf(args) => run_sadf(cli::parse_sadf_args(&args.args)?),
         },
-        Invocation::Sar(_) => not_yet("sar 互換出力"),
-        Invocation::Sadf(_) => not_yet("sadf 互換出力"),
+        Invocation::Sar(opts) => run_sar(*opts),
+        Invocation::Sadf(opts) => run_sadf(*opts),
     }
 }
 
-fn not_yet(what: &str) -> anyhow::Result<ExitCode> {
-    anyhow::bail!("{what} はまだ実装されていません")
+// ===========================================================================
+// 共通ヘルパ
+// ===========================================================================
+
+/// `stdout` を 1 回だけロックして `BufWriter` で包む (`docs/design.md` §6.4)。
+fn stdout_writer() -> BufWriter<io::StdoutLock<'static>> {
+    BufWriter::new(io::stdout().lock())
 }
 
-/// `resarch info` — ヘッダのメタデータと activity 一覧を表示する。
-fn run_info(args: InfoArgs) -> anyhow::Result<ExitCode> {
-    let options = OpenOptions {
-        mmap: if args.no_mmap {
+fn open_options(lenient: bool, no_mmap: bool) -> OpenOptions {
+    OpenOptions {
+        mmap: if no_mmap {
             MmapPolicy::Never
         } else {
             MmapPolicy::Auto
         },
-        tolerance: if args.lenient {
+        tolerance: if lenient {
             Tolerance::Lenient
         } else {
             Tolerance::Strict
         },
         ..Default::default()
+    }
+}
+
+fn open_file(path: &Path, options: &OpenOptions) -> anyhow::Result<SaFile> {
+    SaFile::open_with(path, options.clone()).map_err(anyhow::Error::new)
+}
+
+/// 致命的でない問題を `stderr` へ出す。**stdout には混ぜない。**
+fn report_diagnostics(file: &SaFile) {
+    for d in file.diagnostics() {
+        match d.offset {
+            Some(off) => eprintln!(
+                "resarch: 診断 ({}+{off}): {}",
+                file.path().display(),
+                d.message
+            ),
+            None => eprintln!("resarch: 診断 ({}): {}", file.path().display(), d.message),
+        }
+    }
+}
+
+fn exit_code(partial: bool) -> ExitCode {
+    if partial {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+// ===========================================================================
+// `-f` のファイル解決 (`docs/format/03-output-format.md` §5.2)
+// ===========================================================================
+
+/// `SA_DIR` (既定 `/var/log/sa`)。
+fn sa_dir() -> PathBuf {
+    match std::env::var_os("SA_DIR") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(DEFAULT_SA_DIR),
+    }
+}
+
+/// `day_offset` 日前の日付。
+///
+/// 本家の `get_time(&rectime, N)` はローカル時刻基準だが、
+/// `S_TIME_DEF_TIME=UTC` のときは UTC 基準になる。
+fn target_date(day_offset: u32) -> (i32, u32, u32) {
+    use chrono::{Datelike, Duration, Local, Utc};
+    let back = Duration::days(i64::from(day_offset));
+    if std::env::var("S_TIME_DEF_TIME").as_deref() == Ok("UTC") {
+        let d = (Utc::now() - back).date_naive();
+        (d.year(), d.month(), d.day())
+    } else {
+        let d = (Local::now() - back).date_naive();
+        (d.year(), d.month(), d.day())
+    }
+}
+
+/// `guess_sa_name()` 相当。
+///
+/// `saYYYYMMDD` と `saDD` の **mtime (秒 + nsec)** を比べて新しい方を使う。
+/// 片方しか `stat()` できなければそれを、どちらも無ければ `saDD` を返す。
+fn guess_sa_name(dir: &Path, day_offset: u32) -> PathBuf {
+    let (y, m, d) = target_date(day_offset);
+    let short = dir.join(format!("sa{d:02}"));
+    let long = dir.join(format!("sa{y:04}{m:02}{d:02}"));
+
+    let mtime = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|md| md.modified())
+            .ok()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+    };
+    match (mtime(&long), mtime(&short)) {
+        (Some(a), Some(b)) => {
+            if a > b {
+                long
+            } else {
+                short
+            }
+        }
+        (Some(_), None) => long,
+        (None, Some(_)) => short,
+        (None, None) => short,
+    }
+}
+
+/// `-f` / `sadf <file>` の指定を実際のパスへ解決する。
+///
+/// - 未指定 (`SarInput::DefaultDaily`) → `SA_DIR` 配下を [`guess_sa_name`] で推測
+/// - ディレクトリ指定 → `check_alt_sa_dir()` 相当。その下に日次ファイル名を付加
+/// - ファイル指定 → そのまま
+fn resolve_daily(input: Option<&Path>, day_offset: u32, dir_offset: u32) -> PathBuf {
+    match input {
+        None => guess_sa_name(&sa_dir(), day_offset),
+        Some(p) if p.is_dir() => guess_sa_name(p, dir_offset),
+        Some(p) => p.to_path_buf(),
+    }
+}
+
+/// `sar` の読み出し元を解決する。`-o` は採取なので呼び出し側が先に弾く。
+fn resolve_sar_input(opts: &SarOptions) -> anyhow::Result<PathBuf> {
+    let path = match &opts.input {
+        Some(SarInput::DefaultDaily) | None => resolve_daily(None, opts.day_offset, 0),
+        // `-f <dir>` はディレクトリ指定でも `day_offset` が効く
+        Some(SarInput::File(p)) => resolve_daily(Some(p), opts.day_offset, opts.day_offset),
+    };
+    check_readable(&path, opts.default_file_used)?;
+    Ok(path)
+}
+
+/// `sadf` の読み出し元を解決する。
+///
+/// positional のディレクトリ指定では `check_alt_sa_dir(dfile, 0, -1)` が呼ばれる
+/// ため、**`-N` は効かない** (§2.6)。
+fn resolve_sadf_input(opts: &SadfOptions) -> anyhow::Result<PathBuf> {
+    let path = resolve_daily(opts.data_file.as_deref(), opts.day_offset, 0);
+    check_readable(&path, opts.default_file_used)?;
+    Ok(path)
+}
+
+/// 既定ファイルへフォールバックしたのに開けない場合は本家と同じヒントを添える。
+fn check_readable(path: &Path, default_file_used: bool) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if default_file_used {
+        bail!(
+            "{}: 開けません (Please check if data collecting is enabled)",
+            path.display()
+        );
+    }
+    bail!("{}: 開けません", path.display());
+}
+
+// ===========================================================================
+// SarOptions → 出力層の設定
+// ===========================================================================
+
+fn activity_id(act: Activity) -> ActivityId {
+    ActivityId(u32::from(act.id()))
+}
+
+/// タイムスタンプの基準系 (`sar` テキスト用)。
+fn time_style(flags: &SarFlags) -> TimeStyle {
+    if flags.sec_epoch {
+        TimeStyle::Epoch
+    } else if flags.true_time {
+        TimeStyle::Recorded
+    } else if flags.local_time {
+        TimeStyle::Local
+    } else {
+        TimeStyle::Utc
+    }
+}
+
+/// `-s` / `-e` の比較に使う基準系 (§1.11)。
+///
+/// `-U` (epoch 表示) でも `hh:mm:ss` 形式の境界は UTC と比べる。
+fn time_basis(flags: &SarFlags) -> TimeBasis {
+    if flags.true_time {
+        TimeBasis::Recorded
+    } else if flags.local_time {
+        TimeBasis::Local
+    } else {
+        TimeBasis::Utc
+    }
+}
+
+fn time_bound(spec: TimeSpec) -> TimeBound {
+    match spec {
+        TimeSpec::None => TimeBound::None,
+        TimeSpec::HhMmSs { hour, min, sec } => TimeBound::HhMmSs { hour, min, sec },
+        TimeSpec::Epoch(e) => TimeBound::Epoch(e),
+    }
+}
+
+/// `-s` / `-e` をフィルタへ写す。日跨ぎ補正は解析側 (`check_time_limits`) で済んでいる。
+fn sar_time_filter(opts: &SarOptions, cross_day: CrossDayRule) -> TimeFilter {
+    TimeFilter {
+        start: time_bound(opts.tm_start),
+        end: time_bound(opts.tm_end),
+        basis: time_basis(&opts.flags),
+        cross_day,
+    }
+}
+
+/// `-P` のビットマップを [`CpuSelection`] へ写す。
+///
+/// bit 0 = 集約行 (`all`)、CPU `n` = bit `n + 1`。`-P ALL` / `-A` は全ビットが立つ。
+fn cpu_selection(opts: &SarOptions) -> CpuSelection {
+    let b = &opts.cpu_bitmap;
+    if b.count_bits() == b.capacity_bits() {
+        return CpuSelection::All;
+    }
+    if b.aggregate_selected() && b.count_bits() == 1 {
+        return CpuSelection::Aggregate;
+    }
+    CpuSelection::Listed {
+        aggregate: b.aggregate_selected(),
+        cpus: b.selected_cpus().collect(),
+    }
+}
+
+/// `--dev=` / `--iface=` / `--fs=` のアイテム名フィルタ。
+///
+/// `--int=` (`A_IRQ`) は行ではなく列が CPU に対応する行列レイアウトなので
+/// ここでは渡さない (未対応)。
+fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
+    let mut map = BTreeMap::new();
+    for act in [
+        Activity::Disk,
+        Activity::NetDev,
+        Activity::NetEdev,
+        Activity::Fs,
+    ] {
+        let list = opts.item_list(act);
+        if !list.is_empty() {
+            map.insert(activity_id(act), list.to_vec());
+        }
+    }
+    map
+}
+
+/// [`SarOptions`] を `sar` テキスト出力の設定へ写す。
+fn sar_text_options(opts: &SarOptions) -> SarTextOptions {
+    let mem = opts.opt_flags(Activity::Memory);
+    SarTextOptions {
+        pretty: opts.flags.pretty,
+        human: opts.flags.human,
+        dec_places: opts.dec_places,
+        comment: opts.flags.comment,
+        minmax: opts.flags.minmax,
+        zero_omit: opts.flags.zero_omit,
+        cpu_all: opts.opt_flags(Activity::Cpu).contains(OptFlags::CPU_ALL),
+        memory: mem.contains(OptFlags::MEMORY),
+        mem_all: mem.contains(OptFlags::MEM_ALL),
+        swap: mem.contains(OptFlags::SWAP),
+        mount: opts.opt_flags(Activity::Fs).contains(OptFlags::MOUNT),
+        dev_sid: opts.flags.dev_sid,
+        time: time_style(&opts.flags),
+        cpus: cpu_selection(opts),
+        time_filter: sar_time_filter(opts, CrossDayRule::Sar),
+        item_names: sar_item_names(opts),
+    }
+}
+
+/// 選択された activity を**ファイル記載順**で返す (`id_seq[]` 相当)。
+///
+/// 本家のファイル読み出しモードは `act[]` 配列順ではなくデータファイルの
+/// activity リスト順で出力する (03 §11-19)。
+fn sar_activities(opts: &SarOptions, file: &SaFile) -> Vec<ActivityId> {
+    let selected: Vec<ActivityId> = opts.selected_activities().map(activity_id).collect();
+    sar_text::activities_in_file(file)
+        .into_iter()
+        .filter(|id| selected.contains(id))
+        .collect()
+}
+
+/// `-u ALL` / `-r ALL` / `-F MOUNT` などのセクション選択 (`sadf` 用)。
+fn section_config(opts: &SarOptions) -> SectionConfig {
+    let mem = opts.opt_flags(Activity::Memory);
+    SectionConfig {
+        cpu_all: opts.opt_flags(Activity::Cpu).contains(OptFlags::CPU_ALL),
+        memory: mem.contains(OptFlags::MEMORY),
+        swap: mem.contains(OptFlags::SWAP),
+        mem_all: mem.contains(OptFlags::MEM_ALL),
+        fs_mount: opts.opt_flags(Activity::Fs).contains(OptFlags::MOUNT),
+    }
+}
+
+fn sadf_config(opts: &SadfOptions) -> SadfConfig {
+    SadfConfig {
+        time_base: match opts.time_base() {
+            SadfTimeBase::Utc => TimeBase::Utc,
+            SadfTimeBase::LocalTime => TimeBase::LocalTime,
+            SadfTimeBase::TrueTime => TimeBase::TrueTime,
+            SadfTimeBase::SecEpoch => TimeBase::SecEpoch,
+        },
+        comments: opts.sar.flags.comment,
+        debug: opts.output.debug,
+        horizontally: opts.horizontally,
+        section: section_config(&opts.sar),
+        activities: Some(opts.sar.selected_activities().map(activity_id).collect()),
+        time_filter: sar_time_filter(&opts.sar, CrossDayRule::Sadf),
+    }
+}
+
+// ===========================================================================
+// `sar` 互換入口
+// ===========================================================================
+
+fn run_sar(opts: SarOptions) -> anyhow::Result<ExitCode> {
+    if let Some(immediate) = opts.immediate {
+        return run_sar_immediate(immediate);
+    }
+    // `-o` は採取 (`sadc` 相当)。reSARch はファイル解析専用 (`docs/design.md` §9.1)。
+    if let Some(output) = &opts.output {
+        let name = match output {
+            SarOutput::DefaultDaily => "標準の日次データファイル".to_string(),
+            SarOutput::File(p) => p.display().to_string(),
+        };
+        bail!(
+            "-o ({name}): reSARch は統計の採取を行いません (sa ファイルの解析専用です)。\
+             採取は sysstat の sadc / sar -o を使ってください"
+        );
+    }
+    // ライブ採取は行わないので、interval だけを渡された場合も読み出し元が必要。
+    if opts.input.is_none() {
+        bail!(
+            "読み出す sa ファイルがありません。reSARch はライブ採取を行わないので \
+             `-f <file>` を指定してください"
+        );
+    }
+
+    let path = resolve_sar_input(&opts)?;
+    let options = OpenOptions::default();
+    let file = open_file(&path, &options)?;
+    report_diagnostics(&file);
+
+    let text = sar_text_options(&opts);
+    let activities = sar_activities(&opts, &file);
+
+    let mut out = stdout_writer();
+    let result = sar_text::write_report(&mut out, &file, &text, &activities);
+    out.flush()?;
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_sar_immediate(immediate: SarImmediate) -> anyhow::Result<ExitCode> {
+    match immediate {
+        SarImmediate::Help => {
+            let mut out = stdout_writer();
+            write!(out, "{}", SAR_USAGE)?;
+            out.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        SarImmediate::Version => {
+            let mut out = stdout_writer();
+            writeln!(out, "resarch version {}", env!("CARGO_PKG_VERSION"))?;
+            writeln!(
+                out,
+                "sysstat の sa ファイルを sar / sadf に依存せず解析する (採取は行わない)"
+            )?;
+            out.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        // データコレクタ (`sadc`) を持たないので所在を答えられない。
+        SarImmediate::Sadc => bail!(
+            "--sadc: reSARch はデータコレクタを持ちません (採取は sysstat の sadc を使ってください)"
+        ),
+    }
+}
+
+const SAR_USAGE: &str = "\
+使い方: resarch [sar] [オプション...] [-f <sa ファイル>]
+
+reSARch の sar 互換入口。ファイル解析専用で、採取 (-o) は行わない。
+
+activity の選択:
+  -A                すべての activity
+  -u [ALL]          CPU        -w   タスク生成 / コンテキストスイッチ
+  -B                ページング  -b   I/O 転送レート
+  -r [ALL] / -S     メモリ / スワップ    -v   カーネルテーブル
+  -q [キーワード]    負荷 / PSI   -y   TTY
+  -d                ブロックデバイス      -F [MOUNT]  ファイルシステム
+  -n <キーワード>    ネットワーク          -m <キーワード>  電源管理
+  -I [SUM|ALL]      割り込み    -H   hugepages    -W   スワッピング
+
+絞り込みと書式:
+  -P {<cpulist>|ALL}   CPU 別統計 (ALL は全 CPU、all は集約行のみ)
+  -s [hh:mm[:ss]]      開始時刻 (省略時 08:00:00 / 10 桁なら epoch 秒)
+  -e [hh:mm[:ss]]      終了時刻 (省略時 18:00:00 / 10 桁なら epoch 秒)
+  --dev= / --iface= / --fs=   アイテム名で絞る
+  -p / --pretty        アイテム名を行末へ移す
+  -h                   --pretty --human
+  --human              単位付き表示
+  --dec={0|1|2}        小数桁 (幅は変わらない)
+  -t                   記録時のローカル時刻で表示
+  -z                   前サンプルと同一の行を省略
+  -C                   COM 行を表示
+  -j {SID|<type>}      永続デバイス名
+
+その他:
+  -f [<file>]     読み出し元 (ディレクトリなら日次ファイル名を付加)
+  -[0-9]+         何日前の日次ファイルか
+  --help / -V     このヘルプ / 版の表示
+";
+
+// ===========================================================================
+// `sadf` 互換入口
+// ===========================================================================
+
+fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
+    if opts.immediate == Some(SadfImmediate::Version) {
+        let mut out = stdout_writer();
+        writeln!(out, "resarch version {}", env!("CARGO_PKG_VERSION"))?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `finalize` 後は必ず Some だが、念のため本家の既定 (`-p`) に落とす。
+    let format = opts.format.unwrap_or(SadfFormat::Ppc);
+    let path = resolve_sadf_input(&opts)?;
+    let file = open_file(&path, &OpenOptions::default())?;
+    report_diagnostics(&file);
+
+    let mut out = stdout_writer();
+    if format == SadfFormat::Header {
+        sadf::header::write_header(&mut out, &file)?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if opts.header_only {
+        bail!(
+            "-H は他の形式との併用に未対応です (ヘッダのみを見るには `resarch sadf -H <file>` を使ってください)"
+        );
+    }
+
+    let cfg = sadf_config(&opts);
+    let result = match format {
+        SadfFormat::Db => sadf::dbppc::write_db(&mut out, &file, &cfg),
+        SadfFormat::Ppc => sadf::dbppc::write_ppc(&mut out, &file, &cfg),
+        SadfFormat::Json => sadf::json::write_json(&mut out, &file, &cfg),
+        SadfFormat::Xml => sadf::xml::write_xml(&mut out, &file, &cfg),
+        SadfFormat::Raw => sadf::raw::write_raw(&mut out, &file, &cfg),
+        SadfFormat::Conv => bail!("-c (旧形式の変換) は未対応です"),
+        SadfFormat::Svg => bail!("-g (SVG グラフ) は未対応です"),
+        SadfFormat::Pcp => bail!("-l (PCP アーカイブ) は未対応です"),
+        // 上で処理済み
+        SadfFormat::Header => Ok(()),
+    };
+    out.flush()?;
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+// ===========================================================================
+// 独自サブコマンド共通
+// ===========================================================================
+
+/// `--activity cpu,disk` を [`Selection`] へ写す。
+fn selection_from(names: &[String]) -> anyhow::Result<Selection> {
+    if names.is_empty() {
+        return Ok(Selection::All);
+    }
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let id = parse_activity_name(name)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(Selection::Only(ids))
+}
+
+/// activity 名 (`cpu` / `A_CPU` / `net_dev`) を ID へ写す。
+fn parse_activity_name(name: &str) -> anyhow::Result<ActivityId> {
+    let upper = name.trim().to_ascii_uppercase().replace(['-', ' '], "_");
+    let wanted = match upper.strip_prefix("A_").unwrap_or(&upper) {
+        // よく使う短縮名
+        "MEM" => "MEMORY",
+        "NET" => "NET_DEV",
+        "IRQ" | "INT" => "IRQ",
+        other => other,
+    };
+    for id in KNOWN_ACTIVITIES {
+        let Some(symbol) = id.symbol() else { continue };
+        if symbol.strip_prefix("A_").unwrap_or(symbol) == wanted {
+            return Ok(*id);
+        }
+    }
+    bail!(
+        "--activity {name}: 未知の activity です (例: cpu, memory, disk, net_dev, fs。\
+         `resarch info <file>` でファイルに入っているものが分かります)"
+    )
+}
+
+/// `--from` / `--to` を解釈する。
+///
+/// 受け付ける形は `sar -s` / `-e` と同じ (`hh:mm` / `hh:mm:ss` / 10 桁 epoch)。
+/// 比較は独自出力が表示する時刻 (UTC / epoch) に合わせる。
+fn parse_time_arg(opt: &str, value: &str) -> anyhow::Result<TimeBound> {
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if value.len() == 10 && digits(value) {
+        let epoch: u64 = value.parse().context("epoch 秒として解釈できません")?;
+        if epoch == 0 {
+            bail!("{opt} {value}: epoch 秒に 0 は指定できません");
+        }
+        return Ok(TimeBound::Epoch(epoch));
+    }
+    let parts: Vec<&str> = value.split(':').collect();
+    let bad =
+        || anyhow::anyhow!("{opt} {value}: hh:mm[:ss] または 10 桁の epoch 秒で指定してください");
+    if !(parts.len() == 2 || parts.len() == 3) {
+        return Err(bad());
+    }
+    let mut hms = [0u8; 3];
+    for (i, p) in parts.iter().enumerate() {
+        if p.len() != 2 || !digits(p) {
+            return Err(bad());
+        }
+        hms[i] = p.parse().map_err(|_| bad())?;
+    }
+    if hms[0] > 23 || hms[1] > 59 || hms[2] > 59 {
+        return Err(bad());
+    }
+    Ok(TimeBound::HhMmSs {
+        hour: hms[0],
+        min: hms[1],
+        sec: hms[2],
+    })
+}
+
+/// `--from` / `--to` を独自出力のフィルタへ写す。
+///
+/// `check_time_limits()` と同じ日跨ぎ補正を入れる
+/// (`hh:mm:ss` 形式で `--to` < `--from` なら翌日まで)。
+fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
+    let start = match &common.from {
+        Some(v) => parse_time_arg("--from", v)?,
+        None => TimeBound::None,
+    };
+    let mut end = match &common.to {
+        Some(v) => parse_time_arg("--to", v)?,
+        None => TimeBound::None,
+    };
+    match (start, end) {
+        (TimeBound::HhMmSs { hour: sh, .. }, TimeBound::HhMmSs { hour: eh, min, sec })
+            if eh < sh =>
+        {
+            end = TimeBound::HhMmSs {
+                hour: eh + 24,
+                min,
+                sec,
+            };
+        }
+        (TimeBound::Epoch(s), TimeBound::Epoch(e)) if e < s => {
+            bail!("--to は --from より後の時刻を指定してください");
+        }
+        _ => {}
+    }
+    Ok(TimeFilter {
+        start,
+        end,
+        // 独自出力は UTC / epoch で時刻を出すので、比較も UTC で行う。
+        basis: TimeBasis::Utc,
+        cross_day: CrossDayRule::Sadf,
+    })
+}
+
+fn value_scope(kind: ValueKind) -> ValueScope {
+    match kind {
+        ValueKind::Raw => ValueScope::Raw,
+        ValueKind::Derived => ValueScope::Rates,
+        ValueKind::Both => ValueScope::Both,
+    }
+}
+
+// ===========================================================================
+// `resarch show`
+// ===========================================================================
+
+fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
+    let common = &args.common;
+    let options = open_options(common.lenient, common.no_mmap);
+    let selection = selection_from(&common.activity)?;
+    let filter = custom_time_filter(common)?;
+
+    // 複数ファイルはヘッダだけ先に読み、**日付 → 作成時刻 → パス**の決定的な
+    // 順序へ並べ替えてから流す (`multi.rs` の方針 §6.3)。
+    let paths = ordered_show_paths(&args.files, &options, common.lenient)?;
+    let mut partial = paths.len() != args.files.len();
+
+    let custom = CustomConfig {
+        selection: selection.clone(),
+        values: value_scope(args.values),
+        time_filter: filter,
+    };
+    // 独自 JSON は 1 ファイル 1 文書なので、複数ファイルは配列で包む。
+    let wrap_json = matches!(common.format, OutputFormat::Json) && paths.len() > 1;
+
+    let mut out = stdout_writer();
+    if wrap_json {
+        out.write_all(b"[")?;
+    }
+    for (i, path) in paths.iter().enumerate() {
+        let file = match open_file(path, &options) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("resarch: {e}");
+                partial = true;
+                continue;
+            }
+        };
+        report_diagnostics(&file);
+        if wrap_json && i > 0 {
+            out.write_all(b",")?;
+        }
+        let result = write_show_one(&mut out, &file, common.format, &custom, &selection, filter);
+        if let Err(e) = result {
+            out.flush()?;
+            return Err(e);
+        }
+    }
+    if wrap_json {
+        out.write_all(b"]\n")?;
+    }
+    out.flush()?;
+    Ok(exit_code(partial))
+}
+
+/// 1 ファイルを指定形式で書き出す。
+fn write_show_one<W: Write>(
+    out: &mut W,
+    file: &SaFile,
+    format: OutputFormat,
+    custom: &CustomConfig,
+    selection: &Selection,
+    filter: TimeFilter,
+) -> anyhow::Result<()> {
+    match format {
+        OutputFormat::Table => table::write_table(out, file, custom)?,
+        OutputFormat::Json => re_sar_ch::output::json::write_json(out, file, custom)?,
+        OutputFormat::Csv => csv::write_csv(&mut *out, file, custom)?,
+        OutputFormat::Ndjson => ndjson::write_ndjson(out, file, custom)?,
+        OutputFormat::Sar => {
+            let text = SarTextOptions {
+                time_filter: filter,
+                ..Default::default()
+            };
+            let activities: Vec<ActivityId> = sar_text::activities_in_file(file)
+                .into_iter()
+                .filter(|id| selection_includes(selection, *id))
+                .collect();
+            sar_text::write_report(out, file, &text, &activities)?;
+        }
+        OutputFormat::SadfPpc
+        | OutputFormat::SadfDb
+        | OutputFormat::SadfJson
+        | OutputFormat::SadfXml
+        | OutputFormat::SadfRaw => {
+            let cfg = SadfConfig {
+                activities: match selection {
+                    Selection::All => None,
+                    Selection::Only(ids) => Some(ids.clone()),
+                },
+                time_filter: filter,
+                ..Default::default()
+            };
+            match format {
+                OutputFormat::SadfPpc => sadf::dbppc::write_ppc(out, file, &cfg)?,
+                OutputFormat::SadfDb => sadf::dbppc::write_db(out, file, &cfg)?,
+                OutputFormat::SadfJson => sadf::json::write_json(out, file, &cfg)?,
+                OutputFormat::SadfXml => sadf::xml::write_xml(out, file, &cfg)?,
+                OutputFormat::SadfRaw => sadf::raw::write_raw(out, file, &cfg)?,
+                _ => unreachable!("sadf 形式に限定した分岐"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn selection_includes(selection: &Selection, id: ActivityId) -> bool {
+    match selection {
+        Selection::All => true,
+        Selection::Only(ids) => ids.contains(&id),
+    }
+}
+
+/// `show` に渡されたファイルを決定的な順序へ並べる。
+///
+/// 1 ファイルなら並べ替える必要が無いのでヘッダを二度読まない。
+/// 複数ファイルでは [`multi::outline_files`] でヘッダだけを読み、
+/// 同一ホストかどうかを `stderr` へ報告する。
+fn ordered_show_paths(
+    files: &[PathBuf],
+    options: &OpenOptions,
+    lenient: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if files.len() <= 1 {
+        return Ok(files.to_vec());
+    }
+    let mopts = MultiOptions {
+        open: options.clone(),
+        on_error: if lenient {
+            FileErrorPolicy::Skip
+        } else {
+            FileErrorPolicy::Fail
+        },
+        ..Default::default()
+    };
+    let (mut outlines, skipped) = multi::outline_files(files, &mopts)?;
+    for s in &skipped {
+        eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
+    }
+    outlines.sort_by_key(|o| (o.year, o.month, o.day, o.header_ust_time, o.path.clone()));
+
+    // 別ホストのファイルが混ざっていたら黙って連結しない
+    let hosts: Vec<&str> = {
+        let mut v: Vec<&str> = outlines
+            .iter()
+            .map(|o| o.identity.nodename.as_str())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    if hosts.len() > 1 {
+        eprintln!(
+            "resarch: 診断: 複数ホストのファイルが混ざっている ({})。\
+             ホストごとに分けて実行することを推奨する",
+            hosts.join(", ")
+        );
+    }
+    Ok(outlines
+        .into_iter()
+        .map(|o| PathBuf::from(o.path))
+        .collect())
+}
+
+// ===========================================================================
+// `resarch summarize`
+// ===========================================================================
+
+fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
+    let common = &args.common;
+    reject_time_window(common, "summarize")?;
+    let mopts = multi_options(common)?;
+    let analysis = multi::analyze_files(&args.files, &mopts)?;
+    for s in &analysis.skipped {
+        eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
+    }
+
+    let mut out = stdout_writer();
+    match common.format {
+        OutputFormat::Json | OutputFormat::SadfJson => {
+            serde_json::to_writer_pretty(&mut out, &analysis)?;
+            writeln!(out)?;
+        }
+        OutputFormat::Ndjson => {
+            for host in &analysis.hosts {
+                for seg in &host.segments {
+                    let row = serde_json::json!({
+                        "schema_version": analysis.schema_version,
+                        "record": "boot_segment",
+                        "host": host.identity,
+                        "segment": seg,
+                    });
+                    serde_json::to_writer(&mut out, &row)?;
+                    writeln!(out)?;
+                }
+            }
+        }
+        _ => write_summarize_text(&mut out, &analysis)?,
+    }
+    out.flush()?;
+    Ok(exit_code(!analysis.skipped.is_empty()))
+}
+
+fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
+    Ok(MultiOptions {
+        open: open_options(common.lenient, common.no_mmap),
+        selection: selection_from(&common.activity)?,
+        summary: SummaryOptions {
+            // ホスト比較でも使えるようルール入力の時系列は保持する
+            retain: RetainTimelines::RuleInputs,
+            ..Default::default()
+        },
+        on_error: if common.lenient {
+            FileErrorPolicy::Skip
+        } else {
+            FileErrorPolicy::Fail
+        },
+        max_concurrent_files: common.jobs.unwrap_or(4).max(1),
+        ..Default::default()
+    })
+}
+
+/// `--from` / `--to` は集計経路 (`multi`) に受け口が無いので明示的に拒否する。
+fn reject_time_window(common: &CommonArgs, what: &str) -> anyhow::Result<()> {
+    if common.from.is_some() || common.to.is_some() {
+        bail!(
+            "--from / --to は {what} では未対応です (期間を絞るには `resarch show` を使ってください)"
+        );
+    }
+    Ok(())
+}
+
+fn write_summarize_text<W: Write>(
+    out: &mut W,
+    analysis: &multi::MultiFileAnalysis,
+) -> anyhow::Result<()> {
+    for (hi, host) in analysis.hosts.iter().enumerate() {
+        if hi > 0 {
+            writeln!(out)?;
+        }
+        let id = &host.identity;
+        writeln!(
+            out,
+            "host: {} ({} {} / {}, {} CPU)",
+            id.nodename,
+            id.sysname,
+            id.release,
+            id.machine,
+            id.cpu_nr.map_or("?".to_string(), |n| n.to_string())
+        )?;
+        let files: Vec<&str> = host
+            .files
+            .iter()
+            .filter_map(|i| analysis.files.get(*i).map(|f| f.path.as_str()))
+            .collect();
+        writeln!(out, "files: {}", files.join(", "))?;
+
+        for seg in &host.segments {
+            writeln!(out)?;
+            write_segment_text(out, seg)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_segment_text<W: Write>(out: &mut W, seg: &BootSegment) -> anyhow::Result<()> {
+    let p = &seg.summary.period;
+    writeln!(
+        out,
+        "起動区間 {}  {} → {}  ({} サンプル / 連続 {} 区間 / 不連続 {} 区間)",
+        seg.index,
+        p.first_ust.map_or("-".to_string(), format_epoch),
+        p.last_ust.map_or("-".to_string(), format_epoch),
+        p.samples,
+        p.continuous_intervals,
+        p.broken_intervals
+    )?;
+    for b in &seg.boundaries {
+        writeln!(
+            out,
+            "  ファイル境界 {} → {}: {:?}",
+            b.prev_file, b.next_file, b.decision
+        )?;
+    }
+
+    writeln!(out, "  指標 (ルール判定に使う列)")?;
+    let mut printed = false;
+    for r in rule_inputs() {
+        let key = r.key();
+        if let Some(col) = column_of(&seg.summary, &key) {
+            writeln!(out, "    {:<28} {}", key.display(), format_column(col))?;
+            printed = true;
+        }
+    }
+    if !printed {
+        writeln!(out, "    (該当する列がファイルに無い)")?;
+    }
+
+    writeln!(out, "  判定 (ルール版 {})", ruleset_version(&seg.findings))?;
+    if seg.findings.is_empty() {
+        writeln!(out, "    (判定なし)")?;
+    }
+    for f in &seg.findings {
+        write_finding_text(out, f)?;
+    }
+    Ok(())
+}
+
+fn ruleset_version(findings: &[Finding]) -> &str {
+    findings
+        .first()
+        .map(|f| f.ruleset_version)
+        .unwrap_or(re_sar_ch::analyze::RULESET_VERSION)
+}
+
+fn write_finding_text<W: Write>(out: &mut W, f: &Finding) -> anyhow::Result<()> {
+    let mark = match f.verdict {
+        Verdict::Observed => "!!",
+        Verdict::NotObserved => "ok",
+        Verdict::Undetermined => "??",
+        Verdict::NotApplicable => "--",
+    };
+    writeln!(out, "    {mark} {:<26} {}", f.rule_id, f.title)?;
+    if let Some(obs) = &f.observation {
+        writeln!(out, "       観測: {obs}")?;
+    }
+    if let Some(reason) = f.reason {
+        writeln!(out, "       理由: {reason:?}")?;
+    }
+    if !f.missing_metrics.is_empty() {
+        writeln!(
+            out,
+            "       欠けている指標: {}",
+            f.missing_metrics.join(", ")
+        )?;
+    }
+    Ok(())
+}
+
+fn column_of<'a>(summary: &'a NativePeriodSummary, key: &MetricKey) -> Option<&'a ColumnSummary> {
+    summary.column(key.activity, &key.item, &key.column)
+}
+
+fn format_column(col: &ColumnSummary) -> String {
+    let num = |v: Option<f64>| match v {
+        Some(v) => format!("{v:>10.2}"),
+        None => format!("{:>10}", "-"),
+    };
+    let p95 = match col.p95 {
+        PercentileOutcome::Computed(r) => format!("{:>10.2}", r.value),
+        PercentileOutcome::Unavailable { .. } => format!("{:>10}", "-"),
+    };
+    format!(
+        "max={} mean={} p95={} 区間={}",
+        num(col.max.map(|e| e.value)),
+        num(col.mean),
+        p95,
+        col.intervals
+    )
+}
+
+fn format_epoch(ust: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    match Utc.timestamp_opt(ust as i64, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%SZ").to_string(),
+        None => ust.to_string(),
+    }
+}
+
+// ===========================================================================
+// `resarch compare`
+// ===========================================================================
+
+fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
+    let common = &args.common;
+    reject_time_window(common, "compare")?;
+    let mopts = multi_options(common)?;
+
+    // ホストごとに解析し、代表となる起動区間 (最もサンプル数の多い区間) を採る。
+    struct HostEntry {
+        label: String,
+        identity: multi::HostIdentity,
+        segment: BootSegment,
+    }
+    let mut entries: Vec<HostEntry> = Vec::new();
+    let mut partial = false;
+
+    for spec in &args.hosts {
+        let paths = expand_host_path(&spec.path)?;
+        let analysis = multi::analyze_files(&paths, &mopts)?;
+        for s in &analysis.skipped {
+            eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
+            partial = true;
+        }
+        let Some(host) = analysis.hosts.into_iter().next() else {
+            eprintln!("resarch: --host {}: 統計が取れなかった", spec.name);
+            partial = true;
+            continue;
+        };
+        let Some(segment) = host
+            .segments
+            .into_iter()
+            .max_by_key(|s| s.summary.period.samples)
+        else {
+            eprintln!("resarch: --host {}: 起動区間が無い", spec.name);
+            partial = true;
+            continue;
+        };
+        entries.push(HostEntry {
+            label: spec.name.clone(),
+            identity: host.identity,
+            segment,
+        });
+    }
+
+    if entries.len() < 2 {
+        bail!(
+            "比較には 2 ホスト以上の観測が必要です (--host NAME=PATH を 2 つ以上指定してください)"
+        );
+    }
+
+    // 共通時間窓。片方に観測が無い区間を 0 と見なさないため、交差を先に求める。
+    let ranges: Vec<(u64, u64)> = entries
+        .iter()
+        .filter_map(|e| {
+            let p = &e.segment.summary.period;
+            Some((p.first_ust?, p.last_ust?))
+        })
+        .collect();
+    let Some(window) = multi::common_window(&ranges, COMPARE_STEP_SECS) else {
+        bail!("ホスト間に重なる観測期間がありません (同じ時間帯のファイルを指定してください)");
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut comparisons = Vec::new();
+    for r in rule_inputs() {
+        let key = r.key();
+        let mut series = Vec::new();
+        for e in &entries {
+            if let Some(t) = multi::timeline_of(&e.segment, &key) {
+                series.push((e.label.clone(), e.identity.clone(), t));
+            }
+        }
+        // 全ホストで揃っていない指標は比較しない
+        if series.len() != entries.len() {
+            continue;
+        }
+        comparisons.push(multi::compare_hosts(key, &series, window, GaugeFill::None));
+    }
+
+    let mut out = stdout_writer();
+    match common.format {
+        OutputFormat::Json | OutputFormat::SadfJson => {
+            serde_json::to_writer_pretty(&mut out, &comparisons)?;
+            writeln!(out)?;
+        }
+        OutputFormat::Ndjson => {
+            for c in &comparisons {
+                serde_json::to_writer(&mut out, c)?;
+                writeln!(out)?;
+            }
+        }
+        _ => {
+            writeln!(
+                out,
+                "共通期間 {} → {} ({} 秒区間 × {})",
+                format_epoch(window.start_ust),
+                format_epoch(window.end_ust),
+                window.step_secs,
+                window.bucket_count()
+            )?;
+            if comparisons.is_empty() {
+                writeln!(out, "(全ホストで揃っている指標がありません)")?;
+            }
+            for c in &comparisons {
+                writeln!(out)?;
+                writeln!(
+                    out,
+                    "{}  (比較可能な区間 {}/{})",
+                    c.metric.display(),
+                    c.comparable_buckets,
+                    window.bucket_count()
+                )?;
+                for h in &c.hosts {
+                    let observed = h.observed_buckets();
+                    let mean = bucket_mean(h);
+                    writeln!(
+                        out,
+                        "  {:<16} mean={} 観測区間={}/{}",
+                        h.label,
+                        mean.map_or(format!("{:>10}", "-"), |v| format!("{v:>10.2}")),
+                        observed,
+                        window.bucket_count()
+                    )?;
+                }
+            }
+        }
+    }
+    out.flush()?;
+    Ok(exit_code(partial))
+}
+
+fn bucket_mean(h: &multi::HostAlignedSeries) -> Option<f64> {
+    let values: Vec<f64> = h.buckets.iter().filter_map(|b| b.value).collect();
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+/// `--host NAME=PATH` の `PATH` を対象ファイル列へ展開する。
+///
+/// ディレクトリなら中の `sa*` を名前順で拾う。
+fn expand_host_path(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+        .with_context(|| format!("{}: ディレクトリを読めません", path.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("sa") && !n.starts_with("sar"))
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        bail!("{}: sa ファイルが見つかりません", path.display());
+    }
+    Ok(files)
+}
+
+// ===========================================================================
+// `resarch info`
+// ===========================================================================
+
+/// `resarch info` — ヘッダのメタデータと activity 一覧を表示する。
+fn run_info(args: InfoArgs) -> anyhow::Result<ExitCode> {
+    let options = open_options(args.lenient, args.no_mmap);
+
+    let mut out = stdout_writer();
     let mut failed = false;
 
     for (i, path) in args.files.iter().enumerate() {
@@ -92,11 +1243,7 @@ fn run_info(args: InfoArgs) -> anyhow::Result<ExitCode> {
     }
     out.flush()?;
 
-    Ok(if failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(exit_code(failed))
 }
 
 fn write_info_table<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> {

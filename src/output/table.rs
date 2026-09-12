@@ -30,6 +30,7 @@ use super::sadf::spec;
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
+use crate::output::time_filter::Admit;
 use crate::series::{Selection, WalkItem, walk_items};
 
 /// 値が無いことを示す表記。
@@ -70,11 +71,17 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
     writeln!(out, "source: {}", host.source).map_err(super::sadf::wrap_io)?;
 
     let mut printed_header: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut cursor = cfg.time_filter.cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // 表には統計行しか並べないので、イベントは読み飛ばす。
         let WalkItem::Sample(view) = item else {
             return Ok(ScanControl::Continue);
         };
+        match cursor.sample(view) {
+            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
+            Admit::Stop => return Ok(ScanControl::Stop),
+            Admit::Emit => {}
+        }
         // 派生値を出すときは先頭レコードを飛ばす。基準となる前サンプルが無く、
         // 1 行すべてが `-` になって読みにくいだけなので。
         // 生値だけを見るときは先頭レコードにも意味がある。
@@ -164,11 +171,17 @@ fn utc_hms(ust_time: u64) -> String {
 fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
     let mut widths: BTreeMap<u32, Widths> = BTreeMap::new();
 
+    let mut cursor = cfg.time_filter.cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // 幅の計測も統計行だけを見る (イベント行は表に並ばない)。
         let WalkItem::Sample(view) = item else {
             return Ok(ScanControl::Continue);
         };
+        match cursor.sample(view) {
+            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
+            Admit::Stop => return Ok(ScanControl::Stop),
+            Admit::Emit => {}
+        }
         if !view.has_prev && cfg.values.wants_rates() {
             return Ok(ScanControl::Continue);
         }

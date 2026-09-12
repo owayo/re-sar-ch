@@ -17,11 +17,12 @@
 use std::io::{self, Write};
 
 use super::access::{ActivityPair, ItemPair};
-use super::dbppc::{display_cpu_count, present_specs, scan_comments, scan_restarts};
+use super::dbppc::{display_cpu_count, scan_comments, scan_restarts, selected_specs};
 use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Field, Fmt, Group, Shape};
 use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, render, spec};
 use crate::error::Result;
+use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
 use crate::series::{IntervalView, Selection, WalkItem, walk_items};
@@ -32,17 +33,23 @@ pub const XML_DTD_VERSION: &str = "3.18";
 /// `-x` の出力。
 pub fn write_xml<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
     let info = FileInfo::from_file(file);
-    let specs = present_specs(file);
+    let specs = selected_specs(file, cfg);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
 
     let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
+    let mut cursor = cfg.time_filter.cursor();
     walk_items(file, &Selection::Only(ids), |item| {
         // `logic1` の統計ループは RESTART / COMMENT を見ない。
         // `<restarts>` / `<comments>` は後段の別走査が出す。
         let WalkItem::Sample(view) = item else {
             return Ok(ScanControl::Continue);
         };
+        match cursor.sample(view) {
+            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
+            Admit::Stop => return Ok(ScanControl::Stop),
+            Admit::Emit => {}
+        }
         if !view.has_prev || !view.continuous {
             return Ok(ScanControl::Continue);
         }

@@ -162,6 +162,34 @@ What it will not do is dress up a guess as a measurement:
 - **"Not evaluated" is not "nothing found".** Every series it could not assess is listed
   with the reason.
 
+### Charting detected anomalies as SVG
+
+```bash
+resarch detect sa13 --svg-dir charts
+resarch detect sa13 --svg-dir charts-15m --svg-context 15m
+resarch detect sa13 sa14 --activity cpu,disk --from 09:00 --to 10:00 \
+  --svg-dir charts-window --svg-context 1h --format json > detections.json
+```
+
+Each SVG covers a detected **host, resource and metric**, zoomed to the detection
+and its surrounding context. The default adds 30 minutes on each side; use
+`300s`, `15m`, `1h` or `0` to change it. Overlapping windows for the same metric
+are merged; distant detections and separate boot segments remain separate.
+Charts use UTC and may include input samples outside `--from` / `--to` as context.
+Chart options do not change detection thresholds or baseline selection.
+
+- SVG files show detection ranges, observations and applicable thresholds or
+  comparison baselines. Missing samples and discontinuities break the plotted line.
+- `index.json` maps filenames to hosts, resources, metrics, windows and findings.
+- `report.json` contains the ordinary JSON assessment, including evaluation limits.
+
+Choose a new output directory. The ordinary text / JSON / NDJSON report still goes
+to stdout. With no detections, only the empty index and assessment are saved.
+Incomplete `--lenient` results exit nonzero and mark the index as `partial` with
+input diagnostics. Standing findings get separate background charts so they do
+not expand local detection windows. A level-shift boundary is not presented as
+a confirmed event time.
+
 ### Converting an old file
 
 ```bash

@@ -280,6 +280,16 @@ pub struct DetectArgs {
     #[arg(long, value_enum, default_value_t = DetectFormat::Text)]
     pub format: DetectFormat,
 
+    /// 検知したリソース・指標ごとの SVG と一覧を保存する新規ディレクトリ。
+    /// 通常の検知レポートも標準出力へ出す。既存ディレクトリは上書きしない。
+    #[arg(long, value_name = "DIR")]
+    pub svg_dir: Option<PathBuf>,
+
+    /// SVG に含める検知範囲の前後幅 (既定: 30m)。例: 300s、15m、1h。0 も指定可。
+    /// 報告範囲の外も入力にあれば表示する。検知や比較基準は変えない。
+    #[arg(long, value_name = "DURATION", requires = "svg_dir", value_parser = parse_svg_context)]
+    pub svg_context: Option<u64>,
+
     /// 比較基準の材料をどこから取るか。
     ///
     /// **`--from` / `--to` は報告範囲を絞るだけで、基準の材料は絞らない。**
@@ -325,6 +335,28 @@ pub struct DetectArgs {
     /// 並列処理するファイル数。
     #[arg(long, value_name = "N")]
     pub jobs: Option<usize>,
+}
+
+fn parse_svg_context(value: &str) -> Result<u64, String> {
+    let (number, factor) = if let Some(n) = value.strip_suffix('s') {
+        (n, 1)
+    } else if let Some(n) = value.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = value.strip_suffix('h') {
+        (n, 3600)
+    } else if value == "0" {
+        (value, 1)
+    } else {
+        return Err("前後幅は 300s、15m、1h または 0 の形式で指定してください".into());
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("前後幅には 0 以上の整数と s/m/h を指定してください".into());
+    }
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(factor))
+        .ok_or_else(|| "前後幅が大きすぎます".into())
 }
 
 /// `resarch compare` の引数。

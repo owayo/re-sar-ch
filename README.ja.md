@@ -26,9 +26,15 @@
 
 ## Install
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install owayo/re-sar-ch/re-sar-ch
+```
+
 ### From Source
 
-初回リリース前のため、現在はソースからインストールします。Rust ツールチェーンが必要です。
+Rust ツールチェーンが必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/re-sar-ch

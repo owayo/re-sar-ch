@@ -50,7 +50,7 @@ jobs:
             OLD_YEAR=$(echo "${CURRENT}" | cut -d. -f1)
             OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
             OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
-            OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
+            OLD_YEAR_2DIGIT=${OLD_YEAR#20}
             if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
               NEW_COUNTER=$((OLD_COUNTER + 1))
             else
@@ -72,8 +72,8 @@ jobs:
             sed -i "/^name = \"${PKG_NAME}\"$/{n;s/version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/}" Cargo.lock
           fi
 
-          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and tag
         if: ${{ !inputs.dry_run }}
@@ -211,6 +211,14 @@ jobs:
 
             ### Installation
 
+            #### Homebrew (macOS/Linux)
+            ```bash
+            brew install owayo/re-sar-ch/re-sar-ch
+            ```
+
+            #### Manual Download
+            Download the appropriate binary for your platform and add it to your PATH.
+
             #### macOS (Apple Silicon)
             ```bash
             curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/resarch-aarch64-apple-darwin.tar.gz | tar xz
@@ -250,9 +258,135 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: [prepare-release, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-re-sar-ch
+
+      - name: Download release binaries and create bottles
+        id: bottles
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          REPO="${{ github.repository }}"
+
+          # Source archive SHA256 for platforms without a bottle.
+          curl --fail --silent --show-error --location \
+            "https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz" \
+            --output source.tar.gz
+          SHA256_SOURCE=$(sha256sum source.tar.gz | cut -d' ' -f1)
+
+          # Release binaries used to assemble Homebrew bottle directory layouts.
+          curl --fail --silent --show-error --location \
+            "https://github.com/${REPO}/releases/download/${TAG}/resarch-aarch64-apple-darwin.tar.gz" \
+            --output mac_arm64.tar.gz
+          curl --fail --silent --show-error --location \
+            "https://github.com/${REPO}/releases/download/${TAG}/resarch-x86_64-apple-darwin.tar.gz" \
+            --output mac_x86_64.tar.gz
+          curl --fail --silent --show-error --location \
+            "https://github.com/${REPO}/releases/download/${TAG}/resarch-x86_64-unknown-linux-gnu.tar.gz" \
+            --output linux_x86_64.tar.gz
+
+          create_bottle() {
+            local src_tarball=$1
+            local bottle_tag=$2
+            rm -rf bottle_staging
+            mkdir -p "bottle_staging/re-sar-ch/${VERSION}/bin"
+            tar xzf "${src_tarball}" -C "bottle_staging/re-sar-ch/${VERSION}/bin/"
+            test -f "bottle_staging/re-sar-ch/${VERSION}/bin/resarch"
+            chmod +x "bottle_staging/re-sar-ch/${VERSION}/bin/resarch"
+            local bottle_name="re-sar-ch-${VERSION}.${bottle_tag}.bottle.tar.gz"
+            # Keep tar quiet: verbose output would corrupt the captured SHA256 value.
+            tar czf "${bottle_name}" -C bottle_staging re-sar-ch
+            sha256sum "${bottle_name}" | cut -d' ' -f1
+          }
+
+          SHA256_ARM64=$(create_bottle mac_arm64.tar.gz arm64_sonoma)
+          SHA256_INTEL=$(create_bottle mac_x86_64.tar.gz sonoma)
+          SHA256_LINUX=$(create_bottle linux_x86_64.tar.gz x86_64_linux)
+
+          {
+            echo "sha256_source=${SHA256_SOURCE}"
+            echo "sha256_arm64=${SHA256_ARM64}"
+            echo "sha256_intel=${SHA256_INTEL}"
+            echo "sha256_linux=${SHA256_LINUX}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload bottles to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          gh release upload "${TAG}" ./*.bottle.tar.gz --clobber --repo "${{ github.repository }}"
+
+      - name: Update Homebrew Formula
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          SHA256_SOURCE="${{ steps.bottles.outputs.sha256_source }}"
+          SHA256_ARM64="${{ steps.bottles.outputs.sha256_arm64 }}"
+          SHA256_INTEL="${{ steps.bottles.outputs.sha256_intel }}"
+          SHA256_LINUX="${{ steps.bottles.outputs.sha256_linux }}"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-re-sar-ch.git"
+          cd homebrew-re-sar-ch
+          mkdir -p Formula
+
+          cat > Formula/re-sar-ch.rb << 'FORMULA'
+          class ReSarCh < Formula
+            desc "Standalone parser for sysstat sar binary data files"
+            homepage "https://github.com/owayo/re-sar-ch"
+            url "https://github.com/owayo/re-sar-ch/archive/refs/tags/vVERSION_PLACEHOLDER.tar.gz"
+            sha256 "SOURCE_SHA256_PLACEHOLDER"
+            license "MIT"
+
+            bottle do
+              root_url "https://github.com/owayo/re-sar-ch/releases/download/vVERSION_PLACEHOLDER"
+              sha256 cellar: :any_skip_relocation, arm64_sonoma: "ARM64_SHA256_PLACEHOLDER"
+              sha256 cellar: :any_skip_relocation, sonoma: "INTEL_SHA256_PLACEHOLDER"
+              sha256 cellar: :any_skip_relocation, x86_64_linux: "LINUX_SHA256_PLACEHOLDER"
+            end
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args, "--bin", "resarch"
+            end
+
+            test do
+              system "#{bin}/resarch", "--version"
+            end
+          end
+          FORMULA
+
+          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/re-sar-ch.rb
+          sed -i "s|SOURCE_SHA256_PLACEHOLDER|${SHA256_SOURCE}|g" Formula/re-sar-ch.rb
+          sed -i "s|ARM64_SHA256_PLACEHOLDER|${SHA256_ARM64}|g" Formula/re-sar-ch.rb
+          sed -i "s|INTEL_SHA256_PLACEHOLDER|${SHA256_INTEL}|g" Formula/re-sar-ch.rb
+          sed -i "s|LINUX_SHA256_PLACEHOLDER|${SHA256_LINUX}|g" Formula/re-sar-ch.rb
+          sed -i 's/^          //' Formula/re-sar-ch.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/re-sar-ch.rb
+          git commit -m "Update re-sar-ch to ${TAG}"
+          git push
+
   release-summary:
     name: Release Summary
-    needs: [prepare-release, release]
+    needs: [prepare-release, release, update-homebrew]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -267,3 +401,5 @@ jobs:
           echo "  - resarch-x86_64-apple-darwin.tar.gz"
           echo "  - resarch-aarch64-apple-darwin.tar.gz"
           echo "  - resarch-x86_64-pc-windows-msvc.zip"
+          echo ""
+          echo "🍺 Homebrew tap updated: owayo/homebrew-re-sar-ch"

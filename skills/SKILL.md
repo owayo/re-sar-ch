@@ -28,6 +28,11 @@ macOS や Windows で Linux のログを読める。
 | ファイルの世代・ABI・収録 activity を知る | `resarch info <file>` |
 | 既存のツールやスクリプトに食わせる (本家と同じテキスト) | `resarch -u -f <file>` / `resarch sadf -j <file>` |
 | 旧世代のファイルを他ツールへ渡せる形に変換する | `resarch sadf -c <file> > out` |
+| sa バイナリを全項目の sar テキストへ保存する | `resarch sa2sar sa13 -o sar13` |
+
+`sa2sar` は平均・RESTART・COMMENT も含め、既定は採取元に記録された時刻、
+`--utc` で UTC に切り替える。`-o` 省略または `-o -` は標準出力。
+保存先は上書きせず、失敗時も途中までのファイルを保存先に残さない。
 
 **`sar` が「読めない」と言ったファイルでも読める。** `sar` は `format_magic` が現行と
 違うと即エラーにするが、`resarch` は 4 世代すべてを直読する。

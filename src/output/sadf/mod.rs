@@ -89,6 +89,16 @@ pub struct SadfConfig {
     pub activities: Option<Vec<ActivityId>>,
     /// `-s` / `-e` の時刻フィルタ。既定は無効 (全レコードを出す)。
     pub time_filter: TimeFilter,
+    pub cpus: crate::output::sar_text::CpuSelection,
+    pub item_names: std::collections::BTreeMap<ActivityId, Vec<String>>,
+}
+
+impl SadfConfig {
+    pub fn name_selected(&self, id: ActivityId, name: &str) -> bool {
+        self.item_names
+            .get(&id)
+            .is_none_or(|names| names.is_empty() || names.iter().any(|n| n == name))
+    }
 }
 
 // ===========================================================================
@@ -356,14 +366,11 @@ impl Stamp {
 
     /// `<date> <time> <tz>` の 1 フィールド表記 (`-d` / `-p`)。
     ///
-    /// `-U` のときは epoch 秒だけ。`-t` で `sa_tzname` が空のときは TZ を出さない
-    /// (`print_dbppc_timestamp` の `strlen(sa_tzname)` チェック)。
+    /// `-U` のときは epoch 秒だけ。`-t` で `sa_tzname` が空でも
+    /// `print_dbppc_timestamp` と同じく TZ 前の区切り空白を残す。
     pub fn dbppc(&self) -> String {
         if self.date.is_empty() {
             return self.time.clone();
-        }
-        if self.tz.is_empty() {
-            return format!("{} {}", self.date, self.time);
         }
         format!("{} {} {}", self.date, self.time, self.tz)
     }
@@ -537,12 +544,12 @@ mod tests {
         assert_eq!(s.dbppc(), "2019-04-18 15:20:19 CET");
     }
 
-    /// `-t` かつ `sa_tzname` が空なら TZ 欄そのものを出さない。
+    /// `-t` かつ `sa_tzname` が空でも TZ の区切り空白は残す。
     #[test]
-    fn true_time_without_tzname_omits_tz() {
+    fn true_time_without_tzname_keeps_separator() {
         let info = dummy_info();
         let s = Stamp::new(TimeBase::TrueTime, 1_555_593_619, (13, 20, 19), &info);
-        assert_eq!(s.dbppc(), "2019-04-18 13:20:19");
+        assert_eq!(s.dbppc(), "2019-04-18 13:20:19 ");
         assert_eq!(s.raw(), "13:20:19");
     }
 
@@ -1162,7 +1169,7 @@ mod golden {
         dbppc::write_db(&mut buf, &file, &cfg).unwrap();
         let out = String::from_utf8(buf).unwrap();
 
-        let mut lines = out.lines();
+        let mut lines = out.lines().skip_while(|l| !l.starts_with("# hostname;"));
         let hdr = lines.next().expect("フィールド名一覧行");
         assert!(hdr.starts_with("# hostname;interval;timestamp;"));
         // アイテムが 2 個以上ある activity の後には [...] が入る

@@ -50,6 +50,18 @@ sysstat の全フォーマット世代。本家のテストデータとバイト
 - **壊れた入力** — 切り詰め、ありえない item 数、サイズとオフセットの矛盾、
   `nr × nr2 × size` の整数オーバーフローを、鵜呑みにせず検出する
 
+対応状況は次の 4 軸で区別します。「43 activity」は登録数を指し、全歴史的 revision の
+表示検証が済んでいるという意味ではありません。
+
+| 軸 | 現在の範囲 |
+|---|---|
+| デコード | 43 activity のレイアウトを定義。未知 revision は診断付きでスキップ |
+| 意味モデル | 各 activity の列メタデータに counter / gauge / identity と単位を記述 |
+| 派生指標 | レート・割合・行全体の計算を共通の series 層で処理。値が得られない場合は理由を保持 |
+| 表示検証 | 本家 corpus と回帰テストで世代・ABI・activity ごとに検証。sadf の golden は FAN/IN/TEMP が対象で、43 種すべての全文比較ではない |
+
+revision ごとの定義は [activity 仕様](docs/format/02-activities.md) を参照してください。
+
 ## インストール
 
 [Releases](https://github.com/owayo/re-sar-ch/releases) からバイナリを取得するか、ビルドします。
@@ -79,6 +91,7 @@ resarch -u -i 600 -f sa01                # 10 分刻みに間引く
 resarch -I --int=0,LOC -f sa01           # 割り込みを番号か名前で選ぶ
 resarch sar -A -f sa01                   # 明示的な互換入口
 resarch sadf -j sa01                     # sadf 互換 JSON
+resarch sadf -g sa01 -- -u -P ALL > cpu.svg  # SVG グラフ (reSARch 独自描画)
 ```
 
 `sar` の癖も意図的に再現しています。`-I` は数値を取らない、`-P ALL` と `-P all` は別物、
@@ -93,13 +106,18 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # エージェントやパイプラインへ流す用
 resarch detect sa01                      # いつ・何に異変があったか
 resarch summarize sa01 sa02 --format json
-resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 各日の 9〜18 時だけを集計
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 各日の UTC 9〜18 時を集計
+resarch show sa01 --activity irq --irq-cpus --format ndjson  # 割り込みの CPU 別内訳も表示
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
 
 `summarize` / `compare` の `--from` / `--to` は**集計期間そのもの**を絞ります。
 範囲外のサンプルは平均・p95・差分合計のどれにも入らず、期間の端点も範囲内だけになります。
 `detect` の `--from` / `--to` は意味が違い、報告範囲だけを絞って比較基準の材料は絞りません。
+独自コマンドの `hh:mm[:ss]` はすべて **UTC** です。10 桁の epoch 秒も指定できます。
+`compare` の JSON は `comparisons` と `skipped_metrics` を持ち、比較できなかった指標と
+観測が無いホストを列挙します。割り込み行は `cpu` (`all` または 0 始まりの CPU 番号) を持ち、
+CPU 別内訳の無い旧ファイルでは `all` だけを出します。
 
 ### 異変の当たりを付ける
 
@@ -129,10 +147,10 @@ resarch sadf -c sa01 > sa01-current        # 0x2171 / 0x2173 → 0x2175
 resarch sadf -c sa01 -O hz=250 > out       # 仮定する HZ を上書きする
 ```
 
-旧世代のヘッダは HZ を持たず、本家の `sadf -c` は**変換を実行したマシンの HZ** を
-書き込むため、同じ入力でも実行環境で出力が変わります。reSARch はファイル自身の
-`uptime` カウンタから推定し、**再起動をまたぐ対は使いません**。
-採用した値とその出所は必ず報告します。
+旧世代のヘッダは tick 周波数を持たないため、主要な Linux アーキテクチャと直読経路に
+合わせて **USER_HZ=100** を既定にします。これは `/proc/stat` の単位であり、カーネルの
+`CONFIG_HZ` とは別です。生成元の値が分かる場合にだけ `-O hz=` で上書きしてください。
+suspend や壁時計の飛びから周波数を推定せず、採用値と出所を stderr に報告します。
 
 ## AI エージェントから使う
 
@@ -169,8 +187,9 @@ resarch skill-install codex     # ~/.codex/skills/resarch/SKILL.md
 `sda1` という名前は期待出力を作ったマシンの構成であって、ファイルの中身ではありません。
 reSARch は他ホストで採取したログに誤った名前を付けないよう、あえて `dev8-1` のまま出します。
 
-比較できない 1 件は SVG を描く `sadf -g` です。対応する出力形式が無いので、
-毎回「比較不能」として集計に出し、黙って合格扱いにはしていません。
+`sadf -g` は共通の計算値を使う reSARch 独自の SVG 描画です。装飾・座標の全文一致を
+互換契約に含めないため、SVG の golden 1 件は比較対象外として明示します。
+グラフの値・選択・XML エスケープ・欠測や再起動での線の切断は別の回帰テストで検証します。
 
 不一致は 1 件でもテストを失敗させます。「実装が面倒」「値が合わない」は
 マスクの理由として認めていません。
@@ -195,8 +214,8 @@ v10 のファイルを v12 の `sar` 書式で出すこともその逆もでき�
 | オプション | 扱い |
 |---|---|
 | `sar -o` / `--sadc` | 採取は対象外なので明示的にエラー |
-| `sadf -g` / `-l` | SVG・PCP は未対応 |
-| `sadf` の `--dev=` / `--iface=` / `--fs=` / `--int=` | item 名フィルタは `sar` 側にしか効かない |
+| `sadf -l` | PCP は未対応 |
+| `sadf -g -O autoscale,packed,customcol` | この 3 指定は明示的に拒否。skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday は対応 |
 | `sadf -H` と他形式の併用 | 未対応 (`resarch sadf -H <file>` を使う) |
 
 ## 設計上の要点

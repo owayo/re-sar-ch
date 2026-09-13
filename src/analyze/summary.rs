@@ -40,7 +40,8 @@ use crate::format::file::SaFile;
 use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
 use crate::model::{ActivityId, Aggregation, Availability, Unit, ValueKind};
 use crate::series::compute::{
-    ComputeContext, RateSample, column_value_strict, rate_from_totals, rate_sample, tick_total,
+    ComputeContext, RateSample, column_value_strict, prepare_item, rate_from_totals, rate_sample,
+    raw_column, tick_total,
 };
 use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
@@ -50,7 +51,7 @@ use super::percentile::{PercentileResult, PercentileSpec, PercentileUnavailable,
 use super::timeline::{ExclusionReason, MetricKey, MetricPoint, SINGLE_ITEM, Timelines};
 
 /// 独自サマリのスキーマ版。出力契約として固定する (`docs/design.md` §11)。
-pub const SUMMARY_SCHEMA_VERSION: &str = "1";
+pub const SUMMARY_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 /// このサマリの種別。本家 `Average:` 行と混同されないよう出力に含める。
 pub const SUMMARY_KIND: &str = "resarch_native_summary";
@@ -663,8 +664,28 @@ impl NativeSummaryBuilder {
         let normalize_by_ticks = normalizes_by_cpu_ticks(snap.id);
         let cfg = AccumConfig::of(&self.opts, normalize_by_ticks);
 
-        for (index, item) in snap.items.iter().enumerate() {
-            let label = item_label(snap.id, def.shape, index, item.key.as_deref());
+        let irq_transposed =
+            snap.id == ActivityId::IRQ && (snap.nr2 > 1 || plan.text_index("irq_name").is_some());
+        let item_count = if irq_transposed {
+            snap.nr2 as usize
+        } else {
+            snap.items.len()
+        };
+        for (index, item) in snap.items.iter().take(item_count).enumerate() {
+            let label = if snap.id == ActivityId::DISK {
+                let field = |name| {
+                    def.columns
+                        .iter()
+                        .position(|c| c.public_name == name)
+                        .and_then(|c| raw_column(plan, item, c).ok())
+                };
+                match (field("major"), field("minor")) {
+                    (Some(major), Some(minor)) => format!("dev{major}-{minor}"),
+                    _ => format!("dev{index}"),
+                }
+            } else {
+                item_label(snap.id, def.shape, index, item.key.as_deref())
+            };
             // 前サンプルの同一 item を探す。**位置ではなく識別子で対応付ける**。
             let (prev_item, same_item) = match (prev_snap, item.key.as_deref()) {
                 (Some(p), Some(k)) => match p.item_by_key(k) {
@@ -692,6 +713,19 @@ impl NativeSummaryBuilder {
                 // CPU の `all` 行 / `A_IRQ` の合計列は集約 item として扱う
                 aggregate_item: label == "all" || label == "sum",
             };
+
+            let prepared = prepare_item(
+                snap.id,
+                plan,
+                index,
+                prev_snap.map_or(&[], |s| s.items.as_slice()),
+                &snap.items,
+                ctx,
+            )
+            .expect("現在の item は存在する");
+            let prev_item = prev_item.map(|_| &prepared.prev);
+            let item = &prepared.curr;
+            let ctx = prepared.ctx;
 
             let setup = DeltaSetup {
                 normalize_by_ticks,
@@ -721,6 +755,16 @@ impl NativeSummaryBuilder {
                     .then(|| counter_delta(snap.id, plan, column, prev_item, item, &ctx, setup));
 
                 let outcome = match strict {
+                    _ if prepared.offline && view.has_prev => {
+                        Outcome::Excluded(if normalize_by_ticks && ctx.tick_total == Some(0) {
+                            ExclusionReason::ZeroDenominator
+                        } else {
+                            ExclusionReason::ItemReplaced
+                        })
+                    }
+                    _ if prepared.replaced && !matches!(meta.kind, ValueKind::Gauge) => {
+                        Outcome::Excluded(ExclusionReason::ItemReplaced)
+                    }
                     Some(Err(reason)) => Outcome::Excluded(reason),
                     strict => {
                         // 区間値は `compute` 層から取る。
@@ -1018,7 +1062,7 @@ pub fn item_label(id: ActivityId, shape: ItemShape, index: usize, key: Option<&s
     }
     match shape {
         ItemShape::Single => SINGLE_ITEM.to_string(),
-        _ if id == ActivityId::CPU => {
+        _ if matches!(id, ActivityId::CPU | ActivityId::NET_SOFT) => {
             if index == 0 {
                 "all".to_string()
             } else {
@@ -1072,7 +1116,7 @@ pub fn summarize_file(
         nodename: Some(h.nodename.clone()),
         release: Some(h.release.clone()),
         machine: Some(h.machine.clone()),
-        cpu_nr: h.cpu_nr,
+        cpu_nr: h.real_cpu_count(),
         tzname: h.tzname.clone(),
         files: vec![file.path().display().to_string()],
         boot_segment: None,
@@ -1858,10 +1902,57 @@ mod tests {
         let s = f.finish();
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(SUMMARY_KIND), "{json}");
-        assert!(json.contains(r#""schema_version":"1""#));
+        assert!(json.contains(r#""schema_version":"1.0""#));
         assert!(json.contains("rate_over_valid_intervals"));
         // u64 の生値は十進文字列
         assert!(json.contains(r#""delta_total":"100""#), "{json}");
+    }
+
+    #[test]
+    fn disk_labels_use_source_device_numbers() {
+        let id = ActivityId::DISK;
+        let plan = plan_for(id);
+        let mut feed = Feed::new(id, opts_all());
+        for (at, ios) in [(1000, 100), (1010, 110)] {
+            feed.push(
+                snapshot(
+                    id,
+                    at,
+                    at * 100,
+                    vec![item_of(
+                        &plan,
+                        &[("major", 8), ("minor", 16), ("nr_ios", ios)],
+                    )],
+                ),
+                true,
+            );
+        }
+        let summary = feed.finish();
+        assert_eq!(summary.activity(id).unwrap().items[0].item, "dev8-16");
+        assert!(summary.timelines.iter().all(|t| t.key.item == "dev8-16"));
+    }
+
+    #[test]
+    fn irq_summary_keeps_one_named_aggregate_per_interrupt() {
+        let id = ActivityId::IRQ;
+        let mut feed = Feed::new(id, opts_all());
+        feed.plans[0].plan.nr = 3;
+        feed.plans[0].plan.nr2 = 2;
+        for (at, count) in [(1000, 100), (1010, 200)] {
+            let plan = &feed.plans[0].plan;
+            let mut items: Vec<_> = (0..6).map(|_| graded_item(plan, count, 0)).collect();
+            items[0].key = Some("sum".into());
+            items[1].key = Some("timer".into());
+            let mut sample = snapshot(id, at, at * 100, items);
+            sample.activities[0].nr = 3;
+            sample.activities[0].nr2 = 2;
+            feed.push(sample, true);
+        }
+        let summary = feed.finish();
+        let items = &summary.activity(id).unwrap().items;
+        assert_eq!(items.len(), 2, "CPU の平坦な添字を独立 item にしない");
+        assert!(items.iter().any(|i| i.item == "sum"));
+        assert!(items.iter().any(|i| i.item == "timer"));
     }
 
     #[test]

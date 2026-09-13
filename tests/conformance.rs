@@ -300,9 +300,9 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -g <data> -- -A",
         golden: "expected.sadf-g-trunc",
         phase: Phase::RawValues,
-        // `-g` は SVG グラフ。reSARch には対応する出力形式が無い。
+        // SVG は独自描画。座標・装飾の全文一致は互換契約に含めない。
         repro: Repro::Unsupported {
-            missing: "sadf -g (SVG) 相当の出力形式",
+            missing: "SVG は独自描画のため本家 SVG との全文比較は対象外 (数値・選択は tests/svg.rs で検証)",
         },
         masks: &[],
     },
@@ -390,8 +390,8 @@ const GOLDEN_CASES: &[GoldenCase] = &[
     },
 ];
 // 本家テスト 01530 (`sadf -g ... -- -m FAN,IN,TEMP`) はここに入れていない。
-// `-g` の期待出力は 144 KB の SVG で、対応する出力形式が reSARch に無い。
-// 「SVG が無い」ことは 01405 の [`Repro::Unsupported`] で 1 件数えており、
+// `-g` の期待出力は 144 KB の SVG で、独自描画と装飾・座標が異なる。
+// SVG 全文比較が対象外であることは 01405 の [`Repro::Unsupported`] で 1 件数えており、
 // 同じ理由のケースを 2 件並べても情報が増えないため取得対象からも外している。
 
 /// 期待出力を持たず「エラーメッセージと終了コードだけ」を見るケース (§4.2 の後半)。
@@ -549,6 +549,27 @@ fn render_sadf(
                 .collect(),
         ),
         time_filter: TimeFilter::default(),
+        cpus: if parsed.sar.cpu_bitmap.count_bits() == parsed.sar.cpu_bitmap.capacity_bits() {
+            CpuSelection::All
+        } else {
+            CpuSelection::Listed {
+                aggregate: parsed.sar.cpu_bitmap.aggregate_selected(),
+                cpus: parsed.sar.cpu_bitmap.selected_cpus().collect(),
+            }
+        },
+        item_names: [
+            Activity::Disk,
+            Activity::NetDev,
+            Activity::NetEdev,
+            Activity::Fs,
+            Activity::Irq,
+        ]
+        .into_iter()
+        .filter_map(|a| {
+            let names = parsed.sar.item_list(a);
+            (!names.is_empty()).then(|| (ActivityId(u32::from(a.id())), names.to_vec()))
+        })
+        .collect(),
     };
 
     let mut buf: Vec<u8> = Vec::new();
@@ -1031,7 +1052,7 @@ fn upstream_headers_decode_to_the_measured_facts() {
 ///   `major:minor` を実行ホストの `/dev` で解決した結果なので、`sa` ファイルからは
 ///   再現できない。reSARch は他ホストのファイルに誤名を出さないよう
 ///   `dev<major>-<minor>` のまま出す
-/// - 比較不能は `sadf -g` (SVG) の 1 件のみ。対応する出力形式が無い
+/// - 比較対象外は `sadf -g` (SVG) の 1 件のみ。独自描画で数値検証は tests/svg.rs
 ///
 /// 実測で見つかった 9 件の不一致 (先頭イベントの再出力・magic 不一致 activity の表示・
 /// CPU 数・`kbavail`・空きスロット・オフライン CPU・日付の時刻源・`[Unknown format]`) は
@@ -1068,14 +1089,14 @@ fn golden_outputs_match_upstream() {
         let expected = std::fs::read_to_string(&golden).expect("期待出力が読めない");
         assert!(!expected.is_empty(), "{}: 期待出力が空", case.golden);
 
-        // 出力形式そのものが無いケース。実装の誤りではないので失敗にはしないが、
+        // 全文互換を契約しないケース。実装の誤りではないので失敗にはしないが、
         // 「検証できていない」ことは毎回目に見える形で残す。
         if let Repro::Unsupported { missing } = case.repro {
             eprintln!(
-                "  比較不能  {head}\n            {missing} が無い (本家: {})",
+                "  比較対象外  {head}\n            {missing} (本家: {})",
                 case.upstream_cmd
             );
-            unsupported.push(format!("{head}: {missing} が無い"));
+            unsupported.push(format!("{head}: {missing}"));
             continue;
         }
 

@@ -95,7 +95,7 @@ use crate::analyze::timeline::{MetricKey, MetricTimeline, Timelines};
 use crate::model::{ActivityId, Unit, ValueKind};
 
 /// 検出出力のスキーマ版。出力契約として固定する (`docs/design.md` §11)。
-pub const DETECT_SCHEMA_VERSION: &str = "1";
+pub const DETECT_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 /// 検出器の版。閾値や手順を変えたら上げる。
 pub const DETECTOR_VERSION: &str = "resarch-detect/1";
@@ -180,6 +180,8 @@ pub struct TemporalSupport {
     pub end_ust: u64,
     /// 値が得られた採取回数。
     pub samples: u64,
+    /// 系列全体で値が得られた採取回数 (欠測割合の分母)。
+    pub series_observed_samples: u64,
     /// 系列全体で値が得られなかった採取回数。
     pub missing_samples: u64,
     /// 系列全体で不連続として捨てた区間数。
@@ -230,6 +232,9 @@ impl TemporalSupport {
             start_ust: self.start_ust.min(other.start_ust),
             end_ust: self.end_ust.max(other.end_ust),
             samples: self.samples.max(other.samples),
+            series_observed_samples: self
+                .series_observed_samples
+                .max(other.series_observed_samples),
             missing_samples: self.missing_samples.max(other.missing_samples),
             discontinuities: self.discontinuities.max(other.discontinuities),
             observed_cs: self.observed_cs.max(other.observed_cs),
@@ -923,7 +928,7 @@ pub enum ReportBound {
     None,
     /// エポック秒。
     Epoch(u64),
-    /// 時刻 (UTC)。入力の最初の採取日に当てて解釈する。
+    /// 時刻 (UTC)。UTC の毎日の時刻として比較する。
     TimeOfDay { hour: u8, min: u8, sec: u8 },
 }
 
@@ -1094,6 +1099,8 @@ impl Default for DetectThresholds {
 /// 検出の設定。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DetectOptions {
+    /// None は全 activity。選択外のカタログ系列は入力欠落と区別して報告する。
+    pub selected_activities: Option<Vec<ActivityId>>,
     pub baseline_scope: BaselineScope,
     pub report_from: ReportBound,
     pub report_to: ReportBound,
@@ -1296,6 +1303,7 @@ impl PreparedSeries {
             start_ust: first.reported_start_ust(),
             end_ust: last.end_ust,
             samples: observations.len() as u64,
+            series_observed_samples: self.observations.len() as u64,
             missing_samples: self.missing,
             discontinuities: self.discontinuities,
             // 瞬時値は長さを持つ区間を観測していない
@@ -1507,6 +1515,13 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
     let mut intervals: Vec<u64> = Vec::new();
 
     for timeline in timelines.iter() {
+        if opts
+            .selected_activities
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&timeline.key.activity))
+        {
+            continue;
+        }
         let Some(entry) = metric_catalog::lookup(&timeline.key) else {
             continue;
         };
@@ -1547,7 +1562,15 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
     // **黙って落とすと「検出なし」と区別が付かない。**
     for entry in metric_catalog::CATALOG {
         if !seen.iter().any(|e| std::ptr::eq(*e, entry)) {
-            out.evaluations.push(SeriesEvaluation::absent(entry));
+            let excluded = opts
+                .selected_activities
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&entry.activity));
+            out.evaluations.push(if excluded {
+                SeriesEvaluation::excluded(entry)
+            } else {
+                SeriesEvaluation::absent(entry)
+            });
         }
     }
 
@@ -2207,6 +2230,29 @@ mod tests {
     }
 
     /// カタログにあるのに入力に無い系列は「評価できなかった」として残る。
+    #[test]
+    fn activity_selection_is_not_reported_as_source_absence() {
+        use crate::analyze::assessment::{NotEvaluated, RouteStatus};
+        let opts = DetectOptions {
+            selected_activities: Some(vec![ActivityId::CPU]),
+            ..Default::default()
+        };
+        let out = detect(&single(cpu_idle(&vals(&[90.0; 20]))), &opts);
+        for eval in out.evaluations {
+            if eval.series.activity == ActivityId::CPU {
+                continue;
+            }
+            assert_eq!(
+                eval.fixed_condition,
+                RouteStatus::NotEvaluated {
+                    reason: NotEvaluated::ExcludedBySelection
+                }
+            );
+            assert_eq!(eval.robust_deviation, eval.fixed_condition);
+            assert_eq!(eval.level_shift, eval.fixed_condition);
+        }
+    }
+
     #[test]
     fn absent_series_are_reported_as_not_evaluated() {
         let ts = single(cpu_idle(&vals(&[50.0; 20])));

@@ -51,6 +51,18 @@ Also handled:
 - **Malformed input** — truncation, impossible item counts, size/offset contradictions and
   the `nr × nr2 × size` integer overflow are all detected rather than trusted
 
+Support is tracked on four separate dimensions. “43 activities” describes the registry,
+not verification of every historical revision.
+
+| Dimension | Current coverage |
+|---|---|
+| Decode | Layout definitions for all 43 activities; unknown revisions are skipped with diagnostics |
+| Meaning | Counter/gauge/identity and units in each activity's column metadata |
+| Derived metrics | Shared rates, percentages and group calculations; unavailable values retain a reason |
+| Output verification | Upstream corpus and regression tests cover selected generations, ABIs and activities; golden sadf cases cover FAN/IN/TEMP, not all 43 |
+
+See [the activity specification](docs/format/02-activities.md) for revision details.
+
 ## Install
 
 Grab a binary from [Releases](https://github.com/owayo/re-sar-ch/releases), or build it:
@@ -80,6 +92,7 @@ resarch -u -i 600 -f sa01                # thin the samples to ~10-minute steps
 resarch -I --int=0,LOC -f sa01           # pick interrupts by number or name
 resarch sar -A -f sa01                   # explicit compatibility entry point
 resarch sadf -j sa01                     # sadf-compatible JSON
+resarch sadf -g sa01 -- -u -P ALL > cpu.svg  # SVG charts (reSARch drawing)
 ```
 
 The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs from
@@ -94,7 +107,8 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
 resarch detect sa01                      # where and what looks off
 resarch summarize sa01 sa02 --format json
-resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # only 9am-6pm of each day
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 09:00-18:00 UTC each day
+resarch show sa01 --activity irq --irq-cpus --format ndjson  # per-CPU interrupt detail
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
 
@@ -102,6 +116,10 @@ For `summarize` and `compare`, `--from` / `--to` narrow **the aggregation period
 samples outside the range enter neither the mean, the p95, nor the delta totals, and the
 period bounds shrink with them. `detect` reads the same two options differently — they
 narrow what gets reported, not the material its comparison basis is built from.
+All native commands interpret `hh:mm[:ss]` as **UTC**; 10-digit epoch seconds are also
+accepted. `compare` JSON contains `comparisons` and `skipped_metrics`, including the
+hosts missing each skipped metric. IRQ rows carry a `cpu` dimension (`all` or a zero-based
+CPU number); old files without CPU detail emit only `all`.
 
 ### Finding what went wrong
 
@@ -135,10 +153,11 @@ resarch sadf -c sa01 > sa01-current        # 0x2171 / 0x2173 → 0x2175
 resarch sadf -c sa01 -O hz=250 > out       # override the assumed HZ
 ```
 
-Old headers do not record HZ, and upstream's `sadf -c` substitutes the HZ of whatever
-machine runs the conversion — so the same input produces different output elsewhere.
-reSARch estimates it from the file's own `uptime` counters instead, never pairing samples
-across a restart, and reports which value it used and how it got there.
+Old headers do not record the tick frequency. reSARch uses **USER_HZ=100** by default,
+matching Linux on common architectures and the direct-reading path. This is the unit of
+`/proc/stat`, independent of the kernel's `CONFIG_HZ`. Only `-O hz=` overrides it for an
+input with a known different tick frequency; wall-clock gaps and suspend never change it.
+The chosen value and its source are reported on stderr.
 
 ## Use it from an AI agent
 
@@ -176,9 +195,10 @@ Upstream resolves `major:minor` through the **reading host's** `/dev` and `/sys`
 reSARch deliberately prints `dev8-1` instead rather than inventing a name that would be
 wrong for a log collected elsewhere.
 
-The one case that cannot be compared is `sadf -g`, which draws SVG. That output format
-is not implemented, and the suite reports it as "not comparable" on every run rather than
-quietly counting it as a pass.
+SVG (`sadf -g`) uses reSARch's own drawing with the shared computed values. Its decoration
+and coordinates are outside the byte comparison contract, so one SVG golden remains
+explicitly excluded. Separate tests check chart values, selections, XML escaping, and
+line breaks at missing samples and restarts.
 
 Mismatches are never tolerated: a single one fails the suite. "Hard to implement" and
 "the number doesn't match" are not accepted reasons to mask something.
@@ -204,8 +224,8 @@ Options that are parsed but not yet acted upon are rejected at run time with a r
 | Option | Status |
 |---|---|
 | `sar -o` / `--sadc` | Collection is out of scope — rejected explicitly |
-| `sadf -g` / `-l` | SVG and PCP output are not implemented |
-| `sadf --dev=` / `--iface=` / `--fs=` / `--int=` | Item-name filters reach `sar` but not `sadf` yet |
+| `sadf -l` | PCP output is not implemented |
+| `sadf -g -O autoscale,packed,customcol` | These SVG options are explicitly rejected; skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday are supported |
 | `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
 
 ## Design notes

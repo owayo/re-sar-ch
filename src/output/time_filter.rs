@@ -282,6 +282,25 @@ impl TimeCursor {
             && datecmp(rec, self.filter.end, false) != Ordering::Greater
     }
 
+    /// 独自出力のイベントは、日跨ぎ指定を日内の時刻の弧として判定する。
+    /// 互換出力の特殊レコードに固有の `cross_day = false` 規則とは分ける。
+    pub fn native_event(&self, ust_time: u64, hms: (u8, u8, u8)) -> bool {
+        if let (TimeBound::HhMmSs { .. }, TimeBound::HhMmSs { hour, min, sec }) =
+            (self.filter.start, self.filter.end)
+            && hour >= 24
+        {
+            let rec = self.filter.rec_time(ust_time, hms);
+            let end = TimeBound::HhMmSs {
+                hour: hour - 24,
+                min,
+                sec,
+            };
+            return datecmp(rec, self.filter.start, false) != Ordering::Less
+                || datecmp(rec, end, false) != Ordering::Greater;
+        }
+        self.event(ust_time, hms)
+    }
+
     /// `cross_day` の更新 (§1.9)。一度立ったら戻さない。
     fn update_cross_day(&mut self, view: &IntervalView<'_>, rec: RecTime) {
         if self.cross_day || !view.has_prev {

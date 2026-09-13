@@ -1237,7 +1237,7 @@ pub const SPECS: &[ActivitySpec] = &[
         json_key: "cpu-load",
         xml_elem: "cpu-load",
         xml_child: "cpu",
-        xml_wrapper_attrs: " per=\"second\"",
+        xml_wrapper_attrs: "",
         group: Group::None,
         closes_group: false,
         item: ItemKind::Cpu,

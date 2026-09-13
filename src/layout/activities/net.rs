@@ -101,6 +101,7 @@ const NET_DEV_FIELDS_8A: &[WireField] = &[
 const NET_DEV_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8d,
+        self_describing: true,
         types_nr: [7, 0, 1],
         size_lp64: 80,
         layout: WireLayout::new("stats_net_dev@0x8d", NET_DEV_FIELDS),
@@ -108,6 +109,7 @@ const NET_DEV_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8c,
+        self_describing: false,
         types_nr: [7, 0, 1],
         size_lp64: 144,
         layout: WireLayout::new("stats_net_dev@0x8c", NET_DEV_FIELDS_8C),
@@ -115,6 +117,7 @@ const NET_DEV_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [7, 0, 0],
         size_lp64: 128,
         layout: WireLayout::new("stats_net_dev@0x8b", NET_DEV_FIELDS_8B),
@@ -122,6 +125,7 @@ const NET_DEV_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 7, 0],
         size_lp64: 72,
         layout: WireLayout::new("stats_net_dev@0x8a", NET_DEV_FIELDS_8A),
@@ -281,6 +285,7 @@ const NET_EDEV_FIELDS_8A: &[WireField] = &[
 const NET_EDEV_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [9, 0, 0],
         size_lp64: 88,
         layout: WireLayout::new("stats_net_edev@0x8c", NET_EDEV_FIELDS),
@@ -288,6 +293,7 @@ const NET_EDEV_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [9, 0, 0],
         size_lp64: 160,
         layout: WireLayout::new("stats_net_edev@0x8b", NET_EDEV_FIELDS_8B),
@@ -295,6 +301,7 @@ const NET_EDEV_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 9, 0],
         size_lp64: 88,
         layout: WireLayout::new("stats_net_edev@0x8a", NET_EDEV_FIELDS_8A),
@@ -399,6 +406,7 @@ const NET_NFS_FIELDS: &[WireField] = &[
 
 const NET_NFS_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 0, 6],
     size_lp64: 24,
     layout: WireLayout::new("stats_net_nfs@0x8a", NET_NFS_FIELDS),
@@ -475,6 +483,7 @@ const NET_NFSD_FIELDS: &[WireField] = &[
 
 const NET_NFSD_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 0, 11],
     size_lp64: 44,
     layout: WireLayout::new("stats_net_nfsd@0x8a", NET_NFSD_FIELDS),
@@ -587,6 +596,7 @@ const NET_SOCK_FIELDS: &[WireField] = &[
 
 const NET_SOCK_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 0, 6],
     size_lp64: 24,
     layout: WireLayout::new("stats_net_sock@0x8a", NET_SOCK_FIELDS),
@@ -687,6 +697,7 @@ const NET_IP_FIELDS_8A: &[WireField] = &[
 const NET_IP_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [8, 0, 0],
         size_lp64: 64,
         layout: WireLayout::new("stats_net_ip@0x8c", NET_IP_FIELDS),
@@ -694,6 +705,7 @@ const NET_IP_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [8, 0, 0],
         size_lp64: 128,
         layout: WireLayout::new("stats_net_ip@0x8b", NET_IP_FIELDS_8B),
@@ -701,6 +713,7 @@ const NET_IP_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 8, 0],
         size_lp64: 64,
         layout: WireLayout::new("stats_net_ip@0x8a", NET_IP_FIELDS_8A),
@@ -816,6 +829,7 @@ const NET_EIP_FIELDS_8A: &[WireField] = &[
 const NET_EIP_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [8, 0, 0],
         size_lp64: 64,
         layout: WireLayout::new("stats_net_eip@0x8c", NET_EIP_FIELDS),
@@ -823,6 +837,7 @@ const NET_EIP_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [8, 0, 0],
         size_lp64: 128,
         layout: WireLayout::new("stats_net_eip@0x8b", NET_EIP_FIELDS_8B),
@@ -830,6 +845,7 @@ const NET_EIP_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 8, 0],
         size_lp64: 64,
         layout: WireLayout::new("stats_net_eip@0x8a", NET_EIP_FIELDS_8A),
@@ -927,6 +943,7 @@ const NET_ICMP_FIELDS: &[WireField] = &[
 
 const NET_ICMP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 14, 0],
     size_lp64: 112,
     layout: WireLayout::new("stats_net_icmp@0x8a", NET_ICMP_FIELDS),
@@ -1068,6 +1085,7 @@ const NET_EICMP_FIELDS: &[WireField] = &[
 
 const NET_EICMP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 12, 0],
     size_lp64: 96,
     layout: WireLayout::new("stats_net_eicmp@0x8a", NET_EICMP_FIELDS),
@@ -1185,6 +1203,7 @@ const NET_TCP_FIELDS: &[WireField] = &[
 
 const NET_TCP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 4, 0],
     size_lp64: 32,
     layout: WireLayout::new("stats_net_tcp@0x8a", NET_TCP_FIELDS),
@@ -1239,6 +1258,7 @@ const NET_ETCP_FIELDS: &[WireField] = &[
 
 const NET_ETCP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 5, 0],
     size_lp64: 40,
     layout: WireLayout::new("stats_net_etcp@0x8a", NET_ETCP_FIELDS),
@@ -1300,6 +1320,7 @@ const NET_UDP_FIELDS: &[WireField] = &[
 
 const NET_UDP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 4, 0],
     size_lp64: 32,
     layout: WireLayout::new("stats_net_udp@0x8a", NET_UDP_FIELDS),
@@ -1353,6 +1374,7 @@ const NET_SOCK6_FIELDS: &[WireField] = &[
 
 const NET_SOCK6_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 0, 4],
     size_lp64: 16,
     layout: WireLayout::new("stats_net_sock6@0x8a", NET_SOCK6_FIELDS),
@@ -1441,6 +1463,7 @@ const NET_IP6_FIELDS_8A: &[WireField] = &[
 const NET_IP6_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [10, 0, 0],
         size_lp64: 80,
         layout: WireLayout::new("stats_net_ip6@0x8c", NET_IP6_FIELDS),
@@ -1448,6 +1471,7 @@ const NET_IP6_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [10, 0, 0],
         size_lp64: 160,
         layout: WireLayout::new("stats_net_ip6@0x8b", NET_IP6_FIELDS_8B),
@@ -1455,6 +1479,7 @@ const NET_IP6_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 10, 0],
         size_lp64: 80,
         layout: WireLayout::new("stats_net_ip6@0x8a", NET_IP6_FIELDS_8A),
@@ -1595,6 +1620,7 @@ const NET_EIP6_FIELDS_8A: &[WireField] = &[
 const NET_EIP6_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [11, 0, 0],
         size_lp64: 88,
         layout: WireLayout::new("stats_net_eip6@0x8c", NET_EIP6_FIELDS),
@@ -1602,6 +1628,7 @@ const NET_EIP6_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [11, 0, 0],
         size_lp64: 176,
         layout: WireLayout::new("stats_net_eip6@0x8b", NET_EIP6_FIELDS_8B),
@@ -1609,6 +1636,7 @@ const NET_EIP6_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 11, 0],
         size_lp64: 88,
         layout: WireLayout::new("stats_net_eip6@0x8a", NET_EIP6_FIELDS_8A),
@@ -1732,6 +1760,7 @@ const NET_ICMP6_FIELDS: &[WireField] = &[
 
 const NET_ICMP6_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 17, 0],
     size_lp64: 136,
     layout: WireLayout::new("stats_net_icmp6@0x8a", NET_ICMP6_FIELDS),
@@ -1898,6 +1927,7 @@ const NET_EICMP6_FIELDS: &[WireField] = &[
 
 const NET_EICMP6_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 11, 0],
     size_lp64: 88,
     layout: WireLayout::new("stats_net_eicmp6@0x8a", NET_EICMP6_FIELDS),
@@ -2007,6 +2037,7 @@ const NET_UDP6_FIELDS: &[WireField] = &[
 
 const NET_UDP6_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 4, 0],
     size_lp64: 32,
     layout: WireLayout::new("stats_net_udp6@0x8a", NET_UDP6_FIELDS),
@@ -2064,6 +2095,7 @@ const NET_FC_FIELDS: &[WireField] = &[
 
 const NET_FC_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 4, 0],
     size_lp64: 48,
     layout: WireLayout::new("stats_fchost@0x8a", NET_FC_FIELDS),
@@ -2140,6 +2172,7 @@ const NET_SOFT_FIELDS_V5: &[WireField] = &[
 const NET_SOFT_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8a,
+        self_describing: true,
         types_nr: [0, 0, 6],
         size_lp64: 24,
         layout: WireLayout::new("stats_softnet@0x8a+blg", NET_SOFT_FIELDS),
@@ -2147,6 +2180,7 @@ const NET_SOFT_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: true,
         types_nr: [0, 0, 5],
         size_lp64: 20,
         layout: WireLayout::new("stats_softnet@0x8a", NET_SOFT_FIELDS_V5),

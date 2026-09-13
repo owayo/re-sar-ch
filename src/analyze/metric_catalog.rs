@@ -872,7 +872,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         unit: Unit::Percent,
         label: "メモリ使用率",
         // この列は `100 × (総量 − 利用可能) / 総量` なので、条件は
-        // 「利用可能メモリが総量の 3% 未満」という**割合**の観測である。
+        // 「利用可能メモリが総量の 3% 以下」という**割合**の観測である。
         // 搭載量に依存しない形で書けるのはここまでで、3% という線は
         // 運用上の設定値である (rationale に明記する)。
         //
@@ -886,7 +886,7 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Depletion,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "利用可能メモリが総量の 3% 未満 (%memused が 97% 以上) で続いた。\
+            rationale: "利用可能メモリが総量の 3% 以下 (%memused が 97% 以上) で続いた。\
                         この列の分子は総量 − MemAvailable で、MemAvailable は\
                         「swapping なしで新しいアプリケーションを起動するのに使える量の推定値」\
                         (カーネル文書 filesystems/proc.rst) なので、回収可能なページキャッシュは\
@@ -1408,7 +1408,7 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Depletion,
             min_samples: 1,
             priority: Priority::Investigate,
-            rationale: "使用率が 95% 以上になった (空き容量が 5% 未満)。予約ブロックと\
+            rationale: "使用率が 95% 以上になった (空き容量が 5% 以下)。予約ブロックと\
                         断片化により、この水準からは書き込み失敗が現実的になる",
         }],
         deviation: DeviationInterest::Upper,
@@ -1433,7 +1433,7 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Depletion,
             min_samples: 1,
             priority: Priority::Investigate,
-            rationale: "inode 使用率が 95% 以上になった (残りが 5% 未満)。\
+            rationale: "inode 使用率が 95% 以上になった (残りが 5% 以下)。\
                         容量が空いていてもファイルを作れなくなる",
         }],
         deviation: DeviationInterest::Upper,
@@ -1662,6 +1662,25 @@ mod tests {
                     f.rationale
                 );
             }
+        }
+    }
+
+    #[test]
+    fn complementary_free_percentages_include_the_threshold_boundary() {
+        for (id, free) in [
+            ("memory-available-scarce", 3.0),
+            ("filesystem-nearly-full", 5.0),
+            ("filesystem-inodes-nearly-exhausted", 5.0),
+        ] {
+            let condition = CATALOG
+                .iter()
+                .flat_map(|e| e.fixed)
+                .find(|f| f.id == id)
+                .unwrap();
+            assert!(condition.comparison.holds(condition.value, condition.value));
+            assert_eq!(100.0 - condition.value, free);
+            assert!(condition.rationale.contains(&format!("{free}% 以下")));
+            assert!(!condition.rationale.contains(&format!("{free}% 未満")));
         }
     }
 

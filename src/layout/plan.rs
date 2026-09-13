@@ -125,6 +125,8 @@ pub struct DecodePlan {
     /// 構造体定義から計算した値を使ってはいけない。旧版の `A_HUGE` のように
     /// 本家が別構造体のサイズを書き込んでいる例があり、ずれるとレコード全体が崩れる。
     pub stride: usize,
+    /// 旧 SERIAL (magic 0x8a) は line が 1 起点、0 は未使用。
+    pub serial_line_offset: bool,
     /// item の個数 (`file_activity.nr`)。
     pub nr: u32,
     /// 行列型 activity の列数 (`file_activity.nr2`)。それ以外は 1。
@@ -253,7 +255,11 @@ pub fn select_revision(
     let mut by_types: Option<&'static WireRevision> = None;
     let mut by_size: Option<&'static WireRevision> = None;
     // revisions は新しい順に並んでいるので、最初に見つかったものが最新。
-    for rev in def.revisions.iter().filter(|r| r.magic == magic) {
+    for rev in def
+        .revisions
+        .iter()
+        .filter(|r| r.magic == magic && (shape.types_nr.is_none() || r.self_describing))
+    {
         if newest.is_none() {
             newest = Some(rev);
         }
@@ -387,6 +393,7 @@ impl DecodePlan {
         Ok(Self {
             // ストライドは常に申告値。導出値との差は診断で報告する。
             stride: shape.size,
+            serial_line_offset: def.id == crate::model::ActivityId::SERIAL && rev.magic == 0x8a,
             nr,
             nr2,
             shape: def.shape,
@@ -692,6 +699,7 @@ mod tests {
     fn payload_bytes_rejects_u32_overflow() {
         // data-12.7.1-A_IRQ_overflow 相当: 上限ぴったりの値で乗算が桁溢れする
         let plan = DecodePlan {
+            serial_line_offset: false,
             stride: 1024,
             nr: 8193,
             nr2: 4096,
@@ -715,6 +723,7 @@ mod tests {
     #[test]
     fn payload_bytes_for_list_ignores_nr2() {
         let plan = DecodePlan {
+            serial_line_offset: false,
             stride: 64,
             nr: 9,
             nr2: 1,
@@ -735,6 +744,7 @@ mod tests {
         // 旧版の A_HUGE は宣言サイズと導出サイズが食い違う。
         // ストライドは必ず申告値側を使う。
         let plan = DecodePlan {
+            serial_line_offset: false,
             stride: 136,
             nr: 1,
             nr2: 1,
@@ -754,6 +764,7 @@ mod tests {
     #[test]
     fn detects_fields_overflowing_declared_size() {
         let plan = DecodePlan {
+            serial_line_offset: false,
             stride: 16,
             nr: 1,
             nr2: 1,

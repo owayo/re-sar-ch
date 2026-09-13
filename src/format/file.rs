@@ -106,7 +106,7 @@ pub struct FileHeader {
     pub ust_time: u64,
     /// 秒あたりの jiffies。`0x2175` 以降のみ記録される。
     pub hz: Option<u64>,
-    /// 作成時の CPU 数。
+    /// 作成時の CPU 枠数 (集約行 "all" を含む)。実 CPU 数は real_cpu_count()。
     pub cpu_nr: Option<u32>,
     /// ファイルに含まれる activity 数。
     pub act_nr: u32,
@@ -124,7 +124,7 @@ pub struct FileHeader {
     pub nodename: String,
     pub release: String,
     pub machine: String,
-    /// タイムゾーン名 (v12.5 以降)。
+    /// タイムゾーン名 (v12.2.0 以降)。
     pub tzname: Option<String>,
     /// `file_activity` の型別フィールド数 (`0x2175`)。
     pub act_types_nr: Option<[u32; 3]>,
@@ -134,7 +134,7 @@ pub struct FileHeader {
     pub act_size: Option<u32>,
     /// `record_header` の実サイズ (`0x2175`)。
     pub rec_size: Option<u32>,
-    /// `extra_desc` が続くか (`0x2175` の v12.5 以降)。
+    /// `extra_desc` が続くか (`0x2175` の v12.1.7 以降)。
     pub extra_next: Option<u32>,
 }
 
@@ -172,6 +172,15 @@ impl FileActivityEntry {
     }
 }
 
+impl FileHeader {
+    /// CPU "all" の枠を除く実 CPU 数。不明な値は None。
+    pub fn real_cpu_count(&self) -> Option<u32> {
+        self.cpu_nr
+            .filter(|&nr| nr > 0)
+            .map(|nr| nr.saturating_sub(1).max(1))
+    }
+}
+
 /// 1 レコード分の生データ。
 #[derive(Debug)]
 pub struct RawRecord<'a> {
@@ -193,7 +202,7 @@ pub struct RawRecord<'a> {
     /// activity ごとの統計データの位置。
     pub slices: &'a [ActivitySlice],
     /// コメント本文 (`R_COMMENT` のみ)。
-    pub comment: Option<&'a str>,
+    pub comment: Option<&'a [u8]>,
     /// 再起動後の CPU 数 (`R_RESTART` のみ)。
     pub cpu_count: Option<u32>,
 }
@@ -410,6 +419,15 @@ impl SaFile {
             decode_file_magic(&cur, &magic_layout, spec).map_err(|e| oob(e, "file_magic"))?;
         let file_header_offset = magic_layout.size;
 
+        if let Some(size) = magic.header_size
+            && (size == 0 || size > 8192)
+        {
+            return Err(Error::InconsistentHeader {
+                path,
+                detail: format!("header_size = {size} は 1..=8192 の範囲外"),
+            });
+        }
+
         // --- 2.5 申告値の検証 (レイアウト構築より前に行う) ---
         //
         // 型別個数はファイルから読んだ未検証の入力値であり、レイアウト構築では
@@ -521,7 +539,7 @@ impl SaFile {
             // 既知フィールドが申告領域に収まることだけを要求する。
             // 等しさを要求してはいけない: 将来の版が末尾にフィールドを足すと
             // 申告サイズの方が大きくなるのが正常だからである。
-            if header_layout.size > declared {
+            if layout_data_end(&header_layout) > declared {
                 return Err(Error::InconsistentHeader {
                     path,
                     detail: format!(
@@ -550,18 +568,6 @@ impl SaFile {
                 what: "sa_act_nr".into(),
                 value: header.act_nr as u64,
                 limit: MAX_NR_ACT as u64,
-            });
-        }
-
-        // ust_time の健全性: 2001-09-09 より前は破損とみなす
-        if header.ust_time < 1_000_000_000 {
-            let detail = format!("sa_ust_time = {} が小さすぎる", header.ust_time);
-            if options.tolerance == Tolerance::Strict {
-                return Err(Error::InconsistentHeader { path, detail });
-            }
-            diagnostics.push(Diagnostic {
-                offset: Some(file_header_offset),
-                message: detail,
             });
         }
 
@@ -601,7 +607,7 @@ impl SaFile {
                     limit: MAX_FILE_ACTIVITY_SIZE as u64,
                 });
             }
-            if activity_layout.size > declared {
+            if layout_data_end(&activity_layout) > declared {
                 return Err(Error::InconsistentHeader {
                     path,
                     detail: format!(
@@ -629,8 +635,8 @@ impl SaFile {
 
         // CPU 数を持たない世代は `A_CPU` の item 数で補う。
         //
-        // `sa_cpu_nr` / `sa_last_cpu_nr` が入ったのは `0x2173` 以降。
-        // それより前 (`0x2170` / `0x2171`) は CPU 数がヘッダに無く、
+        // `0x2173` の sa_last_cpu_nr は再起動後の値なので初期値には使わない。
+        // `0x2170`〜`0x2173` は作成時の CPU 数を A_CPU から得る。
         // 本家も `check_file_actlst()` で
         //
         //     if (fal->id == A_CPU && !file_hdr->sa_cpu_nr) sa_cpu_nr = fal->nr;
@@ -685,7 +691,7 @@ impl SaFile {
                     limit: MAX_RECORD_HEADER_SIZE as u64,
                 });
             }
-            if record_layout.size > declared {
+            if layout_data_end(&record_layout) > declared {
                 return Err(Error::InconsistentHeader {
                     path,
                     detail: format!(
@@ -824,7 +830,22 @@ impl SaFile {
         let f_sec = self.record_layout.field("second");
         let f_extra_next = self.record_layout.field("extra_next");
 
-        while offset < bytes.len() {
+        'records: while offset < bytes.len() {
+            macro_rules! record_read {
+                ($read:expr) => {
+                    match $read {
+                        Ok(value) => value,
+                        Err(Error::Truncated { .. })
+                            if self.options.tolerance == Tolerance::Lenient =>
+                        {
+                            summary.incomplete = true;
+                            summary.trailing_bytes = bytes.len() - offset;
+                            break 'records;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+            }
             let remaining = bytes.len() - offset;
             if remaining < rec_size {
                 // 末尾の切れ端
@@ -888,6 +909,22 @@ impl SaFile {
             let minute = read_u8(&cur, offset, f_min);
             let second = read_u8(&cur, offset, f_sec);
 
+            if raw_type == 0
+                || raw_type > 15
+                || hour > 23
+                || minute > 59
+                || second > 60
+                || ust_time < 1_000_000_000
+            {
+                return Err(Error::RecordBoundaryLost {
+                    path: self.path.clone(),
+                    offset: offset as u64,
+                    detail: format!(
+                        "無効な record_header: record_type={raw_type}, time={hour}:{minute}:{second}, ust_time={ust_time}"
+                    ),
+                });
+            }
+
             let mut payload = offset + rec_size;
 
             // `extra_desc` チェーンの位置はレコード種別で変わる。
@@ -908,10 +945,10 @@ impl SaFile {
                     | RecordKind::Extra(_)
             );
             if extra_next != 0 && extra_before_payload {
-                payload += skip_extra_chain(&cur, payload, &self.path)?;
+                payload += record_read!(skip_extra_chain(&cur, payload, &self.path));
             }
 
-            let mut comment: Option<&str> = None;
+            let mut comment: Option<&[u8]> = None;
             let mut cpu_count: Option<u32> = None;
             slices.clear();
 
@@ -925,21 +962,31 @@ impl SaFile {
 
             match kind {
                 RecordKind::Comment => {
-                    let raw = cur
-                        .raw(payload, MAX_COMMENT_LEN)
-                        .map_err(|e| self.truncated(e, "comment"))?;
-                    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-                    comment = std::str::from_utf8(&raw[..end]).ok();
+                    let raw = record_read!(
+                        cur.raw(payload, MAX_COMMENT_LEN)
+                            .map_err(|e| self.truncated(e, "comment"))
+                    );
+                    let end = raw[..MAX_COMMENT_LEN - 1]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(MAX_COMMENT_LEN - 1);
+                    comment = Some(&raw[..end]);
                     payload += MAX_COMMENT_LEN;
-                    summary.comments += 1;
                 }
                 RecordKind::Restart => {
                     match self.spec.restart_payload {
                         RestartPayload::None => {}
                         RestartPayload::CpuCount => {
-                            let v = cur
-                                .u32_at(payload)
-                                .map_err(|e| self.truncated(e, "restart.cpu_count"))?;
+                            let v = record_read!(
+                                cur.u32_at(payload)
+                                    .map_err(|e| self.truncated(e, "restart.cpu_count"))
+                            );
+                            if !(1..=8193).contains(&v) {
+                                return Err(Error::InconsistentHeader {
+                                    path: self.path.clone(),
+                                    detail: format!("restart.cpu_count = {v} は 1..=8193 の範囲外"),
+                                });
+                            }
                             cpu_count = Some(v);
                             payload += 4;
                         }
@@ -949,8 +996,12 @@ impl SaFile {
                             let n = self.header.vol_act_nr.unwrap_or(0) as usize;
                             for i in 0..n {
                                 let base = payload + i * self.act_stride;
-                                let e = decode_file_activity(&cur, &self.activity_layout, base)
-                                    .map_err(|e| self.truncated(e, "restart.volatile_activity"))?;
+                                let e = record_read!(
+                                        decode_file_activity(&cur, &self.activity_layout, base)
+                                            .map_err(
+                                                |e| self.truncated(e, "restart.volatile_activity")
+                                            )
+                                    );
                                 if e.id.0 == 0 || e.nr <= 0 {
                                     // 空スロット
                                     continue;
@@ -984,11 +1035,9 @@ impl SaFile {
                             payload += n * self.act_stride;
                         }
                     }
-                    summary.restarts += 1;
                 }
                 RecordKind::Extra(_) => {
                     // 統計を伴わない拡張レコード。extra チェーンは既に読み飛ばしている。
-                    summary.extras += 1;
                 }
                 _ => {
                     // 統計レコード: activity リスト順にデータが並ぶ
@@ -996,9 +1045,10 @@ impl SaFile {
                         let mut nr = nr_state[i];
                         if act.has_nr {
                             // レコード内に item 数が前置される
-                            let v = cur
-                                .u32_at(payload)
-                                .map_err(|e| self.truncated(e, "record.item_count"))?;
+                            let v = record_read!(
+                                cur.u32_at(payload)
+                                    .map_err(|e| self.truncated(e, "record.item_count"))
+                            );
                             payload += 4;
 
                             // **レコード内の個数も activity 別上限で検証する。**
@@ -1012,7 +1062,7 @@ impl SaFile {
                             // (01 §6.2 の表)。番兵で切り詰めた結果 0 になるのは
                             // 正当な出力で、`sadf -c` が書くファイルにも現れ得る。
                             // `file_activity.nr == 0` (activity リスト側) の拒否とは別物。
-                            let limit = act.id.nr_max().min(NR_MAX);
+                            let limit = activity_nr_limit(act);
                             if v > limit {
                                 return Err(Error::LimitExceeded {
                                     path: self.path.clone(),
@@ -1040,18 +1090,10 @@ impl SaFile {
                                 self.limit("nr * nr2 * size", items.saturating_mul(stride as u64))
                             })? as usize;
 
-                        if payload + len > bytes.len() {
-                            if self.options.tolerance == Tolerance::Strict {
-                                return Err(Error::Truncated {
-                                    path: self.path.clone(),
-                                    context: format!("{} のデータ", act.id),
-                                    need: len,
-                                    have: bytes.len().saturating_sub(payload),
-                                });
-                            }
-                            summary.incomplete = true;
-                            break;
-                        }
+                        record_read!(
+                            cur.raw(payload, len)
+                                .map_err(|e| self.truncated(e, &format!("{} のデータ", act.id)))
+                        );
 
                         slices.push(ActivitySlice {
                             index: i,
@@ -1064,19 +1106,20 @@ impl SaFile {
                         });
                         payload += len;
                     }
-                    summary.stats += 1;
                 }
             }
 
             // RESTART / COMMENT では extra チェーンがペイロードの後に来る
             if extra_next != 0 && !extra_before_payload {
-                payload += skip_extra_chain(&cur, payload, &self.path)?;
+                payload += record_read!(skip_extra_chain(&cur, payload, &self.path));
             }
 
-            if summary.incomplete {
-                break;
+            match kind {
+                RecordKind::Comment => summary.comments += 1,
+                RecordKind::Restart => summary.restarts += 1,
+                RecordKind::Extra(_) => summary.extras += 1,
+                _ => summary.stats += 1,
             }
-
             let record = RawRecord {
                 kind,
                 offset,
@@ -1168,9 +1211,25 @@ impl ScanSummary {
 // デコード補助
 // ===========================================================================
 
+/// 末尾の構造体パディングを除く必要バイト数。
+fn layout_data_end(layout: &ResolvedLayout) -> usize {
+    layout
+        .fields
+        .iter()
+        .map(|field| field.offset + field.width)
+        .max()
+        .unwrap_or(0)
+}
+
+fn activity_nr_limit(entry: &FileActivityEntry) -> u32 {
+    if entry.types_nr.is_some() && !entry.format_compat().is_displayed_by_sar() {
+        NR_MAX
+    } else {
+        entry.id.nr_max().min(NR_MAX)
+    }
+}
+
 /// `file_activity` エントリの健全性を検査する。
-///
-/// 本家が `check_file_actlst()` で行う検証に対応する。
 /// 上限を超える値をそのまま信じると、オフセット計算や確保サイズが破綻する。
 fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
     // 下限割れ (0 / 負値) と内容の矛盾は「上限の超過」ではないので、
@@ -1244,7 +1303,9 @@ fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
     }
 
     // 数値フィールドが申告サイズに収まること (MAP_SIZE <= size)
-    if let Some(t) = e.types_nr {
+    if let Some(t) = e.types_nr
+        && crate::layout::registry::lookup(e.id).is_some()
+    {
         let types = TypesNr(t);
         if !types.within(TYPES_NR_LIMIT) {
             reject(
@@ -1285,6 +1346,21 @@ fn skip_extra_chain(cur: &Cursor<'_>, start: usize, path: &Path) -> Result<usize
         let extra_nr = cur.u32_at(offset).map_err(oob)?;
         let extra_size = cur.u32_at(offset + 4).map_err(oob)?;
         let extra_next = cur.u32_at(offset + 8).map_err(oob)?;
+        let types = TypesNr([
+            cur.u32_at(offset + 12).map_err(oob)?,
+            cur.u32_at(offset + 16).map_err(oob)?,
+            cur.u32_at(offset + 20).map_err(oob)?,
+        ]);
+        if types.map_size() > extra_size as u64 {
+            return Err(Error::InconsistentHeader {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "extra_desc: MAP_SIZE({:?}) = {} が extra_size = {extra_size} を超える",
+                    types.0,
+                    types.map_size()
+                ),
+            });
+        }
 
         if extra_nr > MAX_EXTRA_NR {
             return Err(Error::LimitExceeded {
@@ -1473,9 +1549,7 @@ fn decode_file_header(
     let ust_time = num("sa_ust_time")?.unwrap_or(0);
     // act 数のフィールド名は世代で異なる
     let act_nr = num("sa_act_nr")?.or(num("sa_nr_act")?).unwrap_or(0) as u32;
-    let cpu_nr = num("sa_cpu_nr")?
-        .or(num("sa_last_cpu_nr")?)
-        .map(|v| v as u32);
+    let cpu_nr = num("sa_cpu_nr")?.map(|v| v as u32);
 
     // 月は 0 起点、年は 1900 起点で記録される世代がある
     let raw_month = num("sa_month")?.unwrap_or(0) as u8;

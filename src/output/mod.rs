@@ -12,3 +12,5 @@ pub mod sadf;
 pub mod sar_text;
 pub mod table;
 pub mod time_filter;
+
+pub mod svg;

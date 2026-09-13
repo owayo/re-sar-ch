@@ -488,7 +488,18 @@ where
                     hour: rec.hour,
                     minute: rec.minute,
                     second: rec.second,
-                    text: rec.comment.unwrap_or("").to_string(),
+                    text: rec
+                        .comment
+                        .unwrap_or(b"")
+                        .iter()
+                        .map(|&b| {
+                            if (0x20..=0x7e).contains(&b) {
+                                char::from(b)
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect(),
                 }));
             }
             RecordKind::Extra(_) | RecordKind::Invalid(_) => {

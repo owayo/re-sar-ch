@@ -37,7 +37,7 @@ use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 /// 公開スキーマの版。
 ///
 /// 内部構造の変更ではなく、**公開形が変わったときだけ**上げる。
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 // ===========================================================================
 // 設定
@@ -76,6 +76,8 @@ pub struct CustomConfig {
     /// 差分の基準として消費されるだけで行にならない
     /// (`crate::output::time_filter` 参照)。
     pub time_filter: TimeFilter,
+    /// IRQ の集約行に加えて、記録されている CPU 別内訳を出す。
+    pub irq_cpus: bool,
 }
 
 // ===========================================================================
@@ -211,6 +213,9 @@ pub struct ItemOut {
     pub item: String,
     /// activity 内での添字。
     pub index: usize,
+    /// IRQ の CPU 次元。`all` または 0 始まりの CPU 番号。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
     /// 生値の名前空間。`--values rates` では空。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw: Vec<FieldOut>,
@@ -252,10 +257,7 @@ pub struct SampleOut {
 /// activity 1 種を公開スキーマへ写す。
 pub fn activity_out(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Option<ActivityOut> {
     let sp = spec::lookup(pair.id)?;
-    let mut items = Vec::new();
-    for item in pair.output_items() {
-        items.push(item_out(pair.def, sp, &item, cfg));
-    }
+    let items = custom_items(pair, cfg);
     if items.is_empty() {
         return None;
     }
@@ -264,6 +266,34 @@ pub fn activity_out(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Option<Activ
         label: pair.id.label().unwrap_or(""),
         items,
     })
+}
+
+/// 全独自形式で同じ item / CPU 次元を列挙する。
+pub fn custom_items(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Vec<ItemOut> {
+    let Some(sp) = spec::lookup(pair.id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in pair.output_items() {
+        let aggregate = item_out(pair.def, sp, &item, cfg);
+        let label = aggregate.item.clone();
+        out.push(aggregate);
+        if pair.id != ActivityId::IRQ || !cfg.irq_cpus {
+            continue;
+        }
+        // 古い一次元 IRQ は CPU all しか記録していない。CPU 別をゼロで捏造しない。
+        for cpu in 1..item.row_len() {
+            let Some(slot) = pair.matrix_item(cpu, item.index) else {
+                continue;
+            };
+            let mut row = item_out(pair.def, sp, &slot, cfg);
+            row.item = label.clone();
+            row.index = item.index;
+            row.cpu = Some((cpu - 1).to_string());
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// item 1 個を公開スキーマへ写す。
@@ -306,6 +336,7 @@ pub fn item_out(
             label.jx
         },
         index: item.index,
+        cpu: (sp.id == ActivityId::IRQ).then(|| "all".to_string()),
         raw,
         rates,
     }
@@ -739,7 +770,7 @@ mod tests {
                 cell(None, 40 * scale),
             ],
         };
-        let (prev, curr) = (snapshot(0), snapshot(1));
+        let (prev, curr) = (snapshot(1), snapshot(2));
         let pair = ActivityPair {
             id: ActivityId::IRQ,
             def,
@@ -783,5 +814,18 @@ mod tests {
             Some(300.0),
             "sum 列は全割り込みの和"
         );
+        let expanded = custom_items(
+            &pair,
+            &CustomConfig {
+                irq_cpus: true,
+                ..cfg
+            },
+        );
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[2].item, "eth0-tx");
+        assert_eq!(expanded[2].cpu.as_deref(), Some("all"));
+        assert_eq!(expanded[3].item, "eth0-tx");
+        assert_eq!(expanded[3].cpu.as_deref(), Some("0"));
+        assert_eq!(count_of(&expanded[3]).value, Some(40.0));
     }
 }

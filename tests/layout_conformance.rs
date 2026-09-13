@@ -1355,7 +1355,7 @@ fn body_scan_lands_exactly_on_eof() {
                     ust_time: rec.ust_time,
                     time: (rec.hour, rec.minute, rec.second),
                     uptime_cs: rec.uptime_cs,
-                    comment: rec.comment.map(str::to_string),
+                    comment: rec.comment.map(|s| String::from_utf8_lossy(s).into_owned()),
                     cpu_count: rec.cpu_count,
                 });
                 Ok(ScanControl::Continue)

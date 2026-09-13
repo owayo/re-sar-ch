@@ -68,7 +68,10 @@ pub fn item_label(spec: &ActivitySpec, item: &ItemPair<'_>) -> ItemLabel {
             ItemLabel::numbered(prefix, item.index as u64 + base as u64)
         }
         ItemKind::Column { col, prefix } => match item.raw_curr_by_name(col) {
-            Availability::Present(v) => ItemLabel::numbered(prefix, v),
+            Availability::Present(v) => ItemLabel::numbered(
+                prefix,
+                v.saturating_sub(u64::from(item.plan.serial_line_offset)),
+            ),
             _ => ItemLabel::numbered(prefix, item.index as u64),
         },
         ItemKind::Disk => {
@@ -257,6 +260,7 @@ mod tests {
             curr,
             ctx: ComputeContext::new(itv_cs),
             row: None,
+            prepared: None,
         };
         value_of(&item, field_by_key(id, key))
     }

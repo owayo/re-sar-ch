@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use super::json::{CustomConfig, FieldOut, item_out, selected_ids};
+use super::json::{CustomConfig, FieldOut, ItemOut, custom_items, selected_ids};
 use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
@@ -94,19 +94,18 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
             let Some(pair) = ActivityPair::from_view(view, id) else {
                 continue;
             };
-            let Some(sp) = spec::lookup(id) else { continue };
+            let Some(_) = spec::lookup(id) else { continue };
 
             if !printed_header.get(&id.0).copied().unwrap_or(false) {
                 printed_header.insert(id.0, true);
                 write_block_header(out, id, w)?;
             }
 
-            for item in pair.output_items() {
-                let row = item_out(pair.def, sp, &item, cfg);
+            for row in custom_items(&pair, cfg) {
                 let fields = display_fields(&row.raw, &row.rates);
                 let mut line = String::from(INDENT);
                 push_cell(&mut line, &ts, w.time, false);
-                push_cell(&mut line, &row.item, w.item, false);
+                push_cell(&mut line, &display_item(&row), w.item, false);
                 for (i, name) in w.names.iter().enumerate() {
                     let cell = fields
                         .iter()
@@ -190,7 +189,7 @@ fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
             let Some(pair) = ActivityPair::from_view(view, id) else {
                 continue;
             };
-            let Some(sp) = spec::lookup(id) else { continue };
+            let Some(_) = spec::lookup(id) else { continue };
 
             let entry = widths.entry(id.0).or_insert_with(|| Widths {
                 time: "time".len().max(ts_len),
@@ -198,9 +197,8 @@ fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
                 ..Default::default()
             });
 
-            for item in pair.output_items() {
-                let row = item_out(pair.def, sp, &item, cfg);
-                entry.item = entry.item.max(display_width(&row.item));
+            for row in custom_items(&pair, cfg) {
+                entry.item = entry.item.max(display_width(&display_item(&row)));
 
                 let fields = display_fields(&row.raw, &row.rates);
                 for f in &fields {
@@ -240,6 +238,13 @@ fn display_fields<'a>(raw: &'a [FieldOut], rates: &'a [FieldOut]) -> Vec<&'a Fie
         raw.iter().collect()
     } else {
         rates.iter().collect()
+    }
+}
+
+fn display_item(row: &ItemOut) -> String {
+    match row.cpu.as_deref() {
+        Some(cpu) => format!("{} [CPU {cpu}]", row.item),
+        None => row.item.clone(),
     }
 }
 

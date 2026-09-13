@@ -157,7 +157,7 @@ pub enum CpuSelection {
 
 impl CpuSelection {
     /// item 添字 (`0` = 集約行、`n` = CPU `n-1`) が選択されているか。
-    fn includes(&self, item_index: usize) -> bool {
+    pub fn includes(&self, item_index: usize) -> bool {
         match self {
             CpuSelection::Aggregate => item_index == 0,
             CpuSelection::All => true,
@@ -2104,7 +2104,10 @@ impl SarBlock {
             });
         }
         // 平均行で集約をやり直すため、CPU は生の item 配列も控える
-        if self.view.id == ActivityId::CPU {
+        if matches!(
+            self.view.id,
+            ActivityId::CPU | ActivityId::NET_SOFT | ActivityId::IRQ
+        ) {
             self.cpu_last = curr_items.to_vec();
         }
         for row in rows {
@@ -2151,9 +2154,16 @@ impl SarBlock {
         // 集約行は前後 2 サンプルが揃って初めて作れるので、基準サンプルでは
         // ファイルの item 0 をそのまま控えるだけにする (平均行では
         // `cpu_first` / `cpu_last` から集約をやり直す)。
-        if self.view.id == ActivityId::CPU {
+        if matches!(
+            self.view.id,
+            ActivityId::CPU | ActivityId::NET_SOFT | ActivityId::IRQ
+        ) {
             self.cpu_first = items.to_vec();
             self.cpu_last = items.to_vec();
+        }
+        if self.view.layout == Layout::IrqMatrix {
+            self.irq_cpu_cols =
+                self.irq_columns(items.len(), nr2, plan.text_index("irq_name").is_some());
         }
         for (idx, group) in self.iter_groups(plan, items, nr2, None) {
             self.items.push(ItemState {
@@ -2307,7 +2317,7 @@ impl SarBlock {
                 let nr2 = nr2.max(1) as usize;
                 // `nr2 == 1` は「CPU 次元を持たない世代」(12.5 以前の `stats_irq`)。
                 // nr が割り込み数になるので、1 item = 1 割り込み行 (合計列のみ) になる。
-                if nr2 == 1 {
+                if nr2 == 1 && plan.text_index("irq_name").is_none() {
                     return items
                         .iter()
                         .enumerate()
@@ -2327,19 +2337,12 @@ impl SarBlock {
                 for irq in 0..nr2 {
                     let mut slots = Vec::new();
                     for c in 0..cpus {
-                        if !self.opts.cpus.includes(c) {
+                        if !self.irq_cpu_cols.contains(&c) {
                             continue;
                         }
-                        let item = if c == 0 && cpus > 1 {
-                            compute::sum_items(
-                                width,
-                                (1..cpus).filter_map(|k| items.get(k * nr2 + irq)),
-                            )
-                        } else {
-                            match items.get(c * nr2 + irq) {
-                                Some(it) => it.clone(),
-                                None => continue,
-                            }
+                        let item = match items.get(c * nr2 + irq) {
+                            Some(it) => it.clone(),
+                            None => continue,
                         };
                         slots.push(item);
                     }
@@ -2385,11 +2388,17 @@ impl SarBlock {
     }
 
     /// `A_IRQ` で表示する CPU 列の item 添字。
-    fn irq_columns(&self, items: usize, nr2: u32) -> Vec<usize> {
+    fn irq_columns(&self, items: usize, nr2: u32, named: bool) -> Vec<usize> {
         let nr2 = nr2.max(1) as usize;
         // CPU 次元を持たない世代は合計列 (`all`) だけ
-        if nr2 == 1 {
-            return vec![0];
+        if nr2 == 1 && !named {
+            return self
+                .opts
+                .cpus
+                .includes(0)
+                .then_some(0)
+                .into_iter()
+                .collect();
         }
         let cpus = items / nr2;
         (0..cpus).filter(|c| self.opts.cpus.includes(*c)).collect()
@@ -2441,9 +2450,11 @@ impl SarBlock {
                 }
             }
             HeadItem::Name9 => RowLabel::Name(self.item_name(plan, item, index)),
-            HeadItem::Line3 => {
-                RowLabel::Number(compute::raw_column(plan, item, 0).unwrap_or(0) as i64)
-            }
+            HeadItem::Line3 => RowLabel::Number(
+                compute::raw_column(plan, item, 0)
+                    .unwrap_or(0)
+                    .saturating_sub(u64::from(plan.serial_line_offset)) as i64,
+            ),
             HeadItem::Index5 => match self.view.id {
                 // FAN / TEMP は 1 起点、IN は 0 起点 (03 §11-16)
                 ActivityId::PWR_FAN | ActivityId::PWR_TEMP => RowLabel::Number(index as i64 + 1),
@@ -2541,7 +2552,24 @@ impl SarBlock {
         itv_cs: u64,
     ) -> Vec<Row> {
         if self.view.layout == Layout::IrqMatrix {
-            self.irq_cpu_cols = self.irq_columns(curr_items.len(), nr2);
+            self.irq_cpu_cols =
+                self.irq_columns(curr_items.len(), nr2, plan.text_index("irq_name").is_some());
+            if nr2 > 1 || plan.text_index("irq_name").is_some() {
+                self.irq_cpu_cols.retain(|&cpu| {
+                    compute::prepare_item(
+                        ActivityId::IRQ,
+                        plan,
+                        cpu * nr2.max(1) as usize,
+                        prev_items,
+                        curr_items,
+                        ComputeContext::new(itv_cs),
+                    )
+                    .is_some_and(|p| !p.offline)
+                });
+            }
+        }
+        if self.view.layout == Layout::IrqMatrix && self.irq_cpu_cols.is_empty() {
+            return Vec::new();
         }
         let width = plan.fields.len();
         let zero = || ItemSnapshot {
@@ -2556,6 +2584,8 @@ impl SarBlock {
         // なった CPU の減少が他 CPU の増加を相殺してしまう。
         let cpu_agg = if self.view.id == ActivityId::CPU {
             compute::aggregate_cpu(plan, prev_items, curr_items, false)
+        } else if self.view.id == ActivityId::NET_SOFT {
+            compute::aggregate_soft(plan, prev_items, curr_items)
         } else {
             None
         };
@@ -2591,7 +2621,17 @@ impl SarBlock {
                 .iter()
                 .find(|(pi, pg)| self.item_key(plan, &pg.primary, *pi) == key);
             let (prev_primary, prev_slots) = match matched {
-                Some((_, pg)) => (pg.primary.clone(), pg.slots.clone()),
+                Some((_, pg))
+                    if !compute::item_reregistered(
+                        self.view.id,
+                        plan,
+                        &pg.primary,
+                        &group.primary,
+                    ) =>
+                {
+                    (pg.primary.clone(), pg.slots.clone())
+                }
+                Some(_) => (zero(), vec![zero(); group.slots.len()]),
                 None => (zero(), vec![zero(); group.slots.len()]),
             };
 
@@ -2610,7 +2650,9 @@ impl SarBlock {
             }
 
             // 集約行だけは合算済みの端点と `deltot_jiffies` で計算する
-            let cpu_all = cpu_agg.as_ref().filter(|_| idx == 0);
+            let cpu_all = cpu_agg
+                .as_ref()
+                .filter(|_| idx == 0 && self.view.id == ActivityId::CPU);
             let Some(row) = self.make_row(
                 plan,
                 idx,
@@ -2991,6 +3033,25 @@ impl SarBlock {
             }
         };
         let itv = interval_cs(self.first_uptime.unwrap_or(0), self.last_uptime);
+        if self.view.id == ActivityId::IRQ
+            && let Some(plan) = &self.plan
+        {
+            let named = plan.text_index("irq_name").is_some();
+            if plan.nr2 > 1 || named {
+                self.irq_cpu_cols = self.irq_columns(self.cpu_last.len(), plan.nr2, named);
+                self.irq_cpu_cols.retain(|&cpu| {
+                    compute::prepare_item(
+                        ActivityId::IRQ,
+                        plan,
+                        cpu * plan.nr2.max(1) as usize,
+                        &self.cpu_first,
+                        &self.cpu_last,
+                        ComputeContext::new(itv),
+                    )
+                    .is_some_and(|p| !p.offline)
+                });
+            }
+        }
         let rows = self.average_rows(itv);
         if self.opts.minmax && has_xstats(self.view.id) {
             self.write_minmax_average(out, label, &rows)?;
@@ -3072,6 +3133,8 @@ impl SarBlock {
         // 2 点から作り直される (03 §1.4.3 / §8.1)。
         let cpu_agg = if self.view.id == ActivityId::CPU {
             compute::aggregate_cpu(plan, &self.cpu_first, &self.cpu_last, false)
+        } else if self.view.id == ActivityId::NET_SOFT {
+            compute::aggregate_soft(plan, &self.cpu_first, &self.cpu_last)
         } else {
             None
         };
@@ -3091,8 +3154,17 @@ impl SarBlock {
                 Some(agg) => (&agg.prev, &agg.curr),
                 None => (&state.first, &state.last),
             };
+            let zero = compute::zero_item(plan);
+            let first = if compute::item_reregistered(self.view.id, plan, first, last) {
+                &zero
+            } else {
+                first
+            };
+            let tickless = self.view.id == ActivityId::CPU
+                && state.index > 0
+                && compute::cpu_interval(plan, first, last, compute::CpuRole::Single).is_tickless();
             let mut ctx = ComputeContext::new(itv);
-            if let Some(agg) = aggregated {
+            if let Some(agg) = aggregated.filter(|_| self.view.id == ActivityId::CPU) {
                 ctx = agg.context(ctx);
             } else {
                 ctx.aggregate_item = state.index == 0;
@@ -3103,6 +3175,31 @@ impl SarBlock {
             }
 
             let values: Vec<Computed> = match self.view.layout {
+                Layout::Cpu if tickless => self.tickless_cpu_values(),
+                Layout::IrqMatrix if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => self
+                    .irq_cpu_cols
+                    .iter()
+                    .filter_map(|&cpu| {
+                        let index = cpu * plan.nr2.max(1) as usize + state.index;
+                        compute::prepare_item(
+                            ActivityId::IRQ,
+                            plan,
+                            index,
+                            &self.cpu_first,
+                            &self.cpu_last,
+                            ComputeContext::new(itv),
+                        )
+                        .map(|p| {
+                            p.computed(
+                                ActivityId::IRQ,
+                                irq_col::COUNT,
+                                &self.def.columns[irq_col::COUNT],
+                                plan,
+                                compute::MissingPolicy::Compat,
+                            )
+                        })
+                    })
+                    .collect(),
                 Layout::IrqMatrix => (0..state.last_slots.len())
                     .map(|n| {
                         let mut c = ComputeContext::new(itv);

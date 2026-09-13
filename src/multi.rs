@@ -83,6 +83,7 @@ use crate::analyze::summary::{
 use crate::analyze::timeline::{MetricKey, MetricTimeline};
 use crate::error::Result;
 use crate::format::file::{FileHeader, OpenOptions, SaFile, ScanControl};
+#[cfg(test)]
 use crate::layout::plan::DecodePlan;
 use crate::model::{ActivityId, ValueKind};
 use crate::output::time_filter::{Admit, TimeFilter};
@@ -92,7 +93,7 @@ use crate::series::snapshot::{
 };
 
 /// 複数ファイル横断の出力スキーマ版。
-pub const MULTI_SCHEMA_VERSION: &str = "1";
+pub const MULTI_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 // ===========================================================================
 // ホストの同一性
@@ -117,7 +118,7 @@ impl HostIdentity {
             sysname: h.sysname.clone(),
             release: h.release.clone(),
             machine: h.machine.clone(),
-            cpu_nr: h.cpu_nr,
+            cpu_nr: h.real_cpu_count(),
         }
     }
 
@@ -670,8 +671,18 @@ pub struct MultiFileAnalysis {
     /// 入力ファイルの概要 (指定順)。
     pub files: Vec<FileOutline>,
     pub skipped: Vec<SkippedFile>,
+    /// 完全なレコードまでを採用した、末尾が不完全なファイル。
+    pub incomplete_files: Vec<IncompleteFile>,
     /// ホストごとの系列 (`nodename` 昇順)。
     pub hosts: Vec<HostSeries>,
+}
+
+/// lenient で残した部分結果の出自。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IncompleteFile {
+    pub path: String,
+    pub end_offset: usize,
+    pub trailing_bytes: usize,
 }
 
 // ===========================================================================
@@ -706,50 +717,12 @@ struct FileSamples {
     signature: Arc<PlanSignature>,
     plans: Vec<ActivityPlan>,
     samples: Vec<SampleRecord>,
+    incomplete: Option<IncompleteFile>,
 }
 
-/// `Selection` の判定 (`series` 側の実装は非公開なので同じ規則をここに置く)。
-fn selected(selection: &Selection, id: ActivityId) -> bool {
-    match selection {
-        Selection::All => true,
-        Selection::Only(list) => list.contains(&id),
-    }
-}
-
-/// ファイルのデコード計画を組み立てる。
-///
-/// `series::walk` と同じ規則で revision を選ぶ。マージ時に前ファイルの値を
-/// 解釈するために計画そのものが必要なので、ここで作って保持する。
+/// 単一ファイルと同じ互換性検証・配置選択で計画を作る。
 fn build_plans(file: &SaFile, selection: &Selection) -> Result<Vec<ActivityPlan>> {
-    let mut plans = Vec::new();
-    for (index, act) in file.activities().iter().enumerate() {
-        if !selected(selection, act.id) {
-            continue;
-        }
-        let Some(def) = crate::layout::registry::lookup(act.id) else {
-            continue;
-        };
-        let rev = act
-            .types_nr
-            .and_then(|t| def.revision_for_types_nr(t))
-            .or_else(|| def.revision_for_magic(act.magic))
-            .or_else(|| def.latest());
-        let Some(rev) = rev else { continue };
-        let plan = DecodePlan::build(
-            def,
-            rev,
-            act.size as usize,
-            act.nr.max(0) as u32,
-            act.nr2.max(1) as u32,
-            file.encoding(),
-        )?;
-        plans.push(ActivityPlan {
-            index,
-            id: act.id,
-            plan,
-        });
-    }
-    Ok(plans)
+    Ok(crate::series::snapshot::plan_activities(file, selection)?.plans)
 }
 
 fn signature_of(file: &SaFile, plans: &[ActivityPlan]) -> PlanSignature {
@@ -781,7 +754,7 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
     // 直前に RESTART を読んだか。次の統計レコードへ持ち越す
     // (走査はイベントを束ねずに読んだ順で渡すため、ここで覚えておく)。
     let mut restart_pending = false;
-    walk_items(&file, &opts.selection, |item| {
+    let scan = walk_items(&file, &opts.selection, |item| {
         match item {
             WalkItem::Event(ev) => {
                 if matches!(ev, RecordEvent::Restart { .. }) {
@@ -798,6 +771,11 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
 
     Ok(FileSamples {
         index: outline.index,
+        incomplete: (scan.incomplete || scan.trailing_bytes > 0).then(|| IncompleteFile {
+            path: outline.path.clone(),
+            end_offset: scan.end_offset,
+            trailing_bytes: scan.trailing_bytes,
+        }),
         identity: Arc::new(outline.identity.clone()),
         signature: Arc::new(signature),
         plans,
@@ -1144,6 +1122,7 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
     groups.sort_by_key(|g| g.0.group_key());
 
     let mut hosts = Vec::with_capacity(groups.len());
+    let mut incomplete_files = Vec::new();
     for (identity, mut indices) in groups {
         // 日付 → 作成時刻 → パスの順。ファイル名の辞書順に依存しない。
         indices.sort_by(|a, b| outlines[*a].order_key().cmp(&outlines[*b].order_key()));
@@ -1164,7 +1143,12 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
                 .collect();
             for (slot, result) in window.iter().zip(decoded) {
                 match result {
-                    Ok(fs) => merger.push_file(fs),
+                    Ok(fs) => {
+                        if let Some(partial) = &fs.incomplete {
+                            incomplete_files.push(partial.clone());
+                        }
+                        merger.push_file(fs);
+                    }
                     Err(e) => match opts.on_error {
                         FileErrorPolicy::Fail => return Err(e),
                         // 飛ばしたファイルは出力に残す (黙って落とさない)
@@ -1188,6 +1172,7 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
     Ok(MultiFileAnalysis {
         schema_version: MULTI_SCHEMA_VERSION,
         files: outlines,
+        incomplete_files,
         skipped,
         hosts,
     })
@@ -1815,6 +1800,7 @@ mod tests {
             })
             .collect();
         FileSamples {
+            incomplete: None,
             index,
             identity: Arc::new(ident("testhost")),
             signature: Arc::new(PlanSignature {
@@ -1848,6 +1834,7 @@ mod tests {
     ) -> FileSamples {
         let fields = plan.fields.len();
         FileSamples {
+            incomplete: None,
             index,
             identity: Arc::new(ident("testhost")),
             signature: Arc::new(PlanSignature {

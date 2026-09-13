@@ -620,7 +620,7 @@ fn compare_aligns_hosts_on_a_common_window() {
     assert!(out.contains('a') && out.contains('b'), "{out:.300}");
 }
 
-/// `compare --format json` は `HostComparison` の配列になる。
+/// `compare --format json` は比較結果と未評価指標を持つ。
 #[test]
 fn compare_json_is_an_array_of_comparisons() {
     let Some(f) = main_fixture() else { return };
@@ -628,7 +628,10 @@ fn compare_json_is_an_array_of_comparisons() {
     let b = format!("b={}", as_str(&f));
     let out = run_ok(&["compare", "--host", &a, "--host", &b, "--format", "json"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("妥当な JSON であること");
-    let arr = v.as_array().expect("配列であること");
+    let arr = v["comparisons"]
+        .as_array()
+        .expect("比較結果が配列であること");
+    assert!(v["skipped_metrics"].is_array());
     for c in arr {
         assert!(c["metric"].is_object(), "{c}");
         assert!(c["hosts"].is_array(), "{c}");

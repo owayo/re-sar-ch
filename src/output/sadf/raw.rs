@@ -193,7 +193,7 @@ fn emit_sample<W: Write>(
     }
 
     match spec.id {
-        ActivityId::IRQ => write_irq(out, view, &ts),
+        ActivityId::IRQ => write_irq(out, view, &ts, cfg),
         ActivityId::PWR_FREQ => write_wghfreq(out, view, &ts, cfg),
         _ => write_generic(out, view, &ts, cfg, spec, section),
     }
@@ -220,7 +220,7 @@ fn write_generic<W: Write>(
     // **前**に出る (§4.5)。ラベルを挟む位置をここで決める。
     let label_at = if spec.id == ActivityId::DISK { 2 } else { 0 };
 
-    for item in pair.compat_items() {
+    for item in pair.selected_items(cfg, true) {
         let mut tok = vec![ts.to_string()];
         for (i, f) in fields.iter().enumerate() {
             if i == label_at {
@@ -393,47 +393,39 @@ fn raw_fields(section: &Section) -> Vec<RawField> {
 ///
 /// フィールド名は `all` (CPU 0) / `CPU0` / `CPU1` … (§4.5)。
 /// raw ではオフライン CPU も出す。
-fn write_irq<W: Write>(out: &mut W, view: &IntervalView<'_>, ts: &str) -> io::Result<()> {
+fn write_irq<W: Write>(
+    out: &mut W,
+    view: &IntervalView<'_>,
+    ts: &str,
+    cfg: &SadfConfig,
+) -> io::Result<()> {
     let Some(pair) = ActivityPair::from_view(view, ActivityId::IRQ) else {
         return Ok(());
     };
-    let nr = pair.curr.nr.max(1) as usize;
-    let nr2 = pair.curr.nr2.max(1) as usize;
-
-    // v12.5.6 より前の 1 次元レイアウト (`nr` = 割り込み数 / `nr2` = 1) では
-    // CPU 別の内訳を持たない。行列型と混同すると「割り込み 1 本 × 489 CPU」に
-    // 化けるので、ここで分ける (02 §6.4)。
-    if nr2 <= 1 {
-        for irq in 0..pair.len() {
-            let Some(item) = pair.item(irq) else { break };
-            let name = item
-                .key()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| irq.to_string());
-            let mut tok = vec![ts.to_string(), "INTR".to_string(), name, "all".to_string()];
-            tok.push(u64_token(item.raw_prev_by_name("intr")));
-            tok.push(u64_token(item.raw_curr_by_name("intr")));
-            out.write_all(join_tokens(&tok).as_bytes())?;
-        }
-        return Ok(());
-    }
+    let (nr, nr2) = pair.irq_dimensions();
 
     for irq in 0..nr2 {
+        if !(0..nr).any(|cpu| pair.irq_cpu_selected(cfg, cpu, true)) {
+            continue;
+        }
         // 割り込み名は CPU "all" 行 (行 0) にのみ書かれている
-        let name = pair
-            .matrix_item(0, irq)
-            .and_then(|i| i.key().map(|s| s.to_string()))
-            .unwrap_or_else(|| irq.to_string());
+        let name = pair.irq_name(irq);
+        if !cfg.name_selected(ActivityId::IRQ, &name) {
+            continue;
+        }
 
         let mut tok = vec![ts.to_string(), "INTR".to_string(), name];
         for cpu in 0..nr {
+            if !pair.irq_cpu_selected(cfg, cpu, true) {
+                continue;
+            }
             // フィールド名は `all` (CPU 0) / `CPU0` / `CPU1` … (§4.5)
             tok.push(if cpu == 0 {
                 "all".to_string()
             } else {
                 format!("CPU{}", cpu - 1)
             });
-            match pair.matrix_item(cpu, irq) {
+            match pair.irq_item(cpu, irq) {
                 Some(item) => {
                     tok.push(u64_token(item.raw_prev_by_name("intr")));
                     tok.push(u64_token(item.raw_curr_by_name("intr")));
@@ -465,6 +457,9 @@ fn write_wghfreq<W: Write>(
     let spec = pair_spec();
 
     for row in 0..nr {
+        if !cfg.cpus.includes(row) {
+            continue;
+        }
         let mut tok = vec![
             ts.to_string(),
             "CPU".to_string(),

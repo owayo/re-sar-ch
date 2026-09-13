@@ -19,7 +19,7 @@
 
 use std::io::Write;
 
-use super::json::{CustomConfig, FieldOut, HostOut, Quality, item_out, selected_ids};
+use super::json::{CustomConfig, FieldOut, HostOut, Quality, custom_items, selected_ids};
 use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
@@ -46,6 +46,7 @@ pub const HEADER: &[&str] = &[
     "value",
     "raw",
     "text",
+    "cpu",
     "quality",
 ];
 
@@ -108,8 +109,7 @@ pub fn write_csv_with<W: Write>(
                 continue;
             };
             let Some(sp) = spec::lookup(id) else { continue };
-            for item in pair.output_items() {
-                let row = item_out(pair.def, sp, &item, cfg);
+            for row in custom_items(&pair, cfg) {
                 for (space, fields) in [("raw", &row.raw), ("rates", &row.rates)] {
                     for f in fields.iter() {
                         write_field(
@@ -124,6 +124,7 @@ pub fn write_csv_with<W: Write>(
                             &row.item,
                             row.index,
                             space,
+                            row.cpu.as_deref().unwrap_or(""),
                             f,
                         )?;
                     }
@@ -150,6 +151,7 @@ fn write_field<W: Write>(
     item: &str,
     item_index: usize,
     space: &str,
+    cpu: &str,
     f: &FieldOut,
 ) -> Result<()> {
     // 値が無い列は空欄にする。**0 を書いてはいけない** (正常な 0 と区別できない)。
@@ -175,6 +177,7 @@ fn write_field<W: Write>(
         &value,
         &raw,
         &text,
+        cpu,
         quality_label(f.quality),
     ])
     .map_err(csv_err)?;
@@ -230,7 +233,7 @@ mod tests {
         {
             let mut w = csv::Writer::from_writer(&mut buf);
             write_field(
-                &mut w, &host, 0, 100, 110, 1000, true, "A_DISK", "sda", 0, "rates", &f,
+                &mut w, &host, 0, 100, 110, 1000, true, "A_DISK", "sda", 0, "rates", "", &f,
             )
             .unwrap();
             w.flush().unwrap();
@@ -238,8 +241,8 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         // value / raw / text が空欄で、その後に理由が入る (0 で埋めない)
         assert!(
-            s.contains("gauge,,,,not_implemented"),
-            "空欄 3 つの後に理由: {s}"
+            s.contains("gauge,,,,,not_implemented"),
+            "空欄の値とCPUの後に理由: {s}"
         );
         assert!(!s.contains("gauge,0,"), "0 で埋めてはいけない: {s}");
     }
@@ -281,6 +284,7 @@ mod tests {
                 "eth0",
                 1,
                 "raw",
+                "",
                 &f,
             )
             .unwrap();

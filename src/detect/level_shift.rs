@@ -272,7 +272,13 @@ pub fn detect(
         return (out, evaluated_with_edges(unevaluated_edge_points));
     }
     let count = out.len();
-    (out, RouteStatus::Detected { count })
+    (
+        out,
+        RouteStatus::Detected {
+            count,
+            blind_edge_points: unevaluated_edge_points,
+        },
+    )
 }
 
 /// 「評価した」状態に、構造的に見ていない端の点数を添える。
@@ -650,7 +656,7 @@ mod tests {
                 direction: ShiftDirection::Fall
             }
         );
-        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+        assert!(matches!(status, RouteStatus::Detected { count: 1, .. }));
         let DecisionBasis::LevelShift {
             shift,
             normalized_shift,
@@ -1080,7 +1086,7 @@ mod tests {
                 direction: ShiftDirection::Fall
             }
         );
-        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+        assert!(matches!(status, RouteStatus::Detected { count: 1, .. }));
         let DecisionBasis::LevelShift { shift, .. } = found[0].decision.basis else {
             panic!("水準変化の根拠");
         };

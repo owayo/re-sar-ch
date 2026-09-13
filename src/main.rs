@@ -423,6 +423,8 @@ fn sadf_config(opts: &SadfOptions) -> SadfConfig {
         section: section_config(&opts.sar),
         activities: Some(opts.sar.selected_activities().map(activity_id).collect()),
         time_filter: sar_time_filter(&opts.sar, CrossDayRule::Sadf),
+        cpus: cpu_selection(&opts.sar),
+        item_names: sar_item_names(&opts.sar),
     }
 }
 
@@ -460,6 +462,12 @@ fn run_sar(opts: SarOptions) -> anyhow::Result<ExitCode> {
 
     let text = sar_text_options(&opts);
     let activities = sar_activities(&opts, &file);
+    if activities.is_empty() {
+        bail!(
+            "Requested activities not available in file {}",
+            path.display()
+        );
+    }
 
     let mut out = stdout_writer();
     let result = sar_text::write_report_with(
@@ -568,6 +576,15 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
         );
     }
 
+    if !matches!(format, SadfFormat::Conv | SadfFormat::Pcp)
+        && sadf::dbppc::selected_specs(&file, &cfg).is_empty()
+    {
+        bail!(
+            "Requested activities not available in file {}",
+            path.display()
+        );
+    }
+
     let result = match format {
         SadfFormat::Db => sadf::dbppc::write_db(&mut out, &file, &cfg),
         SadfFormat::Ppc => sadf::dbppc::write_ppc(&mut out, &file, &cfg),
@@ -581,7 +598,7 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
             };
             convert::convert(&file, &cvt, &mut out).map(|r| report_conversion(&r))
         }
-        SadfFormat::Svg => bail!("-g (SVG グラフ) は未対応です"),
+        SadfFormat::Svg => re_sar_ch::output::svg::write_svg(&mut out, &file, &cfg, &opts.output),
         SadfFormat::Pcp => bail!("-l (PCP アーカイブ) は未対応です"),
         // 上で処理済み
         SadfFormat::Header => Ok(()),
@@ -710,9 +727,14 @@ fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
         None => TimeBound::None,
     };
     match (start, end) {
-        (TimeBound::HhMmSs { hour: sh, .. }, TimeBound::HhMmSs { hour: eh, min, sec })
-            if eh < sh =>
-        {
+        (
+            TimeBound::HhMmSs {
+                hour: sh,
+                min: sm,
+                sec: ss,
+            },
+            TimeBound::HhMmSs { hour: eh, min, sec },
+        ) if (eh, min, sec) < (sh, sm, ss) => {
             end = TimeBound::HhMmSs {
                 hour: eh + 24,
                 min,
@@ -729,7 +751,7 @@ fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
         end,
         // 独自出力は UTC / epoch で時刻を出すので、比較も UTC で行う。
         basis: TimeBasis::Utc,
-        cross_day: CrossDayRule::Sadf,
+        cross_day: CrossDayRule::Sar,
     })
 }
 
@@ -766,6 +788,14 @@ fn run_skill_install(args: SkillArgs) -> anyhow::Result<ExitCode> {
 
 fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
+    if args.irq_cpus
+        && !matches!(
+            common.format,
+            OutputFormat::Table | OutputFormat::Json | OutputFormat::Csv | OutputFormat::Ndjson
+        )
+    {
+        bail!("--irq-cpus は独自の table / json / csv / ndjson 出力で指定してください");
+    }
     let options = open_options(common.lenient, common.no_mmap);
     let selection = selection_from(&common.activity)?;
     let filter = custom_time_filter(common)?;
@@ -779,6 +809,7 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
         selection: selection.clone(),
         values: value_scope(args.values),
         time_filter: filter,
+        irq_cpus: args.irq_cpus,
     };
     // 独自 JSON は 1 ファイル 1 文書なので、複数ファイルは配列で包む。
     let wrap_json = matches!(common.format, OutputFormat::Json) && paths.len() > 1;
@@ -805,6 +836,27 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
             }
         };
         report_diagnostics(&file);
+        if common.lenient {
+            let scan = match file.scan(|_| Ok(re_sar_ch::format::ScanControl::Continue)) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    eprintln!(
+                        "resarch: {}: 読めないので飛ばした ({error})",
+                        file.path().display()
+                    );
+                    partial = true;
+                    continue;
+                }
+            };
+            if scan.incomplete {
+                eprintln!(
+                    "resarch: {}: 不完全な末尾レコード (残余 {} バイト)。完全なレコードまでを出力します",
+                    file.path().display(),
+                    scan.trailing_bytes
+                );
+                partial = true;
+            }
+        }
         if wrap_json && written > 0 {
             out.write_all(b",")?;
         }
@@ -960,6 +1012,7 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
     let opts = detect_options(&args)?;
     let mopts = detect_multi_options(&args)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
+    report_incomplete_files(&analysis);
     for s in &analysis.skipped {
         eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
     }
@@ -995,17 +1048,28 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
         }
     }
     out.flush()?;
-    Ok(exit_code(!analysis.skipped.is_empty()))
+    Ok(exit_code(
+        !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty(),
+    ))
 }
 
 fn detect_options(args: &DetectArgs) -> anyhow::Result<DetectOptions> {
+    let report_from = report_bound("--from", args.from.as_deref())?;
+    let report_to = report_bound("--to", args.to.as_deref())?;
+    if matches!((report_from, report_to), (ReportBound::Epoch(s), ReportBound::Epoch(e)) if e < s) {
+        bail!("--to は --from より後の時刻を指定してください");
+    }
     Ok(DetectOptions {
         baseline_scope: match args.baseline_scope {
             BaselineScopeArg::Input => BaselineScope::Input,
             BaselineScopeArg::Window => BaselineScope::Window,
         },
-        report_from: report_bound("--from", args.from.as_deref())?,
-        report_to: report_bound("--to", args.to.as_deref())?,
+        report_from,
+        report_to,
+        selected_activities: match selection_from(&args.activity)? {
+            Selection::All => None,
+            Selection::Only(ids) => Some(ids),
+        },
         ..Default::default()
     })
 }
@@ -1112,6 +1176,7 @@ fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
     let mopts = multi_options(common)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
+    report_incomplete_files(&analysis);
     for s in &analysis.skipped {
         eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
     }
@@ -1140,7 +1205,18 @@ fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
         _ => write_summarize_text(&mut out, &analysis)?,
     }
     out.flush()?;
-    Ok(exit_code(!analysis.skipped.is_empty()))
+    Ok(exit_code(
+        !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty(),
+    ))
+}
+
+fn report_incomplete_files(analysis: &multi::MultiFileAnalysis) {
+    for file in &analysis.incomplete_files {
+        eprintln!(
+            "resarch: {}: 不完全な末尾レコード (残余 {} バイト)。完全なレコードまでを解析しました",
+            file.path, file.trailing_bytes
+        );
+    }
 }
 
 fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
@@ -1335,6 +1411,8 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     for spec in &args.hosts {
         let paths = expand_host_path(&spec.path)?;
         let analysis = multi::analyze_files(&paths, &mopts)?;
+        report_incomplete_files(&analysis);
+        partial |= !analysis.incomplete_files.is_empty();
         for s in &analysis.skipped {
             eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
             partial = true;
@@ -1386,16 +1464,24 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     };
 
     let mut comparisons = Vec::new();
+    let mut skipped_metrics = Vec::new();
     for r in rule_inputs() {
         let key = r.key();
         let mut series = Vec::new();
+        let mut missing_on = Vec::new();
         for e in &entries {
             if let Some(t) = multi::timeline_of(&e.segment, &key) {
                 series.push((e.label.clone(), e.identity.clone(), t));
+            } else {
+                missing_on.push(e.label.clone());
             }
         }
         // 全ホストで揃っていない指標は比較しない
         if series.len() != entries.len() {
+            skipped_metrics.push(serde_json::json!({
+                "metric": key,
+                "missing_on": missing_on,
+            }));
             continue;
         }
         comparisons.push(multi::compare_hosts(key, &series, window, GaugeFill::None));
@@ -1404,10 +1490,26 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     let mut out = stdout_writer();
     match common.format {
         OutputFormat::Json | OutputFormat::SadfJson => {
-            serde_json::to_writer_pretty(&mut out, &comparisons)?;
+            serde_json::to_writer_pretty(
+                &mut out,
+                &serde_json::json!({
+                    "schema_version": re_sar_ch::output::json::SCHEMA_VERSION,
+                    "comparisons": comparisons,
+                    "skipped_metrics": skipped_metrics,
+                }),
+            )?;
             writeln!(out)?;
         }
         OutputFormat::Ndjson => {
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({
+                    "schema_version": re_sar_ch::output::json::SCHEMA_VERSION,
+                    "record": "comparison_coverage",
+                    "skipped_metrics": skipped_metrics,
+                }),
+            )?;
+            writeln!(out)?;
             for c in &comparisons {
                 serde_json::to_writer(&mut out, c)?;
                 writeln!(out)?;
@@ -1425,6 +1527,14 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             if comparisons.is_empty() {
                 writeln!(out, "(全ホストで揃っている指標がありません)")?;
             }
+            for skipped in &skipped_metrics {
+                writeln!(
+                    out,
+                    "比較対象外: {} (観測なし: {})",
+                    skipped["metric"], skipped["missing_on"]
+                )?;
+            }
+            writeln!(out, "mean は観測できた区間値の単純平均")?;
             for c in &comparisons {
                 writeln!(out)?;
                 writeln!(
@@ -1568,7 +1678,7 @@ fn write_info_table<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> 
             file.effective_hz()
         )?;
     }
-    if let Some(cpu) = h.cpu_nr {
+    if let Some(cpu) = h.real_cpu_count() {
         writeln!(out, "cpu_nr        {cpu}")?;
     }
     writeln!(out, "activities    {}", h.act_nr)?;
@@ -1629,7 +1739,7 @@ fn write_info_json<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> {
         .collect();
 
     let value = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": re_sar_ch::output::json::SCHEMA_VERSION,
         "file": file.path().display().to_string(),
         "format": {
             "magic": format!("0x{:04x}", m.format_magic),
@@ -1654,7 +1764,8 @@ fn write_info_json<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> {
             "timezone": h.tzname,
             "hz": h.hz,
             "effective_hz": file.effective_hz(),
-            "cpu_nr": h.cpu_nr,
+            "cpu_nr": h.real_cpu_count(),
+            "sa_cpu_nr": h.cpu_nr,
             "act_nr": h.act_nr,
             "vol_act_nr": h.vol_act_nr,
         },

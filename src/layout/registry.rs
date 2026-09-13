@@ -12,6 +12,8 @@ use crate::model::{ActivityId, Aggregation, Unit, ValueKind};
 pub struct WireRevision {
     /// この revision に対応する activity magic。
     pub magic: u32,
+    /// 自己記述形式 (0x2175) で使用できる配置か。時代 A 専用なら false。
+    pub self_describing: bool,
     /// 型別フィールド数 `(ull, ul, int)`。自己記述形式のファイルとの突合に使う。
     pub types_nr: [u32; 3],
     /// LP64 における 1 item のサイズ。`file_activity.size` との突合に使う
@@ -75,11 +77,13 @@ pub struct ActivityDef {
 
 impl ActivityDef {
     /// activity magic に対応する revision を探す。
+    /// ファイルの読込時はサイズ・世代も検証する plan::select_revision を使う。
     pub fn revision_for_magic(&self, magic: u32) -> Option<&'static WireRevision> {
         self.revisions.iter().find(|r| r.magic == magic)
     }
 
-    /// 型別フィールド数が一致する revision を探す (自己記述形式向け)。
+    /// 型別フィールド数が一致する revision を探す。
+    /// ファイルの読込時は magic・サイズ・世代も検証する plan::select_revision を使う。
     pub fn revision_for_types_nr(&self, types_nr: [u32; 3]) -> Option<&'static WireRevision> {
         self.revisions.iter().find(|r| r.types_nr == types_nr)
     }
@@ -101,9 +105,9 @@ impl ActivityDef {
             .find(|r| r.magic == magic && r.size_lp64 == size)
     }
 
-    /// 申告サイズだけが一致する revision を探す (magic を持たない `0x2170` 世代向け)。
+    /// 申告サイズが一致する最古の revision を探す (magic を持たない `0x2170` 世代向け)。
     pub fn revision_for_size(&self, size: usize) -> Option<&'static WireRevision> {
-        self.revisions.iter().find(|r| r.size_lp64 == size)
+        self.revisions.iter().rev().find(|r| r.size_lp64 == size)
     }
 
     /// 最も新しい revision。

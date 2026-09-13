@@ -125,7 +125,10 @@ pub fn detect(
     let status = if out.is_empty() {
         RouteStatus::Evaluated
     } else {
-        RouteStatus::Detected { count: out.len() }
+        RouteStatus::Detected {
+            count: out.len(),
+            blind_edge_points: 0,
+        }
     };
     (out, status)
 }
@@ -194,7 +197,13 @@ fn absolute_departures(
         return declined;
     }
     let count = out.len();
-    (out, RouteStatus::Detected { count })
+    (
+        out,
+        RouteStatus::Detected {
+            count,
+            blind_edge_points: 0,
+        },
+    )
 }
 
 /// 区間の中で最も基準から離れた点の差 (符号つき)。
@@ -351,7 +360,7 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:#?}");
         assert_eq!(found[0].pattern, Pattern::Spike);
         assert_eq!(found[0].route(), DetectRoute::RobustDeviation);
-        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+        assert!(matches!(status, RouteStatus::Detected { count: 1, .. }));
         let DecisionBasis::RobustDeviation {
             peak_mad_ratio,
             ratio_threshold,
@@ -435,7 +444,7 @@ mod tests {
             DetectRoute::RobustDeviation,
             "経路は 3 つのまま (同じ観点の別状態)"
         );
-        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+        assert!(matches!(status, RouteStatus::Detected { count: 1, .. }));
 
         let DecisionBasis::AbsoluteDeparture {
             reference,

@@ -191,13 +191,13 @@ fn emit_sample<W: Write>(
     );
 
     if spec.id == ActivityId::IRQ {
-        return write_irq(out, view, &pre, sep, isdb);
+        return write_irq(out, view, &pre, sep, isdb, cfg);
     }
 
     let Some(pair) = ActivityPair::from_view(view, spec.id) else {
         return Ok(());
     };
-    for item in pair.compat_items() {
+    for item in pair.selected_items(cfg, false) {
         let label = item_label_in(spec, section, &item);
         let mut line = String::with_capacity(96);
 
@@ -240,19 +240,22 @@ fn write_irq<W: Write>(
     pre: &str,
     sep: &str,
     isdb: bool,
+    cfg: &SadfConfig,
 ) -> io::Result<()> {
     let Some(pair) = ActivityPair::from_view(view, ActivityId::IRQ) else {
         return Ok(());
     };
-    let nr = pair.curr.nr.max(1) as usize;
-    let nr2 = pair.curr.nr2.max(1) as usize;
+    let (nr, nr2) = pair.irq_dimensions();
 
     for irq in 0..nr2 {
+        if !(0..nr).any(|cpu| pair.irq_cpu_selected(cfg, cpu, false)) {
+            continue;
+        }
         // 割り込み名は CPU "all" 行 (行 0) にのみ書かれている
-        let name = pair
-            .matrix_item(0, irq)
-            .and_then(|i| i.key().map(|s| s.to_string()))
-            .unwrap_or_else(|| irq.to_string());
+        let name = pair.irq_name(irq);
+        if !cfg.name_selected(ActivityId::IRQ, &name) {
+            continue;
+        }
 
         let mut line = String::with_capacity(96);
         if isdb {
@@ -262,8 +265,11 @@ fn write_irq<W: Write>(
         }
 
         for cpu in 0..nr {
+            if !pair.irq_cpu_selected(cfg, cpu, false) {
+                continue;
+            }
             let mut v = ABSENT_TEXT.to_string();
-            if let Some(item) = pair.matrix_item(cpu, irq) {
+            if let Some(item) = pair.irq_item(cpu, irq) {
                 let mut s = String::new();
                 super::write_value(
                     &mut s,
@@ -308,7 +314,18 @@ fn write_horizontal<W: Write>(
 ) -> Result<()> {
     // フィールド名一覧行 (1 回だけ)
     let mut hdr = String::from("# hostname;interval;timestamp");
-    for spec in specs {
+    for entry in file.activities() {
+        if entry.nr <= 0
+            || cfg
+                .activities
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&entry.id))
+        {
+            continue;
+        }
+        let Some(spec) = spec::lookup(entry.id) else {
+            continue;
+        };
         for section in spec.active_sections(&cfg.section) {
             hdr.push(';');
             hdr.push_str(&cfg.section.expand_hdr_line(section.hdr_line));
@@ -317,14 +334,33 @@ fn write_horizontal<W: Write>(
             }
         }
     }
-    writeln!(out, "{hdr}").map_err(super::wrap_io)?;
-
+    let mut header_written = false;
+    let mut cpus = CpuNrTracker::new(file);
     let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
     let mut cursor = cfg.time_filter.cursor();
     walk_items(file, &Selection::Only(ids), |item| {
-        // `-dh` は 1 サンプル = 1 行。イベント行は持たない。
-        let WalkItem::Sample(view) = item else {
-            return Ok(ScanControl::Continue);
+        let view = match item {
+            WalkItem::Sample(view) => view,
+            WalkItem::Event(ev) => {
+                if let RecordEvent::Restart {
+                    ust_time,
+                    cpu_count,
+                    ..
+                } = ev
+                {
+                    let mark = RestartMark {
+                        ust_time,
+                        hms: ev.time(),
+                        cpu_count: cpus.take(cpu_count),
+                    };
+                    if cursor.event(ust_time, ev.time()) {
+                        write_restart(out, cfg, info, &mark, true).map_err(super::wrap_io)?;
+                    }
+                } else if cfg.comments && cursor.event(ev.ust_time(), ev.time()) {
+                    emit_comment(out, &ev, cfg, info, true).map_err(super::wrap_io)?;
+                }
+                return Ok(ScanControl::Continue);
+            }
         };
         match cursor.sample(view) {
             Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
@@ -333,6 +369,10 @@ fn write_horizontal<W: Write>(
         }
         if !view.has_prev || !view.continuous {
             return Ok(ScanControl::Continue);
+        }
+        if !header_written {
+            writeln!(out, "{hdr}").map_err(super::wrap_io)?;
+            header_written = true;
         }
         let line = horizontal_line(view, cfg, info, specs);
         out.write_all(line.as_bytes()).map_err(super::wrap_io)?;
@@ -360,8 +400,34 @@ fn horizontal_line(
         let Some(pair) = ActivityPair::from_view(view, spec.id) else {
             continue;
         };
+        if spec.id == ActivityId::IRQ {
+            let (cpus, irqs) = pair.irq_dimensions();
+            for irq in 0..irqs {
+                let name = pair.irq_name(irq);
+                if !cfg.name_selected(ActivityId::IRQ, &name) {
+                    continue;
+                }
+                line.push(';');
+                line.push_str(&name);
+                for cpu in 0..cpus {
+                    if !pair.irq_cpu_selected(cfg, cpu, false) {
+                        continue;
+                    }
+                    line.push(';');
+                    if let Some(item) = pair.irq_item(cpu, irq) {
+                        super::write_value(
+                            &mut line,
+                            item.computed_by_name("intr"),
+                            super::Fmt::R2,
+                            ABSENT_TEXT,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
         for section in spec.active_sections(&cfg.section) {
-            for item in pair.compat_items() {
+            for item in pair.selected_items(cfg, false) {
                 let label = item_label_in(spec, section, &item);
                 if !label.db.is_empty() {
                     line.push(';');
@@ -461,7 +527,7 @@ pub fn display_cpu_count(cpu_count: Option<u32>) -> u32 {
 // 共通ヘルパ
 // ===========================================================================
 
-/// ファイルに実データを持つ activity の出力定義を ID 昇順で返す。
+/// ファイルに実データを持つ activity の出力定義をファイル内の順序で返す。
 ///
 /// **現行世代のファイルでは**、参照する `sar` 版と形式が違う activity を除く。
 /// 本家 `sa_common.c: check_file_actlst()` が `ACTIVITY_MAGIC_UNKNOWN` を
@@ -487,7 +553,6 @@ pub fn present_specs(file: &SaFile) -> Vec<&'static ActivitySpec> {
             out.push(s);
         }
     }
-    out.sort_by_key(|s| s.id.0);
     out
 }
 
@@ -607,7 +672,17 @@ pub fn scan_comments(file: &SaFile) -> Result<Vec<CommentEntry>> {
             out.push((
                 rec.ust_time,
                 (rec.hour, rec.minute, rec.second),
-                rec.comment.unwrap_or("").to_string(),
+                rec.comment
+                    .unwrap_or(b"")
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..=0x7e).contains(&b) {
+                            char::from(b)
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect(),
             ));
         }
         Ok(ScanControl::Continue)

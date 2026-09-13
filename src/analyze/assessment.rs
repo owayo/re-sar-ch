@@ -246,7 +246,7 @@ impl EvidenceSufficiency {
         };
 
         let missing = d.support.missing_samples;
-        let total = material.saturating_add(missing);
+        let total = d.support.series_observed_samples.saturating_add(missing);
         let missing_share = if total == 0 {
             0.0
         } else {
@@ -327,6 +327,8 @@ impl SufficiencySpread {
 pub enum NotEvaluated {
     /// 系列がこの入力に無い (その世代のファイルに列が無い / activity 未収集)。
     SeriesAbsentFromSource,
+    /// 利用者が activity 選択から除外した。
+    ExcludedBySelection,
     /// 値が得られた採取が 1 つも無い。
     NoUsableObservation,
     /// この系列には固定条件を宣言していない。
@@ -360,6 +362,7 @@ impl NotEvaluated {
     pub const fn label(self) -> &'static str {
         match self {
             NotEvaluated::SeriesAbsentFromSource => "この入力に系列が無い",
+            NotEvaluated::ExcludedBySelection => "activity 選択で除外された",
             NotEvaluated::NoUsableObservation => "有効な観測が無い",
             NotEvaluated::NoFixedConditionDeclared => "固定条件を宣言していない",
             NotEvaluated::NoDeviationInterestDeclared => "逸脱の向きを宣言していない",
@@ -378,7 +381,8 @@ impl NotEvaluated {
     pub const fn is_by_design(self) -> bool {
         matches!(
             self,
-            NotEvaluated::NoFixedConditionDeclared
+            NotEvaluated::ExcludedBySelection
+                | NotEvaluated::NoFixedConditionDeclared
                 | NotEvaluated::NoDeviationInterestDeclared
                 | NotEvaluated::LevelShiftNotDeclared
         )
@@ -390,7 +394,11 @@ impl NotEvaluated {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RouteStatus {
     /// 検出あり。
-    Detected { count: usize },
+    Detected {
+        count: usize,
+        /// 検出があっても前後窓を取れない端は未評価。
+        blind_edge_points: usize,
+    },
     /// 評価できたが検出なし。
     Evaluated,
     /// 評価できたが、**構造的に見ていない範囲がある**。
@@ -411,7 +419,7 @@ pub enum RouteStatus {
 impl RouteStatus {
     pub const fn detections(self) -> usize {
         match self {
-            RouteStatus::Detected { count } => count,
+            RouteStatus::Detected { count, .. } => count,
             _ => 0,
         }
     }
@@ -427,7 +435,16 @@ impl RouteStatus {
 
     pub fn label(self) -> String {
         match self {
-            RouteStatus::Detected { count } => format!("検出 {count} 件"),
+            RouteStatus::Detected {
+                count,
+                blind_edge_points,
+            } => {
+                if blind_edge_points == 0 {
+                    format!("検出 {count} 件")
+                } else {
+                    format!("検出 {count} 件 (窓を取れない端 {blind_edge_points} 採取は見ていない)")
+                }
+            }
             RouteStatus::Evaluated => "検出なし".to_string(),
             RouteStatus::EvaluatedWithBlindEdges { edge_points } => {
                 format!("検出なし (窓を取れない端 {edge_points} 採取は見ていない)")
@@ -485,6 +502,18 @@ impl SeriesEvaluation {
             robust_deviation: RouteStatus::Evaluated,
             level_shift: RouteStatus::Evaluated,
         }
+    }
+
+    /// activity 選択から除外された系列。入力の欠落とは区別する。
+    pub fn excluded(entry: &'static CatalogEntry) -> Self {
+        let mut evaluation = Self::absent(entry);
+        let status = RouteStatus::NotEvaluated {
+            reason: NotEvaluated::ExcludedBySelection,
+        };
+        evaluation.fixed_condition = status;
+        evaluation.robust_deviation = status;
+        evaluation.level_shift = status;
+        evaluation
     }
 
     /// 入力に無かった系列の評価。**黙って落とさない。**
@@ -555,7 +584,14 @@ pub struct RouteTally {
 impl RouteTally {
     fn add(&mut self, status: RouteStatus) {
         match status {
-            RouteStatus::Detected { count } => {
+            RouteStatus::Detected {
+                count,
+                blind_edge_points,
+            } => {
+                if blind_edge_points > 0 {
+                    self.series_with_blind_edges += 1;
+                    self.blind_edge_samples += blind_edge_points;
+                }
                 self.detected_series += 1;
                 self.evaluated_series += 1;
                 self.detections += count;
@@ -705,7 +741,9 @@ impl AssessedDetection {
         // 別の検出の持続性を借りてはいけない。
         // 観測範囲の解釈は `TemporalSupport` に任せる (瞬時値と区間レートで
         // 範囲の意味が違うため、ここで秒数を組み立て直さない)。
-        if d.support.samples >= th.persistence_samples
+        // 水準変化の後窓は検出の必要条件であり、追加の持続根拠ではない。
+        if d.route() != DetectRoute::LevelShift
+            && d.support.samples >= th.persistence_samples
             && d.support.span_secs() >= th.persistence_secs
         {
             priority = priority.up();
@@ -1762,6 +1800,50 @@ mod tests {
         );
         assert!(shift.sufficiency.material_samples < shift.sufficiency.baseline_samples);
         assert_eq!(shift.sufficiency.level, SufficiencyLevel::Moderate);
+    }
+
+    #[test]
+    fn a_level_shift_window_does_not_escalate_priority_at_any_sampling_interval() {
+        for interval in [60, 600] {
+            let mut v = vec![90.0; 100];
+            v.extend(vec![60.0; 100]);
+            let mut timeline = cpu_idle(&vals(&v));
+            for (i, point) in timeline.points.iter_mut().enumerate() {
+                point.start_ust = T0 + i as u64 * interval;
+                point.end_ust = T0 + (i as u64 + 1) * interval;
+                point.elapsed_cs = interval * 100;
+            }
+            let a = assess_timelines(&single(timeline), &DetectOptions::default());
+            let shift = a
+                .episodes
+                .iter()
+                .flat_map(|e| &e.detections)
+                .find(|d| d.route == DetectRoute::LevelShift)
+                .expect("段差");
+            assert_eq!(shift.priority, Priority::Watch, "採取間隔 {interval}");
+            assert!(a.coverage.level_shift.blind_edge_samples > 0);
+            assert!(a.coverage.level_shift.series_with_blind_edges > 0);
+        }
+    }
+
+    #[test]
+    fn missing_share_uses_the_series_observations_for_every_route() {
+        let mut points = vec![P::V(90.0); 144];
+        points[10] = P::Missing;
+        for point in &mut points[60..66] {
+            *point = P::V(1.0);
+        }
+        let a = assess_timelines(&single(cpu_idle(&points)), &DetectOptions::default());
+        let fixed = a
+            .episodes
+            .iter()
+            .flat_map(|e| &e.detections)
+            .find(|d| d.route == DetectRoute::FixedCondition)
+            .expect("固定条件");
+        assert_eq!(fixed.support.series_observed_samples, 143);
+        assert_eq!(fixed.sufficiency.missing_samples, 1);
+        assert_eq!(fixed.sufficiency.material_samples, 6);
+        assert_eq!(fixed.sufficiency.level, SufficiencyLevel::Adequate);
     }
 
     /// 一日続く条件を背景の所見として分ける (Issue #5 ⑨)。

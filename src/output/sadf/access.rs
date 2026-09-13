@@ -97,6 +97,18 @@ impl<'a> ActivityPair<'a> {
     /// データ位置 (`row * nr2`) とラベル添字 (`row`) が食い違う。
     pub fn item_indexed(&self, index: usize, label_index: usize) -> Option<ItemPair<'a>> {
         let (prev, curr, matched) = self.slot(index)?;
+        let mut base = ComputeContext::new(self.itv_cs);
+        base.has_prev = self.has_prev;
+        base.continuous = self.continuous;
+        base.aggregate_item = self.is_aggregate_slot(index, label_index);
+        let prepared = compute::prepare_item(
+            self.id,
+            self.plan,
+            index,
+            self.prev.map_or(&[], |p| p.items.as_slice()),
+            &self.curr.items,
+            base,
+        );
         Some(ItemPair {
             index: label_index,
             def: self.def,
@@ -105,6 +117,7 @@ impl<'a> ActivityPair<'a> {
             curr,
             ctx: self.slot_context(index, label_index, matched, prev, curr),
             row: None,
+            prepared,
         })
     }
 
@@ -116,6 +129,7 @@ impl<'a> ActivityPair<'a> {
     fn slot(&self, index: usize) -> Option<(&'a ItemSnapshot, &'a ItemSnapshot, bool)> {
         let curr = self.curr.items.get(index)?;
         let prev = match (&curr.key, self.prev) {
+            (_, Some(p)) if self.id == ActivityId::IRQ => p.items.get(index),
             (Some(key), Some(p)) => p.item_by_key(key),
             (None, Some(p)) => p.items.get(index),
             _ => None,
@@ -210,7 +224,85 @@ impl<'a> ActivityPair<'a> {
         self.output_items()
             .into_iter()
             .filter(|it| !compute::is_unused_item(self.id, it.index, self.plan, it.curr))
+            .filter(|it| !it.prepared.as_ref().is_some_and(|p| p.offline))
             .collect()
+    }
+
+    /// CLI の CPU と item 名選択をすべての互換形式に適用する。
+    pub fn selected_items(&self, cfg: &super::SadfConfig, raw: bool) -> Vec<ItemPair<'a>> {
+        self.output_items()
+            .into_iter()
+            .filter(|it| {
+                // raw softnet は架空の all を出さず、個別 CPU の生値は offline でも残す。
+                if raw && self.id == ActivityId::NET_SOFT {
+                    if it.index == 0 {
+                        return false;
+                    }
+                } else if compute::is_unused_item(self.id, it.index, self.plan, it.curr) {
+                    return false;
+                }
+                if !raw && it.prepared.as_ref().is_some_and(|p| p.offline) {
+                    return false;
+                }
+                if matches!(
+                    self.id,
+                    ActivityId::CPU
+                        | ActivityId::NET_SOFT
+                        | ActivityId::PWR_CPU
+                        | ActivityId::PWR_FREQ
+                ) && !cfg.cpus.includes(it.index)
+                {
+                    return false;
+                }
+                let Some(spec) = super::spec::lookup(self.id) else {
+                    return true;
+                };
+                let label = spec
+                    .active_sections(&cfg.section)
+                    .next()
+                    .map(|section| super::render::item_label_in(spec, section, it).db)
+                    .unwrap_or_default();
+                cfg.name_selected(self.id, &label)
+            })
+            .collect()
+    }
+
+    pub fn irq_dimensions(&self) -> (usize, usize) {
+        if self.irq_is_transposed() {
+            (self.curr.nr as usize, self.curr.nr2.max(1) as usize)
+        } else {
+            (1, self.curr.nr as usize)
+        }
+    }
+
+    pub fn irq_item(&self, cpu: usize, irq: usize) -> Option<ItemPair<'a>> {
+        if self.irq_is_transposed() {
+            self.matrix_item(cpu, irq)
+        } else if cpu == 0 {
+            self.item(irq)
+        } else {
+            None
+        }
+    }
+
+    pub fn irq_name(&self, irq: usize) -> String {
+        self.irq_item(0, irq)
+            .and_then(|it| it.key().filter(|s| !s.is_empty()).map(str::to_owned))
+            .unwrap_or_else(|| {
+                if irq == 0 {
+                    "sum".into()
+                } else {
+                    (irq - 1).to_string()
+                }
+            })
+    }
+
+    pub fn irq_cpu_selected(&self, cfg: &super::SadfConfig, cpu: usize, raw: bool) -> bool {
+        cfg.cpus.includes(cpu)
+            && (raw
+                || self
+                    .irq_item(cpu, 0)
+                    .is_some_and(|it| !it.prepared.as_ref().is_some_and(|p| p.offline)))
     }
 
     /// 行列型の出力行数。
@@ -298,6 +390,7 @@ impl<'a> ActivityPair<'a> {
             curr: head_curr,
             ctx: self.slot_context(at(0), row, head_matched, head_prev, head_curr),
             row: Some(MatrixRow { prev, curr }),
+            prepared: None,
         })
     }
 
@@ -329,6 +422,7 @@ pub struct ItemPair<'a> {
     pub ctx: ComputeContext,
     /// 行列型の出力 1 行ぶんのスロット群 (行でない場合は `None`)。
     pub row: Option<MatrixRow<'a>>,
+    pub prepared: Option<compute::PreparedItem>,
 }
 
 impl<'a> ItemPair<'a> {
@@ -352,6 +446,7 @@ impl<'a> ItemPair<'a> {
             curr,
             ctx,
             row: None,
+            prepared: None,
         }
     }
 
@@ -374,13 +469,39 @@ impl<'a> ItemPair<'a> {
 
     /// 表示値。`series` 層の計算結果をそのまま返す。
     pub fn computed(&self, column: usize) -> Computed {
+        self.computed_with(column, false)
+    }
+
+    fn computed_with(&self, column: usize, strict: bool) -> Computed {
         if self.row.is_some() {
-            return first_of(self.row_values(column));
+            return first_of(if strict {
+                self.row_values_strict(column)
+            } else {
+                self.row_values(column)
+            });
         }
         let Some(meta) = self.def.columns.get(column) else {
             return Err(ComputeIssue::UnsupportedBySource);
         };
-        column_value(
+        if let Some(p) = &self.prepared {
+            return p.computed(
+                self.def.id,
+                column,
+                meta,
+                self.plan,
+                if strict {
+                    compute::MissingPolicy::Strict
+                } else {
+                    compute::MissingPolicy::Compat
+                },
+            );
+        }
+        let f = if strict {
+            column_value_strict
+        } else {
+            column_value
+        };
+        f(
             self.def.id,
             column,
             meta,
@@ -441,7 +562,10 @@ impl<'a> ItemPair<'a> {
     /// 互換出力専用なので厳密モードは持たない。独自出力は同じ指標を
     /// 計算層の単位 (バイト/秒など) でそのまま出す。
     pub fn sadf_unit(&self, variant: SadfUnitColumn) -> Computed {
-        sadf_unit_value(variant, self.plan, self.prev, self.curr, &self.ctx)
+        match &self.prepared {
+            Some(p) => sadf_unit_value(variant, self.plan, &p.prev, &p.curr, &p.ctx),
+            None => sadf_unit_value(variant, self.plan, self.prev, self.curr, &self.ctx),
+        }
     }
 
     /// 表示値 (**厳密モード**)。
@@ -451,21 +575,7 @@ impl<'a> ItemPair<'a> {
     /// 独自出力と集計では嘘の値を出さないことが優先なので、
     /// 欠落は欠落のまま返すこちらを使う。
     pub fn computed_strict(&self, column: usize) -> Computed {
-        if self.row.is_some() {
-            return first_of(self.row_values_strict(column));
-        }
-        let Some(meta) = self.def.columns.get(column) else {
-            return Err(ComputeIssue::UnsupportedBySource);
-        };
-        column_value_strict(
-            self.def.id,
-            column,
-            meta,
-            self.plan,
-            self.prev,
-            self.curr,
-            &self.ctx,
-        )
+        self.computed_with(column, true)
     }
 
     /// 公開名で表示値を引く。列が無ければ「その世代に無い」として返す。
@@ -483,7 +593,14 @@ impl<'a> ItemPair<'a> {
 
     /// 前サンプルの生値。
     pub fn raw_prev(&self, column: usize) -> Availability<u64> {
-        if !self.ctx.has_prev {
+        if let Some(p) = &self.prepared {
+            if !p.ctx.has_prev {
+                return Availability::MissingInSample;
+            }
+            if p.replaced {
+                return self.plan.column_value(&p.prev.values, column);
+            }
+        } else if !self.ctx.has_prev {
             return Availability::MissingInSample;
         }
         self.plan.column_value(&self.prev.values, column)
@@ -626,6 +743,7 @@ mod tests {
             curr: &curr,
             ctx: ComputeContext::new(100),
             row: None,
+            prepared: None,
         };
 
         // sys + irq + soft = 3 + 7 + 8

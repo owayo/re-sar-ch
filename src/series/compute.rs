@@ -530,13 +530,13 @@ pub fn column_is_present(plan: &DecodePlan, column: usize) -> bool {
 /// | `A_FS` | `f_blocks == 0` | `print_filesystem_stats()` |
 /// | `A_NET_DEV` / `A_NET_EDEV` | インターフェース名が空 | `print_net_dev_stats()` |
 /// | `A_NET_FC` | `fchost_name` が空 | `count_stats_fchost()` |
-/// | `A_SERIAL` | `line == 0` | `print_tty_stats()` |
+/// | `A_SERIAL` | 旧 magic 0x8a の `line == 0` | `print_tty_stats()` |
 /// | `A_PWR_USB` | `bus_nr == 0` | `print_pwr_usb_stats()` |
 /// | `A_PWR_CPU` | `cpufreq == 0` (オフライン) | `print_pwr_cpufreq_stats()` |
-/// | `A_NET_SOFT` | CPU ごとの 5 カウンタが全 0 (オフライン) | `print_softnet_stats()` |
+/// | `A_NET_SOFT` | CPU ごとの 5 カウンタと backlog_len が全 0 (オフライン) | `print_softnet_stats()` |
 ///
 /// `A_NET_SOFT` の `index == 0` は CPU "all" なので常に使用中とする。
-/// `blg_len` はゲージ (オフラインでも 0 以外になり得る) なので判定に入れない。
+/// `blg_len` も本家のオンライン判定に含める。
 ///
 /// フィールドがその世代に無い場合は 0 とみなす。**無いフィールドが
 /// スロットを「使用中」にすることはない**ため、判定は保守的に働く。
@@ -568,7 +568,7 @@ pub fn is_unused_item(
         ActivityId::FS => v(plan, item, fs_col::TOTAL) == 0,
         // インターフェース名 / FC ホスト名は 1 本目の文字列フィールド
         ActivityId::NET_DEV | ActivityId::NET_EDEV | ActivityId::NET_FC => text_empty(item, 0),
-        ActivityId::SERIAL => v(plan, item, 0) == 0,
+        ActivityId::SERIAL => plan.serial_line_offset && v(plan, item, 0) == 0,
         ActivityId::PWR_USB => v(plan, item, usb_col::BUS) == 0,
         ActivityId::PWR_CPU => v(plan, item, pwr_cpu_col::MHZ) == 0,
         ActivityId::NET_SOFT => {
@@ -578,6 +578,7 @@ pub fn is_unused_item(
                 && v(plan, item, soft_col::SQUEEZD) == 0
                 && v(plan, item, soft_col::RX_RPS) == 0
                 && v(plan, item, soft_col::FLW_LIM) == 0
+                && v(plan, item, soft_col::BLG_LEN) == 0
         }
         _ => false,
     }
@@ -825,7 +826,8 @@ fn column_value_with(
 
             // 差分は列の元の幅で取る。32bit カウンタ (`unsigned int` のフィールドや
             // 32bit ライタの `unsigned long`) を 64bit のまま引くと、一周した入力で
-            // 差分が 1.84e19 になる。本家も `unsigned int` は 32bit で引いている。
+            // 差分が 1.84e19 になる。`unsigned int` は本家と一致するが、
+            // 32bit ライタの `unsigned long` の幅復元は 64bit 読み手の本家と意図的に異なる。
             let bits = counter_bits(plan, column);
 
             let delta = match policy {
@@ -1282,6 +1284,9 @@ fn memory_derived(
         }
         mem_col::SWPUSED_PCT => {
             let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            if total == 0 && policy == MissingPolicy::Strict {
+                return Err(ComputeIssue::MissingInSample);
+            }
             let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             Ok(if total != 0 {
                 sp_value(free, total, total)
@@ -1291,6 +1296,9 @@ fn memory_derived(
         }
         mem_col::SWPCAD_PCT => {
             let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            if total == 0 && policy == MissingPolicy::Strict {
+                return Err(ComputeIssue::MissingInSample);
+            }
             let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             // caskb は分子そのもの。欠落を 0 にすると %swpcad が常に 0% になる
             let cad = primary_input(plan, curr, mem_col::KBSWPCAD, policy)?;
@@ -2037,21 +2045,17 @@ pub fn aggregate_cpu(
     curr_items: &[ItemSnapshot],
     since_boot: bool,
 ) -> Option<CpuAggregate> {
-    if curr_items.len() <= 1 || prev_items.len() <= 1 {
+    if curr_items.len() <= 1 {
         return None;
     }
-    let width = curr_items[0].values.len();
-    let zero = || ItemSnapshot {
-        key: None,
-        texts: Vec::new(),
-        values: vec![Availability::Present(0); width],
-    };
+    let zero = || aggregate_zero(plan);
     let mut agg_prev = zero();
     let mut agg_curr = zero();
     let mut total: u64 = 0;
     let mut offline = Vec::new();
 
     let n = prev_items.len().min(curr_items.len());
+    offline.extend(n.max(1)..curr_items.len());
     for i in 1..n {
         let scc = &curr_items[i];
         let scp = &prev_items[i];
@@ -2090,11 +2094,230 @@ pub fn aggregate_cpu(
     })
 }
 
+/// 同一名のデバイスが再登録されたか。本家 check_*_reg() の -2 判定。
+pub fn item_reregistered(
+    id: ActivityId,
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+) -> bool {
+    let p = |c| raw_column(plan, prev, c).unwrap_or(0);
+    let c = |n| raw_column(plan, curr, n).unwrap_or(0);
+    match id {
+        ActivityId::NET_DEV => {
+            let decreased = (net_dev_col::RXPCK..=net_dev_col::RXMCST).any(|n| c(n) < p(n));
+            let overflow = [
+                (net_dev_col::RXKB, net_dev_col::RXPCK),
+                (net_dev_col::TXKB, net_dev_col::TXPCK),
+                (net_dev_col::RXPCK, net_dev_col::RXKB),
+                (net_dev_col::TXPCK, net_dev_col::TXKB),
+            ]
+            .iter()
+            .any(|&(n, other)| c(n) < p(n) && c(other) > p(other) && p(n) > u64::MAX / 2);
+            decreased && !overflow
+        }
+        ActivityId::NET_EDEV => (2..=9).any(|n| c(n) < p(n)),
+        ActivityId::DISK => {
+            c(disk_col::TPS) < p(disk_col::TPS)
+                && [disk_col::RKB, disk_col::WKB, disk_col::DKB]
+                    .iter()
+                    .all(|&n| p(n) == 0 || c(n) < p(n))
+        }
+        _ => false,
+    }
+}
+
+/// 本家互換の新規 item の差分基準。
+pub fn zero_item(plan: &DecodePlan) -> ItemSnapshot {
+    ItemSnapshot {
+        key: None,
+        texts: Vec::new(),
+        values: vec![Availability::Present(0); plan.fields.len()],
+    }
+}
+
+fn aggregate_zero(plan: &DecodePlan) -> ItemSnapshot {
+    ItemSnapshot {
+        values: plan
+            .fields
+            .iter()
+            .map(|field| {
+                if field.read.is_some() {
+                    Availability::Present(0)
+                } else {
+                    Availability::UnsupportedBySource
+                }
+            })
+            .collect(),
+        ..ItemSnapshot::default()
+    }
+}
+
+/// softnet の CPU hotplug 補正付き合算。
+pub fn aggregate_soft(
+    plan: &DecodePlan,
+    prev: &[ItemSnapshot],
+    curr: &[ItemSnapshot],
+) -> Option<CpuAggregate> {
+    if curr.len() <= 1 {
+        return None;
+    }
+    let mut out = CpuAggregate {
+        prev: aggregate_zero(plan),
+        curr: aggregate_zero(plan),
+        tick_total: 0,
+        offline: Vec::new(),
+    };
+    for (i, c) in curr.iter().enumerate().skip(1) {
+        let Some(p) = prev.get(i).filter(|p| !soft_offline(plan, p)) else {
+            out.offline.push(i);
+            continue;
+        };
+        let c = if soft_offline(plan, c) {
+            out.offline.push(i);
+            p
+        } else {
+            c
+        };
+        add_into(&mut out.prev, p);
+        add_into(&mut out.curr, c);
+    }
+    Some(out)
+}
+
+fn soft_offline(plan: &DecodePlan, item: &ItemSnapshot) -> bool {
+    (soft_col::TOTAL..=soft_col::BLG_LEN).all(|c| raw_column(plan, item, c).unwrap_or(0) == 0)
+}
+
+/// 全出力・集計で共有する、1 item の補正済み端点と状態。
+#[derive(Debug, Clone)]
+pub struct PreparedItem {
+    pub prev: ItemSnapshot,
+    pub curr: ItemSnapshot,
+    pub ctx: ComputeContext,
+    pub offline: bool,
+    pub tickless: bool,
+    pub replaced: bool,
+}
+
+impl PreparedItem {
+    /// 補正済み端点から値を求める。厳密モードでは再登録・欠測を値にしない。
+    pub fn computed(
+        &self,
+        id: ActivityId,
+        column: usize,
+        meta: &ColumnMeta,
+        plan: &DecodePlan,
+        policy: MissingPolicy,
+    ) -> Computed {
+        if policy == MissingPolicy::Strict {
+            if self.replaced {
+                return Err(ComputeIssue::Discontinuous(Discontinuity::ItemReplaced));
+            }
+            if self.offline {
+                return Err(ComputeIssue::MissingInSample);
+            }
+        }
+        if self.ctx.has_prev && self.ctx.continuous && self.tickless {
+            // まず入力の可用性を調べ、未提供の列を tickless の 0 に偽装しない。
+            let ctx = self.ctx.with_tick_total(1);
+            column_value_with(id, column, meta, plan, &self.prev, &self.curr, &ctx, policy)?;
+            return Ok(if column == cpu_col::IDLE { 100.0 } else { 0.0 });
+        }
+        column_value_with(
+            id, column, meta, plan, &self.prev, &self.curr, &self.ctx, policy,
+        )
+    }
+}
+
+/// CPU の分母・端点、softnet hotplug、デバイス再登録を共通処理する。
+pub fn prepare_item(
+    id: ActivityId,
+    plan: &DecodePlan,
+    index: usize,
+    prev_items: &[ItemSnapshot],
+    curr_items: &[ItemSnapshot],
+    mut ctx: ComputeContext,
+) -> Option<PreparedItem> {
+    let curr = curr_items.get(index)?;
+    let prev = match curr.key.as_deref() {
+        Some(key) if id != ActivityId::IRQ => {
+            prev_items.iter().find(|p| p.key.as_deref() == Some(key))
+        }
+        _ => prev_items.get(index),
+    };
+    let replaced = ctx.has_prev
+        && (prev.is_none() || prev.is_some_and(|p| item_reregistered(id, plan, p, curr)));
+    let mut out = PreparedItem {
+        prev: prev.cloned().unwrap_or_else(|| zero_item(plan)),
+        curr: curr.clone(),
+        ctx,
+        offline: false,
+        tickless: false,
+        replaced,
+    };
+    if replaced {
+        out.prev = zero_item(plan);
+    }
+    match id {
+        ActivityId::CPU => {
+            if index == 0
+                && let Some(agg) = aggregate_cpu(plan, prev_items, curr_items, false)
+            {
+                out.ctx = agg.context(ctx);
+                out.prev = agg.prev;
+                out.curr = agg.curr;
+            } else {
+                let interval = cpu_interval(
+                    plan,
+                    &out.prev,
+                    curr,
+                    if index == 0 {
+                        CpuRole::Aggregate
+                    } else {
+                        CpuRole::Single
+                    },
+                );
+                out.ctx = interval.context(ctx);
+                out.offline = interval.is_offline() || (index > 0 && !interval.prev_online);
+                out.tickless = interval.is_tickless();
+                out.prev = interval.prev;
+            }
+        }
+        ActivityId::NET_SOFT => {
+            if index == 0
+                && let Some(agg) = aggregate_soft(plan, prev_items, curr_items)
+            {
+                out.prev = agg.prev;
+                out.curr = agg.curr;
+            } else if index > 0 {
+                out.offline = soft_offline(plan, &out.prev) || soft_offline(plan, curr);
+                if soft_offline(plan, curr) {
+                    out.curr = out.prev.clone();
+                }
+            }
+        }
+        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
+            let start = index / plan.nr2.max(1) as usize * plan.nr2.max(1) as usize;
+            let p = prev_items.get(start);
+            let c = curr_items.get(start);
+            out.offline = p.is_none_or(|p| raw_column(plan, p, irq_col::COUNT).unwrap_or(0) == 0)
+                || c.is_none_or(|c| raw_column(plan, c, irq_col::COUNT).unwrap_or(0) == 0);
+            if c.is_some_and(|c| raw_column(plan, c, irq_col::COUNT).unwrap_or(0) == 0) {
+                out.curr = out.prev.clone();
+            }
+            ctx.aggregate_item = start == 0;
+            out.ctx = ctx;
+        }
+        _ => {}
+    }
+    Some(out)
+}
+
 /// item 群をフィールド単位で合算する。
 ///
-/// `A_NET_SOFT` の CPU "all" 行 (`get_global_soft_statistics()`) や
-/// `A_IRQ` の合計列 (`get_global_int_statistics()`) のように、
-/// 「集約行は個別行の単純和」で作る activity のために使う。
+/// 差分の相手を必要としない初期集約に用いる。
+/// CPU / softnet の区間値では hotplug 補正付きの専用入口を使う。
 pub fn sum_items<'a, I>(width: usize, items: I) -> ItemSnapshot
 where
     I: IntoIterator<Item = &'a ItemSnapshot>,
@@ -2113,9 +2336,15 @@ where
 /// フィールド単位の加算 (CPU "all" の合算用)。
 fn add_into(acc: &mut ItemSnapshot, src: &ItemSnapshot) {
     for (slot, v) in acc.values.iter_mut().zip(src.values.iter()) {
-        if let (Availability::Present(a), Availability::Present(b)) = (&slot, v) {
-            *slot = Availability::Present(a.wrapping_add(*b));
-        }
+        *slot = match (*slot, *v) {
+            (Availability::Present(a), Availability::Present(b)) => {
+                Availability::Present(a.wrapping_add(b))
+            }
+            (Availability::MissingInSample, _) | (_, Availability::MissingInSample) => {
+                Availability::MissingInSample
+            }
+            _ => Availability::UnsupportedBySource,
+        };
     }
 }
 // ============================================================================
@@ -4817,12 +5046,12 @@ mod tests {
         put(&plan, &mut online, soft_col::RX_RPS, 1);
         assert!(!is_unused_item(ActivityId::NET_SOFT, 1, &plan, &online));
 
-        // `blg_len` はゲージなので判定に入れない (オフラインでも 0 以外になり得る)
+        // 本家は backlog_len もオンライン判定に含める。
         let mut backlog_only = zeros(&plan);
         put(&plan, &mut backlog_only, soft_col::BLG_LEN, 5);
         assert!(
-            is_unused_item(ActivityId::NET_SOFT, 1, &plan, &backlog_only),
-            "blg_len だけではオンラインと判定しない"
+            !is_unused_item(ActivityId::NET_SOFT, 1, &plan, &backlog_only),
+            "blg_len が残っていればオンラインと判定する"
         );
     }
 

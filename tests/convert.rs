@@ -181,7 +181,7 @@ fn record_shapes(file: &SaFile) -> Vec<RecordShape> {
                 .map(|s| (s.id.0, s.nr, s.nr2))
                 .collect::<Vec<_>>(),
             cpu_count: rec.cpu_count,
-            comment: rec.comment.map(|s| s.to_string()),
+            comment: rec.comment.map(|s| String::from_utf8_lossy(s).into_owned()),
         });
         Ok(ScanControl::Continue)
     })
@@ -892,7 +892,7 @@ fn old_fixture(
     comment.uptime = 0;
 
     // 統計レコードは 20 秒間隔。`uptime0` の差を 2000 jiffies にしておくと
-    // 「レコードから推定した HZ = 100」になる (2000 / 20)。
+    // 「既定 USER_HZ = 100」になる (2000 / 20)。
     let mut first = RecordSpec::stats(counts.clone(), 1_600_000_011, 12, 26, 51);
     first.uptime = 100_000;
     let mut second = RecordSpec::stats(counts, 1_600_000_031, 12, 27, 11);
@@ -1027,9 +1027,9 @@ fn irq_dimensions_are_swapped_and_names_are_generated() {
     }
 }
 
-/// HZ を明示しなければレコードから推定し、明示すればその値を使うこと。
+/// HZ を明示しなければ USER_HZ=100 を使い、明示すればその値を使うこと。
 #[test]
-fn hz_is_estimated_from_records_or_taken_from_the_option() {
+fn hz_defaults_to_user_hz_or_is_taken_from_the_option() {
     let fx = old_fixture(
         Generation::G2173,
         FixtureAbi::Le64,
@@ -1037,16 +1037,12 @@ fn hz_is_estimated_from_records_or_taken_from_the_option() {
     );
     let src = SaFile::from_bytes("hz", fx.bytes.clone()).expect("自作 fixture を開ける");
 
-    // 自作 fixture の uptime0 は「ust_time の差 × 100」で書かれているので
-    // 推定値は 100 になる。
+    // 旧形式に保存されない単位は USER_HZ=100 とする。
     let (bytes, report) = convert_bytes(&src, None);
-    assert_eq!(report.hz, 100, "レコードから推定した HZ");
+    assert_eq!(report.hz, 100, "既定 USER_HZ");
     assert!(
-        matches!(
-            report.hz_source,
-            HzSource::EstimatedSnapped { .. } | HzSource::EstimatedRounded { .. }
-        ),
-        "推定経路を通ること: {:?}",
+        matches!(report.hz_source, HzSource::Fallback),
+        "既定 USER_HZ を使うこと: {:?}",
         report.hz_source
     );
     let dst = reopen("hz", bytes);
@@ -1077,12 +1073,9 @@ fn hz_is_estimated_from_records_or_taken_from_the_option() {
     }
 }
 
-/// HZ の推定が RESTART をまたいだ対を使わないこと。
-///
-/// 再起動で `uptime0` は 0 に戻る。ファイル全体の先頭と末尾を単純に引く実装だと
-/// 差が負になり、日次ファイル (再起動を含む) で推定が必ず失敗する。
+/// 再起動で uptime0 が戻っても既定の USER_HZ は変わらない。
 #[test]
-fn hz_estimation_does_not_span_a_restart() {
+fn default_hz_is_unchanged_by_a_restart() {
     let mut spec = FixtureSpec::skeleton(Generation::G2173, FixtureAbi::Le64);
     let cpu_nr = spec.cpu_nr as i32;
     spec.activities = vec![a_cpu_old(cpu_nr), a_memory_old()];
@@ -1110,15 +1103,12 @@ fn hz_estimation_does_not_span_a_restart() {
     let (_, report) = convert_bytes(&src, None);
     assert_eq!(
         report.hz, 100,
-        "RESTART をまたがない対から推定すること ({:?})",
+        "RESTART があっても既定 USER_HZ を使うこと ({:?})",
         report.hz_source
     );
     assert!(
-        matches!(
-            report.hz_source,
-            HzSource::EstimatedSnapped { .. } | HzSource::EstimatedRounded { .. }
-        ),
-        "推定経路を通ること: {:?}",
+        matches!(report.hz_source, HzSource::Fallback),
+        "既定 USER_HZ を使うこと: {:?}",
         report.hz_source
     );
 }

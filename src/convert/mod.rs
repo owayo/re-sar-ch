@@ -17,7 +17,7 @@
 //!     A["convert(file, options, out)"] --> B{"format_magic"}
 //!     B -->|"0x2175"| Z["1 バイトも書かずに<br/>already_current で報告"]
 //!     B -->|"0x2170 以下"| E["変換不能としてエラー"]
-//!     B -->|"0x2171 / 0x2173"| H["HZ を決める<br/>(明示指定 or レコードから推定)"]
+//!     B -->|"0x2171 / 0x2173"| H["HZ を決める<br/>(明示指定 or USER_HZ=100)"]
 //!     H --> M["file_magic (76B) を書く"]
 //!     M --> FH["file_header (336B) を書く"]
 //!     FH --> FA["file_activity[] (36B × act_nr) を書く"]
@@ -35,7 +35,6 @@
 //!
 //! | 論点 | 本家 | reSARch | 理由 |
 //! |---|---|---|---|
-//! | HZ | 変換を実行したマシンの `sysconf(_SC_CLK_TCK)` | 元ファイルの `uptime0` / `ust_time` から**推定** ([`estimate_hz`]) | 本家の方式は結果が実行環境依存になる。同じ入力から同じ出力が出ないのは変換として困る |
 //! | 未知 activity id | `exit(1)` (`get_activity_position[<id>]: Internal error`) | 旧バイト列を**素通し**して変換を続ける | 読み側は未知 id を読み飛ばす作りなので、素通しでも境界は保たれる。1 つの未知 id でファイル全体が救えなくなる方が損失が大きい |
 //! | `A_CPU` が無いファイル | `CPU activity not found in file. Aborting...` | `sa_cpu_nr = 0` で続行し警告 | 現行形式は CPU 統計必須の前提を撤廃している (§5.17) |
 //! | `unsigned long` の拡幅 | `moveto_long_long()` で 32 ビット回転 | 値を `u64` へ正規化してから再直列化 | 回転はバイト列を持ち回る実装の都合。再直列化ならエンディアン不一致でも壊れない (§5.13) |
@@ -96,14 +95,9 @@ const SYSSTAT_MAGIC: u16 = 0xd596;
 /// `__nr_t` のバイト数。
 const NR_T_SIZE: usize = 4;
 
-/// HZ を推定できなかったときに使う値。
-///
-/// Linux の `CONFIG_HZ` は歴史的に 100 が既定で、sysstat のドキュメントも
-/// 100 を前提にした説明をしている。[`crate::format::file::DEFAULT_ASSUMED_HZ`] と同じ値。
+/// 旧形式の tick 単位 USER_HZ。CONFIG_HZ (カーネル割り込み頻度) とは異なる。
+/// 主要 Linux ABI と直読経路の既定値に合わせる。例外的な ABI は明示指定する。
 pub const FALLBACK_HZ: u64 = 100;
-
-/// 推定値を丸める先の候補 (Linux の `CONFIG_HZ` に実在する値)。
-const HZ_CANDIDATES: &[u64] = &[100, 250, 300, 1000];
 
 // ===========================================================================
 // 公開 API
@@ -117,10 +111,9 @@ pub struct ConvertOptions {
     /// 旧ヘッダには HZ が保存されていないが、新形式の `file_header.sa_hz` と
     /// `record_header.uptime_cs` の両方に必要になる (§5.6)。
     ///
-    /// `None` ならレコードの `uptime0` / `ust_time` から推定する ([`estimate_hz`])。
-    /// 本家 (`sadf -c`) は変換を実行したマシンの HZ を使うため、
-    /// **同じ入力でも実行環境が違えば出力が変わる**。それを避けるためにこうしている。
-    /// 本家の `sadf -c -O hz=<値>` に相当する明示指定がこのフィールドである。
+    /// `None` なら USER_HZ = 100。壁時計と CPU0 の tick は suspend や時刻補正で
+    /// 一致しないため、それらの比率から単位を推定しない。
+    /// 本家の `sadf -c -O hz=<値>` に相当する明示指定で上書きできる。
     pub hz: Option<u64>,
 }
 
@@ -129,11 +122,7 @@ pub struct ConvertOptions {
 pub enum HzSource {
     /// 呼び出し側が明示指定した (`sadf -c -O hz=<値>` 相当)。
     Explicit,
-    /// レコードの `uptime0` / `ust_time` から推定し、既知の `CONFIG_HZ` 値へ丸めた。
-    EstimatedSnapped { raw: f64 },
-    /// 推定したが既知の候補から離れていたので、四捨五入した整数をそのまま使った。
-    EstimatedRounded { raw: f64 },
-    /// 推定に使えるレコード対が無かったので既定値を使った。
+    /// USER_HZ の既定値を使った。
     Fallback,
 }
 
@@ -141,15 +130,7 @@ impl HzSource {
     pub fn describe(self) -> String {
         match self {
             HzSource::Explicit => "明示指定".to_string(),
-            HzSource::EstimatedSnapped { raw } => {
-                format!("レコードから推定 (実測 {raw:.3} を既知の CONFIG_HZ へ丸めた)")
-            }
-            HzSource::EstimatedRounded { raw } => {
-                format!("レコードから推定 (実測 {raw:.3} を四捨五入。既知の CONFIG_HZ には無い値)")
-            }
-            HzSource::Fallback => {
-                format!("推定に使えるレコード対が無いため既定値 {FALLBACK_HZ} を仮定")
-            }
+            HzSource::Fallback => format!("既定 USER_HZ {FALLBACK_HZ}"),
         }
     }
 }
@@ -270,7 +251,7 @@ pub fn convert(
     // --- HZ の決定 (§5.6) ---
     let (hz, hz_source) = match options.hz {
         Some(h) if h > 0 => (h, HzSource::Explicit),
-        _ => estimate_hz(file)?,
+        _ => (FALLBACK_HZ, HzSource::Fallback),
     };
     report.hz = hz;
     report.hz_source = hz_source;
@@ -365,83 +346,6 @@ pub fn convert(
 
     report.bytes_written = sink.written;
     Ok(report)
-}
-
-// ===========================================================================
-// HZ の推定
-// ===========================================================================
-
-/// レコードの `uptime0` と `ust_time` から HZ を推定する。
-///
-/// 旧 `record_header` は稼働時間を **jiffies** で持ち、新形式は 1/100 秒単位の
-/// `uptime_cs` に一本化されている。換算 (`uptime_cs = uptime0 * 100 / HZ`) に
-/// HZ が必要だが、旧ヘッダには保存されていない (§5.6)。
-///
-/// 本家は変換を実行したマシンの HZ を使うので、**同じ入力でも実行環境が違えば
-/// 出力が変わる**。reSARch は入力自身から導く:
-///
-/// - `uptime0` は「1 CPU 換算の起動からの jiffies」なので、
-///   隣り合う 2 レコードの差を実時間の差で割れば HZ になる
-/// - **RESTART をまたぐ対は使わない。** 再起動で `uptime0` が 0 に戻るため、
-///   ファイル全体の先頭と末尾を単純に引くと日次ファイルで推定が壊れる
-/// - 候補のうち**時間の最も離れた対**を採る。レコードの時刻は秒単位なので
-///   実測値には必ず 1 サンプル分の丸め誤差が乗り、間隔が長いほどその影響が小さい
-/// - 実在する `CONFIG_HZ` (100 / 250 / 300 / 1000) に 2% 以内で寄れば、その値へ丸める
-/// - 対が 1 つも取れないファイル (統計レコードが 1 本以下) は既定値 100 を仮定する
-///
-/// `uptime0` が 0 のレコード (RESTART / COMMENT) は対の材料にしない。
-pub fn estimate_hz(file: &SaFile) -> Result<(u64, HzSource)> {
-    // 直前の統計レコード。RESTART をまたぐと `uptime0` が 0 に戻るので、
-    // そこで対を切る (またいだ対を使うと負の差になって推定が壊れる)。
-    let mut prev: Option<(u64, u64)> = None;
-    // 最も時間の離れた対。間隔が長いほど 1 サンプル分の丸め誤差の影響が小さい。
-    let mut best: Option<(u64, u64)> = None;
-
-    file.scan(|rec| {
-        match rec.kind {
-            RecordKind::Restart => prev = None,
-            k if k.carries_stats() => {
-                let uptime0 = rec.uptime_jiffies.map(|(_, u0)| u0).unwrap_or(0);
-                if uptime0 == 0 {
-                    // 稼働時間を持たないレコードは対の材料にならない
-                    prev = None;
-                } else {
-                    if let Some((t0, u0)) = prev
-                        && rec.ust_time > t0
-                        && uptime0 > u0
-                    {
-                        let (dt, du) = (rec.ust_time - t0, uptime0 - u0);
-                        if best.is_none_or(|(bt, _)| dt > bt) {
-                            best = Some((dt, du));
-                        }
-                    }
-                    prev = Some((rec.ust_time, uptime0));
-                }
-            }
-            _ => {}
-        }
-        Ok(ScanControl::Continue)
-    })?;
-
-    let Some((dt, du)) = best else {
-        return Ok((FALLBACK_HZ, HzSource::Fallback));
-    };
-
-    let raw = du as f64 / dt as f64;
-    if !raw.is_finite() || raw <= 0.0 {
-        return Ok((FALLBACK_HZ, HzSource::Fallback));
-    }
-
-    // 実在する CONFIG_HZ に十分近ければその値を採る。
-    // レコード間隔は秒単位で記録されるので、実測値には必ず 1 サンプル分の
-    // 丸め誤差が乗る (例: 4590 jiffies / 46 秒 = 99.78)。
-    for &c in HZ_CANDIDATES {
-        if (raw - c as f64).abs() <= c as f64 * 0.02 {
-            return Ok((c, HzSource::EstimatedSnapped { raw }));
-        }
-    }
-    let rounded = raw.round().max(1.0) as u64;
-    Ok((rounded, HzSource::EstimatedRounded { raw }))
 }
 
 // ===========================================================================

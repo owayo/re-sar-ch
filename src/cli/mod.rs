@@ -135,7 +135,7 @@ pub struct CommonArgs {
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     pub activity: Vec<String>,
 
-    /// 開始時刻 (`hh:mm[:ss]` または 10 桁の epoch 秒)。
+    /// 開始時刻 (UTC の `hh:mm[:ss]` または 10 桁の epoch 秒)。
     ///
     /// `show` では表示する行、`summarize` / `compare` では**集計期間そのもの**を
     /// 絞る。範囲外のサンプルは平均・最大 / 最小・p95・差分合計のどれにも
@@ -145,14 +145,14 @@ pub struct CommonArgs {
     /// `sar -s` と同じく、**範囲に最初に合致したサンプルは差分の基準として
     /// 消費される** (`show` では表示されず、`summarize` では値に数えない)。
     /// 複数ファイルを渡した場合はファイルごとに引き直すので、
-    /// `--from 09:00 --to 18:00` は「各日の 09:00〜18:00」を意味する。
+    /// `--from 09:00 --to 18:00` は「各日の UTC 09:00〜18:00」を意味する。
     ///
     /// `detect` の `--from` / `--to` は意味が違う (報告範囲だけを絞り、
     /// 比較基準の材料は絞らない)。`resarch detect --help` を参照。
     #[arg(long, value_name = "TIME", verbatim_doc_comment)]
     pub from: Option<String>,
 
-    /// 終了時刻 (`hh:mm[:ss]` または 10 桁の epoch 秒)。
+    /// 終了時刻 (UTC の `hh:mm[:ss]` または 10 桁の epoch 秒)。
     ///
     /// 意味は `--from` と対。`hh:mm[:ss]` 形式で `--to` < `--from` のときは
     /// 翌日までを指す (`sar` と同じ日跨ぎ補正)。
@@ -193,6 +193,10 @@ pub struct ShowArgs {
     /// 生値と派生値のどちらを出すか。
     #[arg(long, value_enum, default_value_t = ValueKind::Derived)]
     pub values: ValueKind,
+
+    /// 独自出力で割り込みの CPU 別内訳も出す (既定は CPU all のみ)。
+    #[arg(long)]
+    pub irq_cpus: bool,
 
     #[command(flatten)]
     pub common: CommonArgs,
@@ -297,11 +301,11 @@ pub struct DetectArgs {
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     pub activity: Vec<String>,
 
-    /// 報告範囲の開始時刻。**基準の材料は絞らない** (`--baseline-scope` を参照)。
+    /// 報告範囲の開始時刻 (UTC の hh:mm[:ss] または epoch 秒)。基準の材料は絞らない。
     #[arg(long, value_name = "TIME")]
     pub from: Option<String>,
 
-    /// 報告範囲の終了時刻。**基準の材料は絞らない** (`--baseline-scope` を参照)。
+    /// 報告範囲の終了時刻 (UTC の hh:mm[:ss] または epoch 秒)。基準の材料は絞らない。
     #[arg(long, value_name = "TIME")]
     pub to: Option<String>,
 

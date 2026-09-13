@@ -94,7 +94,10 @@ pub fn detect(
     let status = if out.is_empty() {
         RouteStatus::Evaluated
     } else {
-        RouteStatus::Detected { count: out.len() }
+        RouteStatus::Detected {
+            count: out.len(),
+            blind_edge_points: 0,
+        }
     };
     (out, status)
 }
@@ -169,7 +172,7 @@ mod tests {
         assert_eq!(d.base_priority, declared.priority, "宣言された優先度を運ぶ");
         assert_eq!(d.support.samples, 3);
         assert_eq!(d.route(), DetectRoute::FixedCondition);
-        assert!(matches!(status, RouteStatus::Detected { count: 1 }));
+        assert!(matches!(status, RouteStatus::Detected { count: 1, .. }));
         let DecisionBasis::FixedCondition { condition_id, .. } = d.decision.basis else {
             panic!("固定条件の根拠が入っているべき");
         };

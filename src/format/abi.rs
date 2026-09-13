@@ -120,13 +120,16 @@ impl LayoutAbi {
         if sizeof_long == 4 {
             return match m.as_str() {
                 // x86 32bit: long long は 4 境界
-                "i386" | "i486" | "i586" | "i686" | "x86" | "i86pc" => Some(Self::I386),
+                "i386" | "i486" | "i586" | "i686" | "x86" | "i86pc" | "x86_64" | "amd64" => {
+                    Some(Self::I386)
+                }
                 // ARM EABI / PowerPC / MIPS などは 8 境界
                 s if s.starts_with("armv") || s == "arm" || s.starts_with("aarch32") => {
                     Some(Self::ILP32_ALIGN8)
                 }
                 "ppc" | "powerpc" | "ppcle" | "mips" | "mipsel" | "sparc" | "s390" | "riscv32"
-                | "sh4" | "m68k" => Some(Self::ILP32_ALIGN8),
+                | "sh4" | "m68k" | "aarch64" | "arm64" | "ppc64" | "ppc64le" | "mips64"
+                | "s390x" | "sparc64" | "riscv64" => Some(Self::ILP32_ALIGN8),
                 _ => None,
             };
         }

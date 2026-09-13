@@ -39,7 +39,8 @@ pub use sar_args::{
 /// ルートが受け付けるサブコマンド名。
 ///
 /// 先頭引数がこのいずれでもなければ `sar` 互換として解釈する。
-pub const SUBCOMMAND_NAMES: [&str; 8] = [
+pub const SUBCOMMAND_NAMES: [&str; 9] = [
+    "sa2sar",
     "show",
     "summarize",
     "detect",
@@ -381,6 +382,30 @@ pub struct InfoArgs {
     pub no_mmap: bool,
 }
 
+/// `resarch sa2sar` の引数。
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct Sa2SarArgs {
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
+    /// 読み出す sa バイナリファイル。
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// sar テキストの保存先。省略または - なら標準出力。既存ファイルは上書きしない。
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// 採取元に記録された時刻の代わりに UTC で出力する。
+    #[arg(long)]
+    pub utc: bool,
+
+    /// mmap を使わず BufReader で読む。
+    #[arg(long)]
+    pub no_mmap: bool,
+}
+
 /// `resarch skill-install` の引数。
 ///
 /// AI エージェントへ「この CLI の使い方」を渡すためのサブコマンド。
@@ -420,6 +445,9 @@ pub struct CompatArgs {
 /// `resarch` のサブコマンド。
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
+    /// sa バイナリから全項目の sar テキスト (平均・再起動・コメントを含む) を生成する。
+    #[command(disable_help_flag = true, name = "sa2sar")]
+    Sa2Sar(Sa2SarArgs),
     /// 独自形式で閲覧する。
     //
     // `--help` の扱いは [`Commands::Summarize`] と同じ。

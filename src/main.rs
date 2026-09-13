@@ -36,9 +36,9 @@ use re_sar_ch::analyze::{
 };
 use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
-    DetectFormat, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg, SadfFormat,
-    SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate, SarInput, SarOptions,
-    SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
+    DetectFormat, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg, Sa2SarArgs,
+    SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate, SarInput,
+    SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
@@ -89,6 +89,7 @@ fn main() -> ExitCode {
 fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
     match invocation {
         Invocation::Native(cmd) => match *cmd {
+            Commands::Sa2Sar(args) => run_sa2sar(args),
             Commands::Info(args) => run_info(args),
             Commands::SkillInstall(args) => run_skill_install(args),
             Commands::Show(args) => run_show(args),
@@ -431,6 +432,50 @@ fn sadf_config(opts: &SadfOptions) -> SadfConfig {
 // ===========================================================================
 // `sar` 互換入口
 // ===========================================================================
+
+fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
+    let file = open_file(&args.file, &open_options(false, args.no_mmap))?;
+    report_diagnostics(&file);
+    // -A の CPU / memory / swap などの選択規則を互換入口と共有する。
+    let mut opts = cli::parse_sar_args(&["-A".into(), "-C".into()])?;
+    opts.flags.true_time = !args.utc;
+    opts.flags.local_time = false;
+    let text = sar_text_options(&opts);
+    let activities = sar_activities(&opts, &file);
+    if activities.is_empty() {
+        bail!(
+            "Requested activities not available in file {}",
+            args.file.display()
+        );
+    }
+    if let Some(path) = args.output.as_deref().filter(|p| *p != Path::new("-")) {
+        // 同一ディレクトリの一時ファイルへストリーミングし、成功後に公開する。
+        // persist_noclobber は入力自身・hardlink・symlink も上書きしない。
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut temp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("出力先に一時ファイルを作成できません: {}", path.display()))?;
+        {
+            let mut out = BufWriter::new(temp.as_file_mut());
+            sar_text::write_report(&mut out, &file, &text, &activities)?;
+            out.flush()?;
+        }
+        temp.persist_noclobber(path).with_context(|| {
+            format!(
+                "sar テキストを保存できません (既存ファイルは上書きしません): {}",
+                path.display()
+            )
+        })?;
+    } else {
+        let mut out = stdout_writer();
+        let result = sar_text::write_report(&mut out, &file, &text, &activities);
+        out.flush()?;
+        result?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 fn run_sar(opts: SarOptions) -> anyhow::Result<ExitCode> {
     if let Some(immediate) = opts.immediate {

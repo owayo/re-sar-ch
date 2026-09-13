@@ -99,6 +99,22 @@ The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs f
 `-P all`, `-h` means `--pretty --human` rather than help, and the first record matched by
 `-s` is consumed as the baseline rather than displayed.
 
+### Saving an sa binary as sar text
+
+```bash
+resarch sa2sar sa13 -o sar13             # All activities, averages, restarts and comments
+resarch sa2sar sa13 --utc -o sar13-utc   # Use UTC timestamps
+resarch sa2sar sa13                     # Write to stdout for piping
+```
+
+The default is equivalent to `sar -A -C -t -f sa13`, using timestamps recorded by
+the source host. Omit `-o` or use `-o -` for stdout. Existing destination files
+are never overwritten; failed conversion leaves no partial destination file.
+Old and big-endian inputs are read directly. CI compares CLI-generated files
+against five upstream golden reports covering three old versions, a current
+format and big-endian data. Only disk names unavailable on the reading host
+use the existing comparison mask.
+
 ### Its own commands
 
 ```bash

@@ -45,12 +45,12 @@ use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
 use re_sar_ch::model::{ActivityId, KNOWN_ACTIVITIES};
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
-use re_sar_ch::output::detect_report;
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
 use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
 use re_sar_ch::output::{csv, ndjson, table};
+use re_sar_ch::output::{detect_report, detect_svg};
 use re_sar_ch::series::Selection;
 
 /// 既定の日次データファイルを置くディレクトリ (`SA_DIR`)。
@@ -1054,6 +1054,16 @@ fn ordered_show_paths(
 /// **起動区間をまたいだ検出はしない** (再起動の前後で水準が変わるのは当然なので、
 /// それを異変として報告しない)。
 fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
+    if let Some(dir) = &args.svg_dir {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => bail!(
+                "SVG 保存先は新規ディレクトリを指定してください: {}",
+                dir.display()
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     let opts = detect_options(&args)?;
     let mopts = detect_multi_options(&args)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
@@ -1066,16 +1076,33 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
     // 起動区間ごとに所見を作る。**区間をまたいだ検出はしない**
     // (再起動の前後で水準が変わるのは当然なので異変として報告しない)。
     let mut assessments: Vec<Assessment> = Vec::new();
+    let mut charts = Vec::new();
     for host in &analysis.hosts {
         for seg in &host.segments {
             let mut assessment = assess_summary(&seg.summary, &opts);
             assessment.filter_priority(min);
+            if args.svg_dir.is_some() {
+                charts.extend(detect_svg::plan(
+                    &seg.summary,
+                    &assessment,
+                    args.svg_context.unwrap_or(1800),
+                ));
+            }
             assessments.push(assessment);
         }
     }
     if assessments.is_empty() {
         // 統計レコードが 1 件も無かった (ヘッダだけのファイルなど)
         eprintln!("resarch: 解析できる統計レコードがありませんでした");
+    }
+
+    if let Some(dir) = &args.svg_dir {
+        save_detect_graphs(dir, &charts, &assessments, &analysis)?;
+        eprintln!(
+            "resarch: SVG {} 件と index.json / report.json を保存: {}",
+            charts.len(),
+            dir.display()
+        );
     }
 
     let mut out = stdout_writer();
@@ -1096,6 +1123,96 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
     Ok(exit_code(
         !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty(),
     ))
+}
+
+/// 保存用の名前。先頭の通番がホスト・起動区間・記号置換による衝突を防ぐ。
+fn graph_name(index: usize, chart: &detect_svg::Chart) -> String {
+    let label = format!(
+        "{}-{}-{}",
+        chart.series.activity_name, chart.series.item, chart.series.column
+    );
+    let safe: String = label
+        .chars()
+        .take(96)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{:04}-{safe}.svg", index + 1)
+}
+
+fn save_detect_graphs(
+    dir: &Path,
+    charts: &[detect_svg::Chart],
+    assessments: &[Assessment],
+    analysis: &multi::MultiFileAnalysis,
+) -> anyhow::Result<()> {
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let stage = tempfile::tempdir_in(parent)?;
+    let mut assets = Vec::new();
+    let mut entries = Vec::new();
+    for (i, chart) in charts.iter().enumerate() {
+        let filename = graph_name(i, chart);
+        let mut temp = tempfile::NamedTempFile::new_in(stage.path())?;
+        {
+            let mut out = BufWriter::new(temp.as_file_mut());
+            detect_svg::write_svg(&mut out, chart)?;
+            out.flush()?;
+        }
+        entries.push(serde_json::json!({
+            "file": filename, "source": chart.source, "series": chart.series,
+            "unit": chart.unit, "origin": chart.origin,
+            "window_start_ust": chart.window_start_ust, "window_end_ust": chart.window_end_ust,
+            "context_secs": chart.context_secs, "findings": chart.findings,
+            "missing_timeline": chart.missing_timeline,
+        }));
+        assets.push((filename, temp.into_temp_path()));
+    }
+    let partial = !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty();
+    let manifest = serde_json::json!({
+        "schema_version": re_sar_ch::model::NATIVE_SCHEMA_VERSION,
+        "kind": "detect_svg_index", "status": if partial { "partial" } else { "complete" },
+        "timezone": "UTC", "report": "report.json", "charts": entries,
+        "skipped_files": analysis.skipped, "incomplete_files": analysis.incomplete_files,
+    });
+    for name in ["report.json", "index.json"] {
+        let mut temp = tempfile::NamedTempFile::new_in(stage.path())?;
+        {
+            let mut out = BufWriter::new(temp.as_file_mut());
+            if name == "report.json" {
+                detect_report::write_json(&mut out, assessments)?;
+            } else {
+                serde_json::to_writer_pretty(&mut out, &manifest)?;
+                writeln!(out)?;
+            }
+            out.flush()?;
+        }
+        assets.push((name.into(), temp.into_temp_path()));
+    }
+    // 全SVGと一覧の生成後に出力先を確保する。競合時も既存ディレクトリを触らない。
+    std::fs::create_dir(dir)
+        .with_context(|| format!("SVG 保存先を作成できません: {}", dir.display()))?;
+    let mut published = Vec::new();
+    for (name, temp) in assets {
+        let destination = dir.join(name);
+        if let Err(error) = temp.persist_noclobber(&destination) {
+            for path in published {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = std::fs::remove_dir(dir);
+            return Err(error.into());
+        }
+        published.push(destination);
+    }
+    Ok(())
 }
 
 fn detect_options(args: &DetectArgs) -> anyhow::Result<DetectOptions> {

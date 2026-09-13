@@ -68,7 +68,7 @@ jobs:
         # ランナーには sysstat はプリインストールされていないので必ず入れる。
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sysstat
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sysstat libxml2-utils
 
       - name: Record sysstat version
         # 「どの版と比較したのか」を後から追えるようにテストレポートへ残す
@@ -101,6 +101,9 @@ jobs:
 
       - name: Verify sa to sar CLI output against upstream golden files
         run: cargo test --test sa2sar -- --include-ignored --nocapture
+
+      - name: Verify detect SVG windows and XML output
+        run: cargo test --test detect_svg -- --include-ignored --nocapture
 
   build:
     name: Build (${{ matrix.target }})

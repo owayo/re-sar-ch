@@ -1,14 +1,21 @@
-<h1 align="center">reSARch</h1>
-
 <p align="center">
-  A standalone parser for <code>sysstat</code> binary log files (<code>sa</code> files).<br>
-  No <code>sar</code>, no <code>sadf</code>, no C library — one binary reads them all.
+  <img src="docs/images/app.png" width="128" alt="reSARch">
 </p>
 
+<h1 align="center">re<strong>SAR</strong>ch</h1>
+
 <p align="center">
+  A standalone CLI for sysstat sa files. Detect anomalies, chart them as SVG, and produce sar / sadf reports on Linux, macOS and Windows.
+</p>
+
+<h3 align="center">Supported Platforms</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
+  <br>
   <a href="https://github.com/owayo/re-sar-ch/actions/workflows/ci.yml"><img src="https://github.com/owayo/re-sar-ch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="https://github.com/owayo/re-sar-ch/actions/workflows/release.yml"><img src="https://github.com/owayo/re-sar-ch/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
-  <a href="https://github.com/owayo/re-sar-ch/releases"><img src="https://img.shields.io/github/v/release/owayo/re-sar-ch" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
@@ -17,65 +24,68 @@
   <a href="README.ja.md">日本語</a>
 </p>
 
----
-
-## Why
-
-`sar` writes its logs (`/var/log/sa/saXX`) as raw C structs. That makes them fast to write
-and painful to read: you generally need a `sysstat` install of a compatible vintage on a
-compatible architecture. A five-year-old log from a 32-bit PowerPC box is not something
-your laptop's `sar` will open.
-
-reSARch reads the bytes directly. It knows every on-disk format generation `sysstat` has
-shipped, resolves struct layouts from the producer's ABI rather than the host's, and runs
-anywhere Rust runs — including macOS and Windows, on logs collected from Linux.
-
-## What it reads
-
-Every format generation, verified byte-for-byte against upstream's own test corpus:
-
-| `format_magic` | sysstat versions | notes |
-|---|---|---|
-| `0x2170` | … 9.1.5 | oldest known; upstream itself cannot convert these |
-| `0x2171` | 9.1.6 … 10.2 | 8-byte file magic, no RESTART payload |
-| `0x2173` | 10.3 … 11.6 | RESTART records carry a volatile-activity list that changes item counts |
-| `0x2175` | 11.7 … 12.8 | self-describing layout, `extra_desc` chains, three internal variants |
-
-Also handled:
-
-- **All 43 activities** — CPU, memory, disk, every IPv4/IPv6 protocol, PSI, power sensors,
-  filesystems, HugePages, interrupts, and the rest
-- **Big-endian and 32-bit producers** — a PowerPC log opens the same as an x86-64 one
-- **Files converted by `sadf -c`** — the `upgraded` marker is read and reported, and
-  reSARch can perform the conversion itself
-- **Malformed input** — truncation, impossible item counts, size/offset contradictions and
-  the `nr × nr2 × size` integer overflow are all detected rather than trusted
-
-Support is tracked on four separate dimensions. “43 activities” describes the registry,
-not verification of every historical revision.
-
-| Dimension | Current coverage |
-|---|---|
-| Decode | Layout definitions for all 43 activities; unknown revisions are skipped with diagnostics |
-| Meaning | Counter/gauge/identity and units in each activity's column metadata |
-| Derived metrics | Shared rates, percentages and group calculations; unavailable values retain a reason |
-| Output verification | Upstream corpus and regression tests cover selected generations, ABIs and activities; golden sadf cases cover FAN/IN/TEMP, not all 43 |
-
-See [the activity specification](docs/format/02-activities.md) for revision details.
-
 ## Install
 
-Grab a binary from [Releases](https://github.com/owayo/re-sar-ch/releases), or build it:
+### From Source
+
+Before the first release, install from source. A Rust toolchain is required.
 
 ```bash
 cargo install --git https://github.com/owayo/re-sar-ch
 ```
 
+To build from a local checkout:
+
 ```bash
-# macOS (Apple Silicon)
+git clone https://github.com/owayo/re-sar-ch.git
+cd re-sar-ch
+make install
+```
+
+`make install` installs the binary and the Claude / Codex skills. Use `make install-bin` for the binary only. On Windows, use `cargo install --path .`.
+
+### From GitHub Releases
+
+Once published, platform binaries will be available from [Releases](https://github.com/owayo/re-sar-ch/releases).
+
+#### macOS (Apple Silicon)
+
+```bash
 curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv resarch /usr/local/bin/
 ```
+
+#### macOS (Intel)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Linux (x86_64)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Linux (x86_64, static/musl)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Linux (ARM64)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Windows
+
+Download `resarch-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/owayo/re-sar-ch/releases), extract it, and add its directory to PATH.
 
 ## Usage
 
@@ -221,12 +231,56 @@ agent is most likely to overclaim: the caveats are load-bearing. It also states 
 that matters most for any analysis built on top — **an empty value in reSARch's own formats
 is not a zero** — and lists which `--from` / `--to` means what in which subcommand.
 
+## Supported Formats
+
+Every format generation, verified byte-for-byte against upstream's own test corpus:
+
+| `format_magic` | sysstat versions | notes |
+|---|---|---|
+| `0x2170` | … 9.1.5 | oldest known; upstream itself cannot convert these |
+| `0x2171` | 9.1.6 … 10.2 | 8-byte file magic, no RESTART payload |
+| `0x2173` | 10.3 … 11.6 | RESTART records carry a volatile-activity list that changes item counts |
+| `0x2175` | 11.7 … 12.8 | self-describing layout, `extra_desc` chains, three internal variants |
+
+Also handled:
+
+- **All 43 activities** — CPU, memory, disk, every IPv4/IPv6 protocol, PSI, power sensors,
+  filesystems, HugePages, interrupts, and the rest
+- **Big-endian and 32-bit producers** — a PowerPC log opens the same as an x86-64 one
+- **Files converted by `sadf -c`** — the `upgraded` marker is read and reported, and
+  reSARch can perform the conversion itself
+- **Malformed input** — truncation, impossible item counts, size/offset contradictions and
+  the `nr × nr2 × size` integer overflow are all detected rather than trusted
+
+Support is tracked on four separate dimensions. “43 activities” describes the registry,
+not verification of every historical revision.
+
+| Dimension | Current coverage |
+|---|---|
+| Decode | Layout definitions for all 43 activities; unknown revisions are skipped with diagnostics |
+| Meaning | Counter/gauge/identity and units in each activity's column metadata |
+| Derived metrics | Shared rates, percentages and group calculations; unavailable values retain a reason |
+| Output verification | Upstream corpus and regression tests cover selected generations, ABIs and activities; golden sadf cases cover FAN/IN/TEMP, not all 43 |
+
+See [the activity specification](docs/format/02-activities.md) for revision details.
+
+## Why
+
+`sar` writes its logs (`/var/log/sa/saXX`) as raw C structs. That makes them fast to write
+and painful to read: you generally need a `sysstat` install of a compatible vintage on a
+compatible architecture. A five-year-old log from a 32-bit PowerPC box is not something
+your laptop's `sar` will open.
+
+reSARch reads the bytes directly. It knows every on-disk format generation `sysstat` has
+shipped, resolves struct layouts from the producer's ABI rather than the host's, and runs
+anywhere Rust runs — including macOS and Windows, on logs collected from Linux.
+
 ## How the output is verified
 
 Every expected-output file that `sysstat` keeps in its own test suite is compared
 **line by line** against what reSARch produces — 21 cases in total:
 
-| | |
+| Comparison result | Cases |
 |---|---:|
 | Byte-identical | 16 |
 | Identical after masking | 4 |
@@ -258,8 +312,9 @@ than implying all of them:
 | **Computation and output** | Which `sar` / `sadf` version's rendering is reproduced |
 | **CLI compatibility** | Which options and calling conventions are accepted |
 
-reSARch never collects: live sampling (`sadc`) is out of scope. The only thing it writes
-is a re-encoding of a file it just read (`sadf -c`), and that leaves every value alone.
+reSARch never collects: live sampling (`sadc`) is out of scope. Binary output is limited
+to re-encoding a file it just read (`sadf -c`), leaving every value alone.
+Text and charts can be saved with `sa2sar`, `detect --svg-dir`, and the other output commands.
 The generation of the file being read and the output format being reproduced are separate
 settings: a v10 file can be rendered in v12 `sar` style, and vice versa.
 

@@ -1,14 +1,21 @@
-<h1 align="center">reSARch</h1>
-
 <p align="center">
-  sysstat のバイナリログ (<code>sa</code> ファイル) を単体で解析する CLI。<br>
-  <code>sar</code> も <code>sadf</code> も C ライブラリも要りません。
+  <img src="docs/images/app.png" width="128" alt="reSARch">
 </p>
 
+<h1 align="center">re<strong>SAR</strong>ch</h1>
+
 <p align="center">
+  sysstat の sa バイナリを単体で解析する CLI。異変の検知・SVG グラフ・sar / sadf 互換出力を、Linux・macOS・Windows で。
+</p>
+
+<h3 align="center">Supported Platforms</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
+  <br>
   <a href="https://github.com/owayo/re-sar-ch/actions/workflows/ci.yml"><img src="https://github.com/owayo/re-sar-ch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="https://github.com/owayo/re-sar-ch/actions/workflows/release.yml"><img src="https://github.com/owayo/re-sar-ch/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
-  <a href="https://github.com/owayo/re-sar-ch/releases"><img src="https://img.shields.io/github/v/release/owayo/re-sar-ch" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
@@ -17,66 +24,70 @@
   <a href="README.ja.md">日本語</a>
 </p>
 
----
+## Install
 
-## 何のために作ったか
+### From Source
 
-`sar` のログ (`/var/log/sa/saXX`) は C 構造体をそのままディスクへ書いた形式です。
-書くのは速いが読むのが面倒で、通常は**同じ世代・同じアーキテクチャの sysstat** が必要になります。
-5 年前に 32bit の PowerPC 機で採取したログを、手元のマシンの `sar` で開くことはできません。
-
-reSARch はバイト列を直接読みます。sysstat が出荷した全フォーマット世代を知っており、
-構造体の配置を「実行ホスト」ではなく「**ファイルを書いたホストの ABI**」から解決するため、
-Rust が動く環境ならどこでも動きます。macOS や Windows で Linux のログを読むこともできます。
-
-## 何を読めるか
-
-sysstat の全フォーマット世代。本家のテストデータとバイト単位で突合して検証しています。
-
-| `format_magic` | sysstat バージョン | 特徴 |
-|---|---|---|
-| `0x2170` | 〜 9.1.5 | 最古の世代。本家自身が変換対象外にしているもの |
-| `0x2171` | 9.1.6 〜 10.2 | file magic 8 バイト、RESTART にペイロードなし |
-| `0x2173` | 10.3 〜 11.6 | RESTART レコードの後に volatile activity リストが続き、以降の item 数が変わる |
-| `0x2175` | 11.7 〜 12.8 | 自己記述レイアウト、`extra_desc` チェーン、内部に 3 変種 |
-
-このほか次にも対応しています。
-
-- **43 activity すべて** — CPU / メモリ / ディスク / IPv4・IPv6 の各プロトコル / PSI /
-  電源センサ / ファイルシステム / HugePages / 割り込み など
-- **big-endian・32bit で採取されたファイル** — PowerPC のログも x86-64 と同じように開く
-- **`sadf -c` で変換されたファイル** — `upgraded` マーカーを読んで報告する。
-  変換そのものも reSARch で行える
-- **壊れた入力** — 切り詰め、ありえない item 数、サイズとオフセットの矛盾、
-  `nr × nr2 × size` の整数オーバーフローを、鵜呑みにせず検出する
-
-対応状況は次の 4 軸で区別します。「43 activity」は登録数を指し、全歴史的 revision の
-表示検証が済んでいるという意味ではありません。
-
-| 軸 | 現在の範囲 |
-|---|---|
-| デコード | 43 activity のレイアウトを定義。未知 revision は診断付きでスキップ |
-| 意味モデル | 各 activity の列メタデータに counter / gauge / identity と単位を記述 |
-| 派生指標 | レート・割合・行全体の計算を共通の series 層で処理。値が得られない場合は理由を保持 |
-| 表示検証 | 本家 corpus と回帰テストで世代・ABI・activity ごとに検証。sadf の golden は FAN/IN/TEMP が対象で、43 種すべての全文比較ではない |
-
-revision ごとの定義は [activity 仕様](docs/format/02-activities.md) を参照してください。
-
-## インストール
-
-[Releases](https://github.com/owayo/re-sar-ch/releases) からバイナリを取得するか、ビルドします。
+初回リリース前のため、現在はソースからインストールします。Rust ツールチェーンが必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/re-sar-ch
 ```
 
+リポジトリを手元でビルドする場合:
+
 ```bash
-# macOS (Apple Silicon)
+git clone https://github.com/owayo/re-sar-ch.git
+cd re-sar-ch
+make install
+```
+
+`make install` はバイナリと Claude / Codex 向けスキルをインストールします。バイナリだけなら `make install-bin`。Windows では `cargo install --path .` を使います。
+
+### From GitHub Releases
+
+リリース公開後は [Releases](https://github.com/owayo/re-sar-ch/releases) から環境別のバイナリを取得できます。
+
+#### macOS (Apple Silicon)
+
+```bash
 curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv resarch /usr/local/bin/
 ```
 
-## 使い方
+#### macOS (Intel)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Linux (x86_64)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Linux (x86_64, static/musl)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Linux (ARM64)
+
+```bash
+curl -L https://github.com/owayo/re-sar-ch/releases/latest/download/resarch-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv resarch /usr/local/bin/
+```
+
+#### Windows
+
+[Releases](https://github.com/owayo/re-sar-ch/releases) の `resarch-x86_64-pc-windows-msvc.zip` を展開し、`resarch.exe` のあるディレクトリを PATH に追加します。
+
+## Usage
 
 ### `sar` と同じ引数で使う
 
@@ -210,12 +221,55 @@ resarch skill-install codex     # ~/.codex/skills/resarch/SKILL.md
 その上に分析を積むときに一番効く性質 —— **独自出力で値が空なのは 0 ではない** ——
 と、`--from` / `--to` がサブコマンドごとに何を絞るのかも明記しています。
 
+## Supported Formats
+
+sysstat の全フォーマット世代。本家のテストデータとバイト単位で突合して検証しています。
+
+| `format_magic` | sysstat バージョン | 特徴 |
+|---|---|---|
+| `0x2170` | 〜 9.1.5 | 最古の世代。本家自身が変換対象外にしているもの |
+| `0x2171` | 9.1.6 〜 10.2 | file magic 8 バイト、RESTART にペイロードなし |
+| `0x2173` | 10.3 〜 11.6 | RESTART レコードの後に volatile activity リストが続き、以降の item 数が変わる |
+| `0x2175` | 11.7 〜 12.8 | 自己記述レイアウト、`extra_desc` チェーン、内部に 3 変種 |
+
+このほか次にも対応しています。
+
+- **43 activity すべて** — CPU / メモリ / ディスク / IPv4・IPv6 の各プロトコル / PSI /
+  電源センサ / ファイルシステム / HugePages / 割り込み など
+- **big-endian・32bit で採取されたファイル** — PowerPC のログも x86-64 と同じように開く
+- **`sadf -c` で変換されたファイル** — `upgraded` マーカーを読んで報告する。
+  変換そのものも reSARch で行える
+- **壊れた入力** — 切り詰め、ありえない item 数、サイズとオフセットの矛盾、
+  `nr × nr2 × size` の整数オーバーフローを、鵜呑みにせず検出する
+
+対応状況は次の 4 軸で区別します。「43 activity」は登録数を指し、全歴史的 revision の
+表示検証が済んでいるという意味ではありません。
+
+| 軸 | 現在の範囲 |
+|---|---|
+| デコード | 43 activity のレイアウトを定義。未知 revision は診断付きでスキップ |
+| 意味モデル | 各 activity の列メタデータに counter / gauge / identity と単位を記述 |
+| 派生指標 | レート・割合・行全体の計算を共通の series 層で処理。値が得られない場合は理由を保持 |
+| 表示検証 | 本家 corpus と回帰テストで世代・ABI・activity ごとに検証。sadf の golden は FAN/IN/TEMP が対象で、43 種すべての全文比較ではない |
+
+revision ごとの定義は [activity 仕様](docs/format/02-activities.md) を参照してください。
+
+## 何のために作ったか
+
+`sar` のログ (`/var/log/sa/saXX`) は C 構造体をそのままディスクへ書いた形式です。
+書くのは速いが読むのが面倒で、通常は**同じ世代・同じアーキテクチャの sysstat** が必要になります。
+5 年前に 32bit の PowerPC 機で採取したログを、手元のマシンの `sar` で開くことはできません。
+
+reSARch はバイト列を直接読みます。sysstat が出荷した全フォーマット世代を知っており、
+構造体の配置を「実行ホスト」ではなく「**ファイルを書いたホストの ABI**」から解決するため、
+Rust が動く環境ならどこでも動きます。macOS や Windows で Linux のログを読むこともできます。
+
 ## 出力の正確さをどう検証しているか
 
 本家 `sysstat` がテストスイートに持っている期待出力を**全件・1 行ずつ**突き合わせています。
 対象は 21 ケースです。
 
-| | |
+| 比較結果 | 件数 |
 |---|---:|
 | 全文一致 | 16 |
 | マスクして一致 | 4 |
@@ -245,7 +299,8 @@ reSARch は他ホストで採取したログに誤った名前を付けないよ
 | **CLI 互換** | どのオプションと呼び出し方を受け付けるか |
 
 reSARch は**採取しません**。リアルタイム採取 (`sadc` 相当) は対象外です。
-書き出すのは「読んだファイルを別世代の配置で書き直したもの」(`sadf -c`) だけで、値は変えません。
+バイナリの書き出しは「読んだファイルを別世代の配置で書き直したもの」(`sadf -c`) に限り、値は変えません。
+テキストやグラフは `sa2sar` / `detect --svg-dir` などで保存できます。
 また「読むファイルの世代」と「再現する出力の世代」は別の設定で、
 v10 のファイルを v12 の `sar` 書式で出すこともその逆もできます。
 
@@ -274,7 +329,7 @@ v10 のファイルを v12 の `sar` 書式で出すこともその逆もでき�
 
 フォーマットの完全な仕様は [`docs/format/`](docs/format/) にあります。
 
-## 開発
+## Development
 
 ```bash
 make build        # デバッグビルド
@@ -295,6 +350,6 @@ make uninstall    # 両方消す
 reSARch は `sysstat` のソースを移植したものではなく、ディスク上のフォーマットから
 独立に実装したものです。
 
-## ライセンス
+## License
 
 MIT — [LICENSE](LICENSE) を参照してください。

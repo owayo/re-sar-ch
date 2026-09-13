@@ -32,6 +32,12 @@
 brew install owayo/re-sar-ch/re-sar-ch
 ```
 
+### winget (Windows)
+
+```powershell
+winget install owayo.reSARch
+```
+
 ### From Source
 
 Rust ツールチェーンが必要です。
@@ -92,6 +98,8 @@ sudo mv resarch /usr/local/bin/
 #### Windows
 
 [Releases](https://github.com/owayo/re-sar-ch/releases) の `resarch-x86_64-pc-windows-msvc.zip` を展開し、`resarch.exe` のあるディレクトリを PATH に追加します。
+
+> `winget install owayo.reSARch` なら PATH への登録まで自動で行われるため、手動ダウンロードは winget を使わない場合だけで済みます。winget でインストールした直後は、PATH の変更を反映させるために新しいターミナルを開いてください。
 
 ## Usage
 

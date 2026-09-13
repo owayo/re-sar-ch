@@ -32,6 +32,12 @@
 brew install owayo/re-sar-ch/re-sar-ch
 ```
 
+### winget (Windows)
+
+```powershell
+winget install owayo.reSARch
+```
+
 ### From Source
 
 A Rust toolchain is required.
@@ -92,6 +98,8 @@ sudo mv resarch /usr/local/bin/
 #### Windows
 
 Download `resarch-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/owayo/re-sar-ch/releases), extract it, and add its directory to PATH.
+
+> `winget install owayo.reSARch` does this for you (it registers `resarch` on PATH), so the manual download is only needed if you do not use winget. After a winget install, open a new terminal so the updated PATH takes effect.
 
 ## Usage
 

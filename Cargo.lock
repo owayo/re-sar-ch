@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "re-sar-ch"
-version = "0.1.0"
+version = "26.9.100"
 dependencies = [
  "anyhow",
  "assert_cmd",

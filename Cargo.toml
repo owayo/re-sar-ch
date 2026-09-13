@@ -1,6 +1,6 @@
 [package]
 name = "re-sar-ch"
-version = "0.1.0"
+version = "26.9.100"
 edition = "2024"
 authors = ["owayo <yoheiowa@gmail.com>"]
 description = "Standalone parser for sysstat sar binary data files (sa files), independent of sar/sadf"

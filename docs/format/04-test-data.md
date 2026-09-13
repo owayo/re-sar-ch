@@ -114,7 +114,7 @@ u32 × 6) で、`extra_nr × extra_size` バイトの本体が続き、`extra_ne
 
 | ファイル | バイト数 | 作成 sysstat 版 (magic 記載) | `format_magic` | エンディアン | `sizeof(long)` | act 数 | レコード数 (内訳) | ヘッダ日付 / `sa_ust_time` | 何を検証するか |
 |---|---|---|---|---|---|---|---|---|---|
-| `tests/data-9.1.5` | 6028 | 9.1.5 | **0x2170** | little | 8 | 13 | — (本家は読まない) | 2021-06-10 / 1623329128 | **変換不能な旧世代**の拒否。`0x2170` は `sadf -c` の対応下限 (`0x2171`) より古い |
+| `tests/data-9.1.5` | 6028 | 9.1.5 | **0x2170** | little | 8 | 13 | 2 (STATS 2、reSARch の直読) | 2021-06-10 / 1623329128 | **本家が変換不能な旧世代**の直読。`0x2170` は本家の対応下限より古いため、走査境界と自作 fixture で検証する |
 | `tests/data-9.1.6` | 20784 | 9.1.6 | 0x2171 | little | 8 | 32 | 4 (RESTART 1 / COMMENT 1 / STATS 2) | 2017-01-21 / 1484986571 | `0x2171` 世代の読み替え (`sadf -c` 経由) |
 | `tests/data-10.3.1` | 35108 | 10.3.1 | 0x2173 | little | 8 | 34 | 4 (RESTART 1 / COMMENT 1 / STATS 2) | 2017-01-21 / 1484986496 | `0x2173` 世代 + RESTART 後の volatile activity リスト |
 | `tests/data-11.6.5` | 38884 | 11.6.5 | 0x2173 | little | 8 | 36 | 4 (RESTART 1 / STATS 1 / COMMENT 1 / STATS 1) | 2018-08-29 / 1535535218 | `0x2173` 世代の最終形 + センサ系 activity (`A_PWR_FAN/IN/TEMP`) |
@@ -173,7 +173,9 @@ data-12.0.0      96 d5 75 21 0c 00 00 00 | 48 01 00 00 | 00 00 00 00 |
 と読み、`(id=1 A_CPU, nr=9, size=144)`, `(id=2 A_PCSW, nr=1, size=32)`, ... という
 3 フィールド × 13 件の並びとして解釈が通ることで確認した (`magic` フィールドが存在しない世代)。
 
-`0x2170` は本家が `sadf -c` でも変換しないため、reSARch も**明示的に拒否するだけでよい**。
+`0x2170` は本家が `sadf -c` でも変換しないが、reSARch は**直読する**。
+本家との変換後比較はできないため、独立 fixture と末尾までの走査 (`exact=true`) で検証する。
+magic / has_nr / nr2 が無く、既知 ID の形式互換判定は Current となる制約がある。
 `file_activity` の詳細レイアウトは参考情報である。
 
 ### 2.2 異常系・特殊系 (22 本)
@@ -470,7 +472,7 @@ flowchart TB
 | `tests/data-ukwn1` | 未知 magic 混在 | `expected.sadf-data-ukwn1` |
 | `tests/data-ppc-11.7.2` | **big endian + 32bit**。`_ppc_` 表示、`Size of a long int: 4` | (`sadf -H` の golden は本家に無い → CI で生成、または自作 fixture) |
 | `tests/data-9.1.6` / `data-10.3.1` / `data-11.6.5` | 旧世代を**直接**読む (本家は `-c` 変換が必要) | 本家 golden なし → §5.7 の「自己整合性検証」で担保 |
-| `tests/data-9.1.5` | `0x2170` を拒否。`Try to convert` を示唆**しない** | エラーメッセージのみ |
+| `tests/data-9.1.5` | `0x2170` を直読する (本家では比較不可) | 全レコード走査で `exact=true` |
 | `tests/data-12.6.0-*` 14 本 | すべて `Invalid system activity file` 相当で拒否。ただし `types_nr-SARerr` と `A_IRQ_overflow` は**ヘッダ表示は成功**すること | 終了コードと stderr |
 
 `sadf -H` の出力書式は次の 13 項目 (実測)。
@@ -550,6 +552,26 @@ big endian・32bit・旧固定形式・自己記述形式をこの段で全部�
   **妥当性検証も併せて行う** (本家テスト 01547 / 01557 / 01559 / 00420 / 00430 と同じ)。
   `-g` (SVG) は数値と座標が混ざるので、**表記比較ではなく意味比較**にとどめるか、
   対応を後回しにする判断もあり得る。
+
+#### 5.5.1 実際に取り込んだ golden (到達点)
+
+本家テストが**リポジトリに静的に持っている**期待出力はすべて取り込んだ (21 件)。
+`sadc` が生成する `data.tmp` に依存するケースは入力を再現できないので対象外である。
+
+| 本家テスト | 期待出力 | 何を固定するか |
+|---|---|---|
+| 00650 / 00700 / 00740 / 00760 / 00770 / 00780 / 00784 / 00793 | `expected.data-12.0.0` 他 | `sar` テキスト。4 世代 × BE/32bit × 未知 id/magic |
+| 00605 / 00615 / 00625 | `expected.data-{9.1.6,10.3.1,11.6.5}` | 旧世代の**直読**が「変換して `sar` で読んだ結果」と一致すること |
+| 00655 / 00787 / 00791 / 00794 | `expected.*-H` / `expected.sadf-data-ukwn*` | ヘッダ解析と activity 一覧 (`[Unknown format]` の付け方) |
+| **01500 / 01510 / 01520 / 01540 / 01550** | `expected.data-11.6.5-sadf-{d,p,r,j,x}` | 同じ入力・同じ activity 選択 (`-m FAN,IN,TEMP`) で**形式だけ**が違う 5 本 |
+| 01405 | `expected.sadf-g-trunc` | 比較不能 (SVG の出力形式が無い) として毎回集計に出す |
+
+`sadf` の 5 形式を横に並べたのが効く理由は、**値は同じで書式だけ違う**ため
+単位換算やゼロ補完の不統一がその並びで初めて見えることにある
+(`sar` 側だけを見ていると、両方が同じように間違っていても気付けない)。
+電源センサ (`A_PWR_FAN` / `A_PWR_TEMP` / `A_PWR_IN`) を選ぶ理由は、
+値が IEEE-754 double で保存されており `%temp` / `%in` が min/max を使う比率なので、
+計算層の特殊経路がまとめて通ることである。
 
 ### 5.6 自作 fixture で担保する範囲 (同梱、MIT)
 
@@ -1087,7 +1109,7 @@ for case in [
 
 | # | 検証項目 | 使うデータ | golden / 判定 |
 |---|---|---|---|
-| 1 | `0x2170` を拒否し `Try to convert` を示唆しない | `tests/data-9.1.5` | エラーメッセージ |
+| 1 | `0x2170` を直読する (本家では比較不可) | `tests/data-9.1.5` | `exact=true` と独立 fixture |
 | 2 | `0x2171` 直読 (`file_magic` 8B / `file_header` 280B / `file_activity` 20B / `record_header` 48B) | `tests/data-9.1.6` | `expected.data-9.1.6` (要 §5.7 の自己整合性) |
 | 3 | `0x2173` 直読 (`file_header` 288B、RESTART 後の volatile activity リスト) | `tests/data-10.3.1`, `data-11.6.5` | `expected.data-10.3.1`, `expected.data-11.6.5` |
 | 4 | `0x2175` 自己記述 (`hdr_types_nr` による欠落フィールドの末尾補完) | `tests/data-12.0.0` (`[1,1,11]`), `data-ukwn` (`[1,1,12]`) | `expected.data-12.0.0`, `expected.data-12.0.0-H` |

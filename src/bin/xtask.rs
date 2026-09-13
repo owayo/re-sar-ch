@@ -368,6 +368,59 @@ const EXPECTED_FIXTURES: &[Fixture] = &[
         52838,
         "テスト 00625: 0x2173 (最終形) の golden",
     ),
+    // --- sadf の各出力形式の golden (テスト 01500〜01550) ---
+    //
+    // いずれも `sadf -<fmt> data-11.6.5.tmp -- -m FAN,IN,TEMP`。
+    // 電源センサ 3 種を選ぶので、`%temp` / `%in` の比率式、IEEE-754 double で
+    // 保存された値、item ラベル (`DEVICE`) の扱いがまとめて検証できる。
+    // `sadf -g` (144 KB の SVG) だけは対応する出力形式が無いので取得しない。
+    f(
+        "expected.data-11.6.5-sadf-d",
+        "c965b88e45c9edcb780ca7b5bedcbc642364d65b0eaf662fd7c0986f836851ef",
+        1401,
+        "テスト 01500: sadf -d (DB 形式、hostname;interval;timestamp 前置)",
+    ),
+    f(
+        "expected.data-11.6.5-sadf-p",
+        "877516d8a5fd5ada417be5655bd7ad27fc0924a12acfe2dd9dced5f4449779fa",
+        3064,
+        "テスト 01510: sadf -p (ppc 形式、1 行 1 値)",
+    ),
+    f(
+        "expected.data-11.6.5-sadf-r",
+        "615c9280c6c425d388db28f7464b7f370a89e5eae0b6c3b44ddafb098982afd2",
+        1744,
+        "テスト 01520: sadf -r (生値、%f 固定 6 桁)",
+    ),
+    f(
+        "expected.data-11.6.5-sadf-j",
+        "56783be926f653b5aeda6272f038673216f1d1a5494da76c15f7bfb3456c37ec",
+        2110,
+        "テスト 01540: sadf -j (JSON)",
+    ),
+    f(
+        "expected.data-11.6.5-sadf-x",
+        "afaba68a5730602d0870d127f3a2b6d252c76a089484e7f2edf7e9e57ea3a545",
+        2350,
+        "テスト 01550: sadf -x (XML)",
+    ),
+    // --- 変換時に HZ を上書きした場合の golden (テスト 00660 / 00664) ---
+    //
+    // `sadf -c -O hz=250` で変換したファイルに対するもの。
+    // `Genuine sa datafile: no (90a)` の `90a` は**変換を行った実装の版**なので
+    // reSARch では一致しない (マスク対象)。
+    f(
+        "expected.sadf-H-hz",
+        "67da984ef029d205eddcb818e47971e6e3b0b6484303461b2db3eaf7af44a692",
+        1900,
+        "テスト 00660: sadf -H (HZ 上書きで変換したファイル)",
+    ),
+    f(
+        "expected.sadf-r-hz",
+        "a783ea8d18959f553daa0a58708cf3140863fb516580d1fb1db45a5f3fe6e3f0",
+        592,
+        "テスト 00664: sadf -r -O debug (HZ 上書きで変換したファイル)",
+    ),
 ];
 
 /// 取得対象の全件。

@@ -22,6 +22,18 @@
 //! | [`IdentityVerdict::Ambiguous`] | `nodename` は一致、`machine` / `sysname` が違う | 別マシンの可能性。起動区間を分ける |
 //! | [`IdentityVerdict::Different`] | `nodename` が違う | 別ホスト |
 //!
+//! **この判定は境界ごとに実際に効く。** マージ側は直前サンプルのファイルと
+//! 当該ファイルの識別材料を比べ、`Identical` 以外なら
+//! [`BreakReason::IdentityChanged`] として差分を切る。比較相手は
+//! 「グループ代表」ではなく**直前サンプル**である (`A → B → B → A` と
+//! 構成が戻る並びで、切るべき境界だけを切るため)。
+//!
+//! 実際にマージ経路へ来るのは `Identical` と `LikelySameMachine` がほとんどで、
+//! `Ambiguous` / `Different` は [`HostIdentity::group_key`] の段階で
+//! 別グループに分かれる (`machine` / `sysname` / `nodename` が鍵に入っている)。
+//! それでも判定を渡すのは、グループ分けと境界判定が別の鍵で動いており、
+//! 片方だけを信用すると診断と挙動が食い違うためである。
+//!
 //! # 連続性が不明なら差分を作らない
 //!
 //! 日境界の引き継ぎは、次のすべてを確認できたときだけ行う。
@@ -31,6 +43,15 @@
 //! - 時刻が逆行していない
 //! - 空白が許容範囲に収まる
 //! - activity のレイアウト (revision・item サイズ・フィールド数) が一致する
+//!
+//! # 時刻で絞るとき (`summarize --from` / `--to`)
+//!
+//! 集計の時刻フィルタは [`MultiOptions::time_filter`] として受け取り、
+//! **マージ側 (この層) で適用する**。デコードはファイル単位で並列に走るため、
+//! そこで絞ると「範囲に最初に合致したレコード」の判定 (`sar -s` の意味論) が
+//! ファイルごとに独立してしまい、並列度で結果が変わる。
+//!
+//! 絞り方の詳細は [`MultiOptions::time_filter`] を参照。
 //!
 //! # 使い方
 //!
@@ -50,6 +71,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -61,15 +83,17 @@ use crate::analyze::summary::{
 use crate::analyze::timeline::{MetricKey, MetricTimeline};
 use crate::error::Result;
 use crate::format::file::{FileHeader, OpenOptions, SaFile, ScanControl};
+#[cfg(test)]
 use crate::layout::plan::DecodePlan;
 use crate::model::{ActivityId, ValueKind};
+use crate::output::time_filter::{Admit, TimeFilter};
 use crate::series::delta::interval_cs;
 use crate::series::snapshot::{
     ActivityPlan, IntervalView, RecordEvent, Selection, Snapshot, WalkItem, walk_items,
 };
 
 /// 複数ファイル横断の出力スキーマ版。
-pub const MULTI_SCHEMA_VERSION: &str = "1";
+pub const MULTI_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 // ===========================================================================
 // ホストの同一性
@@ -94,7 +118,7 @@ impl HostIdentity {
             sysname: h.sysname.clone(),
             release: h.release.clone(),
             machine: h.machine.clone(),
-            cpu_nr: h.cpu_nr,
+            cpu_nr: h.real_cpu_count(),
         }
     }
 
@@ -103,11 +127,37 @@ impl HostIdentity {
     /// `release` と `cpu_nr` は**含めない** (カーネル更新や CPU 数の変化でも
     /// 同じホストの系列として扱い、起動区間の分割で対処する)。
     /// 逆に `machine` / `sysname` が違うものは同じホスト扱いにしない。
+    ///
+    /// **この鍵は「差分を引き継いでよいか」の判断には使えない。**
+    /// そちらは [`HostIdentity::continuity_key`] を見る。
     pub fn group_key(&self) -> (String, String, String) {
         (
             self.nodename.clone(),
             self.sysname.clone(),
             self.machine.clone(),
+        )
+    }
+
+    /// 「カウンタの差分を引き継いでよいか」を決める鍵。
+    ///
+    /// [`HostIdentity::group_key`] と違い **`release` と `cpu_nr` を含める**。
+    /// この 2 つは別の判断であり、混ぜると診断と挙動が矛盾する。
+    ///
+    /// | 判断 | 鍵 | 違ったときの扱い |
+    /// |---|---|---|
+    /// | 同じホストの系列か | [`group_key`](HostIdentity::group_key) | 別ホストとして分ける |
+    /// | 差分を引き継げるか | `continuity_key` | 同じホストのまま**起動区間を分ける** |
+    ///
+    /// カーネル更新や CPU 数の変化は「同じマシンだが再起動を挟んだ」ことを
+    /// 意味するので、系列は 1 つのまま保ちつつ差分は切る。
+    /// 文字列を確保しないよう参照のタプルを返す (ファイル境界ごとに引く)。
+    pub fn continuity_key(&self) -> (&str, &str, &str, &str, Option<u32>) {
+        (
+            &self.nodename,
+            &self.sysname,
+            &self.machine,
+            &self.release,
+            self.cpu_nr,
         )
     }
 }
@@ -214,6 +264,19 @@ pub fn compare_identity(a: &HostIdentity, b: &HostIdentity) -> IdentityCompariso
         fields,
         notes,
     }
+}
+
+/// 2 つの識別材料の判定だけを求める (判定材料の一覧は作らない)。
+///
+/// サンプル境界ごとに呼ぶため、[`compare_identity`] の
+/// `IdentityFieldMatch` (5 項目 × 2 本の `String`) を毎回確保しない。
+/// 同一ファイル内および構成が変わっていないファイル間では
+/// [`HostIdentity::continuity_key`] の比較だけで済み、確保は起きない。
+fn identity_verdict(prev: &HostIdentity, next: &HostIdentity) -> IdentityVerdict {
+    if prev.continuity_key() == next.continuity_key() {
+        return IdentityVerdict::Identical;
+    }
+    compare_identity(prev, next).verdict
 }
 
 // ===========================================================================
@@ -476,6 +539,71 @@ pub struct MultiOptions {
     pub selection: Selection,
     pub summary: SummaryOptions,
     pub continuity: ContinuityOptions,
+    /// 集計期間を絞る時刻フィルタ (`summarize` / `compare` の `--from` / `--to`)。
+    ///
+    /// 既定は両端未指定 (絞らない) で、出力は 1 バイトも変わらない。
+    ///
+    /// # `detect` の `--from` / `--to` とは意味が違う
+    ///
+    /// `detect` の報告範囲 ([`crate::detect::ReportWindow`]) は**報告する
+    /// エピソードを絞るだけで、比較基準の材料は絞らない** (`docs/design.md` §11.2)。
+    /// こちらは**集計期間そのもの**で、範囲外のサンプルは平均・最大 / 最小・p95・
+    /// 差分合計・区間長合計のどれにも入らない。`detect` はこの欄を使わない
+    /// (既定の「絞らない」まま渡し、報告範囲は検出層が持つ)。
+    ///
+    /// # 何を「範囲内」と見るか
+    ///
+    /// 範囲の判定は出力層と同じ [`TimeFilter`] に任せる (`sar -s` / `-e` の
+    /// 意味論を二重実装しないため。`docs/format/03-output-format.md`
+    /// 第 IV 部 §1.8〜§1.11)。
+    ///
+    /// | [`Admit`] | 集計での扱い |
+    /// |---|---|
+    /// | `Skip` | 範囲に入る前。集計にも基準にも使わない |
+    /// | `Reference` | 範囲に最初に合致したレコード。原則**差分の起点としてだけ使う** (下記) |
+    /// | `Emit` | 集計に入れる |
+    /// | `Stop` | `--to` を超えた。**このレコードは入れず**、そのファイルの走査を打ち切る |
+    ///
+    /// # 基準レコードだけ `show` と扱いが違う
+    ///
+    /// `Reference` を値に数えないのは、その区間 (前サンプル → 当レコード) が
+    /// 範囲の外へはみ出しているからである。**はみ出す区間を持たないなら通常どおり
+    /// 数える** (系列の先頭サンプルと同じ扱い)。持たないのは次の場合。
+    ///
+    /// - 前サンプルも範囲内だった (範囲が観測全体を覆っている / 前のファイルから
+    ///   範囲内のまま続いている)
+    /// - 差分の基準が無い (系列の先頭・再起動直後・引き継げないファイル境界)
+    ///
+    /// 判定材料は前サンプルが範囲内だったかで持つ ([`PrevSample::in_window`])。
+    /// 「範囲に入る前にサンプルを捨てたか」をファイルごとに覚える形は誤りで、
+    /// 前ファイルの末尾が範囲外・次ファイルの先頭が範囲内という並びを取りこぼす。
+    ///
+    /// # 採らなかった形: 値の種類ごとに扱いを分ける
+    ///
+    /// 「基準レコードでも**ゲージの瞬時値は数え**、前サンプルとの区間から作る量
+    /// (カウンタ差分・レート・時間重み) だけ捨てる」という細かい分け方もある。
+    /// 範囲の端にあるゲージ 1 点を平均から落とさない利点があるが、
+    /// 同じレコードが「サンプル数には入るが区間数には入らない」状態になり、
+    /// `sar -s` が表示しないレコードを集計が数えることになる。
+    /// **レコード 1 件を数えるか数えないかで揃える**方を採った
+    /// (期間の端点・サンプル数・区間数が 1 つの規則で説明できる)。
+    ///
+    /// ここだけは `show` と挙動が違う (`show` は基準レコードを必ず表示から落とす)。
+    /// 集計で同じにすると、**何も絞られていないのに先頭サンプルが平均・p95 から
+    /// 落ちる**ため、「範囲を全体に取った結果」と「絞らない結果」が食い違う。
+    /// 期間集計では「絞ったぶんだけ減る」ことを保証する方を採った。
+    ///
+    /// # フィルタはファイルごとに引き直す
+    ///
+    /// `sa01`..`sa31` に `--from 09:00 --to 18:00` を与えたときは
+    /// **各日の 09:00〜18:00** を集計する (本家が 1 ファイルずつ走査するのと同じで、
+    /// `show` に複数ファイルを渡した場合とも揃う)。系列全体で 1 度しか
+    /// 引かないと、初日の 18:00 で `Stop` して以降の全日が落ちる。
+    ///
+    /// 日をまたいだ区間が紛れ込む心配は要らない。範囲の外を挟んだサンプル対は
+    /// [`ContinuityOptions::max_gap_cs`] (既定 2 時間) を超えるので、
+    /// そもそも差分を作らない。
+    pub time_filter: TimeFilter,
     pub on_error: FileErrorPolicy,
     /// 同時にデコードするファイル数の上限。
     ///
@@ -491,6 +619,7 @@ impl Default for MultiOptions {
             selection: Selection::All,
             summary: SummaryOptions::default(),
             continuity: ContinuityOptions::default(),
+            time_filter: TimeFilter::default(),
             on_error: FileErrorPolicy::default(),
             max_concurrent_files: 4,
         }
@@ -542,8 +671,18 @@ pub struct MultiFileAnalysis {
     /// 入力ファイルの概要 (指定順)。
     pub files: Vec<FileOutline>,
     pub skipped: Vec<SkippedFile>,
+    /// 完全なレコードまでを採用した、末尾が不完全なファイル。
+    pub incomplete_files: Vec<IncompleteFile>,
     /// ホストごとの系列 (`nodename` 昇順)。
     pub hosts: Vec<HostSeries>,
+}
+
+/// lenient で残した部分結果の出自。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IncompleteFile {
+    pub path: String,
+    pub end_offset: usize,
+    pub trailing_bytes: usize,
 }
 
 // ===========================================================================
@@ -563,53 +702,27 @@ struct SampleRecord {
 /// **差分は含まない。** 差分はマージ側 (ホスト・起動区間ごとの処理器) が計算する。
 struct FileSamples {
     index: usize,
-    signature: PlanSignature,
+    /// このファイルのヘッダが申告する識別材料。
+    ///
+    /// グループ代表の識別材料ではなく**ファイルごとの値**を持つ。
+    /// ファイル境界で `release` / `cpu_nr` の変化を見るために必要
+    /// ([`HostIdentity::continuity_key`])。
+    ///
+    /// `Arc` で持つのは、マージ側が**サンプルごとに**直前の識別材料を
+    /// 抱え直すため (`PrevSample`)。ファイル内では不変な 4 本の `String` を
+    /// サンプル数だけ確保し直すのは無駄なので、参照だけを配る。
+    identity: Arc<HostIdentity>,
+    /// レイアウト署名。`identity` と同じ理由で `Arc` にする
+    /// (activity 数ぶんの `Vec` をサンプルごとに複製しない)。
+    signature: Arc<PlanSignature>,
     plans: Vec<ActivityPlan>,
     samples: Vec<SampleRecord>,
+    incomplete: Option<IncompleteFile>,
 }
 
-/// `Selection` の判定 (`series` 側の実装は非公開なので同じ規則をここに置く)。
-fn selected(selection: &Selection, id: ActivityId) -> bool {
-    match selection {
-        Selection::All => true,
-        Selection::Only(list) => list.contains(&id),
-    }
-}
-
-/// ファイルのデコード計画を組み立てる。
-///
-/// `series::walk` と同じ規則で revision を選ぶ。マージ時に前ファイルの値を
-/// 解釈するために計画そのものが必要なので、ここで作って保持する。
+/// 単一ファイルと同じ互換性検証・配置選択で計画を作る。
 fn build_plans(file: &SaFile, selection: &Selection) -> Result<Vec<ActivityPlan>> {
-    let mut plans = Vec::new();
-    for (index, act) in file.activities().iter().enumerate() {
-        if !selected(selection, act.id) {
-            continue;
-        }
-        let Some(def) = crate::layout::registry::lookup(act.id) else {
-            continue;
-        };
-        let rev = act
-            .types_nr
-            .and_then(|t| def.revision_for_types_nr(t))
-            .or_else(|| def.revision_for_magic(act.magic))
-            .or_else(|| def.latest());
-        let Some(rev) = rev else { continue };
-        let plan = DecodePlan::build(
-            def,
-            rev,
-            act.size as usize,
-            act.nr.max(0) as u32,
-            act.nr2.max(1) as u32,
-            file.encoding(),
-        )?;
-        plans.push(ActivityPlan {
-            index,
-            id: act.id,
-            plan,
-        });
-    }
-    Ok(plans)
+    Ok(crate::series::snapshot::plan_activities(file, selection)?.plans)
 }
 
 fn signature_of(file: &SaFile, plans: &[ActivityPlan]) -> PlanSignature {
@@ -641,7 +754,7 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
     // 直前に RESTART を読んだか。次の統計レコードへ持ち越す
     // (走査はイベントを束ねずに読んだ順で渡すため、ここで覚えておく)。
     let mut restart_pending = false;
-    walk_items(&file, &opts.selection, |item| {
+    let scan = walk_items(&file, &opts.selection, |item| {
         match item {
             WalkItem::Event(ev) => {
                 if matches!(ev, RecordEvent::Restart { .. }) {
@@ -658,7 +771,13 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
 
     Ok(FileSamples {
         index: outline.index,
-        signature,
+        incomplete: (scan.incomplete || scan.trailing_bytes > 0).then(|| IncompleteFile {
+            path: outline.path.clone(),
+            end_offset: scan.end_offset,
+            trailing_bytes: scan.trailing_bytes,
+        }),
+        identity: Arc::new(outline.identity.clone()),
+        signature: Arc::new(signature),
         plans,
         samples,
     })
@@ -672,6 +791,12 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
 struct OpenSegment {
     index: usize,
     boot_epoch: Option<i64>,
+    /// この区間を開いたファイルの識別材料。
+    ///
+    /// 区間は識別材料が変わった時点で切れる (`BreakReason::IdentityChanged`) ため、
+    /// 区間内では `release` / `cpu_nr` が一定である。グループ代表 (先頭ファイル)
+    /// の値を出力に載せると、カーネル更新後の区間に更新前の `release` が付く。
+    identity: Arc<HostIdentity>,
     builder: NativeSummaryBuilder,
     files: Vec<usize>,
     boundaries: Vec<BoundaryRecord>,
@@ -682,14 +807,27 @@ struct OpenSegment {
 struct PrevSample {
     snapshot: Snapshot,
     file_index: usize,
-    signature: PlanSignature,
+    /// そのサンプルが入っていたファイルの識別材料 (参照のみ。複製しない)。
+    identity: Arc<HostIdentity>,
+    signature: Arc<PlanSignature>,
+    /// 時刻フィルタの範囲内だったか ([`Admit::Reference`] / [`Admit::Emit`])。
+    ///
+    /// **区間を集計に入れてよいかの判定に使う。** 区間 (前サンプル → 当サンプル)
+    /// が範囲に収まっているかは、前サンプルが範囲内だったかで決まる。
+    /// 「捨てたサンプルがあったか」をファイル単位で覚える形では足りない
+    /// (前ファイルの末尾が範囲外・次ファイルの先頭が範囲内だと、そのファイル内で
+    /// 1 件も捨てていないため、範囲の外から始まる区間を数えてしまう)。
+    in_window: bool,
 }
 
 /// 1 ホスト分の系列を組み立てる。
 ///
 /// ファイルを決定的順序で受け取り、**ファイル境界をまたいで差分を作る**。
+///
+/// 識別材料はグループ代表の 1 つを持たず、[`FileSamples::identity`] として
+/// ファイルごとに受け取る。境界での差分引き継ぎの可否も、出力に載せる
+/// `release` / `cpu_nr` も、**代表ではなくその場のファイルの申告値**で決まる。
 struct GroupMerger<'o> {
-    identity: HostIdentity,
     opts: &'o MultiOptions,
     /// 入力ファイルの概要。出力にパスを載せるために参照する。
     outlines: &'o [FileOutline],
@@ -703,9 +841,8 @@ struct GroupMerger<'o> {
 }
 
 impl<'o> GroupMerger<'o> {
-    fn new(identity: HostIdentity, opts: &'o MultiOptions, outlines: &'o [FileOutline]) -> Self {
+    fn new(opts: &'o MultiOptions, outlines: &'o [FileOutline]) -> Self {
         Self {
-            identity,
             opts,
             outlines,
             tzname: None,
@@ -726,12 +863,17 @@ impl<'o> GroupMerger<'o> {
             .unwrap_or_else(|| format!("#{index}"))
     }
 
-    fn open_segment(&mut self, boot_epoch: Option<i64>) -> &mut OpenSegment {
+    fn open_segment(
+        &mut self,
+        boot_epoch: Option<i64>,
+        identity: Arc<HostIdentity>,
+    ) -> &mut OpenSegment {
         let index = self.next_segment_index;
         self.next_segment_index += 1;
         self.current = Some(OpenSegment {
             index,
             boot_epoch,
+            identity,
             builder: NativeSummaryBuilder::new(self.opts.summary.clone()),
             files: Vec::new(),
             boundaries: Vec::new(),
@@ -747,21 +889,25 @@ impl<'o> GroupMerger<'o> {
         if seg.observed == 0 {
             return;
         }
+        // `release` / `cpu_nr` は**その区間の**申告値を載せる。
+        // 区間は識別材料の変化で切れるので区間内では一定であり、
+        // グループ代表の値を使うとカーネル更新後の区間に更新前の版が付く。
         let source = SummarySource {
-            label: self.identity.nodename.clone(),
-            nodename: Some(self.identity.nodename.clone()),
-            release: Some(self.identity.release.clone()),
-            machine: Some(self.identity.machine.clone()),
-            cpu_nr: self.identity.cpu_nr,
+            label: seg.identity.nodename.clone(),
+            nodename: Some(seg.identity.nodename.clone()),
+            release: Some(seg.identity.release.clone()),
+            machine: Some(seg.identity.machine.clone()),
+            cpu_nr: seg.identity.cpu_nr,
             tzname: self.tzname.clone(),
             files: seg.files.iter().map(|i| self.file_label(*i)).collect(),
             boot_segment: Some(seg.index),
         };
         let summary = seg.builder.finish(source);
+        // 判定 (`run_queue` など) の分母も区間の CPU 数を使う
         let findings = evaluate(
             &summary,
             &RuleContext {
-                cpu_nr: self.identity.cpu_nr,
+                cpu_nr: seg.identity.cpu_nr,
             },
         );
         self.segments.push(BootSegment {
@@ -785,6 +931,8 @@ impl<'o> GroupMerger<'o> {
                 .and_then(|o| o.tzname.clone());
         }
         let empty = Snapshot::default();
+        // 時刻フィルタはファイルごとに引き直す ([`MultiOptions::time_filter`])。
+        let mut cursor = self.opts.time_filter.cursor();
 
         for sample in &fs.samples {
             if !sample.snapshot.valid {
@@ -821,7 +969,13 @@ impl<'o> GroupMerger<'o> {
                             BoundaryPoint::of(&prev.snapshot),
                             point,
                             prev.signature == fs.signature,
-                            IdentityVerdict::Identical,
+                            // **同一性検査の結果をそのまま渡す。**
+                            // ここを固定値 `Identical` にすると、
+                            // `LikelySameMachine` (カーネル更新 / CPU 数変化) と
+                            // 診断したファイル間でも、時刻とレイアウトが揃えば
+                            // 差分を引き継いでしまい、出力される診断と
+                            // 実際の集計動作が食い違う。
+                            identity_verdict(&prev.identity, &fs.identity),
                             cross_file,
                             &self.opts.continuity,
                         );
@@ -831,34 +985,19 @@ impl<'o> GroupMerger<'o> {
             };
 
             // --- 起動区間の切り替え ---
+            //
+            // **時刻フィルタより先に行う。** 範囲の外で起きた再起動も区間の
+            // 分割として効かせないと、再起動後の範囲内サンプルが再起動前の
+            // 起動区間に入ってしまう (区間の `boot_epoch` と中身が食い違う)。
+            // 副作用として、区間の索引は絞らないときと同じ値のままになる
+            // (範囲外の区間は `observed == 0` で落ちるので索引に欠番が出る)。
             let start_new = match &decision {
                 Some(d) => d.new_segment || self.current.is_none(),
                 None => self.current.is_none(),
             };
             if start_new {
                 self.close_segment();
-                self.open_segment(point.boot_epoch());
-            }
-
-            // --- ファイル境界の記録 ---
-            // 区間を切り替えた場合、記録は**新しく開いた区間**に残す
-            // (「この区間はどこから始まったか」を追えるようにする)。
-            if cross_file && let (Some(prev), Some(seg)) = (&self.prev, self.current.as_mut()) {
-                let d = decision.unwrap_or(BoundaryDecision {
-                    continuous: true,
-                    reason: None,
-                    new_segment: false,
-                    gap_secs: point.ust_time as i64 - prev.snapshot.ust_time as i64,
-                    boot_epoch_prev: BoundaryPoint::of(&prev.snapshot).boot_epoch(),
-                    boot_epoch_next: point.boot_epoch(),
-                });
-                seg.boundaries.push(BoundaryRecord {
-                    prev_file: prev.file_index,
-                    next_file: fs.index,
-                    prev_sample_ust: prev.snapshot.ust_time,
-                    next_sample_ust: point.ust_time,
-                    decision: d,
-                });
+                self.open_segment(point.boot_epoch(), Arc::clone(&fs.identity));
             }
 
             // --- 集計 ---
@@ -883,18 +1022,70 @@ impl<'o> GroupMerger<'o> {
                 events: &[],
                 plans: &fs.plans,
             };
-            if let Some(seg) = self.current.as_mut() {
-                seg.builder.observe(&view);
-                seg.observed += 1;
-                if !seg.files.contains(&fs.index) {
-                    seg.files.push(fs.index);
+
+            // --- 時刻フィルタ ---
+            // 範囲外の区間は平均・極値・p95・差分合計のどれにも入れない
+            // (集計器へ渡さないので、重みも期間の端点も自動的に範囲内だけになる)。
+            let admit = cursor.sample(&view);
+            let in_window = matches!(admit, Admit::Reference | Admit::Emit);
+            // 前サンプルが範囲内だったか (区間の始点が範囲に収まっているか)。
+            let origin_in_window = self.prev.as_ref().is_some_and(|p| p.in_window);
+            let counted = match admit {
+                // 範囲に入ったあとのレコード。直前のレコードも範囲内なので、
+                // 区間はまるごと範囲に収まっている。
+                Admit::Emit => true,
+                // 範囲に最初に合致したレコード。**区間が範囲の外へはみ出す
+                // ときだけ**値に数えず、次の区間の起点 (差分の基準) として使う。
+                // はみ出すのは「範囲外の前サンプルを基準に採っている」ときだけで、
+                // 基準が無ければ (系列やこのファイルの先頭・再起動直後・
+                // 引き継げないファイル境界) 区間が存在しないので、
+                // 絞らないときと同じに数える。
+                Admit::Reference => !view.has_prev || origin_in_window,
+                Admit::Skip => false,
+                // `--to` を超えた。このレコードは入れず、このファイルは打ち切る。
+                Admit::Stop => break,
+            };
+
+            if counted {
+                // --- ファイル境界の記録 ---
+                // 区間を切り替えた場合、記録は**新しく開いた区間**に残す
+                // (「この区間はどこから始まったか」を追えるようにする)。
+                // 集計に入った区間だけ記録する。入っていない境界を
+                // 「差分を引き継いだ」と報告すると、報告と期間が食い違う。
+                if cross_file && let (Some(prev), Some(seg)) = (&self.prev, self.current.as_mut()) {
+                    let d = decision.unwrap_or(BoundaryDecision {
+                        continuous: true,
+                        reason: None,
+                        new_segment: false,
+                        gap_secs: point.ust_time as i64 - prev.snapshot.ust_time as i64,
+                        boot_epoch_prev: BoundaryPoint::of(&prev.snapshot).boot_epoch(),
+                        boot_epoch_next: point.boot_epoch(),
+                    });
+                    seg.boundaries.push(BoundaryRecord {
+                        prev_file: prev.file_index,
+                        next_file: fs.index,
+                        prev_sample_ust: prev.snapshot.ust_time,
+                        next_sample_ust: point.ust_time,
+                        decision: d,
+                    });
+                }
+
+                if let Some(seg) = self.current.as_mut() {
+                    seg.builder.observe(&view);
+                    seg.observed += 1;
+                    if !seg.files.contains(&fs.index) {
+                        seg.files.push(fs.index);
+                    }
                 }
             }
 
             self.prev = Some(PrevSample {
                 snapshot: sample.snapshot.clone(),
                 file_index: fs.index,
-                signature: fs.signature.clone(),
+                // Arc の参照だけを増やす (ファイル内で不変なものを複製しない)
+                identity: Arc::clone(&fs.identity),
+                signature: Arc::clone(&fs.signature),
+                in_window,
             });
         }
     }
@@ -931,6 +1122,7 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
     groups.sort_by_key(|g| g.0.group_key());
 
     let mut hosts = Vec::with_capacity(groups.len());
+    let mut incomplete_files = Vec::new();
     for (identity, mut indices) in groups {
         // 日付 → 作成時刻 → パスの順。ファイル名の辞書順に依存しない。
         indices.sort_by(|a, b| outlines[*a].order_key().cmp(&outlines[*b].order_key()));
@@ -940,7 +1132,7 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
             .map(|i| compare_identity(&identity, &outlines[*i].identity))
             .collect();
 
-        let mut merger = GroupMerger::new(identity.clone(), opts, &outlines);
+        let mut merger = GroupMerger::new(opts, &outlines);
         let limit = opts.max_concurrent_files.max(1);
         // **全結果を collect しない。** 同時処理数の上限ごとに区切って
         // デコードし、その都度マージへ流して解放する。
@@ -951,7 +1143,12 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
                 .collect();
             for (slot, result) in window.iter().zip(decoded) {
                 match result {
-                    Ok(fs) => merger.push_file(fs),
+                    Ok(fs) => {
+                        if let Some(partial) = &fs.incomplete {
+                            incomplete_files.push(partial.clone());
+                        }
+                        merger.push_file(fs);
+                    }
                     Err(e) => match opts.on_error {
                         FileErrorPolicy::Fail => return Err(e),
                         // 飛ばしたファイルは出力に残す (黙って落とさない)
@@ -975,6 +1172,7 @@ pub fn analyze_files(paths: &[PathBuf], opts: &MultiOptions) -> Result<MultiFile
     Ok(MultiFileAnalysis {
         schema_version: MULTI_SCHEMA_VERSION,
         files: outlines,
+        incomplete_files,
         skipped,
         hosts,
     })
@@ -1018,11 +1216,6 @@ fn outline_one(path: &Path, index: usize, opts: &MultiOptions) -> Result<FileOut
         header_ust_time: h.ust_time,
         activities: file.activities().len(),
     })
-}
-
-/// 1 ファイルだけを横断処理と同じ経路で扱う (`analyze_files` の薄い包み)。
-pub fn analyze_one(path: impl AsRef<Path>, opts: &MultiOptions) -> Result<MultiFileAnalysis> {
-    analyze_files(&[path.as_ref().to_path_buf()], opts)
 }
 
 // ===========================================================================
@@ -1126,6 +1319,18 @@ pub struct HostComparison {
 ///
 /// 交差が無ければ `None`。「片方に観測が無い区間を 0 とみなして比較する」ことを
 /// 避けるため、共通範囲を明示的に求めてから比較する。
+///
+/// # `--from` / `--to` との合成は「交差」
+///
+/// 時刻フィルタ ([`MultiOptions::time_filter`]) は**各ホストの集計期間**を絞る。
+/// ここへ渡す `ranges` はその絞られた期間 ([`NativePeriodSummary::period`] の
+/// `first_ust` / `last_ust`) なので、共通窓は自動的に
+/// 「各ホストの観測範囲の交差 ∩ 指定範囲」になる。
+///
+/// 指定範囲をそのまま窓の端点に使う形は採らない。`--from 09:00` のような
+/// 時分秒指定は「毎日の 09:00」であって 1 つの絶対時刻に解けないうえ、
+/// **観測が無い時間帯まで窓に含めると、比較可能な区間数の分母が水増しされる**
+/// (片方に観測が無い区間を 0 と見なさない方針と衝突する)。
 pub fn common_window(ranges: &[(u64, u64)], step_secs: u64) -> Option<ComparisonWindow> {
     if ranges.is_empty() {
         return None;
@@ -1575,6 +1780,9 @@ mod tests {
     }
 
     /// テスト用のファイル 1 つ分を組む。
+    ///
+    /// 識別材料は `testhost` の既定値。ファイル間で構成が変わる状況を作る
+    /// テストは、戻り値の [`FileSamples::identity`] を直接書き換える。
     fn file_samples(
         index: usize,
         id: ActivityId,
@@ -1592,8 +1800,10 @@ mod tests {
             })
             .collect();
         FileSamples {
+            incomplete: None,
             index,
-            signature: PlanSignature {
+            identity: Arc::new(ident("testhost")),
+            signature: Arc::new(PlanSignature {
                 activities: vec![ActivitySignature {
                     id,
                     magic: signature_tag,
@@ -1601,10 +1811,95 @@ mod tests {
                     item_size: 16,
                     fields: plan.fields.len(),
                 }],
-            },
+            }),
             plans: vec![ActivityPlan { index: 0, id, plan }],
             samples: records,
         }
+    }
+
+    /// その activity の最新 revision で 1 item のデコード計画を作る
+    /// (revision を持たない / 計画が作れない activity は `None`)。
+    fn latest_plan(def: &'static crate::layout::registry::ActivityDef) -> Option<DecodePlan> {
+        let rev = def.latest()?;
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).ok()
+    }
+
+    /// 指定の計画・署名でファイル 1 つ分を組む (item の中身は呼び出し側が作る)。
+    fn samples_of(
+        index: usize,
+        id: ActivityId,
+        plan: DecodePlan,
+        items: Vec<(u64, u64, ItemSnapshot)>,
+    ) -> FileSamples {
+        let fields = plan.fields.len();
+        FileSamples {
+            incomplete: None,
+            index,
+            identity: Arc::new(ident("testhost")),
+            signature: Arc::new(PlanSignature {
+                activities: vec![ActivitySignature {
+                    id,
+                    magic: 1,
+                    types_nr: None,
+                    item_size: 16,
+                    fields,
+                }],
+            }),
+            plans: vec![ActivityPlan { index: 0, id, plan }],
+            samples: items
+                .into_iter()
+                .map(|(ust, uptime, item)| SampleRecord {
+                    snapshot: snap(id, ust, uptime, item),
+                    restart_before: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// 全フィールドに別々の値を入れたファイル 1 つ分を組む。
+    ///
+    /// `samples` は `(ust, uptime_cs, base, step)`。列の取り違え (隣の列の差分を
+    /// 読んでいる) を検出できるよう、一様な値にはしない。
+    fn graded_file(
+        index: usize,
+        id: ActivityId,
+        plan: &DecodePlan,
+        samples: &[(u64, u64, u64, u64)],
+    ) -> FileSamples {
+        let items = samples
+            .iter()
+            .map(|(ust, uptime, base, step)| {
+                let values = (0..plan.fields.len())
+                    .map(|i| Availability::Present(base + step * i as u64))
+                    .collect();
+                (
+                    *ust,
+                    *uptime,
+                    ItemSnapshot {
+                        key: None,
+                        texts: Vec::new(),
+                        values,
+                    },
+                )
+            })
+            .collect();
+        samples_of(index, id, plan.clone(), items)
+    }
+
+    /// 指定フィールドだけに値を入れたファイル 1 つ分を組む。
+    fn field_file_samples(
+        index: usize,
+        id: ActivityId,
+        field: &str,
+        samples: &[(u64, u64, u64)],
+    ) -> FileSamples {
+        let plan = plan_of(id);
+        let items = samples
+            .iter()
+            .map(|(ust, uptime, value)| (*ust, *uptime, item_of(&plan, &[(field, *value)])))
+            .collect();
+        samples_of(index, id, plan, items)
     }
 
     fn opts_for_merge() -> MultiOptions {
@@ -1624,7 +1919,7 @@ mod tests {
     fn delta_is_carried_across_the_file_boundary() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         // ファイル 1: 起動時刻 1000。カウンタ 0 → 100
         m.push_file(file_samples(
             0,
@@ -1665,7 +1960,7 @@ mod tests {
     fn unverifiable_boundary_does_not_produce_a_delta() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1704,7 +1999,7 @@ mod tests {
     fn layout_change_across_files_is_not_carried() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1725,12 +2020,162 @@ mod tests {
         );
     }
 
+    /// **同一性検査の結果が境界判定に効く。**
+    ///
+    /// カーネル版が変わったファイル間は [`IdentityVerdict::LikelySameMachine`]
+    /// と診断される。時刻もレイアウトも揃っているので、判定を使わずに
+    /// `Identical` 固定で境界を見ると差分を引き継いでしまい、
+    /// 「再起動を挟んでいるので差分は引き継がない」という診断の注記と
+    /// 実際の集計動作が矛盾する。
+    #[test]
+    fn identity_change_across_files_breaks_the_delta() {
+        let id = ActivityId::SWAP;
+        let opts = opts_for_merge();
+        let mut m = GroupMerger::new(&opts, &[]);
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        // 起動時刻・レイアウトは揃っているが、カーネル版だけが違うファイル
+        let mut next = file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 300), (2_030, 103_000, 400)],
+            &[],
+            1,
+        );
+        next.identity = Arc::new(HostIdentity {
+            release: "6.1.0-generic".to_string(),
+            ..ident("testhost")
+        });
+        assert_eq!(
+            identity_verdict(&ident("testhost"), &next.identity),
+            IdentityVerdict::LikelySameMachine
+        );
+        m.push_file(next);
+
+        let (_, segments) = m.finish();
+        assert_eq!(segments.len(), 2, "識別材料が変わったら起動区間を分ける");
+        for seg in &segments {
+            let c = seg.summary.column(id, SINGLE_ITEM, "pswpin").expect("列");
+            assert_eq!(c.intervals, 1, "境界の差分は作らない: {c:?}");
+            assert_eq!(c.delta_total.as_deref(), Some("100"));
+        }
+        // 区間ごとに、その区間のファイルが申告した版が載る
+        assert_eq!(
+            segments[0].summary.source.release.as_deref(),
+            Some("5.15.0-generic")
+        );
+        assert_eq!(
+            segments[1].summary.source.release.as_deref(),
+            Some("6.1.0-generic")
+        );
+        // 境界の記録には理由が残る
+        let b = &segments[1].boundaries[0];
+        assert!(!b.decision.continuous);
+        assert_eq!(b.decision.reason, Some(BreakReason::IdentityChanged));
+        assert!(b.decision.new_segment);
+    }
+
+    /// CPU 数だけが変わった場合も差分を引き継がない。
+    ///
+    /// `cpu_nr` は判定 (`run_queue`) の分母でもあるので、
+    /// 区間ごとにその区間の申告値が使われることも併せて確認する。
+    #[test]
+    fn cpu_count_change_across_files_breaks_the_delta() {
+        let id = ActivityId::SWAP;
+        let opts = opts_for_merge();
+        let mut m = GroupMerger::new(&opts, &[]);
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        let mut next = file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 300), (2_030, 103_000, 400)],
+            &[],
+            1,
+        );
+        next.identity = Arc::new(HostIdentity {
+            cpu_nr: Some(8),
+            ..ident("testhost")
+        });
+        m.push_file(next);
+
+        let (_, segments) = m.finish();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].summary.source.cpu_nr, Some(4));
+        assert_eq!(segments[1].summary.source.cpu_nr, Some(8));
+    }
+
+    /// **切るのは識別材料が変わった境界だけ。**
+    ///
+    /// 判定は「グループ代表との比較」ではなく「直前サンプルとの比較」で行う。
+    /// 代表と比べると `A → B → B → A` の 2 本目の B で無用に区間が切れ、
+    /// 構成が戻った 4 本目で切れない。
+    #[test]
+    fn only_the_changing_boundary_is_broken() {
+        let id = ActivityId::SWAP;
+        let opts = opts_for_merge();
+        let other = Arc::new(HostIdentity {
+            release: "6.1.0-generic".to_string(),
+            ..ident("testhost")
+        });
+        let mut m = GroupMerger::new(&opts, &[]);
+        // A → B → B → A の 4 ファイル (時刻・レイアウトはすべて連続)
+        for (index, release_changed) in [(0, false), (1, true), (2, true), (3, false)] {
+            let ust = 2_000 + index as u64 * 20;
+            let uptime = 100_000 + index as u64 * 2_000;
+            let counter = index as u64 * 200;
+            let mut fs = file_samples(
+                index,
+                id,
+                vec![
+                    (ust, uptime, counter),
+                    (ust + 10, uptime + 1_000, counter + 100),
+                ],
+                &[],
+                1,
+            );
+            if release_changed {
+                fs.identity = Arc::clone(&other);
+            }
+            m.push_file(fs);
+        }
+        let (_, segments) = m.finish();
+
+        assert_eq!(segments.len(), 3, "切れるのは A→B と B→A の 2 箇所だけ");
+        // 区間 1 は B のファイル 2 本分。その内側と境界で 3 区間ぶん差分が取れる
+        let c = segments[1]
+            .summary
+            .column(id, SINGLE_ITEM, "pswpin")
+            .expect("列");
+        assert_eq!(c.intervals, 3, "B → B の境界は引き継ぐ: {c:?}");
+        assert_eq!(segments[1].files, vec![1, 2]);
+        assert_eq!(
+            segments[1].summary.source.release.as_deref(),
+            Some("6.1.0-generic")
+        );
+        assert_eq!(
+            segments[2].summary.source.release.as_deref(),
+            Some("5.15.0-generic"),
+            "構成が戻った区間は元の版で報告する"
+        );
+    }
+
     /// ファイル内の RESTART でも起動区間を分ける。
     #[test]
     fn restart_inside_a_file_splits_segments() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1758,7 +2203,7 @@ mod tests {
     fn findings_are_attached_per_segment() {
         let id = ActivityId::SWAP;
         let opts = opts_for_merge();
-        let mut m = GroupMerger::new(ident("testhost"), &opts, &[]);
+        let mut m = GroupMerger::new(&opts, &[]);
         m.push_file(file_samples(
             0,
             id,
@@ -1955,5 +2400,420 @@ mod tests {
         let b = align_to_window(&t, w, GaugeFill::None);
         assert_eq!(b[0].value, None);
         assert_eq!(b[0].source, BucketSource::NoObservation);
+    }
+
+    // -----------------------------------------------------------------------
+    // 集計期間の絞り込み (`summarize` / `compare` の `--from` / `--to`)
+    // -----------------------------------------------------------------------
+
+    /// epoch 秒の両端から時刻フィルタを組む。
+    ///
+    /// テストのスナップショットは時分秒を持たないので、比較は epoch で行う
+    /// (`--from 1555593629` のように 10 桁 epoch を渡した場合と同じ経路)。
+    fn epoch_window(from: Option<u64>, to: Option<u64>) -> TimeFilter {
+        use crate::output::time_filter::{CrossDayRule, TimeBasis, TimeBound};
+        TimeFilter {
+            start: from.map_or(TimeBound::None, TimeBound::Epoch),
+            end: to.map_or(TimeBound::None, TimeBound::Epoch),
+            basis: TimeBasis::Utc,
+            cross_day: CrossDayRule::Sadf,
+        }
+    }
+
+    fn opts_with_window(filter: TimeFilter) -> MultiOptions {
+        MultiOptions {
+            time_filter: filter,
+            ..opts_for_merge()
+        }
+    }
+
+    /// 4 サンプル (10 秒間隔・カウンタ増分つき) を 2 ファイルに分けて流す。
+    fn merge_two_files(opts: &MultiOptions, id: ActivityId) -> Vec<BootSegment> {
+        let mut m = GroupMerger::new(opts, &[]);
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        m.push_file(file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 400), (2_030, 103_000, 900)],
+            &[],
+            1,
+        ));
+        m.finish().1
+    }
+
+    /// **範囲を全体に取った結果は、絞らない結果と 1 バイトも変わらない。**
+    ///
+    /// 基準レコード (`Admit::Reference`) を無条件に落とすと、何も絞られて
+    /// いないのに先頭サンプルがゲージの標本平均と p95 から落ちる。
+    /// ファイル境界の引き継ぎも失われる (2 本目の先頭も基準レコードになる)。
+    #[test]
+    fn a_window_covering_everything_changes_nothing() {
+        let id = ActivityId::SWAP;
+        let bare = merge_two_files(&opts_with_window(epoch_window(None, None)), id);
+        let wide = merge_two_files(
+            &opts_with_window(epoch_window(Some(1_000), Some(9_000))),
+            id,
+        );
+        assert_eq!(wide, bare, "範囲が全体を覆うなら結果は同じ");
+
+        // 念のため中身も見る (等値比較が両方とも空になっていないこと)
+        let c = bare[0].summary.column(id, SINGLE_ITEM, "pswpin").unwrap();
+        assert_eq!(c.intervals, 3);
+        assert_eq!(bare[0].summary.period.first_ust, Some(2_000));
+        assert_eq!(bare[0].summary.period.last_ust, Some(2_030));
+        assert_eq!(bare[0].boundaries.len(), 1, "境界の記録も残る");
+    }
+
+    /// 範囲を絞ると期間の端点も絞られ、基準レコードが差分の起点になる。
+    #[test]
+    fn window_narrows_the_period_and_keeps_the_reference_as_the_delta_origin() {
+        let id = ActivityId::SWAP;
+        let segs = merge_two_files(
+            &opts_with_window(epoch_window(Some(2_010), Some(2_030))),
+            id,
+        );
+        assert_eq!(segs.len(), 1);
+        let p = &segs[0].summary.period;
+        // 2_000 は範囲外、2_010 は基準として消費、数えるのは 2_020 / 2_030
+        assert_eq!(p.samples, 2, "範囲外のサンプルは数えない");
+        assert_eq!(p.first_ust, Some(2_010), "期間の始点は基準レコードの時刻");
+        assert_eq!(p.last_ust, Some(2_030));
+        assert_eq!(p.covered_cs, 2_000, "20 秒ぶんだけ覆う");
+        assert_eq!(p.continuous_intervals, 2);
+        assert_eq!(
+            p.broken_intervals, 0,
+            "基準レコードがあるので先頭は落ちない"
+        );
+
+        let c = segs[0].summary.column(id, SINGLE_ITEM, "pswpin").unwrap();
+        assert_eq!(c.intervals, 2);
+        assert_eq!(c.delta_total.as_deref(), Some("800"), "300 + 500");
+        assert_eq!(c.denominator_total.as_deref(), Some("2000"));
+        assert_eq!(c.mean, Some(40.0), "800 / 20 秒");
+        assert_eq!(c.max.unwrap().value, 50.0);
+        assert_eq!(c.min.unwrap().value, 30.0);
+        assert!(
+            c.exclusions.is_empty(),
+            "基準レコードを起点に使うので first_sample は出ない: {:?}",
+            c.exclusions
+        );
+
+        // 絞らない場合と比べて、確かに減っている
+        let bare = merge_two_files(&opts_with_window(epoch_window(None, None)), id);
+        let b = bare[0].summary.column(id, SINGLE_ITEM, "pswpin").unwrap();
+        assert_eq!(bare[0].summary.period.covered_cs, 3_000);
+        assert_eq!(b.intervals, 3);
+    }
+
+    /// **区間が 1 本だけになる範囲では、平均とその区間の瞬時値が一致する。**
+    ///
+    /// `analyze::summary` の `single_interval_mean_matches_instant_value` と
+    /// 同じ趣旨の窓つき版。期間平均は「差分合計 ÷ 分母合計」から作るため、
+    /// 絞り込みで分母の集め方を間違えると (基準レコードの区間を分母にだけ
+    /// 足す等) ここが機械的に食い違う。
+    #[test]
+    fn a_single_interval_window_averages_to_the_instant_value() {
+        let mut mismatched: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for def in crate::layout::registry::all() {
+            let Some(plan) = latest_plan(def) else {
+                continue;
+            };
+            // 2_010 を基準にして 2_010 → 2_020 の 1 区間だけを数える
+            let opts = opts_with_window(epoch_window(Some(2_010), Some(2_020)));
+            let mut m = GroupMerger::new(&opts, &[]);
+            m.push_file(graded_file(
+                0,
+                def.id,
+                &plan,
+                &[
+                    (2_000, 100_000, 100, 7),
+                    (2_010, 101_000, 1_000, 37),
+                    (2_020, 102_000, 5_000, 101),
+                    (2_030, 103_000, 9_000, 211),
+                ],
+            ));
+            let segs = m.finish().1;
+            let Some(item) = segs
+                .first()
+                .and_then(|s| s.summary.activities.first())
+                .and_then(|a| a.items.first())
+            else {
+                continue;
+            };
+            assert_eq!(
+                segs[0].summary.period.samples, 1,
+                "{}: 数える区間は 1 本だけ",
+                def.id
+            );
+            for c in &item.columns {
+                if c.method != crate::analyze::summary::AggregationMethod::RateOverValidIntervals
+                    || c.intervals == 0
+                {
+                    continue;
+                }
+                let (Some(mean), Some(max)) = (c.mean, c.max) else {
+                    continue;
+                };
+                checked += 1;
+                if (mean - max.value).abs() > max.value.abs() * 1e-9 + 1e-12 {
+                    mismatched.push(format!(
+                        "{} {}: 平均 {mean} vs 瞬時 {}",
+                        def.id, c.column, max.value
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatched.is_empty(),
+            "1 区間に絞ったときの平均と瞬時値が食い違う列がある: {mismatched:?}"
+        );
+        assert!(checked > 50, "検査した列が少なすぎる: {checked}");
+    }
+
+    /// 範囲外のサンプルは p95 の重みに入らない。
+    #[test]
+    fn samples_outside_the_window_do_not_weigh_on_the_percentile() {
+        use crate::analyze::summary::PercentileOutcome;
+        let id = ActivityId::MEMORY;
+        // 前半 10 本は 900、後半 10 本は 10。標本重みの p95 は
+        // 全体なら 900、後半だけなら 10 になる。
+        let mut samples: Vec<(u64, u64, u64)> = Vec::new();
+        for i in 0..20u64 {
+            let value = if i < 10 { 900 } else { 10 };
+            samples.push((2_000 + i * 10, 100_000 + i * 1_000, value));
+        }
+
+        let p95_of = |filter: TimeFilter| {
+            let opts = opts_with_window(filter);
+            let mut m = GroupMerger::new(&opts, &[]);
+            m.push_file(field_file_samples(0, id, "frmkb", &samples));
+            let segs = m.finish().1;
+            let c = segs[0]
+                .summary
+                .column(id, SINGLE_ITEM, "kbmemfree")
+                .expect("列")
+                .clone();
+            match c.p95 {
+                PercentileOutcome::Computed(r) => r,
+                other => panic!("p95 が出ていない: {other:?}"),
+            }
+        };
+
+        let all = p95_of(epoch_window(None, None));
+        assert_eq!(all.value, 900.0, "全体なら前半の 900 が p95 を取る");
+        assert_eq!(all.samples, 20);
+
+        // 後半だけに絞る (2_090 が基準として消費され、数えるのは 2_100 以降)
+        let narrowed = p95_of(epoch_window(Some(2_090), None));
+        assert_eq!(narrowed.value, 10.0, "範囲外の 900 は重みに入らない");
+        assert_eq!(narrowed.samples, 10);
+    }
+
+    /// **範囲の外で起きた再起動も起動区間を分ける。**
+    ///
+    /// 時刻フィルタを起動区間の切り替えより先に適用すると、再起動後の
+    /// 範囲内サンプルが再起動前の区間に入り、区間の `boot_epoch` と中身が
+    /// 食い違う。範囲外になった区間は落ちるが、索引は詰めない
+    /// (絞らない実行と同じ番号のままにする)。
+    #[test]
+    fn a_restart_outside_the_window_still_splits_segments() {
+        let id = ActivityId::SWAP;
+        let opts = opts_with_window(epoch_window(Some(2_030), None));
+        let mut m = GroupMerger::new(&opts, &[]);
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![
+                (2_000, 100_000, 0),
+                (2_010, 101_000, 100),
+                // 再起動 (範囲外)
+                (2_020, 1_000, 5),
+                (2_030, 2_000, 105),
+                (2_040, 3_000, 205),
+            ],
+            &[2],
+            1,
+        ));
+        let segs = m.finish().1;
+        assert_eq!(segs.len(), 1, "範囲外の区間は落ちる");
+        assert_eq!(segs[0].index, 1, "索引は詰めない (欠番 0 は範囲外の区間)");
+        assert_eq!(segs[0].boot_epoch, Some(2_010), "再起動後の起動時刻");
+
+        let p = &segs[0].summary.period;
+        assert_eq!(p.samples, 1);
+        assert_eq!(p.first_ust, Some(2_030));
+        assert_eq!(p.last_ust, Some(2_040));
+        assert_eq!(p.covered_cs, 1_000);
+
+        let c = segs[0].summary.column(id, SINGLE_ITEM, "pswpin").unwrap();
+        assert_eq!(c.intervals, 1);
+        assert_eq!(c.mean, Some(10.0), "100 / 10 秒");
+        assert!(c.exclusions.is_empty(), "{:?}", c.exclusions);
+    }
+
+    /// **差分の基準を持たない基準レコードは値に数える。**
+    ///
+    /// 範囲の始まりが起動区間の先頭 (再起動直後) に当たる場合、そのレコードは
+    /// 「前サンプルとして消費された」わけではない — 消費できる前サンプルが
+    /// そもそも無い。ここを落とすと、範囲外の区間を除いただけのはずの集計から
+    /// 起動区間の先頭サンプルが消え、絞らないときの同じ区間と結果が変わる。
+    #[test]
+    fn a_reference_sample_without_a_delta_origin_is_counted() {
+        let id = ActivityId::SWAP;
+        let samples = vec![
+            (2_000, 100_000, 0),
+            // 再起動。この直後が範囲の始まりになる
+            (2_010, 1_000, 5),
+            (2_020, 2_000, 105),
+        ];
+        let merge = |filter: TimeFilter| {
+            let opts = opts_with_window(filter);
+            let mut m = GroupMerger::new(&opts, &[]);
+            m.push_file(file_samples(0, id, samples.clone(), &[1], 1));
+            m.finish().1
+        };
+
+        let bare = merge(epoch_window(None, None));
+        assert_eq!(bare.len(), 2, "再起動で 2 区間");
+        let narrowed = merge(epoch_window(Some(2_010), None));
+        assert_eq!(narrowed.len(), 1, "再起動前の区間は範囲外");
+        assert_eq!(
+            narrowed[0], bare[1],
+            "起動区間の先頭から始まる範囲なら、その区間の集計は絞らないときと同じ"
+        );
+
+        let p = &narrowed[0].summary.period;
+        assert_eq!(p.samples, 2, "再起動直後のサンプルも数える");
+        assert_eq!(p.first_ust, Some(2_010));
+        assert_eq!(p.last_ust, Some(2_020));
+        assert_eq!(p.covered_cs, 1_000);
+        let c = narrowed[0]
+            .summary
+            .column(id, SINGLE_ITEM, "pswpin")
+            .unwrap();
+        assert_eq!(c.intervals, 1);
+        assert_eq!(c.mean, Some(10.0), "100 / 10 秒");
+        assert!(
+            c.exclusions
+                .iter()
+                .any(|e| e.reason == crate::analyze::timeline::ExclusionReason::FirstSample),
+            "区間の起点が無いことは除外理由として残る: {:?}",
+            c.exclusions
+        );
+    }
+
+    /// **範囲の外から始まる区間は、ファイル境界をまたいでいても集計に入れない。**
+    ///
+    /// 前ファイルの末尾が範囲外・次ファイルの先頭が範囲内という並びでは、
+    /// 次ファイルの中では 1 件も捨てていない。「捨てたか」をファイル単位で
+    /// 覚える作りだと、そこで範囲の外 (前ファイルの末尾) から始まる区間を
+    /// 数えてしまう。判定は前サンプルが範囲内だったかで行う。
+    #[test]
+    fn an_interval_starting_outside_the_window_is_not_counted_across_files() {
+        let id = ActivityId::SWAP;
+        let opts = opts_with_window(epoch_window(Some(2_020), None));
+        let mut m = GroupMerger::new(&opts, &[]);
+        // ファイル 1 は範囲外で終わる (2_000 / 2_010)
+        m.push_file(file_samples(
+            0,
+            id,
+            vec![(2_000, 100_000, 0), (2_010, 101_000, 100)],
+            &[],
+            1,
+        ));
+        // ファイル 2 は範囲内で始まる (2_020)。境界は連続だが、
+        // 2_010 → 2_020 の区間は範囲の外から始まっている。
+        m.push_file(file_samples(
+            1,
+            id,
+            vec![(2_020, 102_000, 400), (2_030, 103_000, 900)],
+            &[],
+            1,
+        ));
+        let segs = m.finish().1;
+        assert_eq!(segs.len(), 1);
+
+        let p = &segs[0].summary.period;
+        assert_eq!(p.samples, 1, "2_020 は基準として消費される");
+        assert_eq!(p.first_ust, Some(2_020));
+        assert_eq!(p.last_ust, Some(2_030));
+        assert_eq!(p.covered_cs, 1_000, "10 秒ぶんだけ覆う");
+
+        let c = segs[0].summary.column(id, SINGLE_ITEM, "pswpin").unwrap();
+        assert_eq!(c.intervals, 1, "境界の区間 (300) は入らない");
+        assert_eq!(c.delta_total.as_deref(), Some("500"));
+        assert_eq!(c.mean, Some(50.0), "500 / 10 秒");
+        assert!(
+            segs[0].boundaries.is_empty(),
+            "集計に入っていない境界は報告しない: {:?}",
+            segs[0].boundaries
+        );
+    }
+
+    /// 範囲にサンプルが 1 つも入らなければ起動区間は出ない (空の集計を出さない)。
+    #[test]
+    fn a_window_with_no_samples_yields_no_segments() {
+        let id = ActivityId::SWAP;
+        let segs = merge_two_files(&opts_with_window(epoch_window(Some(5_000), None)), id);
+        assert!(segs.is_empty(), "{segs:?}");
+    }
+
+    /// **`compare` の共通窓は「各ホストの観測範囲の交差 ∩ 指定範囲」になる。**
+    ///
+    /// 共通窓は絞った後の集計期間から求めるので、合成は自動的に交差になる
+    /// ([`common_window`] の doc を参照)。
+    #[test]
+    fn the_comparison_window_intersects_the_time_filter() {
+        let id = ActivityId::SWAP;
+        // host-a は 2_000〜2_060、host-b は 2_030〜2_090 を観測している
+        let series = |start: u64, count: u64| -> Vec<(u64, u64, u64)> {
+            (0..count)
+                .map(|i| {
+                    (
+                        start + i * 10,
+                        100_000 + (start - 2_000 + i * 10) * 100,
+                        i * 100,
+                    )
+                })
+                .collect()
+        };
+        let range_of = |filter: TimeFilter, samples: Vec<(u64, u64, u64)>| {
+            let opts = opts_with_window(filter);
+            let mut m = GroupMerger::new(&opts, &[]);
+            m.push_file(file_samples(0, id, samples, &[], 1));
+            let segs = m.finish().1;
+            let p = segs[0].summary.period;
+            (p.first_ust.unwrap(), p.last_ust.unwrap())
+        };
+
+        let bare = [
+            range_of(epoch_window(None, None), series(2_000, 7)),
+            range_of(epoch_window(None, None), series(2_030, 7)),
+        ];
+        let unclipped = common_window(&bare, 10).expect("交差がある");
+        assert_eq!((unclipped.start_ust, unclipped.end_ust), (2_030, 2_060));
+
+        // --from 2_040 --to 2_050 で絞る
+        let filter = epoch_window(Some(2_040), Some(2_050));
+        let clipped = [
+            range_of(filter, series(2_000, 7)),
+            range_of(filter, series(2_030, 7)),
+        ];
+        let w = common_window(&clipped, 10).expect("交差がある");
+        assert_eq!(
+            (w.start_ust, w.end_ust),
+            (unclipped.start_ust.max(2_040), unclipped.end_ust.min(2_050)),
+            "共通窓と指定範囲の交差になる"
+        );
+        assert_eq!((w.start_ust, w.end_ust), (2_040, 2_050));
     }
 }

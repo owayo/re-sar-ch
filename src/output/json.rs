@@ -30,14 +30,14 @@ use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::layout::registry::{ActivityDef, ColumnMeta};
 use crate::model::{ActivityId, Availability, ValueKind};
-use crate::series::compute::ComputeIssue;
 use crate::output::time_filter::{Admit, TimeFilter};
+use crate::series::compute::ComputeIssue;
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 公開スキーマの版。
 ///
 /// 内部構造の変更ではなく、**公開形が変わったときだけ**上げる。
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 // ===========================================================================
 // 設定
@@ -76,6 +76,8 @@ pub struct CustomConfig {
     /// 差分の基準として消費されるだけで行にならない
     /// (`crate::output::time_filter` 参照)。
     pub time_filter: TimeFilter,
+    /// IRQ の集約行に加えて、記録されている CPU 別内訳を出す。
+    pub irq_cpus: bool,
 }
 
 // ===========================================================================
@@ -211,6 +213,9 @@ pub struct ItemOut {
     pub item: String,
     /// activity 内での添字。
     pub index: usize,
+    /// IRQ の CPU 次元。`all` または 0 始まりの CPU 番号。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
     /// 生値の名前空間。`--values rates` では空。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw: Vec<FieldOut>,
@@ -252,10 +257,7 @@ pub struct SampleOut {
 /// activity 1 種を公開スキーマへ写す。
 pub fn activity_out(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Option<ActivityOut> {
     let sp = spec::lookup(pair.id)?;
-    let mut items = Vec::new();
-    for item in pair.output_items() {
-        items.push(item_out(pair.def, sp, &item, cfg));
-    }
+    let items = custom_items(pair, cfg);
     if items.is_empty() {
         return None;
     }
@@ -266,14 +268,50 @@ pub fn activity_out(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Option<Activ
     })
 }
 
+/// 全独自形式で同じ item / CPU 次元を列挙する。
+pub fn custom_items(pair: &ActivityPair<'_>, cfg: &CustomConfig) -> Vec<ItemOut> {
+    let Some(sp) = spec::lookup(pair.id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in pair.output_items() {
+        let aggregate = item_out(pair.def, sp, &item, cfg);
+        let label = aggregate.item.clone();
+        out.push(aggregate);
+        if pair.id != ActivityId::IRQ || !cfg.irq_cpus {
+            continue;
+        }
+        // 古い一次元 IRQ は CPU all しか記録していない。CPU 別をゼロで捏造しない。
+        for cpu in 1..item.row_len() {
+            let Some(slot) = pair.matrix_item(cpu, item.index) else {
+                continue;
+            };
+            let mut row = item_out(pair.def, sp, &slot, cfg);
+            row.item = label.clone();
+            row.index = item.index;
+            row.cpu = Some((cpu - 1).to_string());
+            out.push(row);
+        }
+    }
+    out
+}
+
 /// item 1 個を公開スキーマへ写す。
+///
+/// # 行列型 (`A_IRQ` / `A_PWR_FREQ`) の表し方
+///
+/// 行列型は [`ActivityPair::output_items`] が「出力 1 行」を 1 item として返す。
+/// `A_IRQ` なら 1 行 = 1 割り込みで、行の中に CPU ぶんのスロットが並ぶ。
+/// 公開スキーマは 1 列 1 値なので、ここで出すのは
+/// **その行の代表スロット** (`A_IRQ` は CPU `all`、02 §6.1) の値である。
+/// `sar -I` の既定表示と同じ粒度で、CPU 別の内訳は `sar` 互換出力
+/// (CPU 列を展開する `-P` 相当の経路) から得る。
 pub fn item_out(
     def: &'static ActivityDef,
     sp: &spec::ActivitySpec,
     item: &ItemPair<'_>,
     cfg: &CustomConfig,
 ) -> ItemOut {
-    let label = item_label(sp, item);
     let mut raw = Vec::new();
     let mut rates = Vec::new();
 
@@ -286,13 +324,19 @@ pub fn item_out(
         }
     }
 
+    // item の識別子は `sadf` と同じ組み立て (`render::item_label`) を共有する。
+    // 行列型 (`A_IRQ`) の行も割り込み名で識別されるので、ここに独自出力専用の
+    // 分岐は要らない (`irq_rows_are_identified_by_interrupt_name` が固定)。
+    let label = item_label(sp, item);
     ItemOut {
         item: if label.jx.is_empty() {
+            // アイテムを持たない activity (`A_MEMORY` など)
             "-".to_string()
         } else {
             label.jx
         },
         index: item.index,
+        cpu: (sp.id == ActivityId::IRQ).then(|| "all".to_string()),
         raw,
         rates,
     }
@@ -675,5 +719,113 @@ mod tests {
             text: String::new(),
         }]);
         assert_eq!(b.get(), 1, "COMMENT では増えない");
+    }
+
+    /// **`A_IRQ` が独自出力から消えない。**
+    ///
+    /// `A_IRQ` は「行 = 割り込み、列 = CPU」の行列型で、ファイル上の並びは
+    /// その転置 (行 = CPU / 列 = 割り込み、02 §6.1)。`sadf` は専用経路で
+    /// 扱うためアイテム識別子を持たない (`ItemKind::Irq`) が、独自出力は
+    /// [`ActivityPair::output_items`] をそのまま並べるので、
+    /// 行の識別子 (= 割り込み名) をここで当てる必要がある。
+    /// 当てなければ `item` 列が全行 `-` になり割り込みを区別できない。
+    #[test]
+    fn irq_rows_are_identified_by_interrupt_name() {
+        use crate::layout::plan::DecodePlan;
+        use crate::model::Availability;
+        use crate::series::{ActivitySnapshot, ItemSnapshot};
+
+        let def = crate::layout::registry::lookup(ActivityId::IRQ).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = crate::format::abi::SourceEncoding::new(
+            crate::format::abi::Endian::Little,
+            crate::format::abi::LayoutAbi::LP64,
+        );
+        // ファイル上は 行 = CPU (all + cpu0) × 列 = 割り込み (sum + eth0-tx)
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 2, 2, &enc).unwrap();
+        let sp = spec::lookup(ActivityId::IRQ).unwrap();
+        let cfg = CustomConfig::default();
+
+        // 割り込み名は CPU 行 0 にしか入らない (02 §6.2)
+        let cell = |name: Option<&str>, count: u64| ItemSnapshot {
+            key: name.map(|k| k.into()),
+            texts: vec![name.map(|k| k.into())],
+            values: plan
+                .fields
+                .iter()
+                .map(|f| Availability::Present(if f.name == "irq_nr" { count } else { 0 }))
+                .collect(),
+        };
+        let snapshot = |scale: u64| ActivitySnapshot {
+            id: ActivityId::IRQ,
+            index: 0,
+            nr: 2,
+            nr2: 2,
+            items: vec![
+                // CPU all
+                cell(Some("sum"), 300 * scale),
+                cell(Some("eth0-tx"), 100 * scale),
+                // cpu0 (名前は入らない)
+                cell(None, 200 * scale),
+                cell(None, 40 * scale),
+            ],
+        };
+        let (prev, curr) = (snapshot(1), snapshot(2));
+        let pair = ActivityPair {
+            id: ActivityId::IRQ,
+            def,
+            plan: &plan,
+            curr: &curr,
+            prev: Some(&prev),
+            itv_cs: 100,
+            has_prev: true,
+            continuous: true,
+        };
+
+        let items = pair.output_items();
+        assert_eq!(items.len(), 2, "出力は割り込みごとの 1 行 (nr2 行)");
+        let rows: Vec<ItemOut> = items.iter().map(|it| item_out(def, sp, it, &cfg)).collect();
+
+        // 行の識別子は割り込み名 (`-` にしない)
+        assert_eq!(rows[0].item, "sum");
+        assert_eq!(rows[1].item, "eth0-tx");
+        // 割り込み名は列としても出る (文字列フィールドなので `text`)
+        let name_of = |r: &ItemOut| {
+            r.rates
+                .iter()
+                .find(|f| f.name == "intr_name")
+                .unwrap()
+                .text
+                .clone()
+        };
+        assert_eq!(name_of(&rows[1]).as_deref(), Some("eth0-tx"));
+        // 値は行の代表スロット = CPU "all" のレート (1 秒で 100 回)
+        let count_of = |r: &ItemOut| -> FieldOut {
+            r.rates
+                .iter()
+                .find(|f| f.name == "intr")
+                .expect("intr 列")
+                .clone()
+        };
+        assert_eq!(count_of(&rows[1]).value, Some(100.0));
+        assert_eq!(count_of(&rows[1]).quality, Quality::Ok);
+        assert_eq!(
+            count_of(&rows[0]).value,
+            Some(300.0),
+            "sum 列は全割り込みの和"
+        );
+        let expanded = custom_items(
+            &pair,
+            &CustomConfig {
+                irq_cpus: true,
+                ..cfg
+            },
+        );
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[2].item, "eth0-tx");
+        assert_eq!(expanded[2].cpu.as_deref(), Some("all"));
+        assert_eq!(expanded[3].item, "eth0-tx");
+        assert_eq!(expanded[3].cpu.as_deref(), Some("0"));
+        assert_eq!(count_of(&expanded[3]).value, Some(40.0));
     }
 }

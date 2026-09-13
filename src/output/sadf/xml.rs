@@ -20,11 +20,11 @@ use super::access::{ActivityPair, ItemPair};
 use super::dbppc::{display_cpu_count, scan_comments, scan_restarts, selected_specs};
 use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Field, Fmt, Group, Shape};
-use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, render, spec};
+use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, render};
 use crate::error::Result;
-use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
+use crate::output::time_filter::Admit;
 use crate::series::{IntervalView, Selection, WalkItem, walk_items};
 
 /// `sadf.h` の `XML_DTD_VERSION`。
@@ -32,7 +32,7 @@ pub const XML_DTD_VERSION: &str = "3.18";
 
 /// `-x` の出力。
 pub fn write_xml<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file(file);
+    let info = FileInfo::from_file_with(file, cfg.time_base);
     let specs = selected_specs(file, cfg);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
@@ -190,10 +190,7 @@ fn write_sample<W: Write>(
 ) -> io::Result<()> {
     let mut open_group = Group::None;
 
-    for spec in spec::SPECS {
-        if !specs.iter().any(|s| s.id == spec.id) {
-            continue;
-        }
+    for spec in specs {
         let Some(pair) = ActivityPair::from_view(view, spec.id) else {
             continue;
         };
@@ -295,7 +292,7 @@ fn activity_body(
             let wrap = spec.group != Group::Network;
             let child_depth = if wrap { depth + 1 } else { depth };
             let mut rows = String::new();
-            for item in pair.output_items() {
+            for item in pair.selected_items(cfg, false) {
                 let attrs = attr_list(spec, &item, cfg);
                 rows.push_str(&format!(
                     "{}<{}{}/>\n",
@@ -322,7 +319,7 @@ fn activity_body(
         }
         Shape::Custom => match spec.id {
             ActivityId::IO => io_body(pair, depth),
-            ActivityId::IRQ => irq_body(pair, depth),
+            ActivityId::IRQ => irq_body(pair, depth, cfg),
             _ => String::new(),
         },
     }
@@ -375,27 +372,32 @@ fn io_body(pair: &ActivityPair<'_>, depth: usize) -> String {
 /// `A_IRQ` は `<interrupts>` → `<int-global per="second">` → `<irq/>`。
 ///
 /// **1 要素が 1 割込 × 1 CPU** で、JSON とは構造が本質的に違う (§10.6)。
-fn irq_body(pair: &ActivityPair<'_>, depth: usize) -> String {
-    let nr = pair.curr.nr.max(1) as usize;
-    let nr2 = pair.curr.nr2.max(1) as usize;
+fn irq_body(pair: &ActivityPair<'_>, depth: usize, cfg: &SadfConfig) -> String {
+    let (nr, nr2) = pair.irq_dimensions();
     let t = tabs(depth);
     let mid = tabs(depth + 1);
     let leaf = tabs(depth + 2);
 
     let mut rows = String::new();
     for irq in 0..nr2 {
-        let name = pair
-            .matrix_item(0, irq)
-            .and_then(|i| i.key().map(|s| s.to_string()))
-            .unwrap_or_else(|| irq.to_string());
+        if !(0..nr).any(|cpu| pair.irq_cpu_selected(cfg, cpu, false)) {
+            continue;
+        }
+        let name = pair.irq_name(irq);
+        if !cfg.name_selected(ActivityId::IRQ, &name) {
+            continue;
+        }
         for cpu in 0..nr {
+            if !pair.irq_cpu_selected(cfg, cpu, false) {
+                continue;
+            }
             let cpu_label = if cpu == 0 {
                 "all".to_string()
             } else {
                 (cpu - 1).to_string()
             };
             let mut v = String::new();
-            match pair.matrix_item(cpu, irq) {
+            match pair.irq_item(cpu, irq) {
                 Some(item) => {
                     super::write_value(&mut v, item.computed_by_name("intr"), Fmt::R2, ABSENT_XML)
                 }
@@ -445,6 +447,7 @@ fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::sadf::spec;
 
     /// `<sysdata-version>` はファイルの版に依存しない固定値。
     #[test]

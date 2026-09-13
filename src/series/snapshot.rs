@@ -354,6 +354,45 @@ pub enum WalkItem<'a> {
     Event(RecordEvent),
 }
 
+/// 走査するレコードの範囲。
+///
+/// 添字は [`walk_items`] が `visit` を呼ぶ順の通し番号 (0 起点)。
+/// 拡張レコード (`R_EXTRA`) と無効な種別は通知されないので**番号を消費しない**。
+/// したがって同じファイルを何度走査しても同じレコードが同じ番号になる。
+///
+/// 範囲外のレコードは**デコードもしない**。`sar` 互換出力は
+/// 「区間 × activity」で何度も走査するので、区間外のレコードまで
+/// デコードすると RESTART の個数に比例して無駄が増える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordRange {
+    /// 最初に通知するレコードの番号。
+    pub start: usize,
+    /// 通知を打ち切る番号。**この番号のレコードは含まない。**
+    pub end: usize,
+}
+
+impl Default for RecordRange {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: usize::MAX,
+        }
+    }
+}
+
+impl RecordRange {
+    /// 全レコード。
+    pub const ALL: Self = Self {
+        start: 0,
+        end: usize::MAX,
+    };
+
+    /// `start` から `end` の手前まで。
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
 /// レコード対とイベントを順に走査する。
 ///
 /// 選択されていない activity はデコードせず、オフセット加算だけで読み飛ばす。
@@ -364,7 +403,26 @@ pub enum WalkItem<'a> {
 ///
 /// 互換性が確認できない activity (未知 ID / 未知 magic) は読み飛ばす。
 /// 何を読み飛ばしたかを診断したい場合は [`plan_activities`] を直接呼ぶ。
-pub fn walk_items<F>(file: &SaFile, selection: &Selection, mut visit: F) -> Result<ScanSummary>
+pub fn walk_items<F>(file: &SaFile, selection: &Selection, visit: F) -> Result<ScanSummary>
+where
+    F: FnMut(WalkItem<'_>) -> Result<ScanControl>,
+{
+    walk_items_in(file, selection, RecordRange::ALL, visit)
+}
+
+/// レコード範囲を限って走査する。
+///
+/// 範囲外のレコードはデコードせず、`visit` も呼ばない。
+/// 前サンプルの状態も範囲の中だけで作られるので、**範囲の最初の統計レコードは
+/// 前値を持たない** (`ComputeContext::has_prev` が偽)。本家が activity ごとに
+/// 区間の先頭へシークし直し、その区間の最初のレコードを基準値として使うのと
+/// 同じ状態になる (`sar.c: handle_curr_act_stats()`)。
+pub fn walk_items_in<F>(
+    file: &SaFile,
+    selection: &Selection,
+    range: RecordRange,
+    mut visit: F,
+) -> Result<ScanSummary>
 where
     F: FnMut(WalkItem<'_>) -> Result<ScanControl>,
 {
@@ -376,12 +434,36 @@ where
     let empty = Snapshot::default();
     let mut have_prev = false;
     let mut continuous = true;
+    // 通知対象レコードの通し番号 (拡張・無効レコードは数えない)。
+    //
+    // 範囲が全件なら比較する相手が無いので**数えない**。
+    // レコードごとの加算と 2 回の比較は 1 件あたりでは些細だが、
+    // `sar` 互換出力は「区間 × activity」で何度も走査するので、
+    // 既定経路 (`walk_items`) から外しておく。
+    let bounded = range != RecordRange::ALL;
+    let mut index = 0usize;
+    /// 範囲の外か。`bounded` が偽なら常に内側。
+    macro_rules! outside {
+        ($at:expr) => {
+            bounded && ($at < range.start)
+        };
+    }
 
     file.scan(|rec| {
         match rec.kind {
             RecordKind::Restart => {
+                let at = index;
+                if bounded {
+                    index += 1;
+                    if at >= range.end {
+                        return Ok(ScanControl::Stop);
+                    }
+                }
                 // 再起動をまたぐと累積カウンタが 0 に戻るので、差分を作ってはいけない
                 continuous = false;
+                if outside!(at) {
+                    return Ok(ScanControl::Continue);
+                }
                 return visit(WalkItem::Event(RecordEvent::Restart {
                     ust_time: rec.ust_time,
                     hour: rec.hour,
@@ -391,18 +473,53 @@ where
                 }));
             }
             RecordKind::Comment => {
+                let at = index;
+                if bounded {
+                    index += 1;
+                    if at >= range.end {
+                        return Ok(ScanControl::Stop);
+                    }
+                }
+                if outside!(at) {
+                    return Ok(ScanControl::Continue);
+                }
                 return visit(WalkItem::Event(RecordEvent::Comment {
                     ust_time: rec.ust_time,
                     hour: rec.hour,
                     minute: rec.minute,
                     second: rec.second,
-                    text: rec.comment.unwrap_or("").to_string(),
+                    text: rec
+                        .comment
+                        .unwrap_or(b"")
+                        .iter()
+                        .map(|&b| {
+                            if (0x20..=0x7e).contains(&b) {
+                                char::from(b)
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect(),
                 }));
             }
             RecordKind::Extra(_) | RecordKind::Invalid(_) => {
+                // 通知しないので番号を消費しない (走査ごとに番号が揺れないため)
                 return Ok(ScanControl::Continue);
             }
             _ => {}
+        }
+
+        let at = index;
+        if bounded {
+            index += 1;
+            if at >= range.end {
+                return Ok(ScanControl::Stop);
+            }
+        }
+        // 範囲より前の統計レコードは**デコードもしない**。
+        // 前サンプルの状態も作らないので、範囲の最初のレコードが基準値になる。
+        if outside!(at) {
+            return Ok(ScanControl::Continue);
         }
 
         decode_snapshot(&mut curr, rec, file, &plans)?;

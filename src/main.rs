@@ -1,6 +1,6 @@
 //! `resarch` — sysstat の `sa` バイナリを単体で解析する CLI。
 //!
-//! 引数はサブコマンド (`show` / `summarize` / `compare` / `info`) と
+//! 引数はサブコマンド (`show` / `summarize` / `detect` / `compare` / `info`) と
 //! `sar` / `sadf` 互換の 2 系統を受け付ける。サブコマンド名を省略した場合は
 //! `sar` 互換として解釈するため、`resarch -u -f sa01` がそのまま動く。
 //!
@@ -14,6 +14,7 @@
 //! | [`SarOptions`] → [`SarTextOptions`] + activity 列 | [`sar_text::write_report`] |
 //! | [`SadfOptions`] → [`SadfConfig`] | `output::sadf::*` |
 //! | `show` / `summarize` / `compare` の引数 → [`CustomConfig`] / [`MultiOptions`] | 独自出力・`multi` |
+//! | `detect` の引数 → [`DetectOptions`] | `analyze::assessment` → [`detect_report`] |
 //!
 //! # 出力先と終了コード (`docs/design.md` §7)
 //!
@@ -29,20 +30,25 @@ use std::process::ExitCode;
 use anyhow::{Context, bail};
 
 use re_sar_ch::analyze::{
-    ColumnSummary, Finding, MetricKey, NativePeriodSummary, PercentileOutcome, RetainTimelines,
-    SummaryOptions, Verdict, rule_inputs,
+    Assessment, ColumnSummary, Finding, MetricKey, NativePeriodSummary, PercentileOutcome,
+    Priority, RetainTimelines, SummaryOptions, Verdict, assess_summary, metric_catalog,
+    rule_inputs,
 };
 use re_sar_ch::cli::{
-    self, Activity, CliError, Commands, CommonArgs, CompareArgs, InfoArgs, Invocation, OptFlags,
-    OutputFormat, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate,
-    SarInput, SarOptions, SarOutput, ShowArgs, SummarizeArgs, TimeSpec, ValueKind,
+    self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
+    DetectFormat, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg, SadfFormat,
+    SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate, SarInput, SarOptions,
+    SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
 };
+use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
+use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
 use re_sar_ch::model::{ActivityId, KNOWN_ACTIVITIES};
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
+use re_sar_ch::output::detect_report;
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
-use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
+use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
 use re_sar_ch::output::{csv, ndjson, table};
 use re_sar_ch::series::Selection;
@@ -84,8 +90,10 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
     match invocation {
         Invocation::Native(cmd) => match *cmd {
             Commands::Info(args) => run_info(args),
+            Commands::SkillInstall(args) => run_skill_install(args),
             Commands::Show(args) => run_show(args),
             Commands::Summarize(args) => run_summarize(args),
+            Commands::Detect(args) => run_detect(args),
             Commands::Compare(args) => run_compare(args),
             // `dispatch` は互換入口を直接互換パーサへ回すので通常ここには来ない。
             // ルート経由で来た場合も同じ結果になるよう解析し直す。
@@ -322,10 +330,10 @@ fn cpu_selection(opts: &SarOptions) -> CpuSelection {
     }
 }
 
-/// `--dev=` / `--iface=` / `--fs=` のアイテム名フィルタ。
+/// `--dev=` / `--iface=` / `--fs=` / `--int=` / `-I SUM` のアイテム名フィルタ。
 ///
-/// `--int=` (`A_IRQ`) は行ではなく列が CPU に対応する行列レイアウトなので
-/// ここでは渡さない (未対応)。
+/// `--int=` (`A_IRQ`) は行 = 割り込みなので、絞るのは行で、
+/// 列 (CPU) は `-P` のビットマップの担当 (03 §8.6)。
 fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
     let mut map = BTreeMap::new();
     for act in [
@@ -333,6 +341,7 @@ fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
         Activity::NetDev,
         Activity::NetEdev,
         Activity::Fs,
+        Activity::Irq,
     ] {
         let list = opts.item_list(act);
         if !list.is_empty() {
@@ -340,6 +349,17 @@ fn sar_item_names(opts: &SarOptions) -> BTreeMap<ActivityId, Vec<String>> {
         }
     }
     map
+}
+
+/// `-i <interval>` と positional の `interval` / `count` を出力層へ写す。
+///
+/// 本家はファイル読み出しに入る直前で `interval < 0` を 1 に補正する (03 §5.3)。
+/// `interval == 0` は `-f` / `-o` 併用として引数解析が弾いているのでここには来ない。
+fn sar_sample_select(opts: &SarOptions) -> SampleSelect {
+    SampleSelect {
+        interval: opts.interval.unwrap_or(1).max(1),
+        count: opts.count,
+    }
 }
 
 /// [`SarOptions`] を `sar` テキスト出力の設定へ写す。
@@ -403,6 +423,8 @@ fn sadf_config(opts: &SadfOptions) -> SadfConfig {
         section: section_config(&opts.sar),
         activities: Some(opts.sar.selected_activities().map(activity_id).collect()),
         time_filter: sar_time_filter(&opts.sar, CrossDayRule::Sadf),
+        cpus: cpu_selection(&opts.sar),
+        item_names: sar_item_names(&opts.sar),
     }
 }
 
@@ -440,9 +462,21 @@ fn run_sar(opts: SarOptions) -> anyhow::Result<ExitCode> {
 
     let text = sar_text_options(&opts);
     let activities = sar_activities(&opts, &file);
+    if activities.is_empty() {
+        bail!(
+            "Requested activities not available in file {}",
+            path.display()
+        );
+    }
 
     let mut out = stdout_writer();
-    let result = sar_text::write_report(&mut out, &file, &text, &activities);
+    let result = sar_text::write_report_with(
+        &mut out,
+        &file,
+        &text,
+        &activities,
+        sar_sample_select(&opts),
+    );
     out.flush()?;
     result?;
     Ok(ExitCode::SUCCESS)
@@ -526,9 +560,13 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
     let file = open_file(&path, &OpenOptions::default())?;
     report_diagnostics(&file);
 
+    // `-H` も `-t` を見るので、形式の分岐より前に設定を作る
+    // (本家の `get_file_timestamp_struct()` は `PRINT_TRUE_TIME` を全形式で参照する)。
+    let cfg = sadf_config(&opts);
+
     let mut out = stdout_writer();
     if format == SadfFormat::Header {
-        sadf::header::write_header(&mut out, &file)?;
+        sadf::header::write_header_with(&mut out, &file, &cfg)?;
         out.flush()?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -538,15 +576,29 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
         );
     }
 
-    let cfg = sadf_config(&opts);
+    if !matches!(format, SadfFormat::Conv | SadfFormat::Pcp)
+        && sadf::dbppc::selected_specs(&file, &cfg).is_empty()
+    {
+        bail!(
+            "Requested activities not available in file {}",
+            path.display()
+        );
+    }
+
     let result = match format {
         SadfFormat::Db => sadf::dbppc::write_db(&mut out, &file, &cfg),
         SadfFormat::Ppc => sadf::dbppc::write_ppc(&mut out, &file, &cfg),
         SadfFormat::Json => sadf::json::write_json(&mut out, &file, &cfg),
         SadfFormat::Xml => sadf::xml::write_xml(&mut out, &file, &cfg),
         SadfFormat::Raw => sadf::raw::write_raw(&mut out, &file, &cfg),
-        SadfFormat::Conv => bail!("-c (旧形式の変換) は未対応です"),
-        SadfFormat::Svg => bail!("-g (SVG グラフ) は未対応です"),
+        SadfFormat::Conv => {
+            // 変換後のバイナリは stdout のみ、進捗は stderr (01 §5.1)。
+            let cvt = ConvertOptions {
+                hz: opts.output.user_hz.map(u64::from),
+            };
+            convert::convert(&file, &cvt, &mut out).map(|r| report_conversion(&r))
+        }
+        SadfFormat::Svg => re_sar_ch::output::svg::write_svg(&mut out, &file, &cfg, &opts.output),
         SadfFormat::Pcp => bail!("-l (PCP アーカイブ) は未対応です"),
         // 上で処理済み
         SadfFormat::Header => Ok(()),
@@ -554,6 +606,34 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
     out.flush()?;
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// 世代変換の結果を stderr へ報告する。
+///
+/// 変換後のバイナリは stdout に出るので、**進捗や警告を混ぜてはいけない**
+/// (本家も進捗はすべて stderr、01 §5.1)。
+fn report_conversion(r: &ConvertReport) {
+    if r.already_current {
+        eprintln!("File format already up-to-date (何も出力していません)");
+        return;
+    }
+    eprintln!(
+        "{} バイトを書き出しました (activity {} 種 / レコード {} 件 / HZ {} — {})",
+        r.bytes_written,
+        r.activities,
+        r.total_records(),
+        r.hz,
+        r.hz_source.describe()
+    );
+    if r.truncated_values > 0 {
+        eprintln!(
+            "警告: {} 個の値が出力側の幅に収まらず切り詰められました",
+            r.truncated_values
+        );
+    }
+    for w in &r.warnings {
+        eprintln!("警告: {w}");
+    }
 }
 
 // ===========================================================================
@@ -647,9 +727,14 @@ fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
         None => TimeBound::None,
     };
     match (start, end) {
-        (TimeBound::HhMmSs { hour: sh, .. }, TimeBound::HhMmSs { hour: eh, min, sec })
-            if eh < sh =>
-        {
+        (
+            TimeBound::HhMmSs {
+                hour: sh,
+                min: sm,
+                sec: ss,
+            },
+            TimeBound::HhMmSs { hour: eh, min, sec },
+        ) if (eh, min, sec) < (sh, sm, ss) => {
             end = TimeBound::HhMmSs {
                 hour: eh + 24,
                 min,
@@ -666,7 +751,7 @@ fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
         end,
         // 独自出力は UTC / epoch で時刻を出すので、比較も UTC で行う。
         basis: TimeBasis::Utc,
-        cross_day: CrossDayRule::Sadf,
+        cross_day: CrossDayRule::Sar,
     })
 }
 
@@ -679,11 +764,38 @@ fn value_scope(kind: ValueKind) -> ValueScope {
 }
 
 // ===========================================================================
+// `resarch skill-install`
+// ===========================================================================
+
+/// AI エージェント向けのスキルをインストールする。
+///
+/// 書き出した場所は `stderr` へ報告する。**`stdout` には何も出さない**
+/// (他のサブコマンドと同じ規約。パイプへ混ぜない)。
+fn run_skill_install(args: SkillArgs) -> anyhow::Result<ExitCode> {
+    let path = re_sar_ch::skill::install(&args.agent)?;
+    let agent = re_sar_ch::skill::Agent::parse(&args.agent)?;
+    eprintln!(
+        "{} 用のスキルを書き出しました: {}",
+        agent.display_name(),
+        path.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+// ===========================================================================
 // `resarch show`
 // ===========================================================================
 
 fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
+    if args.irq_cpus
+        && !matches!(
+            common.format,
+            OutputFormat::Table | OutputFormat::Json | OutputFormat::Csv | OutputFormat::Ndjson
+        )
+    {
+        bail!("--irq-cpus は独自の table / json / csv / ndjson 出力で指定してください");
+    }
     let options = open_options(common.lenient, common.no_mmap);
     let selection = selection_from(&common.activity)?;
     let filter = custom_time_filter(common)?;
@@ -697,15 +809,24 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
         selection: selection.clone(),
         values: value_scope(args.values),
         time_filter: filter,
+        irq_cpus: args.irq_cpus,
     };
     // 独自 JSON は 1 ファイル 1 文書なので、複数ファイルは配列で包む。
     let wrap_json = matches!(common.format, OutputFormat::Json) && paths.len() > 1;
+
+    // CSV のヘッダ行は**先頭の 1 回だけ**出す。
+    // ファイルごとに出すと 2 本目以降のヘッダがデータ行として読まれ、
+    // `pandas.read_csv` や表計算ソフトで列の型が壊れる。
+    // 「最初に開けたファイル」を基準にするので、先頭のファイルが開けなくても
+    // ヘッダは 1 回出る (`i == 0` を条件にすると出なくなる)。
+    let mut csv_header_pending = true;
 
     let mut out = stdout_writer();
     if wrap_json {
         out.write_all(b"[")?;
     }
-    for (i, path) in paths.iter().enumerate() {
+    let mut written = 0usize;
+    for path in paths.iter() {
         let file = match open_file(path, &options) {
             Ok(f) => f,
             Err(e) => {
@@ -715,10 +836,40 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
             }
         };
         report_diagnostics(&file);
-        if wrap_json && i > 0 {
+        if common.lenient {
+            let scan = match file.scan(|_| Ok(re_sar_ch::format::ScanControl::Continue)) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    eprintln!(
+                        "resarch: {}: 読めないので飛ばした ({error})",
+                        file.path().display()
+                    );
+                    partial = true;
+                    continue;
+                }
+            };
+            if scan.incomplete {
+                eprintln!(
+                    "resarch: {}: 不完全な末尾レコード (残余 {} バイト)。完全なレコードまでを出力します",
+                    file.path().display(),
+                    scan.trailing_bytes
+                );
+                partial = true;
+            }
+        }
+        if wrap_json && written > 0 {
             out.write_all(b",")?;
         }
-        let result = write_show_one(&mut out, &file, common.format, &custom, &selection, filter);
+        let result = write_show_one(
+            &mut out,
+            &file,
+            common.format,
+            &custom,
+            &selection,
+            filter,
+            &mut csv_header_pending,
+        );
+        written += 1;
         if let Err(e) = result {
             out.flush()?;
             return Err(e);
@@ -732,6 +883,10 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
 }
 
 /// 1 ファイルを指定形式で書き出す。
+///
+/// `csv_header_pending` は CSV のヘッダ行をまだ出していないか。
+/// 出したら `false` にする (複数ファイルを 1 本の CSV に連結するため)。
+#[allow(clippy::too_many_arguments)]
 fn write_show_one<W: Write>(
     out: &mut W,
     file: &SaFile,
@@ -739,11 +894,15 @@ fn write_show_one<W: Write>(
     custom: &CustomConfig,
     selection: &Selection,
     filter: TimeFilter,
+    csv_header_pending: &mut bool,
 ) -> anyhow::Result<()> {
     match format {
         OutputFormat::Table => table::write_table(out, file, custom)?,
         OutputFormat::Json => re_sar_ch::output::json::write_json(out, file, custom)?,
-        OutputFormat::Csv => csv::write_csv(&mut *out, file, custom)?,
+        OutputFormat::Csv => {
+            csv::write_csv_with(&mut *out, file, custom, *csv_header_pending)?;
+            *csv_header_pending = false;
+        }
         OutputFormat::Ndjson => ndjson::write_ndjson(out, file, custom)?,
         OutputFormat::Sar => {
             let text = SarTextOptions {
@@ -841,17 +1000,187 @@ fn ordered_show_paths(
 }
 
 // ===========================================================================
-// `resarch summarize`
+// `resarch detect`
 // ===========================================================================
 
-fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
-    let common = &args.common;
-    reject_time_window(common, "summarize")?;
-    let mopts = multi_options(common)?;
+/// 異変検出。
+///
+/// `multi` で起動区間ごとのサマリを作り、その時系列に 3 経路を走らせる。
+/// **起動区間をまたいだ検出はしない** (再起動の前後で水準が変わるのは当然なので、
+/// それを異変として報告しない)。
+fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
+    let opts = detect_options(&args)?;
+    let mopts = detect_multi_options(&args)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
+    report_incomplete_files(&analysis);
     for s in &analysis.skipped {
         eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
     }
+
+    let min = min_priority(args.min_priority);
+    // 起動区間ごとに所見を作る。**区間をまたいだ検出はしない**
+    // (再起動の前後で水準が変わるのは当然なので異変として報告しない)。
+    let mut assessments: Vec<Assessment> = Vec::new();
+    for host in &analysis.hosts {
+        for seg in &host.segments {
+            let mut assessment = assess_summary(&seg.summary, &opts);
+            assessment.filter_priority(min);
+            assessments.push(assessment);
+        }
+    }
+    if assessments.is_empty() {
+        // 統計レコードが 1 件も無かった (ヘッダだけのファイルなど)
+        eprintln!("resarch: 解析できる統計レコードがありませんでした");
+    }
+
+    let mut out = stdout_writer();
+    match args.format {
+        // JSON は起動区間をまとめて 1 ドキュメントにする
+        DetectFormat::Json => detect_report::write_json(&mut out, &assessments)?,
+        DetectFormat::Ndjson => detect_report::write_ndjson(&mut out, &assessments)?,
+        DetectFormat::Text => {
+            for (i, a) in assessments.iter().enumerate() {
+                if i > 0 {
+                    writeln!(out)?;
+                }
+                detect_report::write_text(&mut out, a)?;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(exit_code(
+        !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty(),
+    ))
+}
+
+fn detect_options(args: &DetectArgs) -> anyhow::Result<DetectOptions> {
+    let report_from = report_bound("--from", args.from.as_deref())?;
+    let report_to = report_bound("--to", args.to.as_deref())?;
+    if matches!((report_from, report_to), (ReportBound::Epoch(s), ReportBound::Epoch(e)) if e < s) {
+        bail!("--to は --from より後の時刻を指定してください");
+    }
+    Ok(DetectOptions {
+        baseline_scope: match args.baseline_scope {
+            BaselineScopeArg::Input => BaselineScope::Input,
+            BaselineScopeArg::Window => BaselineScope::Window,
+        },
+        report_from,
+        report_to,
+        selected_activities: match selection_from(&args.activity)? {
+            Selection::All => None,
+            Selection::Only(ids) => Some(ids),
+        },
+        ..Default::default()
+    })
+}
+
+/// `--from` / `--to` を検出層の境界へ写す。
+///
+/// `output::time_filter::TimeBound` をそのまま渡さないのは、分析層が
+/// 出力層へ依存しないようにするため。解釈の規則 (`hh:mm[:ss]` / 10 桁 epoch) は
+/// 他のサブコマンドと同じ [`parse_time_arg`] を使う。
+fn report_bound(opt: &str, value: Option<&str>) -> anyhow::Result<ReportBound> {
+    let Some(v) = value else {
+        return Ok(ReportBound::None);
+    };
+    Ok(match parse_time_arg(opt, v)? {
+        TimeBound::None => ReportBound::None,
+        TimeBound::Epoch(e) => ReportBound::Epoch(e),
+        TimeBound::HhMmSs { hour, min, sec } => ReportBound::TimeOfDay { hour, min, sec },
+    })
+}
+
+/// 検出のためのデコード設定。
+///
+/// **カタログにある activity だけを読む。** 全 activity の全列を保持すると
+/// item 数の多いホスト (128 CPU・多数のデバイス) で時系列が際限なく増える。
+fn detect_multi_options(args: &DetectArgs) -> anyhow::Result<MultiOptions> {
+    let selection = detect_selection(&args.activity)?;
+    Ok(MultiOptions {
+        open: open_options(args.lenient, args.no_mmap),
+        selection,
+        summary: SummaryOptions {
+            // 検出はカタログの系列を見るので、選んだ activity の列は全部保持する。
+            // `RetainTimelines::RuleInputs` では組み込みルールの入力しか残らない。
+            retain: RetainTimelines::All,
+            ..Default::default()
+        },
+        on_error: if args.lenient {
+            FileErrorPolicy::Skip
+        } else {
+            FileErrorPolicy::Fail
+        },
+        max_concurrent_files: args.jobs.unwrap_or(4).max(1),
+        ..Default::default()
+    })
+}
+
+/// カタログの activity と `--activity` の積を取る。
+fn detect_selection(names: &[String]) -> anyhow::Result<Selection> {
+    let catalog = metric_catalog::activities();
+    if names.is_empty() {
+        return Ok(Selection::Only(catalog));
+    }
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let id = parse_activity_name(name)?;
+        if !catalog.contains(&id) {
+            bail!(
+                "--activity {name}: 異変検出の対象に入っていない activity です \
+                 (対象は `resarch detect --help` が案内する指標カタログの activity)"
+            );
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(Selection::Only(ids))
+}
+
+fn min_priority(arg: PriorityArg) -> Priority {
+    match arg {
+        PriorityArg::Informational => Priority::Informational,
+        PriorityArg::Watch => Priority::Watch,
+        PriorityArg::Investigate => Priority::Investigate,
+    }
+}
+
+// ===========================================================================
+// `resarch summarize`
+// ===========================================================================
+
+/// 集計結果が空で、かつ時刻範囲を指定していたときに理由を `stderr` へ出す。
+///
+/// 「範囲外だったので集計が空」と「そもそも読めるデータが無かった」は別の話だが、
+/// 出力はどちらも `segments: []` になる。**黙って空を返さない**
+/// (`docs/design.md` §11 の「欠落を欠落として出す」と同じ方針)。
+///
+/// `-s` / `--from` に最初に一致したレコードは**前サンプルとして消費され、
+/// 値には数えない** (`sar` と同じ)。したがって範囲内のレコードが 1 本しか
+/// 無い場合も区間が作れず空になる。これが一番踏みやすい。
+fn report_empty_window(analysis: &multi::MultiFileAnalysis, common: &CommonArgs) {
+    if common.from.is_none() && common.to.is_none() {
+        return;
+    }
+    if analysis.hosts.iter().any(|h| !h.segments.is_empty()) {
+        return;
+    }
+    eprintln!(
+        "resarch: 指定した時刻範囲に集計できる区間がありません \
+         (--from に最初に一致したレコードは前サンプルとして消費されるので、\
+         範囲内のレコードが 1 本だけでは区間が作れません)"
+    );
+}
+
+fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
+    let common = &args.common;
+    let mopts = multi_options(common)?;
+    let analysis = multi::analyze_files(&args.files, &mopts)?;
+    report_incomplete_files(&analysis);
+    for s in &analysis.skipped {
+        eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
+    }
+    report_empty_window(&analysis, common);
 
     let mut out = stdout_writer();
     match common.format {
@@ -876,7 +1205,18 @@ fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
         _ => write_summarize_text(&mut out, &analysis)?,
     }
     out.flush()?;
-    Ok(exit_code(!analysis.skipped.is_empty()))
+    Ok(exit_code(
+        !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty(),
+    ))
+}
+
+fn report_incomplete_files(analysis: &multi::MultiFileAnalysis) {
+    for file in &analysis.incomplete_files {
+        eprintln!(
+            "resarch: {}: 不完全な末尾レコード (残余 {} バイト)。完全なレコードまでを解析しました",
+            file.path, file.trailing_bytes
+        );
+    }
 }
 
 fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
@@ -894,18 +1234,12 @@ fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
             FileErrorPolicy::Fail
         },
         max_concurrent_files: common.jobs.unwrap_or(4).max(1),
+        // `--from` / `--to` は集計期間そのものを絞る。
+        // `detect` の報告範囲とは意味が違う (`MultiOptions::time_filter` の doc /
+        // `docs/design.md` §9.0)。
+        time_filter: custom_time_filter(common)?,
         ..Default::default()
     })
-}
-
-/// `--from` / `--to` は集計経路 (`multi`) に受け口が無いので明示的に拒否する。
-fn reject_time_window(common: &CommonArgs, what: &str) -> anyhow::Result<()> {
-    if common.from.is_some() || common.to.is_some() {
-        bail!(
-            "--from / --to は {what} では未対応です (期間を絞るには `resarch show` を使ってください)"
-        );
-    }
-    Ok(())
 }
 
 fn write_summarize_text<W: Write>(
@@ -954,10 +1288,22 @@ fn write_segment_text<W: Write>(out: &mut W, seg: &BootSegment) -> anyhow::Resul
         p.broken_intervals
     )?;
     for b in &seg.boundaries {
+        // 引き継いだかどうかを必ず残す (`multi.rs` の方針)
+        let verdict = if b.decision.continuous {
+            "差分を引き継いだ".to_string()
+        } else {
+            format!(
+                "不連続 ({}、空白 {} 秒)",
+                b.decision
+                    .reason
+                    .map_or("理由不明".to_string(), |r| format!("{r:?}")),
+                b.decision.gap_secs
+            )
+        };
         writeln!(
             out,
-            "  ファイル境界 {} → {}: {:?}",
-            b.prev_file, b.next_file, b.decision
+            "  ファイル境界 {} → {}: {verdict}",
+            b.prev_file, b.next_file
         )?;
     }
 
@@ -1051,7 +1397,6 @@ fn format_epoch(ust: u64) -> String {
 
 fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
-    reject_time_window(common, "compare")?;
     let mopts = multi_options(common)?;
 
     // ホストごとに解析し、代表となる起動区間 (最もサンプル数の多い区間) を採る。
@@ -1066,6 +1411,8 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     for spec in &args.hosts {
         let paths = expand_host_path(&spec.path)?;
         let analysis = multi::analyze_files(&paths, &mopts)?;
+        report_incomplete_files(&analysis);
+        partial |= !analysis.incomplete_files.is_empty();
         for s in &analysis.skipped {
             eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
             partial = true;
@@ -1080,7 +1427,14 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             .into_iter()
             .max_by_key(|s| s.summary.period.samples)
         else {
-            eprintln!("resarch: --host {}: 起動区間が無い", spec.name);
+            // 時刻範囲を指定しているなら、それが原因であることが多い
+            // (`--from` に最初に一致したレコードは前サンプルとして消費される)。
+            let hint = if common.from.is_some() || common.to.is_some() {
+                " (指定した時刻範囲に集計できる区間が無いのかもしれません)"
+            } else {
+                ""
+            };
+            eprintln!("resarch: --host {}: 起動区間が無い{hint}", spec.name);
             partial = true;
             continue;
         };
@@ -1110,16 +1464,24 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     };
 
     let mut comparisons = Vec::new();
+    let mut skipped_metrics = Vec::new();
     for r in rule_inputs() {
         let key = r.key();
         let mut series = Vec::new();
+        let mut missing_on = Vec::new();
         for e in &entries {
             if let Some(t) = multi::timeline_of(&e.segment, &key) {
                 series.push((e.label.clone(), e.identity.clone(), t));
+            } else {
+                missing_on.push(e.label.clone());
             }
         }
         // 全ホストで揃っていない指標は比較しない
         if series.len() != entries.len() {
+            skipped_metrics.push(serde_json::json!({
+                "metric": key,
+                "missing_on": missing_on,
+            }));
             continue;
         }
         comparisons.push(multi::compare_hosts(key, &series, window, GaugeFill::None));
@@ -1128,10 +1490,26 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     let mut out = stdout_writer();
     match common.format {
         OutputFormat::Json | OutputFormat::SadfJson => {
-            serde_json::to_writer_pretty(&mut out, &comparisons)?;
+            serde_json::to_writer_pretty(
+                &mut out,
+                &serde_json::json!({
+                    "schema_version": re_sar_ch::output::json::SCHEMA_VERSION,
+                    "comparisons": comparisons,
+                    "skipped_metrics": skipped_metrics,
+                }),
+            )?;
             writeln!(out)?;
         }
         OutputFormat::Ndjson => {
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({
+                    "schema_version": re_sar_ch::output::json::SCHEMA_VERSION,
+                    "record": "comparison_coverage",
+                    "skipped_metrics": skipped_metrics,
+                }),
+            )?;
+            writeln!(out)?;
             for c in &comparisons {
                 serde_json::to_writer(&mut out, c)?;
                 writeln!(out)?;
@@ -1149,6 +1527,14 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             if comparisons.is_empty() {
                 writeln!(out, "(全ホストで揃っている指標がありません)")?;
             }
+            for skipped in &skipped_metrics {
+                writeln!(
+                    out,
+                    "比較対象外: {} (観測なし: {})",
+                    skipped["metric"], skipped["missing_on"]
+                )?;
+            }
+            writeln!(out, "mean は観測できた区間値の単純平均")?;
             for c in &comparisons {
                 writeln!(out)?;
                 writeln!(
@@ -1292,7 +1678,7 @@ fn write_info_table<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> 
             file.effective_hz()
         )?;
     }
-    if let Some(cpu) = h.cpu_nr {
+    if let Some(cpu) = h.real_cpu_count() {
         writeln!(out, "cpu_nr        {cpu}")?;
     }
     writeln!(out, "activities    {}", h.act_nr)?;
@@ -1353,7 +1739,7 @@ fn write_info_json<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> {
         .collect();
 
     let value = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": re_sar_ch::output::json::SCHEMA_VERSION,
         "file": file.path().display().to_string(),
         "format": {
             "magic": format!("0x{:04x}", m.format_magic),
@@ -1378,7 +1764,8 @@ fn write_info_json<W: Write>(out: &mut W, file: &SaFile) -> anyhow::Result<()> {
             "timezone": h.tzname,
             "hz": h.hz,
             "effective_hz": file.effective_hz(),
-            "cpu_nr": h.cpu_nr,
+            "cpu_nr": h.real_cpu_count(),
+            "sa_cpu_nr": h.cpu_nr,
             "act_nr": h.act_nr,
             "vol_act_nr": h.vol_act_nr,
         },

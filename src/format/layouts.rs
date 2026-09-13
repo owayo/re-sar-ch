@@ -21,7 +21,7 @@ use super::wire::{AlignSpec, FieldTy, LayoutExpectation, WireField, WireLayout};
 
 /// `UTSNAME_LEN`: uname 由来文字列の配列長。全世代で 65。
 pub const UTSNAME_LEN: u16 = 65;
-/// `TZNAME_LEN`: タイムゾーン名の配列長 (v12.5 以降)。
+/// `TZNAME_LEN`: タイムゾーン名の配列長 (v12.2.0 以降)。
 pub const TZNAME_LEN: u16 = 8;
 
 // ===========================================================================
@@ -203,7 +203,7 @@ pub const FILE_HEADER_G3_V120_EXPECT_LP64: LayoutExpectation = LayoutExpectation
     ],
 };
 
-/// `0x2175` の現行レイアウト (v12.5 以降)。`extra_next` と `sa_tzname` が加わる。
+/// `0x2175` の現行レイアウト (v12.2.0 以降)。`extra_next` と `sa_tzname` が加わる。
 ///
 /// `int` グループが 12 個になり、その分だけ後続の固定部分がずれる。
 /// この差を吸収するのが自己記述の読み替え。
@@ -353,7 +353,7 @@ pub const RECORD_HEADER_G3_CURRENT: WireLayout = WireLayout::new(
     ],
 );
 
-/// `extra_desc` (v12.5 以降、`extra_next` が非 0 のときに続く)。
+/// `extra_desc` (v12.1.7 以降、`extra_next` が非 0 のときに続く)。
 pub const EXTRA_DESC: WireLayout = WireLayout::new(
     "extra_desc",
     &[

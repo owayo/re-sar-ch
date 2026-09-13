@@ -34,6 +34,23 @@
 //! [`wrapping_delta`] / [`s_value_bits`] に幅を渡す
 //! (詳しい理由と本家との関係は [`super::delta`] のモジュールドキュメント)。
 //!
+//! ## 出力経路ごとに計算を持たせない
+//!
+//! 「表示値を出す計算」は 1 区間ぶんだけではない。次の 4 種類があり、
+//! **どれもこの層に置く**。sar 互換出力にしか無い計算があると、
+//! 同じファイルから出した sadf / 独自出力 / 期間集計の値がずれる。
+//!
+//! | 何を出すか | 入口 |
+//! |---|---|
+//! | 1 区間の表示値 | [`column_value`] / [`column_value_strict`] |
+//! | 期間集計の素材と表示単位 | [`rate_sample`] → [`rate_from_totals`] |
+//! | `sadf` だけにある別単位の列 | [`SadfUnitColumn`] / [`sadf_unit_value`] |
+//! | 行列型の 1 行分 (`wghMHz` / `A_IRQ`) | [`matrix_row_values`] |
+//!
+//! `A_CPU` は分母が特殊なので、どの経路も値を出す前に
+//! [`cpu_interval`] (個別 CPU) / [`aggregate_cpu`] (CPU "all") を通す。
+//! ここに「補正済みの前値・分母・オフライン / tickless 判定」がまとまっている。
+//!
 //! ## 欠落の扱いは方針で分ける
 //!
 //! 「その世代のファイルに無いフィールド」を 0 とみなすと、
@@ -43,9 +60,15 @@
 //! そこで [`MissingPolicy`] で 2 つの方針を分ける。
 //!
 //! - [`MissingPolicy::Compat`] — [`column_value`]。本家の挙動 (0 埋め /
-//!   世代別の代替フィールド) を再現する。`sar` / `sadf` 互換出力用。
+//!   世代別の代替フィールド / 符号なし整数の折り返し) を再現する。
+//!   `sar` / `sadf` 互換出力用。
 //! - [`MissingPolicy::Strict`] — [`column_value_strict`]。欠落は
 //!   [`ComputeIssue::UnsupportedBySource`] として返す。独自出力・集計用。
+//!
+//! 方針は「欠落の埋め方」だけでなく「互換のための整数演算をどこまで真似るか」も
+//! 決める。`await` の分子は本家が `unsigned int` で足すので 2³² で折り返すが、
+//! 折り返した値は待ち時間として意味を持たないため、独自出力では折り返さない
+//! (`disk_sum_delta` の `SumWidth`)。
 //!
 //! 典拠: `docs/format/03-output-format.md` 第 I 部 §1.2〜§1.5、第 III 部 §7。
 
@@ -63,6 +86,13 @@ use crate::model::{ActivityId, Availability, CounterBits, ValueKind};
 // 派生列の計算は「同じ activity の別の列」を参照する。列メタデータの宣言順は
 // `layout::activities` で固定されているため、名前で引かずに添字で引く
 // (ホットパスに文字列比較を置かない)。
+//
+// **表は必ず全列を並べる。参照されていない定数も消さない。**
+// 後ろの定数の値は前の定数が存在することを前提にしているので、
+// 「誰も使っていないから」で 1 行消すと残りの添字の意味が変わる。
+// 識別子列 (`NAME` / `IFACE` / `MOUNTPOINT` / `MANUFACTURER` / `PRODUCT` など) は
+// 数値として読まないため参照が付かないが、列番号としては存在している。
+// dead-code 検査はこれらを未参照として挙げるが、対応は不要である。
 // ============================================================================
 
 /// `A_CPU` の列添字。
@@ -449,16 +479,108 @@ pub enum MissingKind {
 /// 足りない分を 0 埋めした構造体で計算するため、
 /// discard 統計を持たない旧 `A_IO` の `dtps` / `bdscd` は `0.00` と表示される。
 /// 一方 `MissingInSample` や不連続は本家でも値が出ない (行そのものが無い)。
+///
+/// 「値の欠落」ではない理由 (識別子列 / 行列型 / 未実装) は `None` を返す。
+/// これらは 0 でも欠測でもなく、**呼び出し方の問題**なので
+/// 欠落として集計に数えてはいけない。
 #[inline]
-pub fn missing_kind(issue: ComputeIssue) -> MissingKind {
+pub fn missing_kind(issue: ComputeIssue) -> Option<MissingKind> {
     match issue {
         // その世代のファイルにフィールドが無いだけ = 本家は 0 埋めして計算する
-        ComputeIssue::UnsupportedBySource => MissingKind::ZeroFilled,
-        ComputeIssue::MissingInSample
-        | ComputeIssue::Discontinuous(_)
-        | ComputeIssue::NotNumeric
-        | ComputeIssue::NeedsItemGroup
-        | ComputeIssue::NotImplemented => MissingKind::Absent,
+        ComputeIssue::UnsupportedBySource => Some(MissingKind::ZeroFilled),
+        // このサンプルでは値が読めなかった / 差分が取れない = 本家なら行が無い
+        ComputeIssue::MissingInSample | ComputeIssue::Discontinuous(_) => Some(MissingKind::Absent),
+        // 値の欠落ではない (数値でない列 / item 群が必要 / 未実装)
+        ComputeIssue::NotNumeric | ComputeIssue::NeedsItemGroup | ComputeIssue::NotImplemented => {
+            None
+        }
+    }
+}
+
+/// この列がこのファイルに存在するか (指摘 5)。
+///
+/// [`MissingPolicy::Compat`] は本家に合わせて欠落を 0 に埋めるので、
+/// 返ってきた `0.0` が「観測した 0」なのか「ゼロ補完」なのかは値から判らない。
+/// 由来が必要な呼び出し側 (欠落を注記したい独自出力など) はこれで確かめる。
+///
+/// 偽になるのは「その世代のファイルにフィールドが無い」場合だけで、
+/// サンプル単位の欠測 ([`ComputeIssue::MissingInSample`]) は判定できない。
+pub fn column_is_present(plan: &DecodePlan, column: usize) -> bool {
+    matches!(plan.column_fields.get(column), Some(Some(_)))
+}
+
+// ============================================================================
+// 未使用スロットの判定
+// ============================================================================
+
+/// この item スロットは**未使用**か。
+///
+/// `file_activity.nr` は「採取時に確保した枠数」であって、常に全部が
+/// 埋まっているわけではない。レコードごとの item 数 (`has_nr`) を持たない
+/// 世代では枠数しか手掛かりが無いため、素直に回すと空き枠まで行になる
+/// (`expected.data-10.3.1` は 12 デバイスだが枠は 20 あり、
+/// reSARch は差分の 8 行を `dev0-0` として出していた = golden 比較 ⑤)。
+///
+/// 本家は数を数えるのではなく、各 `print_*_stats()` の先頭で
+/// **その activity 固有の番兵**を見て `continue` する。ここはその表である。
+///
+/// | activity | 未使用の条件 | 由来 |
+/// |---|---|---|
+/// | `A_DISK` | `major + minor == 0` | `print_disk_stats()` |
+/// | `A_FS` | `f_blocks == 0` | `print_filesystem_stats()` |
+/// | `A_NET_DEV` / `A_NET_EDEV` | インターフェース名が空 | `print_net_dev_stats()` |
+/// | `A_NET_FC` | `fchost_name` が空 | `count_stats_fchost()` |
+/// | `A_SERIAL` | 旧 magic 0x8a の `line == 0` | `print_tty_stats()` |
+/// | `A_PWR_USB` | `bus_nr == 0` | `print_pwr_usb_stats()` |
+/// | `A_PWR_CPU` | `cpufreq == 0` (オフライン) | `print_pwr_cpufreq_stats()` |
+/// | `A_NET_SOFT` | CPU ごとの 5 カウンタと backlog_len が全 0 (オフライン) | `print_softnet_stats()` |
+///
+/// `A_NET_SOFT` の `index == 0` は CPU "all" なので常に使用中とする。
+/// `blg_len` も本家のオンライン判定に含める。
+///
+/// フィールドがその世代に無い場合は 0 とみなす。**無いフィールドが
+/// スロットを「使用中」にすることはない**ため、判定は保守的に働く。
+///
+/// 独自出力はこれを使わない。空き枠も観測結果として出す方が、
+/// 「本家が表示を省く規則」を独自形式に持ち込むより説明しやすい。
+pub fn is_unused_item(
+    id: ActivityId,
+    index: usize,
+    plan: &DecodePlan,
+    item: &ItemSnapshot,
+) -> bool {
+    /// 欠落・欠測を 0 とみなして生値を取る。
+    #[inline]
+    fn v(plan: &DecodePlan, item: &ItemSnapshot, column: usize) -> u64 {
+        raw_column(plan, item, column).unwrap_or(0)
+    }
+    /// 文字列列が空 (または取得できない) か。
+    #[inline]
+    fn text_empty(item: &ItemSnapshot, index: usize) -> bool {
+        item.texts
+            .get(index)
+            .map(|t| t.as_deref().unwrap_or("").is_empty())
+            .unwrap_or(true)
+    }
+
+    match id {
+        ActivityId::DISK => v(plan, item, disk_col::MAJOR) + v(plan, item, disk_col::MINOR) == 0,
+        ActivityId::FS => v(plan, item, fs_col::TOTAL) == 0,
+        // インターフェース名 / FC ホスト名は 1 本目の文字列フィールド
+        ActivityId::NET_DEV | ActivityId::NET_EDEV | ActivityId::NET_FC => text_empty(item, 0),
+        ActivityId::SERIAL => plan.serial_line_offset && v(plan, item, 0) == 0,
+        ActivityId::PWR_USB => v(plan, item, usb_col::BUS) == 0,
+        ActivityId::PWR_CPU => v(plan, item, pwr_cpu_col::MHZ) == 0,
+        ActivityId::NET_SOFT => {
+            index != 0
+                && v(plan, item, soft_col::TOTAL) == 0
+                && v(plan, item, soft_col::DROPD) == 0
+                && v(plan, item, soft_col::SQUEEZD) == 0
+                && v(plan, item, soft_col::RX_RPS) == 0
+                && v(plan, item, soft_col::FLW_LIM) == 0
+                && v(plan, item, soft_col::BLG_LEN) == 0
+        }
+        _ => false,
     }
 }
 
@@ -704,7 +826,8 @@ fn column_value_with(
 
             // 差分は列の元の幅で取る。32bit カウンタ (`unsigned int` のフィールドや
             // 32bit ライタの `unsigned long`) を 64bit のまま引くと、一周した入力で
-            // 差分が 1.84e19 になる。本家も `unsigned int` は 32bit で引いている。
+            // 差分が 1.84e19 になる。`unsigned int` は本家と一致するが、
+            // 32bit ライタの `unsigned long` の幅復元は 64bit 読み手の本家と意図的に異なる。
             let bits = counter_bits(plan, column);
 
             let delta = match policy {
@@ -793,7 +916,8 @@ pub fn rate_scale(id: ActivityId, column: usize) -> f64 {
             _ => 1.0,
         },
         // PSI の累積 µs 列は本家が `Δµs / (100 × itv)` を出す (03 §1.5.3)。
-        // 生のレート `Δ/itv×100` からは 1/10000 で一致する。
+        // 生のレート `Δ/itv×100` からは 1/10000 で一致する
+        // (区間値は [`psi_pressure`] が直接その式で計算する)。
         // この係数があるので、集計は PSI も他のカウンタと同じ経路で扱える。
         ActivityId::PSI_CPU | ActivityId::PSI_IO | ActivityId::PSI_MEM if is_psi_total(column) => {
             1.0e-4
@@ -892,6 +1016,19 @@ fn special_direct(
         ActivityId::PWR_BAT if column == bat_col::CAP_PCT => {
             Some(primary_input(plan, curr, column, policy).map(|v| f64::from(signed_byte(v))))
         }
+        // --- kbavail は列そのものにも代替規則が要る ---
+        //
+        // `availablekb` が無い世代 (`0x2170` / `0x2171` / 一部の `0x2173`) では、
+        // 派生列 (`kbmemused` / `%memused`) だけでなく **`kbavail` 列自身**も
+        // `frmkb` で代用する。本家の構造体は `availablekb` が存在しないため
+        // `print_memory_stats()` が `frmkb` を読み、`kbmemfree` と同じ値が出る
+        // (`expected.data-10.3.1` の `5646540   5646540`)。
+        //
+        // 汎用経路に落とすと欠落が `Compat` で `0` に埋まり、
+        // 本家が出す値と食い違う (golden 比較 ④)。
+        ActivityId::MEMORY if column == mem_col::KBAVAIL => {
+            Some(memory_available(plan, curr, policy).map(|v| v as f64))
+        }
         _ => None,
     }
 }
@@ -903,6 +1040,11 @@ fn special_direct(
 ///
 /// 本家は `((double) curr - prev) / (100 * itv)` と **f64 で減算**している
 /// (`S_VALUE` の符号なし減算ではない)。計算順序もそのまま合わせる。
+///
+/// **同じ係数が [`rate_scale`] にもある。** 区間値はここで直接 `100 × itv` で
+/// 割るが、期間集計は生のレート `Δ/itv×100` に `1e-4` を掛けて同じ値に到達する。
+/// 2 箇所に分かれているのは本家の式の形をそのまま残すためで、
+/// 両者が一致することは `single_interval_aggregate_matches_instant_value` が固定する。
 fn psi_pressure(
     plan: &DecodePlan,
     prev: &ItemSnapshot,
@@ -1142,6 +1284,9 @@ fn memory_derived(
         }
         mem_col::SWPUSED_PCT => {
             let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            if total == 0 && policy == MissingPolicy::Strict {
+                return Err(ComputeIssue::MissingInSample);
+            }
             let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             Ok(if total != 0 {
                 sp_value(free, total, total)
@@ -1151,6 +1296,9 @@ fn memory_derived(
         }
         mem_col::SWPCAD_PCT => {
             let total = primary_input(plan, curr, mem_col::KBSWPTOTAL, policy)?;
+            if total == 0 && policy == MissingPolicy::Strict {
+                return Err(ComputeIssue::MissingInSample);
+            }
             let free = primary_input(plan, curr, mem_col::KBSWPFREE, policy)?;
             // caskb は分子そのもの。欠落を 0 にすると %swpcad が常に 0% になる
             let cad = primary_input(plan, curr, mem_col::KBSWPCAD, policy)?;
@@ -1383,10 +1531,25 @@ fn net_dev_derived(
         ctx.itv_cs,
         counter_bits(plan, net_dev_col::TXKB),
     );
-    // speed は分母。この世代に `speed` が無いと 0 になり、
-    // 本家は `speed == 0` を「不明」として 0.0 を返す (03 §5.2)。
-    // 互換出力ではそれに従うが、独自出力では「不明」を 0% と見せない。
+    // speed は分母 (Mbit/s)。この世代に `speed` が無ければ上の
+    // [`primary_input`] が方針に従って処理するが、**フィールドがあって値が 0**
+    // という場合が別にある。0 は「速度を取得できなかった」の意味で
+    // (仮想デバイス、`ethtool` が速度を返さない NIC)、本家は
+    // `speed == 0` のとき `%ifutil` に `0.00` を出す (03 §5.2)。
     let speed = primary_input(plan, curr, net_dev_col::SPEED, policy)?;
+    // **分母が無いので率は作れない。**
+    //
+    // ここで 0.0 を返すと「利用率 0%」という別の意味の値になり、
+    // 集計・検出では**有効な観測として数えられてしまう**
+    // (固定条件の経路が「評価済み・検出なし」になる)。
+    // 欠落と 0 を混同しない (`docs/design.md` §4)、
+    // 評価できなかったものを「検出なし」にしない (同 §11.2 の規律 7)。
+    //
+    // 互換出力は本家が出す `0.00` を再現しなければならないので、
+    // [`MissingPolicy::Compat`] ではこの分岐に入らず下の式へ進む。
+    if speed == 0 && matches!(policy, MissingPolicy::Strict) {
+        return Err(ComputeIssue::MissingInSample);
+    }
     // duplex は式の選択にしか使わない。本家も未提供時は
     // 0 = C_DUPLEX_UNKNOWN として半二重側の式を使う。
     let duplex_v = raw_or_zero(plan, curr, net_dev_col::DUPLEX)?;
@@ -1711,6 +1874,14 @@ pub struct CpuInterval {
     /// 割合の分母 (`deltot_jiffies`)。[`CpuRole::Aggregate`] では 1 以上。
     pub tick_total: u64,
     pub state: CpuState,
+    /// 前サンプルの時点で稼働していたか (`tot_jiffies_p != 0`)。
+    ///
+    /// 偽なら「復帰直後で基準値が無い」。本家は
+    /// `!WANT_SINCE_BOOT` のときこの CPU をオフライン扱いにして
+    /// CPU "all" にも加算しない (03 §1.4.3)。
+    /// 「起動時からの統計」モードでは前値が全ゼロなのが正常なので、
+    /// 呼び出し側がそのモードと組み合わせて判断する。
+    pub prev_online: bool,
     role: CpuRole,
 }
 
@@ -1734,15 +1905,17 @@ impl CpuInterval {
 
     /// この CPU の計算文脈。
     ///
-    /// 分母 (`tick_total`) と集約フラグを設定済みの [`ComputeContext`] を返す。
-    /// 呼び出し側が `tick_total` を自分で詰める必要はない。
-    pub fn context(&self, itv_cs: u64) -> ComputeContext {
+    /// `base` の `itv_cs` / `continuous` / `has_prev` はそのまま引き継ぎ、
+    /// 分母 (`tick_total`) と集約フラグだけを上書きする。
+    ///
+    /// **連続性を勝手に真にしない。** RESTART 直後や item が入れ替わった区間で
+    /// `continuous` を偽装すると、全ゼロの前値から 100% が出る。
+    /// 呼び出し側はその区間の連続性を持っているので、それを渡してもらう。
+    pub fn context(&self, base: ComputeContext) -> ComputeContext {
         ComputeContext {
-            itv_cs,
             tick_total: Some(self.tick_total),
-            continuous: true,
-            has_prev: true,
             aggregate_item: self.role == CpuRole::Aggregate,
+            ..base
         }
     }
 
@@ -1796,6 +1969,7 @@ pub fn cpu_interval(
         prev: apply_cpu_fix(plan, prev, &fix),
         tick_total,
         state,
+        prev_online: fix.prev_sum != 0,
         role,
     }
 }
@@ -1835,13 +2009,11 @@ impl CpuAggregate {
     /// 分母は「オンラインだった CPU の tick 合計」なので、
     /// `%user + … + %idle` は常に 100% になる (オフライン時間は分母に入らない)。
     /// `CPU all が tickless になることはない`前提で 1 以上に補正する (03 §1.4.5)。
-    pub fn context(&self, itv_cs: u64) -> ComputeContext {
+    pub fn context(&self, base: ComputeContext) -> ComputeContext {
         ComputeContext {
-            itv_cs,
             tick_total: Some(self.tick_total.max(1)),
-            continuous: true,
-            has_prev: true,
             aggregate_item: true,
+            ..base
         }
     }
 
@@ -1873,21 +2045,17 @@ pub fn aggregate_cpu(
     curr_items: &[ItemSnapshot],
     since_boot: bool,
 ) -> Option<CpuAggregate> {
-    if curr_items.len() <= 1 || prev_items.len() <= 1 {
+    if curr_items.len() <= 1 {
         return None;
     }
-    let width = curr_items[0].values.len();
-    let zero = || ItemSnapshot {
-        key: None,
-        texts: Vec::new(),
-        values: vec![Availability::Present(0); width],
-    };
+    let zero = || aggregate_zero(plan);
     let mut agg_prev = zero();
     let mut agg_curr = zero();
     let mut total: u64 = 0;
     let mut offline = Vec::new();
 
     let n = prev_items.len().min(curr_items.len());
+    offline.extend(n.max(1)..curr_items.len());
     for i in 1..n {
         let scc = &curr_items[i];
         let scp = &prev_items[i];
@@ -1926,11 +2094,230 @@ pub fn aggregate_cpu(
     })
 }
 
+/// 同一名のデバイスが再登録されたか。本家 check_*_reg() の -2 判定。
+pub fn item_reregistered(
+    id: ActivityId,
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+) -> bool {
+    let p = |c| raw_column(plan, prev, c).unwrap_or(0);
+    let c = |n| raw_column(plan, curr, n).unwrap_or(0);
+    match id {
+        ActivityId::NET_DEV => {
+            let decreased = (net_dev_col::RXPCK..=net_dev_col::RXMCST).any(|n| c(n) < p(n));
+            let overflow = [
+                (net_dev_col::RXKB, net_dev_col::RXPCK),
+                (net_dev_col::TXKB, net_dev_col::TXPCK),
+                (net_dev_col::RXPCK, net_dev_col::RXKB),
+                (net_dev_col::TXPCK, net_dev_col::TXKB),
+            ]
+            .iter()
+            .any(|&(n, other)| c(n) < p(n) && c(other) > p(other) && p(n) > u64::MAX / 2);
+            decreased && !overflow
+        }
+        ActivityId::NET_EDEV => (2..=9).any(|n| c(n) < p(n)),
+        ActivityId::DISK => {
+            c(disk_col::TPS) < p(disk_col::TPS)
+                && [disk_col::RKB, disk_col::WKB, disk_col::DKB]
+                    .iter()
+                    .all(|&n| p(n) == 0 || c(n) < p(n))
+        }
+        _ => false,
+    }
+}
+
+/// 本家互換の新規 item の差分基準。
+pub fn zero_item(plan: &DecodePlan) -> ItemSnapshot {
+    ItemSnapshot {
+        key: None,
+        texts: Vec::new(),
+        values: vec![Availability::Present(0); plan.fields.len()],
+    }
+}
+
+fn aggregate_zero(plan: &DecodePlan) -> ItemSnapshot {
+    ItemSnapshot {
+        values: plan
+            .fields
+            .iter()
+            .map(|field| {
+                if field.read.is_some() {
+                    Availability::Present(0)
+                } else {
+                    Availability::UnsupportedBySource
+                }
+            })
+            .collect(),
+        ..ItemSnapshot::default()
+    }
+}
+
+/// softnet の CPU hotplug 補正付き合算。
+pub fn aggregate_soft(
+    plan: &DecodePlan,
+    prev: &[ItemSnapshot],
+    curr: &[ItemSnapshot],
+) -> Option<CpuAggregate> {
+    if curr.len() <= 1 {
+        return None;
+    }
+    let mut out = CpuAggregate {
+        prev: aggregate_zero(plan),
+        curr: aggregate_zero(plan),
+        tick_total: 0,
+        offline: Vec::new(),
+    };
+    for (i, c) in curr.iter().enumerate().skip(1) {
+        let Some(p) = prev.get(i).filter(|p| !soft_offline(plan, p)) else {
+            out.offline.push(i);
+            continue;
+        };
+        let c = if soft_offline(plan, c) {
+            out.offline.push(i);
+            p
+        } else {
+            c
+        };
+        add_into(&mut out.prev, p);
+        add_into(&mut out.curr, c);
+    }
+    Some(out)
+}
+
+fn soft_offline(plan: &DecodePlan, item: &ItemSnapshot) -> bool {
+    (soft_col::TOTAL..=soft_col::BLG_LEN).all(|c| raw_column(plan, item, c).unwrap_or(0) == 0)
+}
+
+/// 全出力・集計で共有する、1 item の補正済み端点と状態。
+#[derive(Debug, Clone)]
+pub struct PreparedItem {
+    pub prev: ItemSnapshot,
+    pub curr: ItemSnapshot,
+    pub ctx: ComputeContext,
+    pub offline: bool,
+    pub tickless: bool,
+    pub replaced: bool,
+}
+
+impl PreparedItem {
+    /// 補正済み端点から値を求める。厳密モードでは再登録・欠測を値にしない。
+    pub fn computed(
+        &self,
+        id: ActivityId,
+        column: usize,
+        meta: &ColumnMeta,
+        plan: &DecodePlan,
+        policy: MissingPolicy,
+    ) -> Computed {
+        if policy == MissingPolicy::Strict {
+            if self.replaced {
+                return Err(ComputeIssue::Discontinuous(Discontinuity::ItemReplaced));
+            }
+            if self.offline {
+                return Err(ComputeIssue::MissingInSample);
+            }
+        }
+        if self.ctx.has_prev && self.ctx.continuous && self.tickless {
+            // まず入力の可用性を調べ、未提供の列を tickless の 0 に偽装しない。
+            let ctx = self.ctx.with_tick_total(1);
+            column_value_with(id, column, meta, plan, &self.prev, &self.curr, &ctx, policy)?;
+            return Ok(if column == cpu_col::IDLE { 100.0 } else { 0.0 });
+        }
+        column_value_with(
+            id, column, meta, plan, &self.prev, &self.curr, &self.ctx, policy,
+        )
+    }
+}
+
+/// CPU の分母・端点、softnet hotplug、デバイス再登録を共通処理する。
+pub fn prepare_item(
+    id: ActivityId,
+    plan: &DecodePlan,
+    index: usize,
+    prev_items: &[ItemSnapshot],
+    curr_items: &[ItemSnapshot],
+    mut ctx: ComputeContext,
+) -> Option<PreparedItem> {
+    let curr = curr_items.get(index)?;
+    let prev = match curr.key.as_deref() {
+        Some(key) if id != ActivityId::IRQ => {
+            prev_items.iter().find(|p| p.key.as_deref() == Some(key))
+        }
+        _ => prev_items.get(index),
+    };
+    let replaced = ctx.has_prev
+        && (prev.is_none() || prev.is_some_and(|p| item_reregistered(id, plan, p, curr)));
+    let mut out = PreparedItem {
+        prev: prev.cloned().unwrap_or_else(|| zero_item(plan)),
+        curr: curr.clone(),
+        ctx,
+        offline: false,
+        tickless: false,
+        replaced,
+    };
+    if replaced {
+        out.prev = zero_item(plan);
+    }
+    match id {
+        ActivityId::CPU => {
+            if index == 0
+                && let Some(agg) = aggregate_cpu(plan, prev_items, curr_items, false)
+            {
+                out.ctx = agg.context(ctx);
+                out.prev = agg.prev;
+                out.curr = agg.curr;
+            } else {
+                let interval = cpu_interval(
+                    plan,
+                    &out.prev,
+                    curr,
+                    if index == 0 {
+                        CpuRole::Aggregate
+                    } else {
+                        CpuRole::Single
+                    },
+                );
+                out.ctx = interval.context(ctx);
+                out.offline = interval.is_offline() || (index > 0 && !interval.prev_online);
+                out.tickless = interval.is_tickless();
+                out.prev = interval.prev;
+            }
+        }
+        ActivityId::NET_SOFT => {
+            if index == 0
+                && let Some(agg) = aggregate_soft(plan, prev_items, curr_items)
+            {
+                out.prev = agg.prev;
+                out.curr = agg.curr;
+            } else if index > 0 {
+                out.offline = soft_offline(plan, &out.prev) || soft_offline(plan, curr);
+                if soft_offline(plan, curr) {
+                    out.curr = out.prev.clone();
+                }
+            }
+        }
+        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
+            let start = index / plan.nr2.max(1) as usize * plan.nr2.max(1) as usize;
+            let p = prev_items.get(start);
+            let c = curr_items.get(start);
+            out.offline = p.is_none_or(|p| raw_column(plan, p, irq_col::COUNT).unwrap_or(0) == 0)
+                || c.is_none_or(|c| raw_column(plan, c, irq_col::COUNT).unwrap_or(0) == 0);
+            if c.is_some_and(|c| raw_column(plan, c, irq_col::COUNT).unwrap_or(0) == 0) {
+                out.curr = out.prev.clone();
+            }
+            ctx.aggregate_item = start == 0;
+            out.ctx = ctx;
+        }
+        _ => {}
+    }
+    Some(out)
+}
+
 /// item 群をフィールド単位で合算する。
 ///
-/// `A_NET_SOFT` の CPU "all" 行 (`get_global_soft_statistics()`) や
-/// `A_IRQ` の合計列 (`get_global_int_statistics()`) のように、
-/// 「集約行は個別行の単純和」で作る activity のために使う。
+/// 差分の相手を必要としない初期集約に用いる。
+/// CPU / softnet の区間値では hotplug 補正付きの専用入口を使う。
 pub fn sum_items<'a, I>(width: usize, items: I) -> ItemSnapshot
 where
     I: IntoIterator<Item = &'a ItemSnapshot>,
@@ -1949,9 +2336,15 @@ where
 /// フィールド単位の加算 (CPU "all" の合算用)。
 fn add_into(acc: &mut ItemSnapshot, src: &ItemSnapshot) {
     for (slot, v) in acc.values.iter_mut().zip(src.values.iter()) {
-        if let (Availability::Present(a), Availability::Present(b)) = (&slot, v) {
-            *slot = Availability::Present(a.wrapping_add(*b));
-        }
+        *slot = match (*slot, *v) {
+            (Availability::Present(a), Availability::Present(b)) => {
+                Availability::Present(a.wrapping_add(b))
+            }
+            (Availability::MissingInSample, _) | (_, Availability::MissingInSample) => {
+                Availability::MissingInSample
+            }
+            _ => Availability::UnsupportedBySource,
+        };
     }
 }
 // ============================================================================
@@ -1969,17 +2362,41 @@ pub fn weighted_mhz(
     prev_slots: &[ItemSnapshot],
     curr_slots: &[ItemSnapshot],
 ) -> Computed {
+    let n = prev_slots.len().min(curr_slots.len());
+    weighted_mhz_core(plan, n, |k| &prev_slots[k], |k| &curr_slots[k])
+}
+
+/// [`weighted_mhz`] の**参照スライス**版。
+///
+/// 行が連続していない行列 (`A_IRQ` のように stride で走査するもの) でも
+/// clone を作らずに渡せる。
+fn weighted_mhz_refs(
+    plan: &DecodePlan,
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
+) -> Computed {
+    let n = prev_slots.len().min(curr_slots.len());
+    weighted_mhz_core(plan, n, |k| prev_slots[k], |k| curr_slots[k])
+}
+
+/// `wghMHz` の本体。スロットの取り出し方だけを呼び出し側から受け取る。
+fn weighted_mhz_core<'a>(
+    plan: &DecodePlan,
+    slots: usize,
+    prev_at: impl Fn(usize) -> &'a ItemSnapshot,
+    curr_at: impl Fn(usize) -> &'a ItemSnapshot,
+) -> Computed {
     let mut tisfreq: u64 = 0;
     let mut tis: u64 = 0;
-    let n = prev_slots.len().min(curr_slots.len());
-    for k in 0..n {
-        let freq = raw_column(plan, &curr_slots[k], freq_col::FREQ_KHZ)?;
+    for k in 0..slots {
+        let curr = curr_at(k);
+        let freq = raw_column(plan, curr, freq_col::FREQ_KHZ)?;
         // 未使用スロットで打ち切り
         if freq == 0 {
             break;
         }
-        let c = raw_column(plan, &curr_slots[k], freq_col::TIME_IN_STATE)?;
-        let p = raw_column(plan, &prev_slots[k], freq_col::TIME_IN_STATE)?;
+        let c = raw_column(plan, curr, freq_col::TIME_IN_STATE)?;
+        let p = raw_column(plan, prev_at(k), freq_col::TIME_IN_STATE)?;
         let d = c.wrapping_sub(p);
         tisfreq = tisfreq.wrapping_add((freq / 1000).wrapping_mul(d));
         tis = tis.wrapping_add(d);
@@ -1989,6 +2406,390 @@ pub fn weighted_mhz(
     } else {
         0.0
     })
+}
+
+// ============================================================================
+// 行列型 activity の 1 行分の計算 (指摘 3)
+//
+// `A_PWR_FREQ` (id=35) と `A_IRQ` (id=3) は「行 × 列」の行列で、
+// 1 item だけでは値を出せない列を持つ。以前は sar 互換出力だけが
+// [`weighted_mhz`] を呼び、sadf・独自出力は単一 item 計算に落ちて
+// [`ComputeIssue::NeedsItemGroup`] になり `wghMHz` が常に欠損していた。
+//
+// [`matrix_row_values`] が「1 行分のスロット群」を受け取る共通入口になる。
+// ============================================================================
+
+/// 行列型 activity の 1 行分の値 (指摘 3)。
+///
+/// `prev_slots` / `curr_slots` はその論理行に属する item の**参照**を
+/// 出力に現れる順に並べたもの。参照で受けるのは、行の並びが activity で違うため。
+///
+/// - `A_PWR_FREQ`: 保存形も論理行も「CPU ごとに連続する `nr2` スロット」
+///   (`行 * nr2 + 列` の連続スライス)
+/// - `A_IRQ`: 保存形は 行 = CPU / 列 = 割り込みだが、出力の 1 行は
+///   「1 割り込み × 全 CPU」なので **stride 走査**した非連続の並びになる
+///
+/// どちらも参照を並べるだけで渡せるので、clone は要らない。
+///
+/// 戻り値の長さは activity によって変わる。
+///
+/// | activity | 列 | 戻り値 |
+/// |---|---|---|
+/// | `A_PWR_FREQ` | `wghMHz` | 全スロットの重み付き平均 = **1 要素** (03 §id=35) |
+/// | `A_IRQ` | `intr` | CPU スロットごとのレート = **スロット数ぶん** (03 §id=3) |
+/// | その他 | — | スロットごとに [`column_value`] を評価 |
+///
+/// `A_IRQ` の先頭スロットは「全 CPU 合計」列で、
+/// 「割り込み総数が減ったら 0」というクランプが効く。
+/// そのため `ctx.aggregate_item` はスロットごとにこの関数が設定し直す
+/// (呼び出し側で詰める必要はない)。
+///
+/// `ctx` の `itv_cs` / `continuous` / `has_prev` はそのまま使う。
+pub fn matrix_row_values(
+    id: ActivityId,
+    column: usize,
+    plan: &DecodePlan,
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
+    ctx: &ComputeContext,
+) -> Vec<Computed> {
+    matrix_row_values_with(
+        id,
+        column,
+        plan,
+        prev_slots,
+        curr_slots,
+        ctx,
+        MissingPolicy::Compat,
+    )
+}
+
+/// [`matrix_row_values`] の欠落を埋めない版 (独自出力・集計用)。
+pub fn matrix_row_values_strict(
+    id: ActivityId,
+    column: usize,
+    plan: &DecodePlan,
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
+    ctx: &ComputeContext,
+) -> Vec<Computed> {
+    matrix_row_values_with(
+        id,
+        column,
+        plan,
+        prev_slots,
+        curr_slots,
+        ctx,
+        MissingPolicy::Strict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matrix_row_values_with(
+    id: ActivityId,
+    column: usize,
+    plan: &DecodePlan,
+    prev_slots: &[&ItemSnapshot],
+    curr_slots: &[&ItemSnapshot],
+    ctx: &ComputeContext,
+    policy: MissingPolicy,
+) -> Vec<Computed> {
+    // `wghMHz` は行全体で 1 値。スロットごとには意味を持たない
+    if id == ActivityId::PWR_FREQ && column == freq_col::WGH_MHZ {
+        return vec![weighted_mhz_refs(plan, prev_slots, curr_slots)];
+    }
+
+    let Some(def) = crate::layout::registry::lookup(id) else {
+        return vec![Err(ComputeIssue::NotImplemented)];
+    };
+    let Some(meta) = def.columns.get(column) else {
+        return vec![Err(ComputeIssue::UnsupportedBySource)];
+    };
+
+    let empty = ItemSnapshot::default();
+    curr_slots
+        .iter()
+        .enumerate()
+        .map(|(n, curr)| {
+            let matched = prev_slots.get(n).copied();
+            let mut slot_ctx = *ctx;
+            // 前サンプルに対応スロットが無い = 差分が取れない
+            if matched.is_none() {
+                slot_ctx.has_prev = false;
+            }
+            // `A_IRQ` の先頭スロットは「全 CPU 合計」列で逆行クランプが効く
+            slot_ctx.aggregate_item = n == 0;
+            let prev = matched.unwrap_or(&empty);
+            column_value_with(id, column, meta, plan, prev, curr, &slot_ctx, policy)
+        })
+        .collect()
+}
+
+// ============================================================================
+// 期間集計の入口 (指摘 2)
+//
+// 期間集計は「区間ごとの表示値の平均」ではなく
+// 「差分の総和 ÷ 分母の総和」でレートを出す (03 §1.10-8)。
+// その素材 (生の差分と分母) をここで作り、表示単位への換算は
+// [`rate_from_totals`] に閉じ込める。
+//
+// **集計側でスケーリングを再実装しない。** 以前は集計が
+// `delta_total / denom_total * 100` をそのまま返していたため、
+// 平均 `rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
+// PSI が 10,000 倍になっていた。
+// ============================================================================
+
+/// 1 区間ぶんのレート素材 (指摘 2)。
+///
+/// 表示単位に直すには [`RateSample::display`] を使うか、
+/// 複数区間ぶんを足してから [`rate_from_totals`] に渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateSample {
+    /// 生の差分 (スケーリング前)。
+    pub delta: u64,
+    /// 分母。`A_CPU` は tick 合計、それ以外は区間長 (1/100 秒)。
+    pub denominator: u64,
+    /// カウンタのラップを復元して得た差分か。
+    pub wrapped: bool,
+}
+
+impl RateSample {
+    /// この 1 区間の表示単位のレート。
+    ///
+    /// [`column_value`] が返す区間値と一致する (スケーリング込み)。
+    pub fn display(&self, id: ActivityId, column: usize) -> Option<f64> {
+        rate_from_totals(
+            id,
+            column,
+            u128::from(self.delta),
+            u128::from(self.denominator),
+        )
+    }
+}
+
+/// 期間集計のための「生の差分と分母」を求める (指摘 2)。
+///
+/// [`column_value`] との違い:
+///
+/// - 本家の符号なし減算をそのまま再現せず、「一周として説明できる減少」だけを
+///   差分にする ([`compute_delta`])。説明できない減少に値を与えると、
+///   巨大な外れ値が平均や p95 を壊す。
+/// - 表示単位へのスケーリングを**掛けない**。掛けるのは
+///   [`rate_from_totals`] / [`RateSample::display`] の役目。
+///
+/// 分母の決め方は [`column_value`] と同じ。`ctx.tick_total` が `Some` なら
+/// それ (= `A_CPU` の `deltot_jiffies`)、`None` なら `ctx.itv_cs`。
+/// tick 合計が 0 の CPU は「動いていない」ので 0% と報告せず
+/// [`Discontinuity::NonPositiveElapsed`] を返す。
+///
+/// 直接列 (`ColumnMeta::is_direct()`) のカウンタ列にだけ使える。
+/// 派生列は単一の差分を持たないため [`ComputeIssue::NotImplemented`] を返す。
+pub fn rate_sample(
+    plan: &DecodePlan,
+    id: ActivityId,
+    column: usize,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    ctx: &ComputeContext,
+) -> Result<RateSample, ComputeIssue> {
+    let def = crate::layout::registry::lookup(id).ok_or(ComputeIssue::NotImplemented)?;
+    let meta = def
+        .columns
+        .get(column)
+        .ok_or(ComputeIssue::NotImplemented)?;
+    if !meta.is_direct() || meta.kind != ValueKind::Counter {
+        return Err(ComputeIssue::NotImplemented);
+    }
+    if !ctx.has_prev {
+        return Err(ComputeIssue::Discontinuous(Discontinuity::FirstSample));
+    }
+    if !ctx.continuous {
+        return Err(ComputeIssue::Discontinuous(Discontinuity::Restart));
+    }
+
+    // 集計は欠落を 0 で埋めない。「フィールドが無い」と「0 だった」は別物
+    let curr_v = raw_column(plan, curr, column)?;
+    let prev_v = raw_column(plan, prev, column)?;
+
+    let denominator = match ctx.tick_total {
+        // tick 合計 0 = その CPU は動いていない。0% と報告しない
+        Some(0) => {
+            return Err(ComputeIssue::Discontinuous(
+                Discontinuity::NonPositiveElapsed,
+            ));
+        }
+        Some(t) => t,
+        None if ctx.itv_cs == 0 => {
+            return Err(ComputeIssue::Discontinuous(
+                Discontinuity::NonPositiveElapsed,
+            ));
+        }
+        None => ctx.itv_cs,
+    };
+
+    // 逆行クランプは**サンプル単位**で効く (03 §1.4.4 / §id=3 / §id=6 / §5.1)。
+    // 本家が「減っていたら 0」と決めている列は、その区間の寄与を 0 として
+    // 次の区間へ進む。区間を跨いで端点差分を取ると値が変わる
+    // (Δ = -5, +10 のとき サンプル毎クランプは 10、端点差分は 5)。
+    // ここを `column_value` と同じ判定にすることで
+    // 「1 区間の集計 == その区間の瞬時値」が逆行区間でも成り立つ。
+    if curr_v < prev_v && clamps_decrease(id, column, ctx) {
+        return Ok(RateSample {
+            delta: 0,
+            denominator,
+            wrapped: false,
+        });
+    }
+
+    let bits = counter_bits(plan, column);
+    let (delta, wrapped) = match compute_delta(prev_v, curr_v, bits, DeltaContext::default()) {
+        Delta::Valid(d) => (d, false),
+        Delta::Wrapped(d) => (d, true),
+        Delta::Unavailable(disc) => return Err(ComputeIssue::Discontinuous(disc)),
+    };
+
+    Ok(RateSample {
+        delta,
+        denominator,
+        wrapped,
+    })
+}
+
+// ============================================================================
+// sadf 専用の別単位列 (指摘 2-3)
+//
+// `sadf` の JSON / XML / CSV には、`sar` に無い「同じ指標の別単位」の列がある。
+// 以前は出力層がそれぞれ自分で換算していたため、
+// `rxkB` にバイト/秒をそのまま入れて 1,024 倍、
+// `MBfsfree` にバイトをそのまま入れて 1,048,576 倍ずれていた。
+//
+// 典拠: 03 §9.6-2 (`MBfsfree` / `MBfsused`) / §9.6-10 (`rd_sec` / `avgrq-sz`) /
+// §1.8.1 (`rxkB` はバイト/秒なので非 human では 1024 で割る)。
+// ============================================================================
+
+/// `sadf` にしか現れない「別単位の列」(指摘 2-3)。
+///
+/// どれも計算層が持っている列の値を換算したものなので、
+/// 元の列と値が食い違うことはない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SadfUnitColumn {
+    /// `rd_sec` — `rkB/s` のセクタ表現 (× 2、03 §9.6-10)。
+    DiskReadSectors,
+    /// `wr_sec` — `wkB/s` のセクタ表現 (× 2)。
+    DiskWriteSectors,
+    /// `dc_sec` — `dkB/s` のセクタ表現 (× 2)。
+    DiskDiscardSectors,
+    /// `avgrq-sz` — `areq-sz` のセクタ表現 (× 2)。
+    DiskAvgRequestSectors,
+    /// `rxkB` — バイト/秒 → kB/s (÷ 1024、03 §1.8.1)。
+    NetRxKilobytes,
+    /// `txkB` — バイト/秒 → kB/s (÷ 1024)。
+    NetTxKilobytes,
+    /// `MBfsfree` — バイト → MB (÷ 1024²、03 §9.6-2)。
+    FsFreeMegabytes,
+    /// `MBfsused` — バイト → MB (÷ 1024²)。
+    FsUsedMegabytes,
+}
+
+impl SadfUnitColumn {
+    /// `sadf` の列名から引く。
+    ///
+    /// CSV / DB 形式と JSON / XML で名前が違う列 (`rxkB/s` ↔ `rxkB`) は
+    /// どちらでも引ける。
+    pub fn from_sadf_name(id: ActivityId, name: &str) -> Option<Self> {
+        match (id, name) {
+            (ActivityId::DISK, "rd_sec" | "rd_sec/s") => Some(Self::DiskReadSectors),
+            (ActivityId::DISK, "wr_sec" | "wr_sec/s") => Some(Self::DiskWriteSectors),
+            (ActivityId::DISK, "dc_sec" | "dc_sec/s") => Some(Self::DiskDiscardSectors),
+            (ActivityId::DISK, "avgrq-sz") => Some(Self::DiskAvgRequestSectors),
+            (ActivityId::NET_DEV, "rxkB" | "rxkB/s") => Some(Self::NetRxKilobytes),
+            (ActivityId::NET_DEV, "txkB" | "txkB/s") => Some(Self::NetTxKilobytes),
+            (ActivityId::FS, "MBfsfree") => Some(Self::FsFreeMegabytes),
+            (ActivityId::FS, "MBfsused") => Some(Self::FsUsedMegabytes),
+            _ => None,
+        }
+    }
+
+    /// この列が属する activity。
+    pub fn activity(self) -> ActivityId {
+        match self {
+            Self::DiskReadSectors
+            | Self::DiskWriteSectors
+            | Self::DiskDiscardSectors
+            | Self::DiskAvgRequestSectors => ActivityId::DISK,
+            Self::NetRxKilobytes | Self::NetTxKilobytes => ActivityId::NET_DEV,
+            Self::FsFreeMegabytes | Self::FsUsedMegabytes => ActivityId::FS,
+        }
+    }
+
+    /// 換算元になる列の添字 (計算層が値を持っている列)。
+    pub fn source_column(self) -> usize {
+        match self {
+            Self::DiskReadSectors => disk_col::RKB,
+            Self::DiskWriteSectors => disk_col::WKB,
+            Self::DiskDiscardSectors => disk_col::DKB,
+            Self::DiskAvgRequestSectors => disk_col::AREQ_SZ,
+            Self::NetRxKilobytes => net_dev_col::RXKB,
+            Self::NetTxKilobytes => net_dev_col::TXKB,
+            Self::FsFreeMegabytes => fs_col::MB_FREE,
+            Self::FsUsedMegabytes => fs_col::MB_USED,
+        }
+    }
+
+    /// 換算元の表示値を、この列の単位に直す係数。
+    pub fn scale(self) -> f64 {
+        match self {
+            // kB → セクタ (512 B)。`rkB/s` は既にセクタを 2 で割ってあるので戻す
+            Self::DiskReadSectors
+            | Self::DiskWriteSectors
+            | Self::DiskDiscardSectors
+            | Self::DiskAvgRequestSectors => 2.0,
+            // `A_NET_DEV` の rx/tx はバイト/秒。非 human 出力は 1024 で割って kB/s
+            Self::NetRxKilobytes | Self::NetTxKilobytes => 1.0 / 1024.0,
+            // `A_FS` の `f_*` はバイト。MB へ
+            Self::FsFreeMegabytes | Self::FsUsedMegabytes => 1.0 / (1024.0 * 1024.0),
+        }
+    }
+
+    /// 換算元の表示値を、この列の単位に直す。
+    #[inline]
+    pub fn convert(self, source_value: f64) -> f64 {
+        source_value * self.scale()
+    }
+}
+
+/// `sadf` の別単位列の値を計算する (指摘 2-3)。
+///
+/// 換算元の列を [`column_value`] で計算し、[`SadfUnitColumn::scale`] を掛ける。
+/// 元の列と同じ計算を通るので、`rd_sec` と `rkB/s` が食い違うことはない
+/// (本家も「同じ式を 2 回評価している」だけである。03 §9.6-10)。
+pub fn sadf_unit_value(
+    variant: SadfUnitColumn,
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    ctx: &ComputeContext,
+) -> Computed {
+    sadf_unit_value_with(variant, plan, prev, curr, ctx, MissingPolicy::Compat)
+}
+
+fn sadf_unit_value_with(
+    variant: SadfUnitColumn,
+    plan: &DecodePlan,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+    ctx: &ComputeContext,
+    policy: MissingPolicy,
+) -> Computed {
+    let id = variant.activity();
+    let column = variant.source_column();
+    let def = crate::layout::registry::lookup(id).ok_or(ComputeIssue::NotImplemented)?;
+    let meta = def
+        .columns
+        .get(column)
+        .ok_or(ComputeIssue::NotImplemented)?;
+    let base = column_value_with(id, column, meta, plan, prev, curr, ctx, policy)?;
+    Ok(variant.convert(base))
 }
 
 // ============================================================================
@@ -2185,14 +2986,6 @@ mod tests {
     use crate::format::abi::{Endian, LayoutAbi, SourceEncoding};
     use crate::layout::registry::lookup;
 
-    fn item(values: &[u64]) -> ItemSnapshot {
-        ItemSnapshot {
-            key: None,
-            texts: Vec::new(),
-            values: values.iter().map(|v| Availability::Present(*v)).collect(),
-        }
-    }
-
     /// 最新 revision のデコード計画を作る (単体テスト用)。
     fn plan_for(id: ActivityId) -> DecodePlan {
         let def = lookup(id).expect("定義がある");
@@ -2227,19 +3020,25 @@ mod tests {
         column_value(id, column, &def.columns[column], plan, prev, curr, ctx)
     }
 
+    /// tick 合計は 8 フィールドだけを足す (`guest` / `guest_nice` を含めない)。
     #[test]
-    fn tick_total_sums_all_field_deltas() {
-        let p = item(&[100, 200, 300]);
-        let c = item(&[110, 220, 330]);
-        assert_eq!(tick_total(&p, &c), 10 + 20 + 30);
+    fn tick_total_sums_only_the_eight_tick_fields() {
+        let plan = plan_for(ActivityId::CPU);
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, cpu_col::USER, 10);
+        put(&plan, &mut c, cpu_col::SYS, 20);
+        put(&plan, &mut c, cpu_col::IDLE, 30);
+        assert_eq!(tick_total(&plan, &p, &c), 60);
     }
 
     /// オフライン CPU は全フィールドが 0 のままなので合計も 0 になる。
     #[test]
     fn offline_cpu_has_zero_tick_total() {
-        let p = item(&[0, 0, 0]);
-        let c = item(&[0, 0, 0]);
-        assert_eq!(tick_total(&p, &c), 0);
+        let plan = plan_for(ActivityId::CPU);
+        let z = zeros(&plan);
+        assert_eq!(tick_total(&plan, &z, &z), 0);
+        assert!(cpu_is_offline(&plan, &z));
     }
 
     // ---- A_CPU ----
@@ -3354,6 +4153,44 @@ mod tests {
         );
     }
 
+    /// **指摘 18 の点検**: `speed` フィールドはあるが値が 0 の `%ifutil`。
+    ///
+    /// フィールドの欠落 (上のテスト) とは別の経路である。速度を取得できない
+    /// インターフェース (仮想デバイス、`ethtool` が速度を返さない NIC) では
+    /// フィールドが存在して値が 0 になる。ここで `0.0` を返すと
+    /// **計算結果の 0 が有効な観測になり**、固定条件の経路が
+    /// 「評価済み・検出なし」として数えてしまう (規律 7 の抜け)。
+    #[test]
+    fn ifutil_with_a_zero_speed_value_is_unavailable_outside_compat() {
+        // 現行レイアウト。speed / duplex フィールドは存在する
+        let plan = plan_for(ActivityId::NET_DEV);
+        let col = net_dev_col::IFUTIL_PCT;
+        let meta = &lookup(ActivityId::NET_DEV).unwrap().columns[col];
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, net_dev_col::RXKB, 1_000_000);
+        // speed = 0 (取得できなかった)。フィールド自体は存在する
+        put(&plan, &mut c, net_dev_col::SPEED, 0);
+        let ctx = ComputeContext::new(100);
+
+        assert_eq!(
+            column_value(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx).unwrap(),
+            0.0,
+            "互換出力は本家と同じ 0.00 を出す (03 §5.2)"
+        );
+        assert_eq!(
+            column_value_strict(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx),
+            Err(ComputeIssue::MissingInSample),
+            "分母が無いので率を作れない。0% と見せると評価済みに数えられる"
+        );
+
+        // 速度が取れていれば従来どおり計算する (この分岐で他を壊していない)
+        put(&plan, &mut c, net_dev_col::SPEED, 1_000);
+        let v = column_value_strict(ActivityId::NET_DEV, col, meta, &plan, &p, &c, &ctx)
+            .expect("速度があるので計算できる");
+        assert!(v > 0.0, "{v}");
+    }
+
     // ---- Average: (方式 B′) ----
 
     /// `%memused` の平均は整数除算を経由し、`tlmkb` は最終サンプルの値を使う。
@@ -3422,6 +4259,887 @@ mod tests {
         assert_eq!(
             average_ratio(ActivityId::HUGE, huge_col::HUGUSED_PCT, &plan, &acc, &last),
             Err(ComputeIssue::MissingInSample)
+        );
+    }
+    // ========================================================================
+    // 指摘 1: CPU 使用率の分母 (guest の二重計上)
+    // ========================================================================
+
+    /// **回帰テスト (指摘 1)**: guest を含む CPU の `%user` が仕様どおりになる。
+    ///
+    /// レビューの具体例: Δuser=100、Δguest=50、他 0。
+    /// `guest` は `user` に内包されるので分母は 100 で、`%user` は **100%**。
+    /// 修正前は全フィールドの差分を足していたため分母が 150 になり
+    /// 約 66.67% (= 仮想マシン稼働中の使用率が過小) になっていた。
+    #[test]
+    fn cpu_denominator_excludes_guest_time() {
+        let plan = plan_for(ActivityId::CPU);
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, cpu_col::USER, 100);
+        put(&plan, &mut c, cpu_col::GUEST, 50);
+
+        let total = tick_total(&plan, &p, &c);
+        assert_eq!(
+            total, 100,
+            "guest / guest_nice は分母に入れない (03 §1.10-4)"
+        );
+        // 修正前の「全フィールドの単純和」は 150 だった
+        let naive: u64 = c
+            .values
+            .iter()
+            .zip(p.values.iter())
+            .filter_map(|(x, y)| match (x, y) {
+                (Availability::Present(x), Availability::Present(y)) => Some(x.wrapping_sub(*y)),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(naive, 150, "全フィールドを足すと guest を二重計上する");
+
+        let ctx = ComputeContext::new(100).with_tick_total(total);
+        assert_eq!(
+            compute(ActivityId::CPU, cpu_col::USER, &plan, &p, &c, &ctx).unwrap(),
+            100.0,
+            "%user は 100% (66.67% ではない)"
+        );
+        assert_eq!(
+            compute(ActivityId::CPU, cpu_col::GUEST, &plan, &p, &c, &ctx).unwrap(),
+            50.0,
+            "%guest は user の内訳なので 50%"
+        );
+        assert_eq!(
+            compute(ActivityId::CPU, cpu_col::USR, &plan, &p, &c, &ctx).unwrap(),
+            50.0,
+            "%usr = user - guest"
+        );
+        // `-u` の 6 列 (%user + %nice + %system + %iowait + %steal + %idle) は 100% になる
+        let sum: f64 = [
+            cpu_col::USER,
+            cpu_col::NICE,
+            cpu_col::SYSTEM,
+            cpu_col::IOWAIT,
+            cpu_col::STEAL,
+            cpu_col::IDLE,
+        ]
+        .iter()
+        .map(|col| compute(ActivityId::CPU, *col, &plan, &p, &c, &ctx).unwrap())
+        .sum();
+        assert!((sum - 100.0).abs() < 1e-9, "合計は 100%: {sum}");
+    }
+
+    /// `cpu_interval` が「補正済み前値・分母・状態」を 1 度に返す (指摘 1)。
+    ///
+    /// sar 互換出力だけでなく sadf / 独自出力 / 集計もこれを通せば
+    /// 同じ分母・同じ判定になる。
+    #[test]
+    fn cpu_interval_reports_online_offline_and_tickless() {
+        let plan = plan_for(ActivityId::CPU);
+
+        // --- 通常 ---
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, cpu_col::USER, 300);
+        put(&plan, &mut c, cpu_col::IDLE, 700);
+        let iv = cpu_interval(&plan, &p, &c, CpuRole::Single);
+        assert_eq!(iv.state, CpuState::Online);
+        assert_eq!(iv.tick_total, 1_000);
+        assert!(
+            !iv.prev_online,
+            "前サンプルが全ゼロ = 復帰直後 (基準値が無い)"
+        );
+        assert_eq!(iv.role(), CpuRole::Single);
+        assert_eq!(iv.tickless_value(cpu_col::IDLE), None);
+        let ctx = iv.context(ComputeContext::new(100));
+        assert_eq!(ctx.tick_total, Some(1_000));
+        assert!(!ctx.aggregate_item);
+        assert_eq!(
+            compute(ActivityId::CPU, cpu_col::USER, &plan, &iv.prev, &c, &ctx).unwrap(),
+            30.0
+        );
+
+        // --- オフライン (現サンプルの tick 8 フィールドが全 0) ---
+        let mut online_prev = zeros(&plan);
+        put(&plan, &mut online_prev, cpu_col::IDLE, 500);
+        let off = cpu_interval(&plan, &online_prev, &zeros(&plan), CpuRole::Single);
+        assert_eq!(off.state, CpuState::Offline);
+        assert!(off.is_offline(), "行そのものを出さない");
+
+        // --- tickless (オンラインだが tick が増えない) ---
+        let mut same = zeros(&plan);
+        put(&plan, &mut same, cpu_col::IDLE, 500);
+        let tl = cpu_interval(&plan, &same, &same, CpuRole::Single);
+        assert_eq!(tl.state, CpuState::Tickless);
+        assert!(tl.prev_online, "前サンプルでも稼働していた");
+        assert_eq!(
+            tl.tickless_value(cpu_col::IDLE),
+            Some(100.0),
+            "%idle = 100.00 (03 §1.4.5)"
+        );
+        assert_eq!(tl.tickless_value(cpu_col::USER), Some(0.0));
+        assert_eq!(tl.tickless_value(cpu_col::GUEST), Some(0.0));
+
+        // --- CPU "all" は tickless にならない (分母 0 は 1 に差し替え) ---
+        let agg = cpu_interval(&plan, &same, &same, CpuRole::Aggregate);
+        assert_eq!(agg.state, CpuState::Online);
+        assert_eq!(
+            agg.tick_total, 1,
+            "「CPU all が tickless になることはない」"
+        );
+        assert!(agg.context(ComputeContext::new(100)).aggregate_item);
+    }
+
+    /// 集約 (`all` 行) は CPU ごとに補正してから合算する (指摘 1 / 03 §1.4.3)。
+    #[test]
+    fn cpu_aggregate_context_is_ready_to_use() {
+        let plan = plan_for(ActivityId::CPU);
+        let mut p0 = zeros(&plan);
+        put(&plan, &mut p0, cpu_col::IDLE, 10);
+        let mut p1 = zeros(&plan);
+        put(&plan, &mut p1, cpu_col::IDLE, 10);
+        let prev = vec![zeros(&plan), p0, p1];
+
+        let mut cpu0 = zeros(&plan);
+        put(&plan, &mut cpu0, cpu_col::USER, 200);
+        put(&plan, &mut cpu0, cpu_col::GUEST, 100);
+        put(&plan, &mut cpu0, cpu_col::IDLE, 810);
+        let mut cpu1 = zeros(&plan);
+        put(&plan, &mut cpu1, cpu_col::USER, 400);
+        put(&plan, &mut cpu1, cpu_col::IDLE, 610);
+        let curr = vec![zeros(&plan), cpu0, cpu1];
+
+        let agg = aggregate_cpu(&plan, &prev, &curr, false).expect("SMP なので合算する");
+        // guest を含んでいても分母は 8 フィールドぶんのまま
+        assert_eq!(agg.tick_total, 2_000);
+        assert!(!agg.is_offline(1));
+        let ctx = agg.context(ComputeContext::new(1_000));
+        assert!(ctx.aggregate_item);
+        assert_eq!(ctx.tick_total, Some(2_000));
+        assert_eq!(
+            compute(
+                ActivityId::CPU,
+                cpu_col::USER,
+                &plan,
+                &agg.prev,
+                &agg.curr,
+                &ctx
+            )
+            .unwrap(),
+            30.0,
+            "(200 + 400) / 2000"
+        );
+    }
+
+    // ========================================================================
+    // 指摘 2: 表示単位への変換を計算層で共通化
+    // ========================================================================
+
+    /// **回帰テスト (指摘 2)**: 単一区間の集計結果が、その区間の瞬時値と一致する。
+    ///
+    /// 期間集計は「差分合計 ÷ 分母合計」でレートを出すため、
+    /// 表示単位へのスケーリングを掛け忘れると平均 `rkB/s` が 2 倍、
+    /// `aqu-sz` が 1,000 倍、`%util` が 10 倍、PSI が 10,000 倍になる。
+    /// 1 区間だけ足し込んだ集計は定義上その区間の瞬時値と等しいので、
+    /// この不変量を全 activity の全カウンタ列で機械的に確認すれば
+    /// スケーリング漏れが検出できる。
+    #[test]
+    fn single_interval_aggregate_matches_instant_value() {
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        let mut mismatched: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        // 増加する区間と、逆行する区間の両方を見る。
+        // 逆行側は「本家が 0 にクランプする列」で集計と瞬時値が揃うことの確認
+        // (クランプはサンプル単位なので、集計も区間ごとに 0 を足す必要がある)。
+        for increasing in [true, false] {
+            for def in crate::layout::registry::all() {
+                let Some(rev) = def.latest() else { continue };
+                let plan = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).unwrap();
+                let mut lo = zeros(&plan);
+                let mut hi = zeros(&plan);
+                // 全フィールドを別々の値にして、列の取り違えを検出できるようにする
+                for (i, slot) in hi.values.iter_mut().enumerate() {
+                    *slot = Availability::Present(1_000 + 37 * i as u64);
+                }
+                for (i, slot) in lo.values.iter_mut().enumerate() {
+                    *slot = Availability::Present(100 + 7 * i as u64);
+                }
+                let (prev, curr) = if increasing { (&lo, &hi) } else { (&hi, &lo) };
+
+                let mut ctx = ComputeContext::new(250);
+                if def.id == ActivityId::CPU {
+                    ctx.tick_total = Some(tick_total(&plan, prev, curr));
+                }
+
+                for (column, meta) in def.columns.iter().enumerate() {
+                    if !meta.is_direct() || meta.kind != ValueKind::Counter {
+                        continue;
+                    }
+                    // 集計が値を作らない区間 (説明できない逆行など) は比較対象外。
+                    // 「集計が値を出したなら瞬時値と一致する」が守りたい不変量。
+                    let Ok(sample) = rate_sample(&plan, def.id, column, prev, curr, &ctx) else {
+                        continue;
+                    };
+                    let Some(aggregated) = sample.display(def.id, column) else {
+                        continue;
+                    };
+                    let instant = column_value(def.id, column, meta, &plan, prev, curr, &ctx)
+                        .expect("全フィールドを埋めてあるので計算できる");
+                    checked += 1;
+                    if (aggregated - instant).abs() > instant.abs() * 1e-9 + 1e-12 {
+                        mismatched.push(format!(
+                            "{} {} (increasing={increasing}): 集計 {aggregated} vs 瞬時 {instant}",
+                            def.id, meta.public_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            mismatched.is_empty(),
+            "1 区間の集計と瞬時値が食い違う列がある (スケーリング漏れ): {mismatched:?}"
+        );
+        assert!(checked > 50, "検査した列が少なすぎる: {checked}");
+    }
+
+    /// 逆行クランプはサンプル単位で効く (集計も区間ごとに 0 を足す)。
+    #[test]
+    fn rate_sample_clamps_decrease_per_interval() {
+        let plan = plan_for(ActivityId::IO);
+        let col = column_of(ActivityId::IO, "tps");
+        let meta = &lookup(ActivityId::IO).unwrap().columns[col];
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, col, 5_000);
+        put(&plan, &mut c, col, 4_000);
+        let ctx = ComputeContext::new(100);
+
+        // `A_IO` は 7 列すべてに明示クランプがある (03 §id=6)
+        assert_eq!(
+            column_value(ActivityId::IO, col, meta, &plan, &p, &c, &ctx),
+            Ok(0.0)
+        );
+        let sample = rate_sample(&plan, ActivityId::IO, col, &p, &c, &ctx).unwrap();
+        assert_eq!(sample.delta, 0, "その区間の寄与を 0 にして次へ進む");
+        assert_eq!(sample.display(ActivityId::IO, col), Some(0.0));
+        assert!(!sample.wrapped);
+    }
+
+    /// ゼロ補完かどうかは値からは判らないので、列の有無で確かめる (指摘 5)。
+    #[test]
+    fn column_presence_tells_zero_fill_from_observed_zero() {
+        // discard 統計を持たない世代
+        let old = plan_for_revision(ActivityId::IO, 0x8b, 40, LayoutAbi::LP64);
+        let dtps = column_of(ActivityId::IO, "dtps");
+        let tps = column_of(ActivityId::IO, "tps");
+        assert!(!column_is_present(&old, dtps), "この世代には無い列");
+        assert!(column_is_present(&old, tps));
+
+        // 現行世代なら両方ある
+        let modern = plan_for(ActivityId::IO);
+        assert!(column_is_present(&modern, dtps));
+    }
+
+    /// 保存値のスケールが必要な代表列で、集計経路の値が区間値と一致する。
+    ///
+    /// 機械的なテストが「たまたま全部 1.0 倍」で通っていないことの確認。
+    #[test]
+    fn rate_scale_is_applied_to_scaled_columns() {
+        // ディスク: セクタ → kB (1/2)、rq_ticks → aqu-sz (1/1000)、tot_ticks → %util (1/10)
+        assert_eq!(rate_scale(ActivityId::DISK, disk_col::RKB), 0.5);
+        assert_eq!(rate_scale(ActivityId::DISK, disk_col::AQU_SZ), 0.001);
+        assert_eq!(rate_scale(ActivityId::DISK, disk_col::UTIL_PCT), 0.1);
+        assert_eq!(rate_scale(ActivityId::DISK, disk_col::TPS), 1.0);
+        // PSI の累積 µs は `Δµs / (100 × itv)` なので生のレートの 1/10000
+        assert_eq!(rate_scale(ActivityId::PSI_CPU, psi_col::SOME_TOTAL), 1.0e-4);
+        assert_eq!(rate_scale(ActivityId::PSI_IO, psi_col::FULL_TOTAL), 1.0e-4);
+        assert_eq!(rate_scale(ActivityId::PSI_IO, psi_col::SOME_10), 1.0);
+        // ゲージのスケールは別関数 (区間値には既に掛かっている)
+        assert_eq!(gauge_scale(ActivityId::QUEUE, queue_col::LDAVG_1), 0.01);
+        assert_eq!(gauge_scale(ActivityId::PWR_CPU, pwr_cpu_col::MHZ), 0.01);
+
+        // 1 秒間に 1000 セクタ読んだ区間を 3 つ足した「期間平均」
+        let totals = (1_000u128 * 3, 100u128 * 3);
+        assert_eq!(
+            rate_from_totals(ActivityId::DISK, disk_col::RKB, totals.0, totals.1),
+            Some(500.0),
+            "1000 セクタ/秒 = 500 kB/s (2 倍にならない)"
+        );
+        // PSI: 10 秒のうち 1 秒 (1e6 µs) 停止 → 10%
+        assert_eq!(
+            rate_from_totals(ActivityId::PSI_CPU, psi_col::SOME_TOTAL, 1_000_000, 1_000),
+            Some(10.0)
+        );
+        // 分母が 0 なら「0%」と報告しない
+        assert_eq!(
+            rate_from_totals(ActivityId::DISK, disk_col::RKB, 10, 0),
+            None
+        );
+    }
+
+    /// 集計用の差分は「一周として説明できる減少」だけを採る。
+    #[test]
+    fn rate_sample_refuses_unexplainable_decrease() {
+        let plan = plan_for(ActivityId::PCSW);
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, 0, 1_000_000);
+        put(&plan, &mut c, 0, 10);
+        let ctx = ComputeContext::new(100);
+        assert_eq!(
+            rate_sample(&plan, ActivityId::PCSW, 0, &p, &c, &ctx),
+            Err(ComputeIssue::Discontinuous(
+                Discontinuity::AmbiguousDecrease
+            )),
+            "巨大な外れ値を平均や p95 に入れない"
+        );
+
+        // 32bit カウンタの一周は復元して `wrapped` を立てる
+        let serial = plan_for(ActivityId::SERIAL);
+        let col = column_of(ActivityId::SERIAL, "rcvin");
+        let mut sp = zeros(&serial);
+        let mut sc = zeros(&serial);
+        put(&serial, &mut sp, col, 4_294_967_290);
+        put(&serial, &mut sc, col, 4);
+        let s = rate_sample(&serial, ActivityId::SERIAL, col, &sp, &sc, &ctx).unwrap();
+        assert_eq!(s.delta, 10);
+        assert!(s.wrapped);
+        assert_eq!(s.display(ActivityId::SERIAL, col), Some(10.0));
+
+        // 派生列は単一の差分を持たない
+        let disk = plan_for(ActivityId::DISK);
+        assert_eq!(
+            rate_sample(
+                &disk,
+                ActivityId::DISK,
+                disk_col::AREQ_SZ,
+                &zeros(&disk),
+                &zeros(&disk),
+                &ctx
+            ),
+            Err(ComputeIssue::NotImplemented)
+        );
+    }
+
+    /// **回帰テスト (指摘 2-3)**: `sadf` の別単位列。
+    ///
+    /// 換算を出力層ごとに書くと `rxkB` が 1,024 倍、`MBfsfree` が
+    /// 1,048,576 倍ずれる。計算層の換算と元の列が食い違わないことを確認する。
+    #[test]
+    fn sadf_unit_columns_convert_from_the_same_computation() {
+        let ctx = ComputeContext::new(100); // 1 秒
+
+        // --- ディスク: セクタ = kB 系列の 2 倍 (03 §9.6-10) ---
+        let plan = plan_for(ActivityId::DISK);
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, disk_col::TPS, 10);
+        put(&plan, &mut c, disk_col::RKB, 512);
+        put(&plan, &mut c, disk_col::WKB, 128);
+        let rkb = compute(ActivityId::DISK, disk_col::RKB, &plan, &p, &c, &ctx).unwrap();
+        assert_eq!(rkb, 256.0);
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::DiskReadSectors, &plan, &p, &c, &ctx).unwrap(),
+            512.0,
+            "rd_sec は rkB/s の 2 倍"
+        );
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::DiskWriteSectors, &plan, &p, &c, &ctx).unwrap(),
+            128.0
+        );
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::DiskDiscardSectors, &plan, &p, &c, &ctx).unwrap(),
+            0.0
+        );
+        let areq = compute(ActivityId::DISK, disk_col::AREQ_SZ, &plan, &p, &c, &ctx).unwrap();
+        assert_eq!(areq, 32.0, "(512 + 128) セクタ / 10 I/O / 2");
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::DiskAvgRequestSectors, &plan, &p, &c, &ctx).unwrap(),
+            64.0,
+            "avgrq-sz は areq-sz の 2 倍"
+        );
+
+        // --- ネットワーク: 保存値はバイト/秒。非 human 出力は 1024 で割る (03 §1.8.1) ---
+        let net = plan_for(ActivityId::NET_DEV);
+        let np = zeros(&net);
+        let mut nc = zeros(&net);
+        put(&net, &mut nc, net_dev_col::RXKB, 1_048_576);
+        put(&net, &mut nc, net_dev_col::TXKB, 2_097_152);
+        assert_eq!(
+            compute(ActivityId::NET_DEV, net_dev_col::RXKB, &net, &np, &nc, &ctx).unwrap(),
+            1_048_576.0,
+            "計算層はバイト毎秒を返す"
+        );
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::NetRxKilobytes, &net, &np, &nc, &ctx).unwrap(),
+            1_024.0,
+            "rxkB は kB/s (1024 倍にならない)"
+        );
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::NetTxKilobytes, &net, &np, &nc, &ctx).unwrap(),
+            2_048.0
+        );
+
+        // --- ファイルシステム: 保存値はバイト。MB へ (03 §9.6-2) ---
+        let fs = plan_for(ActivityId::FS);
+        let fp = zeros(&fs);
+        let mut fc = zeros(&fs);
+        put(&fs, &mut fc, fs_col::TOTAL, 1_024 * 1_024 * 1_000);
+        put(&fs, &mut fc, fs_col::MB_FREE, 1_024 * 1_024 * 300);
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::FsFreeMegabytes, &fs, &fp, &fc, &ctx).unwrap(),
+            300.0,
+            "MBfsfree は MB (1,048,576 倍にならない)"
+        );
+        assert_eq!(
+            sadf_unit_value(SadfUnitColumn::FsUsedMegabytes, &fs, &fp, &fc, &ctx).unwrap(),
+            700.0
+        );
+
+        // 列名からの逆引き (CSV / DB の `rxkB/s` と JSON の `rxkB` の両方)
+        assert_eq!(
+            SadfUnitColumn::from_sadf_name(ActivityId::NET_DEV, "rxkB"),
+            Some(SadfUnitColumn::NetRxKilobytes)
+        );
+        assert_eq!(
+            SadfUnitColumn::from_sadf_name(ActivityId::NET_DEV, "rxkB/s"),
+            Some(SadfUnitColumn::NetRxKilobytes)
+        );
+        assert_eq!(
+            SadfUnitColumn::from_sadf_name(ActivityId::DISK, "avgrq-sz"),
+            Some(SadfUnitColumn::DiskAvgRequestSectors)
+        );
+        assert_eq!(
+            SadfUnitColumn::from_sadf_name(ActivityId::FS, "MBfsused"),
+            Some(SadfUnitColumn::FsUsedMegabytes)
+        );
+        assert_eq!(
+            SadfUnitColumn::from_sadf_name(ActivityId::DISK, "tps"),
+            None
+        );
+    }
+
+    // ========================================================================
+    // 指摘 3: 行列型の派生列
+    // ========================================================================
+
+    /// **回帰テスト (指摘 3)**: `wghMHz` を単一 item 経路以外からも計算できる。
+    ///
+    /// 以前は sar 互換出力だけが [`weighted_mhz`] を呼んでおり、
+    /// sadf / 独自出力は `NeedsItemGroup` になって常に欠損していた。
+    #[test]
+    fn matrix_row_values_computes_weighted_mhz_for_any_output() {
+        let plan = plan_for(ActivityId::PWR_FREQ);
+        let mut p0 = zeros(&plan);
+        let mut p1 = zeros(&plan);
+        let mut c0 = zeros(&plan);
+        let mut c1 = zeros(&plan);
+        put(&plan, &mut c0, freq_col::FREQ_KHZ, 1_500_999);
+        put(&plan, &mut c0, freq_col::TIME_IN_STATE, 100);
+        put(&plan, &mut p0, freq_col::TIME_IN_STATE, 0);
+        put(&plan, &mut c1, freq_col::FREQ_KHZ, 800_000);
+        put(&plan, &mut c1, freq_col::TIME_IN_STATE, 300);
+        put(&plan, &mut p1, freq_col::TIME_IN_STATE, 0);
+
+        let ctx = ComputeContext::new(400);
+        let got = matrix_row_values(
+            ActivityId::PWR_FREQ,
+            freq_col::WGH_MHZ,
+            &plan,
+            &[&p0, &p1],
+            &[&c0, &c1],
+            &ctx,
+        );
+        assert_eq!(got.len(), 1, "行全体で 1 値");
+        assert_eq!(got[0], Ok(975.0), "(1500 × 100 + 800 × 300) / 400");
+    }
+
+    /// `A_IRQ` も同じ形の API で扱える (CPU スロットごとに 1 値)。
+    #[test]
+    fn matrix_row_values_yields_one_value_per_slot_for_irq() {
+        let plan = plan_for(ActivityId::IRQ);
+        let mut p_all = zeros(&plan);
+        let mut p_cpu0 = zeros(&plan);
+        let mut c_all = zeros(&plan);
+        let mut c_cpu0 = zeros(&plan);
+        // 1 秒で 合計 300 件 / CPU0 は 100 件
+        put(&plan, &mut p_all, irq_col::COUNT, 1_000);
+        put(&plan, &mut c_all, irq_col::COUNT, 1_300);
+        put(&plan, &mut p_cpu0, irq_col::COUNT, 500);
+        put(&plan, &mut c_cpu0, irq_col::COUNT, 600);
+
+        let ctx = ComputeContext::new(100);
+        let got = matrix_row_values(
+            ActivityId::IRQ,
+            irq_col::COUNT,
+            &plan,
+            &[&p_all, &p_cpu0],
+            &[&c_all, &c_cpu0],
+            &ctx,
+        );
+        assert_eq!(got, vec![Ok(300.0), Ok(100.0)]);
+
+        // 先頭スロット (= `all` 列) だけ「総数が減ったら 0」のクランプが効く (03 §id=3)。
+        // CPU がオフラインになると割り込み総数が減る。
+        let mut high = zeros(&plan);
+        put(&plan, &mut high, irq_col::COUNT, 1_300);
+        let mut low = zeros(&plan);
+        put(&plan, &mut low, irq_col::COUNT, 900);
+        let clamped = matrix_row_values(
+            ActivityId::IRQ,
+            irq_col::COUNT,
+            &plan,
+            &[&high, &high],
+            &[&low, &low],
+            &ctx,
+        );
+        assert_eq!(
+            clamped[0],
+            Ok(0.0),
+            "合計列は CPU オフラインで総数が減っても 0"
+        );
+        // 個別 CPU 列にクランプは無いので、本家と同じ符号なし減算の巨大値が出る
+        let per_cpu = clamped[1].unwrap();
+        assert!(
+            per_cpu > 1.0e9,
+            "個別 CPU 列にクランプは無い (03 §id=3): {per_cpu}"
+        );
+    }
+
+    // ========================================================================
+    // 指摘 4: await の加算幅
+    // ========================================================================
+
+    /// **回帰テスト (指摘 4)**: `await` の分子が 2³² を超えたときの値。
+    ///
+    /// 本家の `compute_ext_disk_stats()` は `unsigned int` 同士を足すため、
+    /// Δ=3,000,000,000 と Δ=2,000,000,000 の和は 5,000,000,000 ではなく
+    /// **705,032,704** (= 5,000,000,000 − 2³²) になる。
+    /// 和を f64 で取ると本家と食い違う。
+    #[test]
+    fn await_numerator_adds_like_unsigned_int() {
+        let plan = plan_for(ActivityId::DISK);
+        for col in [disk_col::RD_TICKS, disk_col::WR_TICKS, disk_col::DC_TICKS] {
+            assert_eq!(
+                plan.column_bits(col),
+                Some(CounterBits::B32),
+                "tick 群は unsigned int (02 §7)"
+            );
+        }
+        let meta = &lookup(ActivityId::DISK).unwrap().columns[disk_col::AWAIT];
+
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, disk_col::TPS, 1); // Δnr_ios = 1
+        put(&plan, &mut c, disk_col::RD_TICKS, 3_000_000_000);
+        put(&plan, &mut c, disk_col::WR_TICKS, 2_000_000_000);
+        let ctx = ComputeContext::new(100);
+
+        assert_eq!(
+            column_value(ActivityId::DISK, disk_col::AWAIT, meta, &plan, &p, &c, &ctx).unwrap(),
+            705_032_704.0,
+            "本家の unsigned int 加算を再現する (5,000,000,000 ではない)"
+        );
+        // 独自出力・集計では折り返しを再現しない (折り返した分子は待ち時間として
+        // 意味を持たないため。互換と独自で意図的に分けている)
+        assert_eq!(
+            column_value_strict(ActivityId::DISK, disk_col::AWAIT, meta, &plan, &p, &c, &ctx)
+                .unwrap(),
+            5_000_000_000.0
+        );
+    }
+
+    /// セクタ系の加算幅は `unsigned long` なので 2³² では折り返さない (指摘 4)。
+    #[test]
+    fn sector_numerator_adds_in_64_bits() {
+        let plan = plan_for(ActivityId::DISK);
+        for col in [disk_col::RKB, disk_col::WKB, disk_col::DKB] {
+            assert_eq!(
+                plan.column_bits(col),
+                Some(CounterBits::B64),
+                "rd_sect / wr_sect / dc_sect は unsigned long (LP64 では 8 バイト)"
+            );
+        }
+        let meta = &lookup(ActivityId::DISK).unwrap().columns[disk_col::AREQ_SZ];
+
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, disk_col::TPS, 1);
+        put(&plan, &mut c, disk_col::RKB, 3_000_000_000);
+        put(&plan, &mut c, disk_col::WKB, 2_000_000_000);
+        let ctx = ComputeContext::new(100);
+
+        assert_eq!(
+            column_value(
+                ActivityId::DISK,
+                disk_col::AREQ_SZ,
+                meta,
+                &plan,
+                &p,
+                &c,
+                &ctx
+            )
+            .unwrap(),
+            2_500_000_000.0,
+            "5,000,000,000 セクタ / 1 I/O / 2 (折り返さない)"
+        );
+    }
+
+    // ========================================================================
+    // 指摘 5: 旧世代の欠落フィールドのゼロ補完
+    // ========================================================================
+
+    /// **回帰テスト (指摘 5)**: discard 統計を持たない旧 `A_IO`。
+    ///
+    /// 本家は足りないフィールドを 0 埋めした構造体で計算するので
+    /// `dtps` / `bdscd` は `0.00` と表示される (03 §1.9-1)。
+    /// 以前はこのゼロ補完が `sar` 互換テキストの**出力層**にしか無く、
+    /// `sadf` は同じ列を空欄 / `null` にしていた (互換出力どうしの不統一)。
+    #[test]
+    fn missing_discard_fields_are_zero_filled_only_in_compat() {
+        // v11.7.1〜v12.1.1 の A_IO (5 フィールド / 40 バイト) に discard 統計は無い
+        let plan = plan_for_revision(ActivityId::IO, 0x8b, 40, LayoutAbi::LP64);
+        let dtps = column_of(ActivityId::IO, "dtps");
+        let bdscd = column_of(ActivityId::IO, "bdscd");
+        let tps = column_of(ActivityId::IO, "tps");
+        assert_eq!(
+            plan.column_value(&zeros(&plan).values, dtps),
+            Availability::UnsupportedBySource,
+            "この世代には dk_drive_dio が無い"
+        );
+
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, tps, 500);
+        let ctx = ComputeContext::new(100);
+        let meta = |col: usize| &lookup(ActivityId::IO).unwrap().columns[col];
+
+        // --- 互換出力: 本家と同じ 0.00 ---
+        for col in [dtps, bdscd] {
+            assert_eq!(
+                column_value(ActivityId::IO, col, meta(col), &plan, &p, &c, &ctx),
+                Ok(0.0),
+                "本家はゼロ補完した構造体で計算する"
+            );
+        }
+        assert_eq!(
+            column_value(ActivityId::IO, tps, meta(tps), &plan, &p, &c, &ctx).unwrap(),
+            500.0,
+            "存在する列は普通に計算する"
+        );
+
+        // --- 独自出力: 欠落のまま ---
+        for col in [dtps, bdscd] {
+            assert_eq!(
+                column_value_strict(ActivityId::IO, col, meta(col), &plan, &p, &c, &ctx),
+                Err(ComputeIssue::UnsupportedBySource),
+                "0 と欠落を混同しない"
+            );
+        }
+    }
+
+    /// 欠落の種類を分類できる (指摘 5)。
+    ///
+    /// 互換出力は `ZeroFilled` を 0 として出し、独自出力は欠落のまま残す。
+    #[test]
+    fn missing_kind_separates_zero_filled_from_absent() {
+        assert_eq!(
+            missing_kind(ComputeIssue::UnsupportedBySource),
+            Some(MissingKind::ZeroFilled),
+            "その世代にフィールドが無いだけ = 本家は 0 埋めする"
+        );
+        for issue in [
+            ComputeIssue::MissingInSample,
+            ComputeIssue::Discontinuous(Discontinuity::FirstSample),
+            ComputeIssue::Discontinuous(Discontinuity::Restart),
+            ComputeIssue::Discontinuous(Discontinuity::AmbiguousDecrease),
+        ] {
+            assert_eq!(
+                missing_kind(issue),
+                Some(MissingKind::Absent),
+                "ゼロ補完してはいけない: {issue:?}"
+            );
+        }
+        for issue in [
+            ComputeIssue::NotNumeric,
+            ComputeIssue::NeedsItemGroup,
+            ComputeIssue::NotImplemented,
+        ] {
+            assert_eq!(
+                missing_kind(issue),
+                None,
+                "値の欠落ではない (呼び出し方の問題): {issue:?}"
+            );
+        }
+    }
+
+    /// レコードに値が無い欠落は、方針に関わらずゼロ補完しない (指摘 5)。
+    ///
+    /// 「その世代にフィールドが無い」(= 本家も 0) と
+    /// 「このサンプルで値が読めなかった」(= 本家なら行が無い) は別物。
+    #[test]
+    fn missing_in_sample_is_never_zero_filled() {
+        let plan = plan_for(ActivityId::PCSW);
+        let meta = &lookup(ActivityId::PCSW).unwrap().columns[0];
+        let p = zeros(&plan);
+        // 値を持たない item (レコードが短い等)
+        let c = ItemSnapshot {
+            key: None,
+            texts: Vec::new(),
+            values: vec![Availability::MissingInSample; plan.fields.len()],
+        };
+        let ctx = ComputeContext::new(100);
+        assert_eq!(
+            column_value(ActivityId::PCSW, 0, meta, &plan, &p, &c, &ctx),
+            Err(ComputeIssue::MissingInSample)
+        );
+    }
+
+    // ---- 未使用スロットの判定 (golden 比較 ⑤ / ⑥) ----
+
+    /// `A_DISK` は `major + minor == 0` のスロットを未使用とみなす。
+    ///
+    /// `file_activity.nr` は確保枠数なので、枠が余っていると
+    /// 「`dev0-0` が 0.00 を並べる行」が出る。本家はこの番兵で飛ばす。
+    #[test]
+    fn disk_slot_without_major_minor_is_unused() {
+        let plan = plan_for(ActivityId::DISK);
+        let empty = zeros(&plan);
+        assert!(is_unused_item(ActivityId::DISK, 3, &plan, &empty));
+
+        // minor だけでも 0 でなければ使用中 (`dev8-0` は major=8 / minor=0)
+        let mut used = zeros(&plan);
+        put(&plan, &mut used, disk_col::MAJOR, 8);
+        assert!(!is_unused_item(ActivityId::DISK, 3, &plan, &used));
+
+        let mut minor_only = zeros(&plan);
+        put(&plan, &mut minor_only, disk_col::MINOR, 1);
+        assert!(!is_unused_item(ActivityId::DISK, 3, &plan, &minor_only));
+    }
+
+    /// `A_FS` は `f_blocks == 0` のスロットを未使用とみなす。
+    #[test]
+    fn filesystem_slot_without_total_blocks_is_unused() {
+        let plan = plan_for(ActivityId::FS);
+        let empty = zeros(&plan);
+        assert!(is_unused_item(ActivityId::FS, 1, &plan, &empty));
+
+        let mut used = zeros(&plan);
+        put(&plan, &mut used, fs_col::TOTAL, 1 << 30);
+        assert!(!is_unused_item(ActivityId::FS, 1, &plan, &used));
+    }
+
+    /// `A_NET_SOFT` はカウンタが全 0 の CPU をオフラインとみなすが、
+    /// CPU "all" (先頭スロット) は常に表示する。
+    #[test]
+    fn net_soft_offline_cpu_is_unused_but_all_is_kept() {
+        let plan = plan_for(ActivityId::NET_SOFT);
+        let z = zeros(&plan);
+        assert!(
+            !is_unused_item(ActivityId::NET_SOFT, 0, &plan, &z),
+            "index 0 は CPU \"all\" なので値が 0 でも出す"
+        );
+        assert!(is_unused_item(ActivityId::NET_SOFT, 1, &plan, &z));
+
+        // カウンタが 1 本でも動いていればオンライン
+        let mut online = zeros(&plan);
+        put(&plan, &mut online, soft_col::RX_RPS, 1);
+        assert!(!is_unused_item(ActivityId::NET_SOFT, 1, &plan, &online));
+
+        // 本家は backlog_len もオンライン判定に含める。
+        let mut backlog_only = zeros(&plan);
+        put(&plan, &mut backlog_only, soft_col::BLG_LEN, 5);
+        assert!(
+            !is_unused_item(ActivityId::NET_SOFT, 1, &plan, &backlog_only),
+            "blg_len が残っていればオンラインと判定する"
+        );
+    }
+
+    /// 番兵を持たない activity は常に使用中 (枠を飛ばさない)。
+    #[test]
+    fn activities_without_sentinel_are_never_unused() {
+        for id in [ActivityId::CPU, ActivityId::MEMORY, ActivityId::QUEUE] {
+            let plan = plan_for(id);
+            let z = zeros(&plan);
+            assert!(!is_unused_item(id, 1, &plan, &z), "{id:?}");
+        }
+    }
+
+    /// `kbavail` 列そのものも、持たない世代では `kbmemfree` で代用する
+    /// (golden 比較 ④)。
+    ///
+    /// 派生列 (`kbmemused` / `%memused`) だけを代用しても、
+    /// 表示される `kbavail` 列が 0 になって本家と食い違う。
+    #[test]
+    fn kbavail_column_falls_back_to_free_memory() {
+        let def = lookup(ActivityId::MEMORY).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        // `availablekb` を持たない旧世代を、申告サイズを削って再現する
+        // (`DecodePlan::build` は申告領域に収まらないフィールドを欠落にする)
+        let ctx = ComputeContext::new(100);
+        let meta = &def.columns[mem_col::KBAVAIL];
+
+        let modern = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).unwrap();
+        let mut m = zeros(&modern);
+        put(&modern, &mut m, mem_col::KBMEMFREE, 4_066_192);
+        put(&modern, &mut m, mem_col::KBAVAIL, 5_791_704);
+        assert_eq!(
+            column_value(
+                ActivityId::MEMORY,
+                mem_col::KBAVAIL,
+                meta,
+                &modern,
+                &m,
+                &m,
+                &ctx
+            ),
+            Ok(5_791_704.0),
+            "持っている世代は自分の値を出す"
+        );
+
+        // 旧世代を模したゼロ幅の計画。`availablekb` が欠落する構成を探す。
+        let old = def
+            .revisions
+            .iter()
+            .find(|r| {
+                let p = DecodePlan::build(def, r, r.size_lp64, 1, 1, &enc);
+                p.map(|p| !column_is_present(&p, mem_col::KBAVAIL))
+                    .unwrap_or(false)
+            })
+            .map(|r| DecodePlan::build(def, r, r.size_lp64, 1, 1, &enc).unwrap());
+        let Some(old) = old else {
+            // レジストリに `availablekb` 抜きの revision が無い構成では検証できない
+            return;
+        };
+        let mut o = zeros(&old);
+        put(&old, &mut o, mem_col::KBMEMFREE, 5_646_540);
+        assert_eq!(
+            column_value(
+                ActivityId::MEMORY,
+                mem_col::KBAVAIL,
+                meta,
+                &old,
+                &o,
+                &o,
+                &ctx
+            ),
+            Ok(5_646_540.0),
+            "持たない世代は kbmemfree を出す (本家と同じ値)"
+        );
+        // 独自出力・集計は欠落を欠落として受け取る
+        assert_eq!(
+            column_value_strict(
+                ActivityId::MEMORY,
+                mem_col::KBAVAIL,
+                meta,
+                &old,
+                &o,
+                &o,
+                &ctx
+            ),
+            Err(ComputeIssue::UnsupportedBySource),
+            "厳密モードは代用しない"
         );
     }
 }

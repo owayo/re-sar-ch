@@ -36,8 +36,8 @@
 //! v11.7.1 は構造体を時代 B へ移したが per-activity の `magic` を上げ忘れており、
 //! 「新レイアウトなのに旧 magic」という組み合わせが実在する
 //! (`A_CPU` = `0x8a`/80、`A_MEMORY` = `0x8a`/136、`A_QUEUE` = `0x8b`/40 など)。
-//! ここでは本家互換 (= 旧 magic は時代 A のレイアウトとして扱う) を既定とし、
-//! v11.7.1 用の救済は上位層の判断に委ねる。そのため v11.7.1 専用の revision は置かない。
+//! 自己記述形式では時代 A 専用の配置を候補から外す。未対応の旧 magic は
+//! 本家と同様に読み飛ばし、他 activity の処理を続ける。
 
 use crate::format::wire::{FieldTy, WireField, WireLayout};
 use crate::layout::registry::{ActivityDef, ColumnMeta, ItemShape, WireRevision};
@@ -94,6 +94,7 @@ const CPU_FIELDS_A9: &[WireField] = &[
 const CPU_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [10, 0, 0],
         size_lp64: 80,
         layout: WireLayout::new("stats_cpu@0x8b", CPU_FIELDS_B),
@@ -102,6 +103,7 @@ const CPU_REVISIONS: &[WireRevision] = &[
     // v10.1.2 で cpu_guest_nice が加わり 144 → 160 になった。
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [10, 0, 0],
         size_lp64: 160,
         layout: WireLayout::new("stats_cpu@0x8a+guest_nice", CPU_FIELDS_A10),
@@ -109,6 +111,7 @@ const CPU_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [9, 0, 0],
         size_lp64: 144,
         layout: WireLayout::new("stats_cpu@0x8a", CPU_FIELDS_A9),
@@ -254,6 +257,7 @@ const PCSW_FIELDS_A: &[WireField] = &[
 const PCSW_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [1, 1, 0],
         size_lp64: 16,
         layout: WireLayout::new("stats_pcsw@0x8b", PCSW_FIELDS_B),
@@ -261,6 +265,7 @@ const PCSW_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [1, 1, 0],
         size_lp64: 32,
         layout: WireLayout::new("stats_pcsw@0x8a", PCSW_FIELDS_A),
@@ -308,15 +313,14 @@ const IRQ_FIELDS_C: &[WireField] = &[
 /// magic が `0x8c` に上がったため、現行の sar はこの世代の `A_IRQ` を読み飛ばす。
 const IRQ_FIELDS_B: &[WireField] = &[WireField::natural("irq_nr", FieldTy::U64)];
 
-/// 時代 A (v9.1.5〜v11.0.x)。`aligned(16)` により 1 フィールドで 16 バイト (§6.4)。
-///
-/// v11.1.0〜v11.7.1 の形はドキュメントに明記が無い (8 バイトと推測されるが未確認)
-/// ため revision を置いていない。
+/// 時代 A (v9.1.5〜v11.6.6)。`aligned(16)` により 1 フィールドで 16 バイト (§6.4)。
+/// data-10.3.1 / data-11.6.5 と sa_conv.h stats_irq_8a で確認。
 const IRQ_FIELDS_A: &[WireField] = &[WireField::aligned("irq_nr", FieldTy::U64, 16)];
 
 const IRQ_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [0, 0, 1],
         size_lp64: 12,
         layout: WireLayout::new("stats_irq@0x8c", IRQ_FIELDS_C),
@@ -324,6 +328,7 @@ const IRQ_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [1, 0, 0],
         size_lp64: 8,
         layout: WireLayout::new("stats_irq@0x8b", IRQ_FIELDS_B),
@@ -331,6 +336,7 @@ const IRQ_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [1, 0, 0],
         size_lp64: 16,
         layout: WireLayout::new("stats_irq@0x8a", IRQ_FIELDS_A),
@@ -376,6 +382,7 @@ const SWAP_FIELDS: &[WireField] = &[
 
 const SWAP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 2, 0],
     size_lp64: 16,
     layout: WireLayout::new("stats_swap@0x8a", SWAP_FIELDS),
@@ -438,6 +445,7 @@ const PAGE_FIELDS_8: &[WireField] = &[
 const PAGE_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8a,
+        self_describing: true,
         types_nr: [0, 10, 0],
         size_lp64: 80,
         layout: WireLayout::new("stats_paging@0x8a+promote", PAGE_FIELDS_10),
@@ -446,6 +454,7 @@ const PAGE_REVISIONS: &[WireRevision] = &[
     // magic は昇格していない (§9.3)。64 と 80 の判別は types_nr / size で行う。
     WireRevision {
         magic: 0x8a,
+        self_describing: true,
         types_nr: [0, 8, 0],
         size_lp64: 64,
         layout: WireLayout::new("stats_paging@0x8a", PAGE_FIELDS_8),
@@ -587,6 +596,7 @@ const IO_FIELDS_A5_U32: &[WireField] = &[
 const IO_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [7, 0, 0],
         size_lp64: 56,
         layout: WireLayout::new("stats_io@0x8b+discard", IO_FIELDS_7),
@@ -594,6 +604,7 @@ const IO_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [5, 0, 0],
         size_lp64: 40,
         layout: WireLayout::new("stats_io@0x8b", IO_FIELDS_5),
@@ -601,6 +612,7 @@ const IO_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [5, 0, 0],
         size_lp64: 48,
         layout: WireLayout::new("stats_io@0x8b:aligned16", IO_FIELDS_A5),
@@ -608,6 +620,7 @@ const IO_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 0, 5],
         size_lp64: 20,
         layout: WireLayout::new("stats_io@0x8a", IO_FIELDS_A5_U32),
@@ -799,9 +812,22 @@ const MEMORY_FIELDS_A10: &[WireField] = &[
     WireField::natural("inactkb", FieldTy::CULong),
 ];
 
+/// v9.1.5 / v9.1.6。sa_conv.h stats_memory_8a の先頭 8 本 (§9.4)。
+const MEMORY_FIELDS_A8: &[WireField] = &[
+    WireField::natural("frmkb", FieldTy::CULong),
+    WireField::natural("bufkb", FieldTy::CULong),
+    WireField::natural("camkb", FieldTy::CULong),
+    WireField::natural("tlmkb", FieldTy::CULong),
+    WireField::natural("frskb", FieldTy::CULong),
+    WireField::natural("tlskb", FieldTy::CULong),
+    WireField::natural("caskb", FieldTy::CULong),
+    WireField::natural("comkb", FieldTy::CULong),
+];
+
 const MEMORY_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [18, 0, 0],
         size_lp64: 144,
         layout: WireLayout::new("stats_memory@0x8b+shmem", MEMORY_FIELDS_18),
@@ -809,6 +835,7 @@ const MEMORY_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [17, 0, 0],
         size_lp64: 136,
         layout: WireLayout::new("stats_memory@0x8b", MEMORY_FIELDS_17),
@@ -816,6 +843,7 @@ const MEMORY_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 17, 0],
         size_lp64: 136,
         layout: WireLayout::new("stats_memory@0x8a:17", MEMORY_FIELDS_A17),
@@ -823,6 +851,7 @@ const MEMORY_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 16, 0],
         size_lp64: 128,
         layout: WireLayout::new("stats_memory@0x8a:16", MEMORY_FIELDS_A16),
@@ -830,6 +859,7 @@ const MEMORY_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 11, 0],
         size_lp64: 88,
         layout: WireLayout::new("stats_memory@0x8a:11", MEMORY_FIELDS_A11),
@@ -837,13 +867,20 @@ const MEMORY_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 10, 0],
         size_lp64: 80,
         layout: WireLayout::new("stats_memory@0x8a:10", MEMORY_FIELDS_A10),
         since: "9.1.7",
     },
-    // v9.1.5 / v9.1.6 の 64 バイト (8 フィールド) は、その時期に `frhkb` / `tlhkb` が
-    // 一時的に含まれていた経緯 (§9.7) がありフィールド構成が確定できないため置かない。
+    WireRevision {
+        magic: 0x8a,
+        self_describing: false,
+        types_nr: [0, 8, 0],
+        size_lp64: 64,
+        layout: WireLayout::new("stats_memory@0x8a:8", MEMORY_FIELDS_A8),
+        since: "9.1.5",
+    },
 ];
 
 /// `hdr_line` (2 セクション) =
@@ -1080,6 +1117,7 @@ const KTABLES_FIELDS_A: &[WireField] = &[
 const KTABLES_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [4, 0, 0],
         size_lp64: 32,
         layout: WireLayout::new("stats_ktables@0x8b", KTABLES_FIELDS_B),
@@ -1087,6 +1125,7 @@ const KTABLES_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 0, 4],
         size_lp64: 16,
         layout: WireLayout::new("stats_ktables@0x8a", KTABLES_FIELDS_A),
@@ -1176,6 +1215,7 @@ const QUEUE_FIELDS_A5: &[WireField] = &[
 const QUEUE_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [3, 0, 3],
         size_lp64: 40,
         layout: WireLayout::new("stats_queue@0x8c", QUEUE_FIELDS_B),
@@ -1183,6 +1223,7 @@ const QUEUE_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [0, 2, 4],
         size_lp64: 32,
         layout: WireLayout::new("stats_queue@0x8b", QUEUE_FIELDS_A6),
@@ -1190,6 +1231,7 @@ const QUEUE_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 1, 4],
         size_lp64: 24,
         layout: WireLayout::new("stats_queue@0x8a", QUEUE_FIELDS_A5),
@@ -1273,6 +1315,7 @@ const SERIAL_FIELDS: &[WireField] = &[
 const SERIAL_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [0, 0, 7],
         size_lp64: 28,
         layout: WireLayout::new("stats_serial@0x8b", SERIAL_FIELDS),
@@ -1280,6 +1323,7 @@ const SERIAL_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 0, 7],
         size_lp64: 28,
         layout: WireLayout::new("stats_serial@0x8a", SERIAL_FIELDS),
@@ -1394,6 +1438,7 @@ const HUGE_FIELDS_A2: &[WireField] = &[
 const HUGE_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [4, 0, 0],
         size_lp64: 32,
         layout: WireLayout::new("stats_huge@0x8b+rsvd", HUGE_FIELDS_4),
@@ -1401,6 +1446,7 @@ const HUGE_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [2, 0, 0],
         size_lp64: 16,
         layout: WireLayout::new("stats_huge@0x8b", HUGE_FIELDS_B2),
@@ -1408,6 +1454,7 @@ const HUGE_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [0, 2, 0],
         size_lp64: 16,
         layout: WireLayout::new("stats_huge@0x8a", HUGE_FIELDS_A2),
@@ -1496,6 +1543,7 @@ const PSI_CPU_FIELDS: &[WireField] = &[
 
 const PSI_CPU_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [1, 3, 0],
     size_lp64: 32,
     layout: WireLayout::new("stats_psi_cpu@0x8a", PSI_CPU_FIELDS),
@@ -1555,6 +1603,7 @@ const PSI_IO_FIELDS: &[WireField] = &[
 
 const PSI_IO_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [2, 6, 0],
     size_lp64: 64,
     layout: WireLayout::new("stats_psi_io@0x8a", PSI_IO_FIELDS),
@@ -1643,6 +1692,7 @@ const PSI_MEM_FIELDS: &[WireField] = &[
 
 const PSI_MEM_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [2, 6, 0],
     size_lp64: 64,
     layout: WireLayout::new("stats_psi_mem@0x8a", PSI_MEM_FIELDS),

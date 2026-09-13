@@ -12,6 +12,8 @@ use crate::model::{ActivityId, Aggregation, Unit, ValueKind};
 pub struct WireRevision {
     /// この revision に対応する activity magic。
     pub magic: u32,
+    /// 自己記述形式 (0x2175) で使用できる配置か。時代 A 専用なら false。
+    pub self_describing: bool,
     /// 型別フィールド数 `(ull, ul, int)`。自己記述形式のファイルとの突合に使う。
     pub types_nr: [u32; 3],
     /// LP64 における 1 item のサイズ。`file_activity.size` との突合に使う
@@ -75,11 +77,13 @@ pub struct ActivityDef {
 
 impl ActivityDef {
     /// activity magic に対応する revision を探す。
+    /// ファイルの読込時はサイズ・世代も検証する plan::select_revision を使う。
     pub fn revision_for_magic(&self, magic: u32) -> Option<&'static WireRevision> {
         self.revisions.iter().find(|r| r.magic == magic)
     }
 
-    /// 型別フィールド数が一致する revision を探す (自己記述形式向け)。
+    /// 型別フィールド数が一致する revision を探す。
+    /// ファイルの読込時は magic・サイズ・世代も検証する plan::select_revision を使う。
     pub fn revision_for_types_nr(&self, types_nr: [u32; 3]) -> Option<&'static WireRevision> {
         self.revisions.iter().find(|r| r.types_nr == types_nr)
     }
@@ -101,14 +105,69 @@ impl ActivityDef {
             .find(|r| r.magic == magic && r.size_lp64 == size)
     }
 
-    /// 申告サイズだけが一致する revision を探す (magic を持たない `0x2170` 世代向け)。
+    /// 申告サイズが一致する最古の revision を探す (magic を持たない `0x2170` 世代向け)。
     pub fn revision_for_size(&self, size: usize) -> Option<&'static WireRevision> {
-        self.revisions.iter().find(|r| r.size_lp64 == size)
+        self.revisions.iter().rev().find(|r| r.size_lp64 == size)
     }
 
     /// 最も新しい revision。
     pub fn latest(&self) -> Option<&'static WireRevision> {
         self.revisions.first()
+    }
+}
+
+/// 本家が「この activity を表示できる形式か」をどう判定するか。
+///
+/// 本家 `sa_common.c: check_file_actlst()` は、ファイルの activity 一覧を
+/// 自分がコンパイル時に持つ表と突き合わせ、**既知 ID だが magic が違う**
+/// ものに `ACTIVITY_MAGIC_UNKNOWN` を立てる。以降の表示経路 (`sar`) は
+/// それを `id_seq[]` に入れないので、そのブロックは**丸ごと出ない**。
+/// `sadf -H` は一覧には出すが `[Unknown format]` を付ける。
+///
+/// reSARch 自身は旧 revision も解釈できるので、**独自出力ではここで
+/// 弾かない**。判定結果を使うのは `sar` / `sadf` 互換出力だけである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatCompat {
+    /// 参照する `sar` 版と同じ形式。本家も表示する。
+    Current,
+    /// 既知 ID だが magic が参照版と違う。本家は表示せず、
+    /// `sadf -H` に `[Unknown format]` を付ける。
+    UnknownFormat,
+    /// 未知 ID。本家は表示せず、`[Unknown format]` も**付けない**
+    /// (既知 ID との区別が付かなくなるため)。
+    UnknownActivity,
+}
+
+impl FormatCompat {
+    /// `sar` / `sadf` 互換出力がこの activity のブロックを出すか。
+    #[inline]
+    pub const fn is_displayed_by_sar(self) -> bool {
+        matches!(self, FormatCompat::Current)
+    }
+
+    /// `sadf -H` の一覧行末に `[Unknown format]` を付けるか。
+    #[inline]
+    pub const fn shows_unknown_format_marker(self) -> bool {
+        matches!(self, FormatCompat::UnknownFormat)
+    }
+}
+
+/// ファイルの activity 1 件を参照 `sar` 版の表と突き合わせる。
+///
+/// `magic` が `None` の世代 (`0x2170`) は activity magic をファイルに持たない。
+/// 本家はこの世代を読めないので比較相手が無く、既知 ID なら
+/// [`FormatCompat::Current`] とする (reSARch はサイズから revision を決める)。
+pub fn format_compat(id: ActivityId, magic: Option<u32>) -> FormatCompat {
+    let Some(def) = lookup(id) else {
+        return FormatCompat::UnknownActivity;
+    };
+    let Some(magic) = magic else {
+        return FormatCompat::Current;
+    };
+    // 参照版が持つ magic = 最新 revision の magic。
+    match def.latest() {
+        Some(latest) if latest.magic == magic => FormatCompat::Current,
+        _ => FormatCompat::UnknownFormat,
     }
 }
 
@@ -134,6 +193,52 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unknown_id() {
         assert!(lookup(ActivityId(200)).is_none());
+    }
+
+    /// 形式互換の 3 分類。
+    ///
+    /// 「既知 ID で magic 不一致」と「未知 ID」を混ぜてはいけない。
+    /// `sadf -H` は前者にだけ `[Unknown format]` を付けるので、
+    /// 混ぜると本家の一覧と食い違う (golden 比較 ⑨)。
+    #[test]
+    fn format_compat_separates_unknown_format_from_unknown_activity() {
+        let cpu = lookup(ActivityId::CPU).expect("A_CPU は登録済み");
+        let current = cpu.latest().expect("revision がある").magic;
+
+        assert_eq!(
+            format_compat(ActivityId::CPU, Some(current)),
+            FormatCompat::Current
+        );
+        // 現行 magic と違う値 (古い revision の magic でも同じ扱いになる)
+        assert_eq!(
+            format_compat(ActivityId::CPU, Some(current - 1)),
+            FormatCompat::UnknownFormat
+        );
+        assert_eq!(
+            format_compat(ActivityId(255), Some(0x8a)),
+            FormatCompat::UnknownActivity
+        );
+        // magic を持たない世代 (`0x2170`) は比較相手が無い
+        assert_eq!(
+            format_compat(ActivityId::CPU, None),
+            FormatCompat::Current,
+            "magic を持たない世代は revision を申告サイズから決める"
+        );
+    }
+
+    /// 表示するかどうかと、印を付けるかどうかは別の判断。
+    #[test]
+    fn only_current_is_displayed_and_only_mismatch_is_marked() {
+        assert!(FormatCompat::Current.is_displayed_by_sar());
+        assert!(!FormatCompat::UnknownFormat.is_displayed_by_sar());
+        assert!(!FormatCompat::UnknownActivity.is_displayed_by_sar());
+
+        assert!(!FormatCompat::Current.shows_unknown_format_marker());
+        assert!(FormatCompat::UnknownFormat.shows_unknown_format_marker());
+        assert!(
+            !FormatCompat::UnknownActivity.shows_unknown_format_marker(),
+            "未知 ID には印を付けない (既知 ID との区別が付かなくなる)"
+        );
     }
 
     /// 登録済み定義の整合性を機械的に検査する。

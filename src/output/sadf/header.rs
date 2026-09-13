@@ -29,11 +29,21 @@ use chrono::{Datelike, TimeZone, Utc};
 
 use crate::format::file::SaFile;
 
+use super::SadfConfig;
+
 /// 現行の `FORMAT_MAGIC`。これ以外のファイルはヘッダ 2 行で打ち切る。
 pub const FORMAT_MAGIC: u16 = 0x2175;
 
-/// `-H` の出力。
+/// `-H` の出力 (既定の時刻基準)。
+///
+/// `-t` を反映するには [`write_header_with`] を使う。
 pub fn write_header<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> {
+    write_header_with(out, file, &SadfConfig::default())
+}
+
+/// `-H` の出力。`cfg.time_base` が [`super::TimeBase::TrueTime`] (`-t`) の
+/// ときだけ `File date:` がヘッダの日付フィールド由来になる (§1.5)。
+pub fn write_header_with<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> io::Result<()> {
     let magic = file.magic();
     let h = file.header();
 
@@ -66,11 +76,24 @@ pub fn write_header<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> {
     write!(out, "Host: ")?;
     write_gal_header(out, file)?;
 
-    writeln!(out, "File date: {:04}-{:02}-{:02}", h.year, h.month, h.day)?;
     let utc = Utc
         .timestamp_opt(h.ust_time as i64, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    // `sa_common.c: get_file_timestamp_struct()` — 既定は `sa_ust_time` を
+    // 暦に開いた日付で、ヘッダの `sa_day` / `sa_month` / `sa_year` を使うのは
+    // `-t` (`PRINT_TRUE_TIME`) のときだけ (§1.5)。両者は食い違い得る
+    // (本家のテストデータ `data-ukwn` は ust_time が 09-15、ヘッダ日付が 10-15)。
+    //
+    // `-j` / `-x` の `file-date` も本家は同じ関数で作るので
+    // ([`super::FileInfo::from_file_with`])、そちらと同じ値を使う。
+    // `-H` だけ別実装にすると、同じファイルの日付が形式ごとに食い違う。
+    writeln!(
+        out,
+        "File date: {}",
+        super::FileInfo::from_file_with(file, cfg.time_base).file_date
+    )?;
     writeln!(
         out,
         "File time: {} UTC ({})",
@@ -166,15 +189,13 @@ fn write_activity_line<W: Write>(
     let t = e.types_nr.unwrap_or([0, 0, 0]);
     line.push_str(&format!("\t({},{},{})", t[0], t[1], t[2]));
 
-    // 本家は「**現行の** magic と食い違うか」だけを見る (`act[p]->magic != fal->magic`)。
-    // 旧 magic のレイアウトを知っていても marker は付く点に注意
+    // 本家 `sa_common.c: check_file_actlst()` が `ACTIVITY_MAGIC_UNKNOWN` を
+    // 立てるのは**既知 ID で magic が食い違うとき**だけ。未知 ID は表に無いので
+    // 比較相手が無く、マーカーも付かない (実測: `expected.sadf-data-ukwn` の
+    // `255: [8a] Unknown activity` に marker は無い)。
+    // 旧 magic のレイアウトを reSARch が読めるかどうかとは無関係に付く点に注意
     // (実測: A_IRQ の 0x8b は読めるが `[Unknown format]` が付く)。
-    let marker = match crate::layout::registry::lookup(e.id) {
-        Some(def) => def.latest().map(|r| r.magic) != Some(e.magic),
-        // 未知 ID は常に付く
-        None => true,
-    };
-    if marker {
+    if e.format_compat().shows_unknown_format_marker() {
         line.push_str(" \t[Unknown format]");
     }
 
@@ -259,8 +280,12 @@ mod tests {
     }
 
     /// 未知 ID は名前の位置が `Unknown activity`。
+    ///
+    /// マーカーは**付かない**。本家 `check_file_actlst()` は自分の表に無い ID を
+    /// 比較しないので `ACTIVITY_MAGIC_UNKNOWN` が立たない
+    /// (実測: `expected.sadf-data-ukwn` の `255: [8a] Unknown activity`)。
     #[test]
-    fn unknown_activity_name() {
+    fn unknown_activity_name_has_no_marker() {
         let e = FileActivityEntry {
             id: ActivityId(200),
             magic: 0x01,
@@ -273,8 +298,7 @@ mod tests {
         let mut buf = Vec::new();
         write_activity_line(&mut buf, &e).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("200: [01] Unknown activity     N:   1\t(0,1,0)"));
-        assert!(s.contains("[Unknown format]"));
+        assert_eq!(s, "200: [01] Unknown activity     N:   1\t(0,1,0)\n");
     }
 }
 

@@ -20,16 +20,16 @@ use super::access::ActivityPair;
 use super::dbppc::{display_cpu_count, scan_comments, scan_restarts, selected_specs};
 use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Fmt, Group, Shape};
-use super::{ABSENT_JSON, FileInfo, SadfConfig, Stamp, interval_secs, render, spec};
+use super::{ABSENT_JSON, FileInfo, SadfConfig, Stamp, interval_secs, render};
 use crate::error::Result;
-use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::ActivityId;
+use crate::output::time_filter::Admit;
 use crate::series::{IntervalView, Selection, WalkItem, walk_items};
 
 /// `-j` の出力。
 pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file(file);
+    let info = FileInfo::from_file_with(file, cfg.time_base);
     let specs = selected_specs(file, cfg);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
@@ -68,6 +68,9 @@ pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Res
     } else {
         Vec::new()
     };
+    if !first {
+        writeln!(out).map_err(super::wrap_io)?;
+    }
     write_epilogue(out, cfg, &info, &restarts, &comments).map_err(super::wrap_io)?;
     Ok(())
 }
@@ -102,7 +105,6 @@ fn write_epilogue<W: Write>(
     restarts: &[super::dbppc::RestartMark],
     comments: &[(u64, (u8, u8, u8), String)],
 ) -> io::Result<()> {
-    writeln!(out)?;
     writeln!(out, "\t\t\t],")?;
 
     writeln!(out, "\t\t\t\"restarts\": [")?;
@@ -183,12 +185,9 @@ fn sample_body(
     let mut open_group = Group::None;
     let mut children: Vec<String> = Vec::new();
 
-    // SPECS の並びが act[] 順 = JSON の出力順。グループは連続しているので
+    // ファイルの activity 順 = JSON の出力順。通常の採取順ではグループが連続するので
     // 順に走査しながら開閉できる。
-    for spec in spec::SPECS {
-        if !specs.iter().any(|s| s.id == spec.id) {
-            continue;
-        }
+    for spec in specs {
         if spec.group != open_group {
             flush_group(&mut entries, open_group, &mut children);
             open_group = spec.group;
@@ -265,7 +264,7 @@ fn activity_block(
         Shape::Array => {
             let inner = tabs(tab + 1);
             let mut rows: Vec<String> = Vec::new();
-            for item in pair.output_items() {
+            for item in pair.selected_items(cfg, false) {
                 let mut members: Vec<String> = Vec::new();
                 for section in spec.active_sections(&cfg.section) {
                     let label = item_label_in(spec, section, &item);
@@ -289,7 +288,7 @@ fn activity_block(
         }
         Shape::Custom => match spec.id {
             ActivityId::IO => io_block(&pair, tab),
-            ActivityId::IRQ => irq_block(&pair, tab, spec),
+            ActivityId::IRQ => irq_block(&pair, tab, spec, cfg),
             _ => None,
         },
     }
@@ -339,27 +338,37 @@ fn io_block(pair: &ActivityPair<'_>, tab: usize) -> Option<String> {
 /// `A_IRQ` は 1 要素が「1 割込 × 全 CPU」。
 ///
 /// CPU キー集合はサンプルごとに変わり得る (§9.6-13)。固定スキーマにしてはいけない。
-fn irq_block(pair: &ActivityPair<'_>, tab: usize, spec: &ActivitySpec) -> Option<String> {
-    let nr = pair.curr.nr.max(1) as usize;
-    let nr2 = pair.curr.nr2.max(1) as usize;
+fn irq_block(
+    pair: &ActivityPair<'_>,
+    tab: usize,
+    spec: &ActivitySpec,
+    cfg: &SadfConfig,
+) -> Option<String> {
+    let (nr, nr2) = pair.irq_dimensions();
     let t = tabs(tab);
     let inner = tabs(tab + 1);
     let mut rows: Vec<String> = Vec::new();
 
     for irq in 0..nr2 {
-        let name = pair
-            .matrix_item(0, irq)
-            .and_then(|i| i.key().map(|s| s.to_string()))
-            .unwrap_or_else(|| irq.to_string());
+        if !(0..nr).any(|cpu| pair.irq_cpu_selected(cfg, cpu, false)) {
+            continue;
+        }
+        let name = pair.irq_name(irq);
+        if !cfg.name_selected(ActivityId::IRQ, &name) {
+            continue;
+        }
         let mut members = vec![format!("\"intr\": \"{}\"", esc(&name))];
         for cpu in 0..nr {
+            if !pair.irq_cpu_selected(cfg, cpu, false) {
+                continue;
+            }
             let key = if cpu == 0 {
                 "all".to_string()
             } else {
                 format!("CPU{}", cpu - 1)
             };
             let mut v = String::new();
-            match pair.matrix_item(cpu, irq) {
+            match pair.irq_item(cpu, irq) {
                 Some(item) => {
                     super::write_value(&mut v, item.computed_by_name("intr"), Fmt::R2, ABSENT_JSON)
                 }
@@ -412,6 +421,7 @@ fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::sadf::spec;
 
     /// ラッパを持たない activity は tab 5、グループ内は tab 6 (§9.4)。
     #[test]

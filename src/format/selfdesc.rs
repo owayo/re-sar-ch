@@ -11,7 +11,7 @@
 //! |---|---:|---|---|---|
 //! | 12.0.0 | 328 | (1, 1, 11) | (2, 0, 0) | `extra_next` なし |
 //! | 12.1.7 | 328 | (1, 1, 12) | (2, 0, 1) | `extra_next` 追加 |
-//! | 12.5.6 | 336 | (1, 1, 12) | (2, 0, 1) | `sa_tzname` 追加 |
+//! | 12.2.0 | 336 | (1, 1, 12) | (2, 0, 1) | `sa_tzname` 追加 |
 //! | 12.7.1 | 336 | (1, 1, 12) | (2, 0, 1) | 同上 |
 //!
 //! **12.0.0 と 12.1.7 は `header_size` が同じ 328 でありながら中身が違う。**
@@ -58,7 +58,7 @@ const FH_TAIL: &[WireField] = &[
     WireField::natural("sa_machine", FieldTy::Bytes(UTSNAME_LEN)),
 ];
 
-/// v12.5 以降で末尾に加わる。申告サイズとの差で在否を判定する。
+/// v12.2.0 以降で末尾に加わる。申告サイズとの差で在否を判定する。
 const FH_TZNAME: WireField = WireField::natural("sa_tzname", FieldTy::Bytes(TZNAME_LEN));
 
 /// `file_activity` の `int` グループ (ull / ul グループは空)。

@@ -25,11 +25,22 @@
 //! # Ok::<(), re_sar_ch::Error>(())
 //! ```
 
+pub mod assessment;
+pub mod metric_catalog;
 pub mod percentile;
 pub mod rules;
 pub mod summary;
 pub mod timeline;
 
+pub use assessment::{
+    ASSESSMENT_KIND, AssessedEpisode, Assessment, EvaluationCoverage, EvidenceSufficiency,
+    NotEvaluated, Priority, RouteStatus, RouteTally, SeriesEvaluation, SufficiencyLevel, assess,
+    assess_summary, describe_assessment, describe_detection,
+};
+pub use metric_catalog::{
+    CATALOG, CATALOG_VERSION, CatalogEntry, DeviationInterest, FixedCondition, ItemScope,
+    ShiftMagnitude,
+};
 pub use percentile::{
     PercentileAlgorithm, PercentileInterpolation, PercentileResult, PercentileSpec,
     PercentileUnavailable, PercentileWeighting,

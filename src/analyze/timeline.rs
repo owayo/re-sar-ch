@@ -152,6 +152,25 @@ impl ExclusionReason {
                 | ExclusionReason::LayoutChanged
         )
     }
+
+    /// この不連続は**全系列に及ぶ**か。
+    ///
+    /// 再起動・採取の中断・ファイルの切り替え・レイアウトの変更は
+    /// **レコード列の性質**なので、その時刻をまたぐ全系列に効く。
+    ///
+    /// 一方 item の入れ替えやカウンタの逆行は**その系列だけ**の話である。
+    /// 区別しないと、あるデバイスの着脱が無関係な系列の所見まで分断する。
+    ///
+    /// `is_discontinuity()` が偽の理由 (欠落・未実装など) は連続区間を
+    /// 切らないので、ここでは意味を持たない。
+    pub const fn affects_all_series(self) -> bool {
+        matches!(
+            self,
+            ExclusionReason::Restart
+                | ExclusionReason::FileBoundaryUnverified
+                | ExclusionReason::LayoutChanged
+        )
+    }
 }
 
 impl From<Discontinuity> for ExclusionReason {
@@ -371,17 +390,6 @@ impl MetricTimeline {
         c
     }
 
-    /// 全観測の最大値。
-    pub fn max_observed(&self) -> Option<(f64, u64)> {
-        self.points
-            .iter()
-            .filter_map(|p| p.value.map(|v| (v, p.end_ust)))
-            .fold(None, |acc: Option<(f64, u64)>, (v, t)| match acc {
-                Some((bv, _)) if bv >= v => acc,
-                _ => Some((v, t)),
-            })
-    }
-
     /// 条件を連続して満たす最長区間。
     ///
     /// **値が無い区間 (`None`) は連続を切る。** 欠損を「条件を満たさない」と
@@ -488,18 +496,6 @@ impl Timelines {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// item ラベルを問わず、同じ activity/column の指標を集める
-    /// (デバイスごと・CPU ごとの判定に使う)。
-    pub fn all_items<'a>(
-        &'a self,
-        activity: ActivityId,
-        column: &'a str,
-    ) -> impl Iterator<Item = &'a MetricTimeline> {
-        self.entries
-            .iter()
-            .filter(move |t| t.key.activity == activity && t.key.column == column)
     }
 
     /// 保持している指標を鍵の昇順へ並べる (出力を決定的にする)。

@@ -19,7 +19,7 @@
 
 use std::io::Write;
 
-use super::json::{CustomConfig, FieldOut, HostOut, Quality, item_out, selected_ids};
+use super::json::{CustomConfig, FieldOut, HostOut, Quality, custom_items, selected_ids};
 use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
@@ -46,6 +46,7 @@ pub const HEADER: &[&str] = &[
     "value",
     "raw",
     "text",
+    "cpu",
     "quality",
 ];
 
@@ -54,9 +55,29 @@ pub const HEADER: &[&str] = &[
 /// `csv::Writer` が内部バッファを持つので、レコードを書いた時点で
 /// 順次書き出される。全レコードを溜めることはしない。
 pub fn write_csv<W: Write>(out: W, file: &SaFile, cfg: &CustomConfig) -> Result<()> {
+    write_csv_with(out, file, cfg, true)
+}
+
+/// ヘッダ行を出すかどうかを指定して書き出す。
+///
+/// **複数ファイルを 1 本の CSV に連結する場合、ヘッダは先頭の 1 回だけ**にする。
+/// ファイルごとに出すと 2 本目以降のヘッダが**データ行として読まれ**、
+/// `pandas.read_csv` や表計算ソフトで列の型が壊れる
+/// (`hostname` 列に `"hostname"` という文字列が混ざる)。
+///
+/// JSON は配列で包めるので同じ問題が起きない。NDJSON は 1 行 1 オブジェクトなので
+/// そもそもヘッダを持たない。CSV だけがこの区別を必要とする。
+pub fn write_csv_with<W: Write>(
+    out: W,
+    file: &SaFile,
+    cfg: &CustomConfig,
+    header: bool,
+) -> Result<()> {
     let host = HostOut::new(file);
     let mut w = csv::WriterBuilder::new().from_writer(out);
-    w.write_record(HEADER).map_err(csv_err)?;
+    if header {
+        w.write_record(HEADER).map_err(csv_err)?;
+    }
 
     let mut boot: u32 = 0;
     let mut cursor = cfg.time_filter.cursor();
@@ -88,8 +109,7 @@ pub fn write_csv<W: Write>(out: W, file: &SaFile, cfg: &CustomConfig) -> Result<
                 continue;
             };
             let Some(sp) = spec::lookup(id) else { continue };
-            for item in pair.output_items() {
-                let row = item_out(pair.def, sp, &item, cfg);
+            for row in custom_items(&pair, cfg) {
                 for (space, fields) in [("raw", &row.raw), ("rates", &row.rates)] {
                     for f in fields.iter() {
                         write_field(
@@ -104,6 +124,7 @@ pub fn write_csv<W: Write>(out: W, file: &SaFile, cfg: &CustomConfig) -> Result<
                             &row.item,
                             row.index,
                             space,
+                            row.cpu.as_deref().unwrap_or(""),
                             f,
                         )?;
                     }
@@ -130,6 +151,7 @@ fn write_field<W: Write>(
     item: &str,
     item_index: usize,
     space: &str,
+    cpu: &str,
     f: &FieldOut,
 ) -> Result<()> {
     // 値が無い列は空欄にする。**0 を書いてはいけない** (正常な 0 と区別できない)。
@@ -155,6 +177,7 @@ fn write_field<W: Write>(
         &value,
         &raw,
         &text,
+        cpu,
         quality_label(f.quality),
     ])
     .map_err(csv_err)?;
@@ -210,7 +233,7 @@ mod tests {
         {
             let mut w = csv::Writer::from_writer(&mut buf);
             write_field(
-                &mut w, &host, 0, 100, 110, 1000, true, "A_DISK", "sda", 0, "rates", &f,
+                &mut w, &host, 0, 100, 110, 1000, true, "A_DISK", "sda", 0, "rates", "", &f,
             )
             .unwrap();
             w.flush().unwrap();
@@ -218,8 +241,8 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         // value / raw / text が空欄で、その後に理由が入る (0 で埋めない)
         assert!(
-            s.contains("gauge,,,,not_implemented"),
-            "空欄 3 つの後に理由: {s}"
+            s.contains("gauge,,,,,not_implemented"),
+            "空欄の値とCPUの後に理由: {s}"
         );
         assert!(!s.contains("gauge,0,"), "0 で埋めてはいけない: {s}");
     }
@@ -261,6 +284,7 @@ mod tests {
                 "eth0",
                 1,
                 "raw",
+                "",
                 &f,
             )
             .unwrap();

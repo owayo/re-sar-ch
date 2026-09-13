@@ -1010,7 +1010,7 @@ pub(crate) fn parse_values(value: &str, bitmap: &mut CpuBitmap) -> Result<(), Sa
 ///
 /// **不正な値でもエラーにならない**。範囲として解釈できなければそのまま名前として
 /// 登録される (`--int=MCE-XXX` は名前、`--int=30-50` は範囲)。
-pub(crate) fn parse_sa_devices(
+fn parse_sa_devices(
     o: &mut SarOptions,
     act: Activity,
     value: &str,
@@ -1030,6 +1030,28 @@ pub(crate) fn parse_sa_devices(
         }
         o.add_list_item(act, token, max_len);
     }
+}
+
+/// 両互換パーサで共有する item 絞り込み。空値も認識済みとして返す。
+///
+/// activity の選択や引数位置の更新は呼び出し元に任せる。
+pub(super) fn parse_item_filter(arg: &str, o: &mut SarOptions) -> bool {
+    if let Some(value) = arg.strip_prefix("--dev=") {
+        parse_sa_devices(o, Activity::Disk, value, MAX_DEV_LEN, NO_RANGE);
+    } else if let Some(value) = arg.strip_prefix("--fs=") {
+        parse_sa_devices(o, Activity::Fs, value, MAX_FS_LEN, NO_RANGE);
+    } else if let Some(value) = arg.strip_prefix("--iface=") {
+        parse_sa_devices(o, Activity::NetDev, value, MAX_IFACE_LEN, NO_RANGE);
+        // C 側はポインタ共有。再指定時も累積したリスト全体を同期する。
+        if let Some(list) = o.item_lists.get(&Activity::NetDev).cloned() {
+            o.item_lists.insert(Activity::NetEdev, list);
+        }
+    } else if let Some(value) = arg.strip_prefix("--int=") {
+        parse_sa_devices(o, Activity::Irq, value, MAX_SA_IRQ_LEN, NR_IRQS);
+    } else {
+        return false;
+    }
+    true
 }
 
 /// `decode_timestamp()` 相当。`hh:mm:ss` の 8 バイト文字列を検証する。
@@ -1223,7 +1245,7 @@ pub(crate) fn parse_sar_n_opt(value: &str, o: &mut SarOptions) -> Result<(), Sar
 ///
 /// 失敗を `Err(())` で返すのは、**`-q` だけは usage を出さず `A_QUEUE` を選んで
 /// そのトークンを次の引数として再解析する**という特殊な回復をするため。
-pub(crate) fn parse_sar_q_opt(value: &str, o: &mut SarOptions) -> Result<(), ()> {
+fn parse_sar_q_opt(value: &str, o: &mut SarOptions) -> Result<(), ()> {
     for token in value.split(',').filter(|t| !t.is_empty()) {
         match token {
             "LOAD" => o.select(Activity::Queue),
@@ -1245,6 +1267,29 @@ pub(crate) fn parse_sar_q_opt(value: &str, o: &mut SarOptions) -> Result<(), ()>
         }
     }
     Ok(())
+}
+
+/// 単独の `-q` と任意キーワードを処理し、次に解析する引数位置へ進める。
+///
+/// 失敗時はそれまでの選択を残して A_QUEUE を追加する。本家の strtok による
+/// カンマ切り詰めも再現し、次のトークンを呼び出し元で再解析できるよう残す。
+pub(super) fn parse_queue_option(argv: &mut [String], opt: &mut usize, o: &mut SarOptions) {
+    match argv.get(*opt + 1).cloned() {
+        Some(value) => {
+            if parse_sar_q_opt(&value, o).is_err() {
+                o.select(Activity::Queue);
+                argv[*opt + 1] = value.split(',').next().unwrap_or_default().to_string();
+                *opt += 1;
+            } else {
+                *opt += 2;
+            }
+        }
+        None => {
+            // 引数なしの -q は LOAD 相当。
+            o.select(Activity::Queue);
+            *opt += 1;
+        }
+    }
 }
 
 // ============================================================================
@@ -1420,21 +1465,7 @@ pub fn parse_sar_args(argv: &[String]) -> Result<SarOptions, SarArgError> {
         if arg == "--sadc" {
             o.immediate = Some(SarImmediate::Sadc);
             return Ok(o);
-        } else if let Some(value) = arg.strip_prefix("--dev=") {
-            parse_sa_devices(&mut o, Activity::Disk, value, MAX_DEV_LEN, NO_RANGE);
-            opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--fs=") {
-            parse_sa_devices(&mut o, Activity::Fs, value, MAX_FS_LEN, NO_RANGE);
-            opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--iface=") {
-            // A_NET_DEV に登録したリストを A_NET_EDEV にも共有する (C 側はポインタ共有)。
-            parse_sa_devices(&mut o, Activity::NetDev, value, MAX_IFACE_LEN, NO_RANGE);
-            if let Some(list) = o.item_lists.get(&Activity::NetDev).cloned() {
-                o.item_lists.insert(Activity::NetEdev, list);
-            }
-            opt += 1;
-        } else if let Some(value) = arg.strip_prefix("--int=") {
-            parse_sa_devices(&mut o, Activity::Irq, value, MAX_SA_IRQ_LEN, NR_IRQS);
+        } else if parse_item_filter(&arg, &mut o) {
             opt += 1;
         } else if arg == "--help" {
             o.immediate = Some(SarImmediate::Help);
@@ -1525,25 +1556,7 @@ pub fn parse_sar_args(argv: &[String]) -> Result<SarOptions, SarArgError> {
             parse_sar_n_opt(&value, &mut o)?;
             opt += 2;
         } else if arg == "-q" {
-            match argv.get(opt + 1).cloned() {
-                Some(value) => {
-                    if parse_sar_q_opt(&value, &mut o).is_err() {
-                        // usage は出さない。A_QUEUE を選択し、strtok に切られた
-                        // トークンを次の引数として再解析する。
-                        o.select(Activity::Queue);
-                        let truncated = value.split(',').next().unwrap_or_default().to_string();
-                        argv[opt + 1] = truncated;
-                        opt += 1;
-                    } else {
-                        opt += 2;
-                    }
-                }
-                None => {
-                    // 引数なしの -q は LOAD 相当。
-                    o.select(Activity::Queue);
-                    opt += 1;
-                }
-            }
+            parse_queue_option(&mut argv, &mut opt, &mut o);
         } else if is_day_offset(&arg) {
             if o.input.is_some() || o.day_offset != 0 {
                 return Err(SarArgError::ConflictingInput { opt: "-[0-9]+" });

@@ -24,7 +24,7 @@ use std::io::Write;
 use serde::Serialize;
 
 use super::json::{
-    BootCounter, CustomConfig, FieldOut, HostOut, ItemOut, SCHEMA_VERSION, item_out, selected_ids,
+    BootCounter, CustomConfig, FieldOut, HostOut, SCHEMA_VERSION, custom_items, selected_ids,
 };
 use super::sadf::access::ActivityPair;
 use super::sadf::spec;
@@ -61,6 +61,8 @@ pub struct Row<'a> {
     pub item: &'a str,
     /// activity 内での添字。
     pub item_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<&'a str>,
     /// 累積カウンタの生値。値は十進文字列。
     #[serde(skip_serializing_if = "<[FieldOut]>::is_empty")]
     pub raw: &'a [FieldOut],
@@ -114,7 +116,7 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                         host: &host,
                         boot: boot.get(),
                         epoch: *ust_time,
-                        cpu_count: *cpu_count,
+                        cpu_count: cpu_count.map(|n| n.saturating_sub(1).max(1)),
                         comment: None,
                     },
                     RecordEvent::Comment { ust_time, text, .. } => EventRow {
@@ -128,7 +130,7 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                     },
                 };
                 // 範囲外のイベント行は出さない
-                if cursor.event(ev.ust_time(), ev.time()) {
+                if cursor.native_event(ev.ust_time(), ev.time()) {
                     write_line(out, &row)?;
                 }
                 return Ok(ScanControl::Continue);
@@ -152,8 +154,7 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                 continue;
             };
             let Some(sp) = spec::lookup(id) else { continue };
-            for item in pair.output_items() {
-                let out_item: ItemOut = item_out(pair.def, sp, &item, cfg);
+            for out_item in custom_items(&pair, cfg) {
                 let row = Row {
                     schema_version: SCHEMA_VERSION,
                     record: "sample",
@@ -167,6 +168,7 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                     activity_label: id.label().unwrap_or(""),
                     item: &out_item.item,
                     item_index: out_item.index,
+                    cpu: out_item.cpu.as_deref(),
                     raw: &out_item.raw,
                     rates: &out_item.rates,
                 };
@@ -238,6 +240,7 @@ mod tests {
             activity_label: "CPU 使用率",
             item: "all",
             item_index: 0,
+            cpu: None,
             raw: &raw,
             rates: &rates,
         };
@@ -311,6 +314,7 @@ mod tests {
             activity_label: "",
             item: "all",
             item_index: 0,
+            cpu: None,
             raw: &raw,
             rates: &[],
         };

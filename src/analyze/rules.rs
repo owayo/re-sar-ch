@@ -239,10 +239,10 @@ pub static RULES: &[RuleDef] = &[
     RuleDef {
         id: "cpu-saturation",
         version: "1",
-        title: "CPU の空き時間が少ない状態が継続した",
+        title: "I/O 待ちを伴わない CPU idle 時間が少ない状態が継続した",
         required: &[M_CPU_IDLE],
         thresholds: &[ThresholdRecord {
-            target: "cpu_busy (100 - %idle)",
+            target: "100 - %idle (= %user + %nice + %system + %iowait + %steal)",
             comparison: Comparison::AtLeast,
             value: 90.0,
             unit: Unit::Percent,
@@ -251,10 +251,12 @@ pub static RULES: &[RuleDef] = &[
         missing_policy: MissingPolicy::UndeterminedOnMissing,
         interpretations: &[
             "CPU 能力が要求に対して不足している",
+            "idle 時間が I/O 待ち (%iowait) または仮想 CPU の実行待ち (%steal) に寄っている",
             "単一のプロセスが CPU を占有している",
             "意図的に CPU を使い切るバッチ処理が動いていた",
         ],
         not_established: &[
+            "CPU 能力の不足 (%idle が低いことだけからは確定できない)",
             "どのプロセスが CPU を使っていたか (sa ファイルにプロセス別の内訳は無い)",
             "処理が遅延したかどうか (応答時間は観測していない)",
         ],
@@ -656,11 +658,11 @@ fn eval_cpu_saturation(def: &RuleDef, t: &Timelines, _ctx: &RuleContext) -> Find
             missing_metrics(def.required, t),
         );
     };
-    // %idle から使用率を作る。%idle の欠損は使用率の欠損として伝わる。
-    let busy = offset_from(idle, 100.0, "cpu_busy");
+    // I/O 待ちと steal を含む非 %idle 時間。CPU の実行時間とは断定しない。
+    let non_idle = offset_from(idle, 100.0, "cpu_non_idle");
     judge(
         def,
-        &busy,
+        &non_idle,
         vec![M_CPU_IDLE.display()],
         Some("100 - %idle"),
         None,

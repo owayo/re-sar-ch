@@ -35,16 +35,16 @@ use super::{
     ABSENT_TEXT, FileInfo, SadfConfig, Stamp, double_from_bits, render, spec, write_sensor,
 };
 use crate::error::Result;
-use crate::output::time_filter::Admit;
 use crate::format::file::{SaFile, ScanControl};
 use crate::model::{ActivityId, Availability};
+use crate::output::time_filter::Admit;
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 use super::dbppc::{display_cpu_count, scan_blocks, selected_specs};
 
 /// `-r` の出力。
 pub fn write_raw<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file(file);
+    let info = FileInfo::from_file_with(file, cfg.time_base);
     let specs = selected_specs(file, cfg);
     let blocks = scan_blocks(file)?;
 
@@ -193,7 +193,7 @@ fn emit_sample<W: Write>(
     }
 
     match spec.id {
-        ActivityId::IRQ => write_irq(out, view, &ts),
+        ActivityId::IRQ => write_irq(out, view, &ts, cfg),
         ActivityId::PWR_FREQ => write_wghfreq(out, view, &ts, cfg),
         _ => write_generic(out, view, &ts, cfg, spec, section),
     }
@@ -220,7 +220,7 @@ fn write_generic<W: Write>(
     // **前**に出る (§4.5)。ラベルを挟む位置をここで決める。
     let label_at = if spec.id == ActivityId::DISK { 2 } else { 0 };
 
-    for item in pair.output_items() {
+    for item in pair.selected_items(cfg, true) {
         let mut tok = vec![ts.to_string()];
         for (i, f) in fields.iter().enumerate() {
             if i == label_at {
@@ -345,11 +345,23 @@ fn push_raw_field(
     }
 }
 
-/// 生値 1 個のトークン。欠落は空文字 (**0 にはしない**)。
+/// 生値 1 個のトークン。
+///
+/// **欠落の 2 種類を区別する** (指摘 8 と同じ規則)。
+///
+/// | 欠落 | 出力 | 理由 |
+/// |---|---|---|
+/// | `UnsupportedBySource` (その世代にフィールドが無い) | `0` | 本家は「期待する型別本数よりファイル側が少なければ足りない分を 0 埋め」した構造体を読むので、`pval()` は `0` を出す (03 §1.9-1) |
+/// | `MissingInSample` (フィールドはあるがこのレコードで読めていない) | 空文字 | 本家ならその行自体が無い。0 を書くと観測値と区別が付かなくなる |
+///
+/// `-d` / `-p` / `-j` / `-x` は [`super::write_value`] が同じ区別をする。
+/// ここだけ空文字にすると**互換出力どうしで不統一**になる
+/// (旧 `A_IO` の `dtps` が `-d` では `0.00`、`-r` では空欄になっていた)。
 fn u64_token(v: Availability<u64>) -> String {
     match v {
         Availability::Present(x) => x.to_string(),
-        _ => ABSENT_TEXT.to_string(),
+        Availability::UnsupportedBySource => "0".to_string(),
+        Availability::MissingInSample => ABSENT_TEXT.to_string(),
     }
 }
 
@@ -381,47 +393,39 @@ fn raw_fields(section: &Section) -> Vec<RawField> {
 ///
 /// フィールド名は `all` (CPU 0) / `CPU0` / `CPU1` … (§4.5)。
 /// raw ではオフライン CPU も出す。
-fn write_irq<W: Write>(out: &mut W, view: &IntervalView<'_>, ts: &str) -> io::Result<()> {
+fn write_irq<W: Write>(
+    out: &mut W,
+    view: &IntervalView<'_>,
+    ts: &str,
+    cfg: &SadfConfig,
+) -> io::Result<()> {
     let Some(pair) = ActivityPair::from_view(view, ActivityId::IRQ) else {
         return Ok(());
     };
-    let nr = pair.curr.nr.max(1) as usize;
-    let nr2 = pair.curr.nr2.max(1) as usize;
-
-    // v12.5.6 より前の 1 次元レイアウト (`nr` = 割り込み数 / `nr2` = 1) では
-    // CPU 別の内訳を持たない。行列型と混同すると「割り込み 1 本 × 489 CPU」に
-    // 化けるので、ここで分ける (02 §6.4)。
-    if nr2 <= 1 {
-        for irq in 0..pair.len() {
-            let Some(item) = pair.item(irq) else { break };
-            let name = item
-                .key()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| irq.to_string());
-            let mut tok = vec![ts.to_string(), "INTR".to_string(), name, "all".to_string()];
-            tok.push(u64_token(item.raw_prev_by_name("intr")));
-            tok.push(u64_token(item.raw_curr_by_name("intr")));
-            out.write_all(join_tokens(&tok).as_bytes())?;
-        }
-        return Ok(());
-    }
+    let (nr, nr2) = pair.irq_dimensions();
 
     for irq in 0..nr2 {
+        if !(0..nr).any(|cpu| pair.irq_cpu_selected(cfg, cpu, true)) {
+            continue;
+        }
         // 割り込み名は CPU "all" 行 (行 0) にのみ書かれている
-        let name = pair
-            .matrix_item(0, irq)
-            .and_then(|i| i.key().map(|s| s.to_string()))
-            .unwrap_or_else(|| irq.to_string());
+        let name = pair.irq_name(irq);
+        if !cfg.name_selected(ActivityId::IRQ, &name) {
+            continue;
+        }
 
         let mut tok = vec![ts.to_string(), "INTR".to_string(), name];
         for cpu in 0..nr {
+            if !pair.irq_cpu_selected(cfg, cpu, true) {
+                continue;
+            }
             // フィールド名は `all` (CPU 0) / `CPU0` / `CPU1` … (§4.5)
             tok.push(if cpu == 0 {
                 "all".to_string()
             } else {
                 format!("CPU{}", cpu - 1)
             });
-            match pair.matrix_item(cpu, irq) {
+            match pair.irq_item(cpu, irq) {
                 Some(item) => {
                     tok.push(u64_token(item.raw_prev_by_name("intr")));
                     tok.push(u64_token(item.raw_curr_by_name("intr")));
@@ -453,6 +457,9 @@ fn write_wghfreq<W: Write>(
     let spec = pair_spec();
 
     for row in 0..nr {
+        if !cfg.cpus.includes(row) {
+            continue;
+        }
         let mut tok = vec![
             ts.to_string(),
             "CPU".to_string(),
@@ -538,11 +545,22 @@ mod tests {
         assert!(names.contains(&"tot_ticks"));
     }
 
-    /// 欠落は空トークンになり 0 にはならない。
+    /// 欠落の 2 種類を区別する (指摘 8 と同じ規則)。
+    ///
+    /// 「その世代にフィールドが無い」は本家がゼロ補完した構造体を読むので `0`、
+    /// 「このレコードで読めていない」は本家ならその行自体が無いので空文字。
     #[test]
-    fn absent_raw_value_is_empty_not_zero() {
-        assert_eq!(u64_token(Availability::UnsupportedBySource), "");
-        assert_eq!(u64_token(Availability::MissingInSample), "");
+    fn unsupported_field_is_zero_filled_but_missing_sample_is_empty() {
+        assert_eq!(
+            u64_token(Availability::UnsupportedBySource),
+            "0",
+            "本家は 0 埋めした構造体の値を出す (03 §1.9-1)"
+        );
+        assert_eq!(
+            u64_token(Availability::MissingInSample),
+            "",
+            "観測できていない値に 0 を与えない"
+        );
         assert_eq!(u64_token(Availability::Present(0)), "0", "正常な 0 は 0");
     }
 

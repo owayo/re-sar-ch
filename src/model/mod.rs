@@ -12,3 +12,6 @@ pub mod value;
 
 pub use activity::{ActivityId, KNOWN_ACTIVITIES, MAX_NR_ACT, NR_ACT};
 pub use value::{Aggregation, Availability, Counter, CounterBits, Unit, ValueKind};
+
+/// 独自出力で共通の公開スキーマ版。
+pub const NATIVE_SCHEMA_VERSION: &str = "1.0";

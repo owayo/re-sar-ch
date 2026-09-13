@@ -4,6 +4,8 @@
 
 pub mod analyze;
 pub mod cli;
+pub mod convert;
+pub mod detect;
 pub mod error;
 pub mod format;
 pub mod layout;
@@ -11,5 +13,6 @@ pub mod model;
 pub mod multi;
 pub mod output;
 pub mod series;
+pub mod skill;
 
 pub use error::{Error, Result};

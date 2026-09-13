@@ -46,6 +46,7 @@
 mod fixtures;
 mod golden;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -53,14 +54,16 @@ use fixtures::{Corruption, ExpectedError, FixtureAbi};
 use golden::{Comparison, Mask};
 
 use re_sar_ch::Error;
+use re_sar_ch::cli::sadf_args::{SadfFormat, parse_sadf_args};
 use re_sar_ch::cli::sar_args::{Activity, OptFlags, SarOptions, parse_sar_args};
 use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::ResolvedLayout;
 use re_sar_ch::format::{SaFile, ScanControl, layouts, selfdesc};
 use re_sar_ch::model::ActivityId;
-use re_sar_ch::output::sadf;
+use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
 use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
+use re_sar_ch::output::time_filter::TimeFilter;
 use re_sar_ch::series::{Selection, walk};
 
 // ===========================================================================
@@ -150,6 +153,12 @@ enum Repro {
     /// `sadf -H`。本家テストは `| grep -v 0x2175` を通すので、
     /// reSARch 側の出力からも同じ行を落とす (先頭行が入力パスを含むため)。
     SadfHeader,
+    /// `sadf` の各出力形式 (`-d` / `-p` / `-r` / `-j` / `-x`)。
+    ///
+    /// 要素は本家のコマンドラインの引数そのまま。`--` の後ろの `sar` 側引数
+    /// (`-m FAN,IN,TEMP` など) も含める。[`parse_sadf_args`] に通してから
+    /// 対応する writer を呼ぶ。
+    Sadf(&'static [&'static str]),
     /// reSARch にその出力形式が無く、比較できないケース。
     Unsupported {
         /// 何が無いのか。報告にそのまま出す。
@@ -160,6 +169,22 @@ enum Repro {
 /// `sadf -H` の 1 行目を落とすための語 (本家テストの `grep -v 0x2175` と同じ)。
 const SADF_H_GREP_V: &str = "0x2175";
 
+/// `docs/format/04-test-data.md` §5.1 のフェーズ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// ヘッダ解析のみ (`sadf -H` 相当)。
+    Header,
+    /// 生値デコード (`sadf -r -O debug` 相当)。
+    RawValues,
+    /// `sar` テキスト出力。
+    SarText,
+}
+
+/// 同梱バイナリ由来の golden (全件)。
+///
+/// コマンドラインは本家テストのものをそのまま記録してある。
+/// 環境変数の固定 (`LC_ALL=C` / `TZ=GMT`) は再現性のために必須 (§7.3)。
+/// reSARch 側はプロセスを起動しないので、`TZ=GMT` は [`TimeStyle::Utc`] で表す。
 const GOLDEN_CASES: &[GoldenCase] = &[
     GoldenCase {
         upstream_test: "00655",
@@ -275,9 +300,9 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         upstream_cmd: "LC_ALL=C TZ=GMT sadf -g <data> -- -A",
         golden: "expected.sadf-g-trunc",
         phase: Phase::RawValues,
-        // `-g` は SVG グラフ。reSARch には対応する出力形式が無い。
+        // SVG は独自描画。座標・装飾の全文一致は互換契約に含めない。
         repro: Repro::Unsupported {
-            missing: "sadf -g (SVG) 相当の出力形式",
+            missing: "SVG は独自描画のため本家 SVG との全文比較は対象外 (数値・選択は tests/svg.rs で検証)",
         },
         masks: &[],
     },
@@ -311,7 +336,63 @@ const GOLDEN_CASES: &[GoldenCase] = &[
         repro: Repro::Sar(&["-C", "-A"]),
         masks: &[Mask::DiskDeviceName],
     },
+    // --- sadf の各出力形式 (テスト 01500〜01550) ---
+    //
+    // どれも同じ入力・同じ activity 選択 (`-m FAN,IN,TEMP`) で形式だけが違う。
+    // 5 形式を横に並べることで「値は同じなのに書式だけ違う」ことを固定できる
+    // (単位換算やゼロ補完の不統一は、この並びで初めて見える)。
+    // 電源センサは IEEE-754 double で保存されており、`%temp` / `%in` は
+    // min/max を使う比率なので、計算層の特殊経路もここで検証される。
+    GoldenCase {
+        upstream_test: "01500",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -d <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-d",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-d", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01510",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -p <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-p",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-p", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01520",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -r <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-r",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-r", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01540",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -j <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-j",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-j", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
+    GoldenCase {
+        upstream_test: "01550",
+        data: "data-11.6.5",
+        upstream_cmd: "LC_ALL=C TZ=GMT sadf -x <data> -- -m FAN,IN,TEMP",
+        golden: "expected.data-11.6.5-sadf-x",
+        phase: Phase::RawValues,
+        repro: Repro::Sadf(&["-x", "--", "-m", "FAN,IN,TEMP"]),
+        masks: &[],
+    },
 ];
+// 本家テスト 01530 (`sadf -g ... -- -m FAN,IN,TEMP`) はここに入れていない。
+// `-g` の期待出力は 144 KB の SVG で、独自描画と装飾・座標が異なる。
+// SVG 全文比較が対象外であることは 01405 の [`Repro::Unsupported`] で 1 件数えており、
+// 同じ理由のケースを 2 件並べても情報が増えないため取得対象からも外している。
 
 /// 期待出力を持たず「エラーメッセージと終了コードだけ」を見るケース (§4.2 の後半)。
 struct ErrorCase {
@@ -373,11 +454,11 @@ const HEADER_ERROR_DATA: &[&str] = &[
 // 期待出力の再現 (ライブラリ API を直接呼ぶ)
 // ===========================================================================
 //
-// `resarch` をプロセスとして起動はしない。CLI (`src/main.rs`) は出力層へ
-// まだ繋がっておらず、また環境変数 (`TZ` / `LC_ALL`) に依存させると
-// 「差分の原因が環境か実装か」を切り分けられなくなる。
-// 代わりに `sar` の引数列を [`parse_sar_args`] へ通し、その結果を
-// 出力層のオプションへ写して [`sar_text::write_report`] を呼ぶ。
+// `resarch` をプロセスとして起動はしない。環境変数 (`TZ` / `LC_ALL`) に
+// 依存させると「差分の原因が環境か実装か」を切り分けられなくなるうえ、
+// CLI 層と出力層のどちらが原因かも分からなくなる。
+// 代わりに `sar` の引数列を [`parse_sar_args`] へ通し (= CLI の解釈も検証し)、
+// その結果を出力層のオプションへ写して [`sar_text::write_report`] を呼ぶ。
 
 /// `sar` 互換テキストを生成する。
 ///
@@ -409,12 +490,129 @@ fn render_sadf_header(file: &SaFile) -> Result<String, String> {
         .collect())
 }
 
+/// `sadf` の各出力形式を生成する。
+///
+/// 引数列は本家のコマンドラインそのまま ([`parse_sadf_args`] に通すので
+/// `--` の前後の解釈も検証される)。時刻基準は本家テストの `TZ=GMT` に合わせて
+/// [`TimeBase::Utc`] にする。
+///
+/// **[`SadfConfig`] のフィールドは `..Default::default()` で省略しない。**
+/// 出力オプションが増えたときにコンパイルエラーで気付けるようにして、
+/// 「新しいオプションが既定値のまま無視され、再現が静かに崩れる」のを防ぐ
+/// ([`sar_text_options`] と同じ方針)。
+fn render_sadf(
+    file: &SaFile,
+    data: &Path,
+    args: &'static [&'static str],
+) -> Result<String, String> {
+    // 本家は `sadf <fmt> <file> -- <sar 引数>` の順に並べる。
+    // `--` より前にファイル名を置く必要があるので、先頭の形式指定の直後に挿す。
+    // [`parse_sadf_args`] はプログラム名を含まない引数列を受け取る。
+    let mut argv: Vec<String> = vec![args[0].to_string(), data.display().to_string()];
+    argv.extend(args[1..].iter().map(|s| s.to_string()));
+
+    let parsed =
+        parse_sadf_args(&argv).map_err(|e| format!("引数 {args:?} を解析できない: {e}"))?;
+    let format = parsed
+        .format
+        .ok_or_else(|| format!("引数 {args:?} から出力形式が決まらない"))?;
+
+    let cfg = SadfConfig {
+        time_base: TimeBase::Utc,
+        comments: parsed.sar.flags.comment,
+        debug: parsed.output.debug,
+        horizontally: parsed.horizontally,
+        section: SectionConfig {
+            cpu_all: parsed
+                .sar
+                .opt_flags(Activity::Cpu)
+                .contains(OptFlags::CPU_ALL),
+            memory: parsed
+                .sar
+                .opt_flags(Activity::Memory)
+                .contains(OptFlags::MEMORY),
+            swap: parsed
+                .sar
+                .opt_flags(Activity::Memory)
+                .contains(OptFlags::SWAP),
+            mem_all: parsed
+                .sar
+                .opt_flags(Activity::Memory)
+                .contains(OptFlags::MEM_ALL),
+            fs_mount: parsed.sar.opt_flags(Activity::Fs).contains(OptFlags::MOUNT),
+        },
+        activities: Some(
+            parsed
+                .sar
+                .selected_activities()
+                .map(|a| ActivityId(u32::from(a.id())))
+                .collect(),
+        ),
+        time_filter: TimeFilter::default(),
+        cpus: if parsed.sar.cpu_bitmap.count_bits() == parsed.sar.cpu_bitmap.capacity_bits() {
+            CpuSelection::All
+        } else {
+            CpuSelection::Listed {
+                aggregate: parsed.sar.cpu_bitmap.aggregate_selected(),
+                cpus: parsed.sar.cpu_bitmap.selected_cpus().collect(),
+            }
+        },
+        item_names: [
+            Activity::Disk,
+            Activity::NetDev,
+            Activity::NetEdev,
+            Activity::Fs,
+            Activity::Irq,
+        ]
+        .into_iter()
+        .filter_map(|a| {
+            let names = parsed.sar.item_list(a);
+            (!names.is_empty()).then(|| (ActivityId(u32::from(a.id())), names.to_vec()))
+        })
+        .collect(),
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    let r = match format {
+        SadfFormat::Db => sadf::dbppc::write_db(&mut buf, file, &cfg),
+        SadfFormat::Ppc => sadf::dbppc::write_ppc(&mut buf, file, &cfg),
+        SadfFormat::Json => sadf::json::write_json(&mut buf, file, &cfg),
+        SadfFormat::Xml => sadf::xml::write_xml(&mut buf, file, &cfg),
+        SadfFormat::Raw => sadf::raw::write_raw(&mut buf, file, &cfg),
+        other => return Err(format!("{other:?} は golden 比較の対象外")),
+    };
+    r.map_err(|e| format!("sadf 出力を書けない: {e}"))?;
+    String::from_utf8(buf).map_err(|e| format!("出力が UTF-8 でない: {e}"))
+}
+
 /// [`SarOptions`] (CLI 層) を [`SarTextOptions`] (出力層) へ写す。
 ///
 /// 時刻は [`TimeStyle::Utc`] にする。本家テストは `TZ=GMT` を明示しており、
 /// `sar` 既定のローカル時刻表示は GMT 環境では UTC 表示と一致する。
 /// `-t` (`true_time`) のときだけレコードに焼き込まれた時分秒を使う。
+///
+/// **フィールドは `..Default::default()` で省略せず全て明示する。**
+/// 出力オプションが増えたときにコンパイルエラーで気付けるようにして、
+/// 「新しいオプションが既定値のまま無視され、再現が静かに崩れる」のを防ぐ。
 fn sar_text_options(o: &SarOptions) -> SarTextOptions {
+    // GOLDEN_CASES はいずれも `-s` / `-e` と item リストを使わない。
+    // 使うケースが増えたらここで気付けるようにしておく (黙って無視しない)。
+    assert!(
+        o.tm_start.is_none() && o.tm_end.is_none(),
+        "-s / -e を使うケースは時刻フィルタの写しが必要"
+    );
+    assert!(
+        o.item_lists.is_empty(),
+        "--dev= / --iface= / --fs= / --int= を使うケースは item フィルタの写しが必要"
+    );
+    // `-i` / positional interval / count も同様。ここは既定 (全レコード) だけを
+    // 再現する経路 (`write_report`) を呼ぶので、指定があれば
+    // `write_report_with` へ `SampleSelect` を渡す必要がある。
+    assert!(
+        !o.flags.interval_set && o.interval.unwrap_or(1) <= 1 && o.count.is_none(),
+        "-i / positional interval / count を使うケースはサンプル選別の写しが必要"
+    );
+
     let bitmap = &o.cpu_bitmap;
     let cpus = if bitmap.count_bits() == bitmap.capacity_bits() {
         // `-P ALL` / `-A` は全ビットを立てる
@@ -448,10 +646,13 @@ fn sar_text_options(o: &SarOptions) -> SarTextOptions {
             TimeStyle::Utc
         },
         cpus,
+        // 上の assert のとおり、対象ケースは時刻範囲も item リストも使わない
+        time_filter: TimeFilter::default(),
+        item_names: BTreeMap::new(),
     }
 }
 
-/// 不一致ケースの出力全体を `target/golden-actual/` へ書き出す。
+/// 不一致ケースの出力全体を `target/fixtures/golden-actual/` へ書き出す。
 ///
 /// 行単位の要約では追えない食い違い (ブロックの増減・順序) を
 /// `diff -u <expected> <actual>` で追えるようにする。書けなければ諦める
@@ -831,15 +1032,31 @@ fn upstream_headers_decode_to_the_measured_facts() {
 ///
 /// 1. 入力 `sa` ファイルを [`SaFile`] で開く
 /// 2. 本家のコマンドラインに相当する出力をライブラリ API で生成する
-///    ([`render_sar_text`] / [`render_sadf_header`])
+///    ([`render_sar_text`] / [`render_sadf_header`] / [`render_sadf`])
 /// 3. `expected*` と 1 行ずつ突き合わせる ([`golden::compare`])
 /// 4. 「全文一致 / N 行マスクして一致 / 不一致」をケースごとに出す
 ///
 /// マスクは [`GoldenCase::masks`] に宣言したものだけが効く。
 /// 対象は「ファイルの中身からは原理的に再現できない値」に限り、理由を必ず添える。
 ///
-/// 差分の一覧は `--nocapture` で読める。1 件でも不一致が残っていれば失敗する
+/// 差分の一覧は `--nocapture` で読める。不一致が 1 件でも残っていれば失敗する
 /// (`sar` 互換が中核価値なので、未達を緑にしない)。
+/// [`Repro::Unsupported`] を宣言したケースだけは「比較不能」として集計し、
+/// 失敗にはしない (実装の誤りではなく、出力形式そのものが無いため)。
+///
+/// # 到達点
+///
+/// 全 21 件のうち **全文一致 16 / マスクして一致 4 / 不一致 0 / 比較不能 1**。
+///
+/// - マスクが効いているのは `A_DISK` のデバイス名列だけ (4 件)。
+///   `major:minor` を実行ホストの `/dev` で解決した結果なので、`sa` ファイルからは
+///   再現できない。reSARch は他ホストのファイルに誤名を出さないよう
+///   `dev<major>-<minor>` のまま出す
+/// - 比較対象外は `sadf -g` (SVG) の 1 件のみ。独自描画で数値検証は tests/svg.rs
+///
+/// 実測で見つかった 9 件の不一致 (先頭イベントの再出力・magic 不一致 activity の表示・
+/// CPU 数・`kbavail`・空きスロット・オフライン CPU・日付の時刻源・`[Unknown format]`) は
+/// すべて解消済み。経緯と本家の規則は Issue #4 に残してある。
 #[test]
 #[ignore = "本家データ (GPL) が必要。make fixtures 後 --include-ignored で実行する"]
 fn golden_outputs_match_upstream() {
@@ -849,39 +1066,37 @@ fn golden_outputs_match_upstream() {
 
     let mut exact = 0usize;
     let mut masked = 0usize;
+    let mut unsupported: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    let mut compared = 0usize;
 
     eprintln!(
         "\n=== 本家期待出力との全文比較 ({} 件) ===",
         GOLDEN_CASES.len()
     );
     for case in GOLDEN_CASES {
-        let (Some(data), Some(golden)) = (
-            upstream_file(&dir, case.data),
-            upstream_file(&dir, case.golden),
-        ) else {
-            failures.push(format!(
-                "[{}] {} -> {}: 入力または期待出力が無い",
-                case.upstream_test, case.data, case.golden
-            ));
-            continue;
-        };
-        let expected = std::fs::read_to_string(&golden).expect("期待出力が読めない");
-        assert!(!expected.is_empty(), "{}: 期待出力が空", case.golden);
-
         let head = format!(
             "[{}] {:?} {} -> {}",
             case.upstream_test, case.phase, case.data, case.golden
         );
 
-        // 未実装の出力形式は「比較できなかった」として明示する (緑にしない)
+        let (Some(data), Some(golden)) = (
+            upstream_file(&dir, case.data),
+            upstream_file(&dir, case.golden),
+        ) else {
+            failures.push(format!("{head}: 入力または期待出力が無い"));
+            continue;
+        };
+        let expected = std::fs::read_to_string(&golden).expect("期待出力が読めない");
+        assert!(!expected.is_empty(), "{}: 期待出力が空", case.golden);
+
+        // 全文互換を契約しないケース。実装の誤りではないので失敗にはしないが、
+        // 「検証できていない」ことは毎回目に見える形で残す。
         if let Repro::Unsupported { missing } = case.repro {
             eprintln!(
-                "  比較不能  {head}\n            {missing} が無い ({})",
+                "  比較対象外  {head}\n            {missing} (本家: {})",
                 case.upstream_cmd
             );
-            failures.push(format!("{head}: {missing} が無いため比較できない"));
+            unsupported.push(format!("{head}: {missing}"));
             continue;
         }
 
@@ -889,6 +1104,7 @@ fn golden_outputs_match_upstream() {
             Ok(file) => match case.repro {
                 Repro::Sar(args) => render_sar_text(&file, &data, args),
                 Repro::SadfHeader => render_sadf_header(&file),
+                Repro::Sadf(args) => render_sadf(&file, &data, args),
                 Repro::Unsupported { .. } => unreachable!("上で処理済み"),
             },
             Err(e) => Err(format!("ファイルを開けない: {e}")),
@@ -902,16 +1118,7 @@ fn golden_outputs_match_upstream() {
             }
         };
 
-        compared += 1;
         let cmp: Comparison = golden::compare(&expected, &actual, case.masks);
-        // 差分が出たケースは出力全体をファイルへ落とす。
-        // 行単位の要約だけでは追えない食い違い (行の増減・ブロック順) を
-        // `diff -u` で追えるようにするため。
-        if !cmp.is_match() {
-            if let Some(path) = dump_actual(case, &actual) {
-                eprintln!("            実際の出力: {}", path.display());
-            }
-        }
         let label = if cmp.is_match() {
             if cmp.masked.is_empty() {
                 exact += 1;
@@ -929,19 +1136,31 @@ fn golden_outputs_match_upstream() {
         }
         if !cmp.is_match() {
             eprint!("{}", cmp.diff_report(6));
+            // 行単位の要約では追えない食い違い (行の増減・ブロック順) を
+            // `diff -u` で追えるよう、出力全体をファイルへ落とす。
+            if let Some(path) = dump_actual(case, &actual) {
+                eprintln!("            実際の出力全体: {}", path.display());
+            }
             failures.push(format!("{head}: {}\n{}", cmp.verdict(), cmp.diff_report(6)));
         }
     }
 
     eprintln!(
-        "\n--- 集計: 全文一致 {} / マスク一致 {} / 不一致・比較不能 {} (全 {} 件, 比較実行 {} 件) ---",
-        exact,
-        masked,
+        "\n--- 集計: 全文一致 {exact} / マスクして一致 {masked} / 不一致 {} / 比較不能 {} (全 {} 件) ---",
         failures.len(),
-        GOLDEN_CASES.len(),
-        compared
+        unsupported.len(),
+        GOLDEN_CASES.len()
     );
+    for u in &unsupported {
+        eprintln!("    比較不能: {u}");
+    }
 
+    // 数え落ちがないこと (どのケースも「比較した」か「比較不能と宣言した」のどちらか)
+    assert_eq!(
+        exact + masked + failures.len() + unsupported.len(),
+        GOLDEN_CASES.len(),
+        "集計から漏れたケースがある"
+    );
     assert!(
         failures.is_empty(),
         "本家の期待出力と一致しないケースが {} 件ある:\n{}",

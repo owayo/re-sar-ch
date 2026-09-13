@@ -649,8 +649,11 @@ const SERIAL_RAW: &[RawField] = &[
 // ===========================================================================
 
 /// `rd_sec` / `wr_sec` / `dc_sec` / `avgrq-sz` は JSON / XML にしか無いセクタ単位の
-/// 別表現。`series` 層がまだセクタ換算列を持たないため `col` は空にしてある
-/// (0 を代入せず「未対応」として出す)。
+/// 別表現で、kB 系列・`areq-sz` の 2 倍 (512 B セクタ、§9.6-10)。
+///
+/// 対応する `sar` 列が無いので `col` は空のまま。値は列名から
+/// [`crate::series::compute::SadfUnitColumn`] を引いて計算層に換算させる
+/// ([`super::render::value_of`])。出力層で 2 を掛けない。
 const DISK_FIELDS: &[Field] = &[
     item_key!("disk-device", "dev", ItemKeyStr),
     rate!("tps", "tps", "tps"),
@@ -688,6 +691,9 @@ const DISK_RAW: &[RawField] = &[
 // A_NET_DEV (12) / A_NET_EDEV (13)
 // ===========================================================================
 
+/// `rxkB/s` / `txkB/s` の保存値は**バイト**累積なので、表示は 1024 で割る
+/// (§1.8.1)。換算は列名から引く [`crate::series::compute::SadfUnitColumn`] の
+/// 担当で、`col` が指す計算層の列はバイト/秒のままである。
 const NET_DEV_FIELDS: &[Field] = &[
     item_key!("iface", "iface", ItemKeyStr),
     rate!("rxpck_per_sec", "rxpck/s", "rxpck"),
@@ -1077,6 +1083,9 @@ const PWR_BAT_RAW: &[RawField] = &[
 // A_FS (37)
 // ===========================================================================
 
+/// `MBfsfree` / `MBfsused` の保存値は**バイト**なので、表示は 1024² で割る
+/// (§9.6-2)。換算は列名から引く
+/// [`crate::series::compute::SadfUnitColumn`] の担当。
 macro_rules! fs_fields {
     ($item_key:literal, $item_attr:literal) => {
         &[
@@ -1228,7 +1237,7 @@ pub const SPECS: &[ActivitySpec] = &[
         json_key: "cpu-load",
         xml_elem: "cpu-load",
         xml_child: "cpu",
-        xml_wrapper_attrs: " per=\"second\"",
+        xml_wrapper_attrs: "",
         group: Group::None,
         closes_group: false,
         item: ItemKind::Cpu,
@@ -2094,13 +2103,6 @@ pub fn lookup(id: ActivityId) -> Option<&'static ActivitySpec> {
     SPECS.iter().find(|s| s.id == id)
 }
 
-/// `-d` / `-p` / `-r` の出力順 (ID 昇順 = `sar` のレポート順)。
-pub fn in_id_order() -> Vec<&'static ActivitySpec> {
-    let mut v: Vec<_> = SPECS.iter().collect();
-    v.sort_by_key(|s| s.id.0);
-    v
-}
-
 // ===========================================================================
 // テスト
 // ===========================================================================
@@ -2174,6 +2176,72 @@ mod tests {
                     spec.name
                 );
             }
+        }
+    }
+
+    /// **回帰テスト (指摘 5)**: `col` を持たないフィールドに値の出所があること。
+    ///
+    /// `col` が空でよいのは次の 2 通りだけ:
+    ///
+    /// - アイテム識別子の再掲 (`Fmt::ItemKeyStr` / `ItemKeyNum` / `Skip`)
+    /// - `sadf` 専用の別単位列 (計算層の
+    ///   [`crate::series::compute::SadfUnitColumn`] が値を持つ)
+    ///
+    /// どちらでもないフィールドは、正常な入力でも `NotImplemented` に落ちて
+    /// JSON で `null` / XML で空属性になる。`rd_sec` / `wr_sec` / `dc_sec` /
+    /// `avgrq-sz` が実際にそうなっていた。
+    #[test]
+    fn fields_without_a_column_have_a_value_source() {
+        use crate::series::compute::SadfUnitColumn;
+
+        for spec in SPECS {
+            for sec in spec.sections {
+                for fld in sec.fields {
+                    if !fld.col.is_empty() {
+                        continue;
+                    }
+                    let unit = [fld.key, fld.attr, fld.pp]
+                        .into_iter()
+                        .find_map(|n| SadfUnitColumn::from_sadf_name(spec.id, n));
+                    let is_item_key =
+                        matches!(fld.jx_fmt, Fmt::ItemKeyStr | Fmt::ItemKeyNum | Fmt::Skip)
+                            && matches!(fld.dp_fmt, Fmt::ItemKeyStr | Fmt::ItemKeyNum | Fmt::Skip);
+                    assert!(
+                        unit.is_some() || is_item_key,
+                        "{}: フィールド {} ({}) に値の出所が無い",
+                        spec.name,
+                        fld.key,
+                        fld.attr
+                    );
+                }
+            }
+        }
+    }
+
+    /// 別単位列が想定どおりの変種に解決すること (03 §9.6-2 / §9.6-10 / §1.8.1)。
+    #[test]
+    fn sadf_only_unit_columns_resolve() {
+        use crate::series::compute::SadfUnitColumn as U;
+
+        let want = [
+            (ActivityId::DISK, "rd_sec", U::DiskReadSectors),
+            (ActivityId::DISK, "wr_sec", U::DiskWriteSectors),
+            (ActivityId::DISK, "dc_sec", U::DiskDiscardSectors),
+            (ActivityId::DISK, "avgrq-sz", U::DiskAvgRequestSectors),
+            (ActivityId::NET_DEV, "rxkB", U::NetRxKilobytes),
+            (ActivityId::NET_DEV, "txkB", U::NetTxKilobytes),
+            (ActivityId::FS, "MBfsfree", U::FsFreeMegabytes),
+            (ActivityId::FS, "MBfsused", U::FsUsedMegabytes),
+        ];
+        for (id, key, variant) in want {
+            let spec = lookup(id).expect("出力定義");
+            let found = spec
+                .sections
+                .iter()
+                .flat_map(|s| s.fields.iter())
+                .any(|f| f.key == key);
+            assert!(found, "{id}: フィールド {key} が表に無い");
+            assert_eq!(U::from_sadf_name(id, key), Some(variant));
         }
     }
 

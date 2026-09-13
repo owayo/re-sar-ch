@@ -163,12 +163,27 @@ fn is_dev_major_minor(s: &str) -> bool {
 /// 1 行分の食い違い。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineDiff {
-    /// 行番号 (1 起点)。
-    pub line: usize,
+    /// 期待出力側の行番号 (1 起点)。`None` = 実際の側にだけある行。
+    pub expected_line: Option<usize>,
+    /// reSARch 側の行番号 (1 起点)。`None` = 期待の側にだけある行。
+    pub actual_line: Option<usize>,
     /// 期待出力の行 (`None` = 実際の側にだけある)。
     pub expected: Option<String>,
     /// reSARch の行 (`None` = 期待の側にだけある)。
     pub actual: Option<String>,
+}
+
+impl LineDiff {
+    /// 報告用の位置表記。
+    fn position(&self) -> String {
+        match (self.expected_line, self.actual_line) {
+            (Some(e), Some(a)) if e == a => format!("{e} 行目"),
+            (Some(e), Some(a)) => format!("期待 {e} 行目 / 実際 {a} 行目"),
+            (Some(e), None) => format!("期待 {e} 行目 (実際には無い行)"),
+            (None, Some(a)) => format!("実際 {a} 行目 (期待には無い行)"),
+            (None, None) => "位置不明".to_string(),
+        }
+    }
 }
 
 /// 比較結果。
@@ -219,7 +234,7 @@ impl Comparison {
     pub fn diff_report(&self, limit: usize) -> String {
         let mut s = String::new();
         for d in self.diffs.iter().take(limit) {
-            let _ = writeln!(s, "    {} 行目", d.line);
+            let _ = writeln!(s, "    {}", d.position());
             let _ = writeln!(s, "      期待: {}", show(d.expected.as_deref()));
             let _ = writeln!(s, "      実際: {}", show(d.actual.as_deref()));
         }
@@ -287,9 +302,88 @@ fn lines_of(text: &str) -> Vec<&str> {
     body.split('\n').collect()
 }
 
+/// 行の対応づけ (最長共通部分列)。
+///
+/// 単純に行番号で突き合わせると、途中に 1 行増えただけで以降の全行が
+/// 「不一致」になり、原因が読めなくなる。共通部分列で揃えてから
+/// 食い違いの塊を取り出す。
+///
+/// 戻り値は `(期待側の添字, 実際側の添字)` の列。片側が `None` なら
+/// その行は相手側に対応が無い (増えた行 / 消えた行)。
+fn align(exp: &[&str], act: &[&str]) -> Vec<(Option<usize>, Option<usize>)> {
+    // 先頭と末尾の一致部分を先に削ると DP の規模が小さくなる
+    let mut head = 0usize;
+    while head < exp.len() && head < act.len() && exp[head] == act[head] {
+        head += 1;
+    }
+    let mut tail = 0usize;
+    while tail < exp.len() - head
+        && tail < act.len() - head
+        && exp[exp.len() - 1 - tail] == act[act.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let (e0, e1) = (head, exp.len() - tail);
+    let (a0, a1) = (head, act.len() - tail);
+    let (n, m) = (e1 - e0, a1 - a0);
+
+    let mut out: Vec<(Option<usize>, Option<usize>)> =
+        (0..head).map(|i| (Some(i), Some(i))).collect();
+
+    // DP 表は (n+1)*(m+1)。巨大な入力では諦めて素朴な対応づけに落とす
+    // (本家の期待出力はいずれも数千行以内なので実際には通らない経路)。
+    const MAX_CELLS: usize = 16_000_000;
+    if (n + 1).saturating_mul(m + 1) > MAX_CELLS {
+        for k in 0..n.max(m) {
+            out.push(((k < n).then(|| e0 + k), (k < m).then(|| a0 + k)));
+        }
+    } else {
+        // lcs[i][j] = exp[e0+i..e1] と act[a0+j..a1] の最長共通部分列の長さ
+        let w = m + 1;
+        let mut lcs = vec![0u32; (n + 1) * w];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                lcs[i * w + j] = if exp[e0 + i] == act[a0 + j] {
+                    lcs[(i + 1) * w + (j + 1)] + 1
+                } else {
+                    lcs[(i + 1) * w + j].max(lcs[i * w + (j + 1)])
+                };
+            }
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < n && j < m {
+            if exp[e0 + i] == act[a0 + j] {
+                out.push((Some(e0 + i), Some(a0 + j)));
+                i += 1;
+                j += 1;
+            } else if lcs[(i + 1) * w + j] >= lcs[i * w + (j + 1)] {
+                out.push((Some(e0 + i), None));
+                i += 1;
+            } else {
+                out.push((None, Some(a0 + j)));
+                j += 1;
+            }
+        }
+        while i < n {
+            out.push((Some(e0 + i), None));
+            i += 1;
+        }
+        while j < m {
+            out.push((None, Some(a0 + j)));
+            j += 1;
+        }
+    }
+
+    for k in 0..tail {
+        out.push((Some(e1 + k), Some(a1 + k)));
+    }
+    out
+}
+
 /// 期待出力と実際の出力を**全文比較**する。
 ///
-/// 行数が違っても行番号をずらさずに突き合わせる (最初の食い違いから原因を追える)。
+/// 共通部分列で行を揃え、食い違いの塊ごとに期待側と実際側を 1 行ずつ
+/// 突き合わせる。マスクはこの「揃えた組」にだけ試す。
 pub fn compare(expected: &str, actual: &str, masks: &[Mask]) -> Comparison {
     let exp = lines_of(expected);
     let act = lines_of(actual);
@@ -300,22 +394,23 @@ pub fn compare(expected: &str, actual: &str, masks: &[Mask]) -> Comparison {
         diffs: Vec::new(),
     };
 
-    for i in 0..exp.len().max(act.len()) {
-        match (exp.get(i), act.get(i)) {
-            (Some(e), Some(a)) => {
-                if e == a {
-                    continue;
-                }
-                // 食い違った行にだけマスクを試す
-                let mut me = (*e).to_string();
-                let mut ma = (*a).to_string();
+    // 食い違いの塊 (期待側だけの行 / 実際側だけの行) を溜めてから突き合わせる
+    let mut only_exp: Vec<usize> = Vec::new();
+    let mut only_act: Vec<usize> = Vec::new();
+    let flush = |cmp: &mut Comparison, only_exp: &mut Vec<usize>, only_act: &mut Vec<usize>| {
+        for k in 0..only_exp.len().max(only_act.len()) {
+            let (ei, ai) = (only_exp.get(k).copied(), only_act.get(k).copied());
+            let (e, a) = (ei.map(|i| exp[i]), ai.map(|i| act[i]));
+            if let (Some(e), Some(a)) = (e, a) {
+                let mut me = e.to_string();
+                let mut ma = a.to_string();
                 let mut hits: Vec<Masked> = Vec::new();
                 for mask in masks {
                     if let Some((ne, na, we, wa)) = mask.apply(&me, &ma) {
                         me = ne;
                         ma = na;
                         hits.push(Masked {
-                            line: i + 1,
+                            line: ei.map_or(0, |i| i + 1),
                             expected: we,
                             actual: wa,
                             reason: mask.reason(),
@@ -324,21 +419,38 @@ pub fn compare(expected: &str, actual: &str, masks: &[Mask]) -> Comparison {
                 }
                 if me == ma {
                     cmp.masked.extend(hits);
-                } else {
-                    cmp.diffs.push(LineDiff {
-                        line: i + 1,
-                        expected: Some((*e).to_string()),
-                        actual: Some((*a).to_string()),
-                    });
+                    continue;
                 }
             }
-            (e, a) => cmp.diffs.push(LineDiff {
-                line: i + 1,
-                expected: e.map(|s| (*s).to_string()),
-                actual: a.map(|s| (*s).to_string()),
-            }),
+            cmp.diffs.push(LineDiff {
+                expected_line: ei.map(|i| i + 1),
+                actual_line: ai.map(|i| i + 1),
+                expected: e.map(str::to_string),
+                actual: a.map(str::to_string),
+            });
+        }
+        only_exp.clear();
+        only_act.clear();
+    };
+
+    for (ei, ai) in align(&exp, &act) {
+        match (ei, ai) {
+            (Some(i), Some(j)) if exp[i] == act[j] => {
+                // 揃って内容も一致した行。溜めていた塊を先に処理する
+                flush(&mut cmp, &mut only_exp, &mut only_act);
+            }
+            // 対応づけはできたが内容が違う組 (規模が大きすぎて素朴な対応づけに
+            // 落ちた場合に起きる)。塊として扱い、マスクを試す。
+            (Some(i), Some(j)) => {
+                only_exp.push(i);
+                only_act.push(j);
+            }
+            (Some(i), None) => only_exp.push(i),
+            (None, Some(j)) => only_act.push(j),
+            (None, None) => {}
         }
     }
+    flush(&mut cmp, &mut only_exp, &mut only_act);
     cmp
 }
 
@@ -354,16 +466,30 @@ mod tests {
 
         let c = compare("a\nb\n", "a\nc\n", &[]);
         assert_eq!(c.diffs.len(), 1);
-        assert_eq!(c.diffs[0].line, 2);
+        assert_eq!(c.diffs[0].expected_line, Some(2));
+        assert_eq!(c.diffs[0].actual_line, Some(2));
     }
 
-    /// 行数が違う場合も行番号をずらさずに報告する。
+    /// 途中に 1 行増えても、以降の行が全部不一致にならない (共通部分列で揃える)。
+    #[test]
+    fn an_inserted_line_does_not_shift_everything() {
+        let e = "a\nb\nc\nd\n";
+        let a = "a\nb\nX\nc\nd\n";
+        let c = compare(e, a, &[]);
+        assert_eq!(c.diffs.len(), 1, "増えた 1 行だけが差分になる");
+        assert_eq!(c.diffs[0].expected, None);
+        assert_eq!(c.diffs[0].actual.as_deref(), Some("X"));
+        assert_eq!(c.diffs[0].actual_line, Some(3));
+    }
+
+    /// 行数が違う場合も対応づけて報告する。
     #[test]
     fn reports_missing_and_extra_lines() {
         let c = compare("a\n", "a\nb\n", &[]);
         assert_eq!(c.diffs.len(), 1);
         assert_eq!(c.diffs[0].expected, None);
         assert_eq!(c.diffs[0].actual.as_deref(), Some("b"));
+        assert_eq!(c.diffs[0].actual_line, Some(2));
     }
 
     /// `Host:` 行の日付だけが潰れ、他の語は比較されたまま残る。

@@ -121,6 +121,7 @@ const DISK_FIELDS_8A: &[WireField] = &[
 const DISK_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [3, 3, 8],
         size_lp64: 80,
         layout: WireLayout::new("stats_disk@0x8c/80", DISK_FIELDS_80),
@@ -128,6 +129,7 @@ const DISK_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [1, 3, 7],
         size_lp64: 64,
         layout: WireLayout::new("stats_disk@0x8c/64", DISK_FIELDS_64),
@@ -135,6 +137,7 @@ const DISK_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8c,
+        self_describing: true,
         types_nr: [1, 2, 6],
         size_lp64: 48,
         layout: WireLayout::new("stats_disk@0x8c/48", DISK_FIELDS_48),
@@ -145,6 +148,7 @@ const DISK_REVISIONS: &[WireRevision] = &[
     //      判別は magic と file_activity.size で行う。
     WireRevision {
         magic: 0x8b,
+        self_describing: false,
         types_nr: [1, 2, 6],
         size_lp64: 64,
         layout: WireLayout::new("stats_disk_8b@0x8b/64", DISK_FIELDS_8B),
@@ -152,6 +156,7 @@ const DISK_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [2, 5, 2],
         size_lp64: 80,
         layout: WireLayout::new("stats_disk_8a@0x8a/80", DISK_FIELDS_8A),
@@ -367,6 +372,7 @@ const MAX_FS_LEN_OLD: u16 = 72;
 const FS_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [5, 0, 0],
         size_lp64: 296,
         layout: WireLayout::new("stats_filesystem@0x8b/296", FS_FIELDS_296),
@@ -375,6 +381,7 @@ const FS_REVISIONS: &[WireRevision] = &[
     // ---- 時代 A。どちらも magic は 0x8a なので file_activity.size で判別する。
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [5, 0, 0],
         size_lp64: 336,
         layout: WireLayout::new("stats_filesystem_8a@0x8a/336", FS_FIELDS_336),
@@ -382,6 +389,7 @@ const FS_REVISIONS: &[WireRevision] = &[
     },
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [5, 0, 0],
         size_lp64: 160,
         layout: WireLayout::new("stats_filesystem_8a@0x8a/160", FS_FIELDS_160),

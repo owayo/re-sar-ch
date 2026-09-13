@@ -38,20 +38,20 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::format::file::SaFile;
 use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
-use crate::model::{ActivityId, Aggregation, Availability, CounterBits, Unit, ValueKind};
-use crate::series::compute::{ComputeContext, column_value, tick_total};
-use crate::series::delta::{Delta, DeltaContext, compute_delta};
+use crate::model::{ActivityId, Aggregation, Availability, Unit, ValueKind};
+use crate::series::compute::{
+    ComputeContext, RateSample, column_value_strict, prepare_item, rate_from_totals, rate_sample,
+    raw_column, tick_total,
+};
 use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
 };
 
 use super::percentile::{PercentileResult, PercentileSpec, PercentileUnavailable, WeightedSamples};
-use super::timeline::{
-    Coverage, ExclusionReason, MetricKey, MetricPoint, MetricTimeline, SINGLE_ITEM, Timelines,
-};
+use super::timeline::{ExclusionReason, MetricKey, MetricPoint, SINGLE_ITEM, Timelines};
 
 /// 独自サマリのスキーマ版。出力契約として固定する (`docs/design.md` §11)。
-pub const SUMMARY_SCHEMA_VERSION: &str = "1";
+pub const SUMMARY_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 /// このサマリの種別。本家 `Average:` 行と混同されないよう出力に含める。
 pub const SUMMARY_KIND: &str = "resarch_native_summary";
@@ -191,7 +191,11 @@ pub struct SummarySource {
 /// 期間の範囲。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PeriodBounds {
-    /// 最初のサンプルの時刻 (エポック秒)。
+    /// 集計期間の始点 (エポック秒) = 最初に採った区間の始点。
+    ///
+    /// 系列の先頭サンプルは区間を持たないのでそのサンプルの時刻になる。
+    /// 時刻フィルタで絞った場合は、範囲に最初に合致したサンプル
+    /// (差分の基準として消費したもの) の時刻になる。
     pub first_ust: Option<u64>,
     /// 最後のサンプルの時刻 (エポック秒)。
     pub last_ust: Option<u64>,
@@ -203,16 +207,6 @@ pub struct PeriodBounds {
     pub broken_intervals: u64,
     /// 連続区間の長さの合計 (1/100 秒)。
     pub covered_cs: u64,
-}
-
-impl PeriodBounds {
-    /// 最初と最後のサンプルの時刻差 (秒)。観測が無ければ `None`。
-    pub fn wall_secs(&self) -> Option<u64> {
-        match (self.first_ust, self.last_ust) {
-            (Some(a), Some(b)) if b >= a => Some(b - a),
-            _ => None,
-        }
-    }
 }
 
 /// 除外理由ごとの件数。
@@ -334,11 +328,6 @@ impl NativePeriodSummary {
             .iter()
             .find(|c| c.column == column)
     }
-
-    /// 除外区間の総数。
-    pub fn excluded_total(&self) -> u64 {
-        self.exclusions.iter().map(|e| e.intervals).sum()
-    }
 }
 
 // ===========================================================================
@@ -347,6 +336,13 @@ impl NativePeriodSummary {
 
 #[derive(Debug)]
 struct ColumnAccum {
+    /// どの activity の何列目か。
+    ///
+    /// 「差分合計 ÷ 分母合計」から表示単位のレートを出すには
+    /// [`rate_from_totals`] に列を渡す必要がある (列ごとに保存値のスケールが
+    /// 違う: `rkB/s` は 1/2、`aqu-sz` は 1/1000、`%util` は 1/10)。
+    id: ActivityId,
+    column: usize,
     meta: ColumnMeta,
     method: AggregationMethod,
     rate_denominator: Option<RateDenominator>,
@@ -390,9 +386,11 @@ impl AccumConfig {
 }
 
 impl ColumnAccum {
-    fn new(meta: ColumnMeta, cfg: AccumConfig) -> Self {
+    fn new(id: ActivityId, column: usize, meta: ColumnMeta, cfg: AccumConfig) -> Self {
         let (method, denom) = plan_method(&meta, cfg);
         Self {
+            id,
+            column,
             meta,
             method,
             rate_denominator: denom,
@@ -450,12 +448,21 @@ impl ColumnAccum {
 
     fn mean(&self) -> Option<f64> {
         match self.method {
+            // **保存値 → 表示単位の換算を計算層に委ねる (指摘 2)。**
+            //
+            // ここで `delta_total / denom_total * 100.0` を直接返すと、
+            // 生の差分の単位がそのまま出てしまい、瞬時値から作る
+            // 最大 / 最小 / p95 と平均の単位が食い違う
+            // (`rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
+            // PSI の圧力割合が 10,000 倍)。列ごとの係数は計算層が
+            // [`rate_scale`] に持っているので、換算はそこへ一本化する。
             AggregationMethod::RateOverValidIntervals => {
-                if self.denom_total == 0 {
-                    return None;
-                }
-                Some(self.delta_total as f64 / self.denom_total as f64 * 100.0)
+                rate_from_totals(self.id, self.column, self.delta_total, self.denom_total)
             }
+            // 差分の総量そのもの (`read_ticks` などの内部フィールド)。
+            // レートではないので `rate_scale` は掛けない。掛けてよい列が
+            // `Aggregation::Sum` に現れないことは
+            // `sum_columns_need_no_rate_scale` が機械的に確認する。
             AggregationMethod::DeltaSum => {
                 if self.intervals == 0 {
                     return None;
@@ -565,6 +572,15 @@ struct ActivityAccum {
 /// 複数ファイル横断では、ファイル境界をまたいだ区間も
 /// [`NativeSummaryBuilder::observe`] へ渡すことで 1 つの系列として集計できる
 /// (`src/multi.rs` がその繋ぎを担う)。**差分をファイル単位で完結させない**。
+///
+/// # 期間を絞るのは呼び出し側
+///
+/// `--from` / `--to` による絞り込みは、**渡す区間を選ぶ**ことで行う
+/// ([`crate::multi::MultiOptions::time_filter`])。この集計器は受け取った区間を
+/// すべて数えるので、範囲外のサンプルが平均や p95 の重みに混ざる余地が無い。
+/// 集計器側で時刻を見る作りにすると、「範囲に最初に合致したレコードを
+/// 差分の起点としてだけ使う」`sar -s` の意味論や、ファイルごとに
+/// フィルタを引き直す必要 (日ごとの時間帯指定) を持ち込むことになる。
 #[derive(Debug)]
 pub struct NativeSummaryBuilder {
     opts: SummaryOptions,
@@ -590,16 +606,24 @@ impl NativeSummaryBuilder {
         }
         self.period.samples += 1;
         let end_ust = view.curr.ust_time;
-        if self.period.first_ust.is_none() {
-            self.period.first_ust = Some(end_ust);
-        }
-        self.period.last_ust = Some(end_ust);
-
         let start_ust = if view.has_prev {
             view.prev.ust_time
         } else {
             end_ust
         };
+        // 期間の始点は**最初に採った区間の始点**。
+        //
+        // 当サンプルの時刻を入れると、時刻フィルタ (`--from`) で絞ったときに
+        // 「基準サンプル → 最初に数えた区間」の長さが `covered_cs` に入るのに
+        // `first_ust` には現れず、`covered_cs` と `last_ust − first_ust` が
+        // 食い違う (レートの分母を読む側が期間を取り違える)。
+        // 系列の先頭サンプルは前サンプルが無く `start_ust == end_ust` なので、
+        // 絞らないときの値は変わらない。
+        if self.period.first_ust.is_none() {
+            self.period.first_ust = Some(start_ust);
+        }
+        self.period.last_ust = Some(end_ust);
+
         // 区間長を重みに使えるのは「前サンプルがあり、かつ連続」な場合だけ。
         // 再起動を挟むと uptime 差分が意味を失うため、重み 0 として扱う。
         let weight_cs = if view.has_prev && view.continuous {
@@ -640,8 +664,28 @@ impl NativeSummaryBuilder {
         let normalize_by_ticks = normalizes_by_cpu_ticks(snap.id);
         let cfg = AccumConfig::of(&self.opts, normalize_by_ticks);
 
-        for (index, item) in snap.items.iter().enumerate() {
-            let label = item_label(snap.id, def.shape, index, item.key.as_deref());
+        let irq_transposed =
+            snap.id == ActivityId::IRQ && (snap.nr2 > 1 || plan.text_index("irq_name").is_some());
+        let item_count = if irq_transposed {
+            snap.nr2 as usize
+        } else {
+            snap.items.len()
+        };
+        for (index, item) in snap.items.iter().take(item_count).enumerate() {
+            let label = if snap.id == ActivityId::DISK {
+                let field = |name| {
+                    def.columns
+                        .iter()
+                        .position(|c| c.public_name == name)
+                        .and_then(|c| raw_column(plan, item, c).ok())
+                };
+                match (field("major"), field("minor")) {
+                    (Some(major), Some(minor)) => format!("dev{major}-{minor}"),
+                    _ => format!("dev{index}"),
+                }
+            } else {
+                item_label(snap.id, def.shape, index, item.key.as_deref())
+            };
             // 前サンプルの同一 item を探す。**位置ではなく識別子で対応付ける**。
             let (prev_item, same_item) = match (prev_snap, item.key.as_deref()) {
                 (Some(p), Some(k)) => match p.item_by_key(k) {
@@ -659,7 +703,8 @@ impl NativeSummaryBuilder {
             let ctx = ComputeContext {
                 itv_cs: timing.itv_cs,
                 tick_total: match (normalize_by_ticks, prev_item) {
-                    (true, Some(p)) => Some(tick_total(p, item)),
+                    // guest / guest_nice を分母に入れないため、列を特定する plan が必要
+                    (true, Some(p)) => Some(tick_total(plan, p, item)),
                     (true, None) => None,
                     (false, _) => None,
                 },
@@ -669,9 +714,21 @@ impl NativeSummaryBuilder {
                 aggregate_item: label == "all" || label == "sum",
             };
 
+            let prepared = prepare_item(
+                snap.id,
+                plan,
+                index,
+                prev_snap.map_or(&[], |s| s.items.as_slice()),
+                &snap.items,
+                ctx,
+            )
+            .expect("現在の item は存在する");
+            let prev_item = prev_item.map(|_| &prepared.prev);
+            let item = &prepared.curr;
+            let ctx = prepared.ctx;
+
             let setup = DeltaSetup {
                 normalize_by_ticks,
-                timing,
                 missing_prev: if view.has_prev {
                     // 前サンプルはあるのに同一 item が無い
                     ExclusionReason::ItemReplaced
@@ -695,9 +752,19 @@ impl NativeSummaryBuilder {
                 // `compute` 層の表示値は本家の符号なし減算をそのまま再現するため、
                 // カウンタ逆行時に巨大な値になり得る。集計ではそれを採らない。
                 let strict = (meta.is_direct() && matches!(meta.kind, ValueKind::Counter))
-                    .then(|| counter_delta(plan, column, prev_item, item, &ctx, setup));
+                    .then(|| counter_delta(snap.id, plan, column, prev_item, item, &ctx, setup));
 
                 let outcome = match strict {
+                    _ if prepared.offline && view.has_prev => {
+                        Outcome::Excluded(if normalize_by_ticks && ctx.tick_total == Some(0) {
+                            ExclusionReason::ZeroDenominator
+                        } else {
+                            ExclusionReason::ItemReplaced
+                        })
+                    }
+                    _ if prepared.replaced && !matches!(meta.kind, ValueKind::Gauge) => {
+                        Outcome::Excluded(ExclusionReason::ItemReplaced)
+                    }
                     Some(Err(reason)) => Outcome::Excluded(reason),
                     strict => {
                         // 区間値は `compute` 層から取る。
@@ -705,7 +772,12 @@ impl NativeSummaryBuilder {
                         // activity 固有の補正をここで再実装すると、
                         // 同じ指標が出力形式ごとに違う値になる。
                         let prev_for_compute = prev_item.unwrap_or(&EMPTY_ITEM);
-                        match column_value(
+                        // **厳密モードを使う。**
+                        // 互換出力は本家の代替規則で欠落を埋める (旧世代の
+                        // `%memused` を `frmkb` から出す等) が、集計でそれをやると
+                        // 「その世代のファイルには無い値」が有効な観測として
+                        // 平均や p95 に混ざる。欠落は欠落として除外する。
+                        match column_value_strict(
                             snap.id,
                             column,
                             &meta,
@@ -807,6 +879,7 @@ impl NativeSummaryBuilder {
         columns: &'static [ColumnMeta],
         cfg: AccumConfig,
     ) -> usize {
+        let id = self.activities[activity].id;
         let items = &mut self.activities[activity].items;
         if let Some(i) = items.iter().position(|it| it.label == label) {
             return i;
@@ -814,7 +887,11 @@ impl NativeSummaryBuilder {
         items.push(ItemAccum {
             label: label.to_string(),
             key: key.map(|k| k.to_string()),
-            columns: columns.iter().map(|m| ColumnAccum::new(*m, cfg)).collect(),
+            columns: columns
+                .iter()
+                .enumerate()
+                .map(|(column, m)| ColumnAccum::new(id, column, *m, cfg))
+                .collect(),
         });
         items.len() - 1
     }
@@ -915,7 +992,6 @@ static EMPTY_ITEM: ItemSnapshot = ItemSnapshot {
 struct DeltaSetup {
     /// CPU tick 合計で正規化するか。
     normalize_by_ticks: bool,
-    timing: Timing,
     /// 前サンプルの同一 item が無いときの除外理由。
     ///
     /// 系列の先頭なら `FirstSample`、前サンプルはあるのに同一 item が
@@ -923,78 +999,49 @@ struct DeltaSetup {
     missing_prev: ExclusionReason,
 }
 
-/// レート集計の分子と分母。
-#[derive(Debug, Clone, Copy)]
-struct StrictDelta {
-    /// 有効と判定した差分。
-    delta: u64,
-    /// 分母 (区間長または tick 合計)。
-    denominator: u64,
-    /// カウンタのラップを復元して得た差分か。
-    wrapped: bool,
-}
-
 /// カウンタ列の差分と分母を、厳密な不連続判定付きで求める。
 ///
-/// `series::delta::compute_delta` を使うので、
-/// 減少を一律ラップと解釈せず、曖昧な場合は除外する。
+/// 本体は計算層の [`rate_sample`] で、ここは**除外理由を集計側の語彙へ
+/// 翻訳するだけ**の薄い層である。差分の採り方 (減少を一律ラップと解釈しない、
+/// 本家が 0 にクランプする列は区間の寄与を 0 にする) を集計側で書き直すと、
+/// 同じ区間の瞬時値と集計が食い違う。
+///
+/// 計算層が持たない情報だけを先に判定する。
+///
+/// | 先に見る理由 | 集計側の語彙 |
+/// |---|---|
+/// | この世代のファイルにその列が無い | `UnsupportedBySource` (系列の先頭でも「列が無い」と言う) |
+/// | 前サンプルの同一 item が無い | `FirstSample` / `ItemReplaced` の区別 (計算層は前者しか知らない) |
+/// | CPU の tick 合計が 0 | `ZeroDenominator` (区間長 0 の `NonPositiveElapsed` と区別する) |
 fn counter_delta(
+    id: ActivityId,
     plan: &crate::layout::plan::DecodePlan,
     column: usize,
     prev_item: Option<&ItemSnapshot>,
     curr_item: &ItemSnapshot,
     ctx: &ComputeContext,
     setup: DeltaSetup,
-) -> std::result::Result<StrictDelta, ExclusionReason> {
-    let curr_v = match plan.column_value(&curr_item.values, column) {
-        Availability::Present(v) => v,
+) -> std::result::Result<RateSample, ExclusionReason> {
+    // 「列そのものが無い」は前サンプルの有無より先に報告する。
+    // 差分が取れないのは列が無いからであって、系列の先頭だからではない
+    // (先頭サンプルだけ `first_sample` と報告されると理由が揺れる)。
+    match plan.column_value(&curr_item.values, column) {
+        Availability::Present(_) => {}
         Availability::UnsupportedBySource => return Err(ExclusionReason::UnsupportedBySource),
         Availability::MissingInSample => return Err(ExclusionReason::MissingInSample),
-    };
+    }
     // 前サンプルの同一 item が無い理由は呼び出し側が知っている
     // (系列の先頭なのか、item が入れ替わったのか)
     let Some(prev_item) = prev_item else {
         return Err(setup.missing_prev);
     };
-    let prev_v = match plan.column_value(&prev_item.values, column) {
-        Availability::Present(v) => v,
-        Availability::UnsupportedBySource => return Err(ExclusionReason::UnsupportedBySource),
-        Availability::MissingInSample => return Err(ExclusionReason::MissingInSample),
-    };
+    // CPU 割合の分母はその item の tick 合計。0 = その CPU は動いていないので
+    // 0% と報告しない。区間長が 0 の場合と理由を分けるためここで判定する。
+    if setup.normalize_by_ticks && !matches!(ctx.tick_total, Some(t) if t > 0) {
+        return Err(ExclusionReason::ZeroDenominator);
+    }
 
-    let bits = plan.column_bits(column).unwrap_or(CounterBits::B64);
-    let (delta, wrapped) = match compute_delta(
-        prev_v,
-        curr_v,
-        bits,
-        DeltaContext {
-            continuous: ctx.continuous,
-            same_item: true,
-        },
-    ) {
-        Delta::Valid(d) => (d, false),
-        Delta::Wrapped(d) => (d, true),
-        Delta::Unavailable(disc) => return Err(ExclusionReason::from(disc)),
-    };
-
-    // 分母: CPU 割合はその item の tick 合計、それ以外は区間長
-    let denominator = if setup.normalize_by_ticks {
-        match ctx.tick_total {
-            // tick 合計 0 = その CPU は動いていない。0% と報告しない。
-            Some(0) | None => return Err(ExclusionReason::ZeroDenominator),
-            Some(t) => t,
-        }
-    } else if setup.timing.itv_cs == 0 {
-        return Err(ExclusionReason::NonPositiveElapsed);
-    } else {
-        setup.timing.itv_cs
-    };
-
-    Ok(StrictDelta {
-        delta,
-        denominator,
-        wrapped,
-    })
+    rate_sample(plan, id, column, prev_item, curr_item, ctx).map_err(ExclusionReason::from)
 }
 
 /// CPU tick 合計で正規化する activity か。
@@ -1015,7 +1062,7 @@ pub fn item_label(id: ActivityId, shape: ItemShape, index: usize, key: Option<&s
     }
     match shape {
         ItemShape::Single => SINGLE_ITEM.to_string(),
-        _ if id == ActivityId::CPU => {
+        _ if matches!(id, ActivityId::CPU | ActivityId::NET_SOFT) => {
             if index == 0 {
                 "all".to_string()
             } else {
@@ -1069,17 +1116,12 @@ pub fn summarize_file(
         nodename: Some(h.nodename.clone()),
         release: Some(h.release.clone()),
         machine: Some(h.machine.clone()),
-        cpu_nr: h.cpu_nr,
+        cpu_nr: h.real_cpu_count(),
         tzname: h.tzname.clone(),
         files: vec![file.path().display().to_string()],
         boot_segment: None,
     };
     Ok(builder.finish(source))
-}
-
-/// 時系列の網羅度をまとめる (判定の前段検査用)。
-pub fn coverage_of(timeline: Option<&MetricTimeline>) -> Coverage {
-    timeline.map(MetricTimeline::coverage).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1194,6 +1236,189 @@ mod tests {
         SummaryOptions {
             retain: RetainTimelines::All,
             ..Default::default()
+        }
+    }
+
+    /// 全フィールドに別々の値を入れた item を作る。
+    ///
+    /// 列の取り違え (隣の列の差分を読んでいる) を検出できるようにするため、
+    /// 一様な値にはしない。
+    fn graded_item(plan: &DecodePlan, base: u64, step: u64) -> ItemSnapshot {
+        ItemSnapshot {
+            key: None,
+            texts: Vec::new(),
+            values: (0..plan.fields.len())
+                .map(|i| Availability::Present(base + step * i as u64))
+                .collect(),
+        }
+    }
+
+    /// その activity の最新 revision で 1 item のデコード計画を作る
+    /// (revision を持たない / 計画が作れない activity は `None`)。
+    fn latest_plan(def: &'static crate::layout::registry::ActivityDef) -> Option<DecodePlan> {
+        let rev = def.latest()?;
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // 保存値 → 表示単位のスケーリング (指摘 2)
+    // -----------------------------------------------------------------------
+
+    /// **回帰テスト (指摘 2)**: 単一区間の平均は、その区間の瞬時値と一致する。
+    ///
+    /// 期間平均は「差分合計 ÷ 分母合計」から作るため、保存値 → 表示単位の
+    /// スケーリング ([`crate::series::compute::rate_scale`]) を掛け忘れると、
+    /// 瞬時値から作る最大 / 最小 / p95 とだけ単位が食い違う
+    /// (`rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
+    /// PSI の圧力割合が 10,000 倍)。
+    ///
+    /// 区間が 1 本だけの集計は定義上その区間の瞬時値に等しいので、
+    /// 全 activity の全レート列で `平均 == 最大` を確認すれば漏れが機械的に出る。
+    /// 増加する区間と逆行する区間の両方を見る (本家が 0 にクランプする列は
+    /// 逆行区間でも値が出るので、そこでも一致しなければならない)。
+    #[test]
+    fn single_interval_mean_matches_instant_value() {
+        let mut mismatched: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for increasing in [true, false] {
+            for def in crate::layout::registry::all() {
+                let Some(plan) = latest_plan(def) else {
+                    continue;
+                };
+                let lo = graded_item(&plan, 100, 7);
+                let hi = graded_item(&plan, 1_000, 37);
+                let (first, second) = if increasing { (lo, hi) } else { (hi, lo) };
+
+                let mut f = Feed::new(def.id, opts_all());
+                f.push(snapshot(def.id, 1_000, 100_000, vec![first]), true);
+                f.push(snapshot(def.id, 1_010, 101_000, vec![second]), true);
+                let s = f.finish();
+
+                let Some(item) = s.activities.first().and_then(|a| a.items.first()) else {
+                    continue;
+                };
+                for c in &item.columns {
+                    if c.method != AggregationMethod::RateOverValidIntervals || c.intervals == 0 {
+                        continue;
+                    }
+                    // 集計が値を作らなかった区間は比較対象外。
+                    // 「値を出したなら瞬時値と一致する」が守りたい不変量。
+                    let (Some(mean), Some(max)) = (c.mean, c.max) else {
+                        continue;
+                    };
+                    checked += 1;
+                    if (mean - max.value).abs() > max.value.abs() * 1e-9 + 1e-12 {
+                        mismatched.push(format!(
+                            "{} {} (increasing={increasing}): 平均 {mean} vs 瞬時 {}",
+                            def.id, c.column, max.value
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            mismatched.is_empty(),
+            "1 区間の平均と瞬時値が食い違う列がある (スケーリング漏れ): {mismatched:?}"
+        );
+        assert!(checked > 50, "検査した列が少なすぎる: {checked}");
+    }
+
+    /// スケールが必要な代表列の平均が、表示単位で出ること。
+    ///
+    /// 機械的なテストが「たまたま全部 1.0 倍」で通っていないことの確認も兼ねる。
+    /// 期待値の根拠は `docs/format/03-output-format.md` §id=11 (ディスク列) と
+    /// §1.5.3 (PSI)。
+    #[test]
+    fn scaled_rate_columns_are_averaged_in_display_units() {
+        // --- A_DISK: 10 秒で 1,000 セクタ / 1,000 ms ---
+        let id = ActivityId::DISK;
+        let plan = plan_for(id);
+        let mut f = Feed::new(id, opts_all());
+        let fields = |sect: u64, ticks: u64| {
+            item_of(
+                &plan,
+                &[
+                    ("major", 8),
+                    ("minor", 0),
+                    ("rd_sect", sect),
+                    ("rq_ticks", ticks),
+                    ("tot_ticks", ticks),
+                ],
+            )
+        };
+        f.push(snapshot(id, 1_000, 100_000, vec![fields(0, 0)]), true);
+        f.push(
+            snapshot(id, 1_010, 101_000, vec![fields(1_000, 1_000)]),
+            true,
+        );
+        let s = f.finish();
+        let disk = s.activities.first().and_then(|a| a.items.first()).unwrap();
+        let col = |name: &str| disk.columns.iter().find(|c| c.column == name).unwrap();
+
+        // 100 セクタ/秒 = 50 kB/s (セクタは 512 B なので 2 倍にならない)
+        assert_eq!(col("read_kb_per_sec").mean, Some(50.0));
+        // rq_ticks 1,000 ms / 10 秒 → 平均キュー長 0.1 (1,000 倍にならない)
+        assert_eq!(col("avg_queue_size").mean, Some(0.1));
+        // tot_ticks 1,000 ms / 10 秒 = 10% ビジー (10 倍にならない)
+        assert_eq!(col("util_pct").mean, Some(10.0));
+        // 平均は瞬時値と一致する (区間は 1 本だけ)
+        assert_eq!(col("read_kb_per_sec").max.unwrap().value, 50.0);
+        assert_eq!(col("avg_queue_size").max.unwrap().value, 0.1);
+        assert_eq!(col("util_pct").max.unwrap().value, 10.0);
+
+        // --- A_PSI_CPU: 10 秒のうち 1 秒 (1e6 µs) 停止 → 10% ---
+        let id = ActivityId::PSI_CPU;
+        let plan = plan_for(id);
+        let mut f = Feed::new(id, opts_all());
+        f.push(
+            snapshot(
+                id,
+                1_000,
+                100_000,
+                vec![item_of(&plan, &[("some_cpu_total", 0)])],
+            ),
+            true,
+        );
+        f.push(
+            snapshot(
+                id,
+                1_010,
+                101_000,
+                vec![item_of(&plan, &[("some_cpu_total", 1_000_000)])],
+            ),
+            true,
+        );
+        let s = f.finish();
+        let psi = s.activities.first().and_then(|a| a.items.first()).unwrap();
+        let scpu = psi.columns.iter().find(|c| c.column == "scpu").unwrap();
+        assert_eq!(scpu.mean, Some(10.0), "10,000 倍にならない");
+        assert_eq!(scpu.max.unwrap().value, 10.0);
+    }
+
+    /// `Aggregation::Sum` の列に保存値スケールが必要なものは無い。
+    ///
+    /// [`AggregationMethod::DeltaSum`] は差分の総量をそのまま平均欄に出すため、
+    /// レートのスケール係数を掛けない。スケールが必要な列が `Sum` で宣言されたら
+    /// 単位が壊れるので、その組み合わせが現れないことを機械的に固定する。
+    #[test]
+    fn sum_columns_need_no_rate_scale() {
+        use crate::series::compute::rate_scale;
+        for def in crate::layout::registry::all() {
+            for (column, meta) in def.columns.iter().enumerate() {
+                if meta.aggregation != Aggregation::Sum {
+                    continue;
+                }
+                assert_eq!(
+                    rate_scale(def.id, column),
+                    1.0,
+                    "{} {} は Sum 宣言だがレートのスケールを持つ",
+                    def.id,
+                    meta.public_name
+                );
+            }
         }
     }
 
@@ -1677,10 +1902,57 @@ mod tests {
         let s = f.finish();
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(SUMMARY_KIND), "{json}");
-        assert!(json.contains(r#""schema_version":"1""#));
+        assert!(json.contains(r#""schema_version":"1.0""#));
         assert!(json.contains("rate_over_valid_intervals"));
         // u64 の生値は十進文字列
         assert!(json.contains(r#""delta_total":"100""#), "{json}");
+    }
+
+    #[test]
+    fn disk_labels_use_source_device_numbers() {
+        let id = ActivityId::DISK;
+        let plan = plan_for(id);
+        let mut feed = Feed::new(id, opts_all());
+        for (at, ios) in [(1000, 100), (1010, 110)] {
+            feed.push(
+                snapshot(
+                    id,
+                    at,
+                    at * 100,
+                    vec![item_of(
+                        &plan,
+                        &[("major", 8), ("minor", 16), ("nr_ios", ios)],
+                    )],
+                ),
+                true,
+            );
+        }
+        let summary = feed.finish();
+        assert_eq!(summary.activity(id).unwrap().items[0].item, "dev8-16");
+        assert!(summary.timelines.iter().all(|t| t.key.item == "dev8-16"));
+    }
+
+    #[test]
+    fn irq_summary_keeps_one_named_aggregate_per_interrupt() {
+        let id = ActivityId::IRQ;
+        let mut feed = Feed::new(id, opts_all());
+        feed.plans[0].plan.nr = 3;
+        feed.plans[0].plan.nr2 = 2;
+        for (at, count) in [(1000, 100), (1010, 200)] {
+            let plan = &feed.plans[0].plan;
+            let mut items: Vec<_> = (0..6).map(|_| graded_item(plan, count, 0)).collect();
+            items[0].key = Some("sum".into());
+            items[1].key = Some("timer".into());
+            let mut sample = snapshot(id, at, at * 100, items);
+            sample.activities[0].nr = 3;
+            sample.activities[0].nr2 = 2;
+            feed.push(sample, true);
+        }
+        let summary = feed.finish();
+        let items = &summary.activity(id).unwrap().items;
+        assert_eq!(items.len(), 2, "CPU の平坦な添字を独立 item にしない");
+        assert!(items.iter().any(|i| i.item == "sum"));
+        assert!(items.iter().any(|i| i.item == "timer"));
     }
 
     #[test]

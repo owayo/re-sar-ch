@@ -1255,7 +1255,7 @@ flowchart TB
 | 項目 | 〜v12.5.5 | v12.5.6 〜 |
 |---|---|---|
 | `stats_irq` | `unsigned long long irq_nr` の 1 フィールドのみ | `unsigned int irq_nr` + `char irq_name[8]` |
-| 構造体サイズ | **8 バイト** (v11.7.1〜)。v11.0.x 以前は `aligned(16)` 付きで **16 バイト** | **12 バイト** |
+| 構造体サイズ | **8 バイト** (v11.7.1〜)。v9.1.5〜v11.6.6 は `aligned(16)` 付きで **16 バイト** | **12 バイト** |
 | `types_nr` | `(1, 0, 0)` | `(0, 0, 1)` |
 | `.magic` | `0x8b` (`BASE + 1`) | **`0x8c` (`BASE + 2`)** |
 | `.options` | `AO_COUNTED` のみ | `AO_COUNTED + AO_MATRIX + AO_PERSISTENT` |
@@ -1892,3 +1892,15 @@ sysstat は「奇数マイナー = 開発版 (master)」「偶数マイナー = 
 reSARch 側では `sadf -j` (JSON) / `sadf -r` (raw) の出力と自前パーサの結果を
 突き合わせるのが最も確実な検証方法になる (`sadf -r --debug` は
 `record_header` の生値も表示する)。
+
+### 一次資料による旧配置の追加確認 (Issue #7)
+
+- `A_MEMORY` の 64 B (v9.1.5 / v9.1.6) は `sa_conv.h` の `stats_memory_8a` の先頭 8 本
+  (`frmkb`〜`comkb`)。`types_nr=(0,8,0)` として登録し、32bit の UL 幅を保持する。
+- 自己記述形式は時代 A 専用 revision を候補から除く。v11.7.1 相当の旧 magic を
+  新配置へ推測で読み替えず、当該 activity をスキップして他の activity を処理する。
+- `A_DISK` の 64 B / `(1,3,7)` の順序は
+  [v12.1.2 rd_stats.h](https://github.com/sysstat/sysstat/blob/v12.1.2/rd_stats.h) の
+  `stats_disk` と一致する (`dc_sect` は UL 群の 3 本目、`dc_ticks` は末尾)。
+- `MAX_FS_LEN = 72` は
+  [v10.1.6 rd_stats.h](https://github.com/sysstat/sysstat/blob/v10.1.6/rd_stats.h) の定義で確認した。

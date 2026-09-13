@@ -41,6 +41,7 @@ const PWR_CPU_FIELDS: &[WireField] = &[WireField::aligned("cpufreq", FieldTy::CU
 
 const PWR_CPU_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 1, 0],
     size_lp64: 8,
     layout: WireLayout::new("stats_pwr_cpufreq@0x8a", PWR_CPU_FIELDS),
@@ -91,6 +92,7 @@ const PWR_FAN_FIELDS: &[WireField] = &[
 
 const PWR_FAN_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [2, 0, 0],
     size_lp64: 40,
     layout: WireLayout::new("stats_pwr_fan@0x8a", PWR_FAN_FIELDS),
@@ -161,6 +163,7 @@ const PWR_TEMP_FIELDS: &[WireField] = &[
 
 const PWR_TEMP_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [3, 0, 0],
     size_lp64: 48,
     layout: WireLayout::new("stats_pwr_temp@0x8a", PWR_TEMP_FIELDS),
@@ -241,6 +244,7 @@ const PWR_IN_FIELDS: &[WireField] = &[
 
 const PWR_IN_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [3, 0, 0],
     size_lp64: 48,
     layout: WireLayout::new("stats_pwr_in@0x8a", PWR_IN_FIELDS),
@@ -327,6 +331,7 @@ const PWR_FREQ_FIELDS_32: &[WireField] = &[
 const PWR_FREQ_REVISIONS: &[WireRevision] = &[
     WireRevision {
         magic: 0x8b,
+        self_describing: true,
         types_nr: [1, 1, 0],
         size_lp64: 16,
         layout: WireLayout::new("stats_pwr_wghfreq@0x8b/16", PWR_FREQ_FIELDS_16),
@@ -335,6 +340,7 @@ const PWR_FREQ_REVISIONS: &[WireRevision] = &[
     // 時代 A。types_nr はファイルに存在しないため、宣言値は整合性検査用。
     WireRevision {
         magic: 0x8a,
+        self_describing: false,
         types_nr: [1, 1, 0],
         size_lp64: 32,
         layout: WireLayout::new("stats_pwr_wghfreq_8a@0x8a/32", PWR_FREQ_FIELDS_32),
@@ -407,6 +413,7 @@ const PWR_USB_FIELDS: &[WireField] = &[
 
 const PWR_USB_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 0, 4],
     size_lp64: 88,
     layout: WireLayout::new("stats_pwr_usb@0x8a", PWR_USB_FIELDS),
@@ -495,6 +502,7 @@ const PWR_BAT_FIELDS: &[WireField] = &[
 
 const PWR_BAT_REVISIONS: &[WireRevision] = &[WireRevision {
     magic: 0x8a,
+    self_describing: true,
     types_nr: [0, 0, 0],
     size_lp64: 3,
     layout: WireLayout::new("stats_pwr_bat@0x8a", PWR_BAT_FIELDS),

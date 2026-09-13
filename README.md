@@ -46,9 +46,22 @@ Also handled:
 - **All 43 activities** — CPU, memory, disk, every IPv4/IPv6 protocol, PSI, power sensors,
   filesystems, HugePages, interrupts, and the rest
 - **Big-endian and 32-bit producers** — a PowerPC log opens the same as an x86-64 one
-- **Files converted by `sadf -c`** — the `upgraded` marker is read and reported
+- **Files converted by `sadf -c`** — the `upgraded` marker is read and reported, and
+  reSARch can perform the conversion itself
 - **Malformed input** — truncation, impossible item counts, size/offset contradictions and
   the `nr × nr2 × size` integer overflow are all detected rather than trusted
+
+Support is tracked on four separate dimensions. “43 activities” describes the registry,
+not verification of every historical revision.
+
+| Dimension | Current coverage |
+|---|---|
+| Decode | Layout definitions for all 43 activities; unknown revisions are skipped with diagnostics |
+| Meaning | Counter/gauge/identity and units in each activity's column metadata |
+| Derived metrics | Shared rates, percentages and group calculations; unavailable values retain a reason |
+| Output verification | Upstream corpus and regression tests cover selected generations, ABIs and activities; golden sadf cases cover FAN/IN/TEMP, not all 43 |
+
+See [the activity specification](docs/format/02-activities.md) for revision details.
 
 ## Install
 
@@ -75,8 +88,11 @@ resarch -u -f sa01                       # CPU utilisation
 resarch -r -f sa01                       # memory
 resarch -n DEV,EDEV -f sa01              # network interfaces
 resarch -u -P ALL -s 09:00:00 -e 18:00:00 -f sa01
+resarch -u -i 600 -f sa01                # thin the samples to ~10-minute steps
+resarch -I --int=0,LOC -f sa01           # pick interrupts by number or name
 resarch sar -A -f sa01                   # explicit compatibility entry point
 resarch sadf -j sa01                     # sadf-compatible JSON
+resarch sadf -g sa01 -- -u -P ALL > cpu.svg  # SVG charts (reSARch drawing)
 ```
 
 The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs from
@@ -89,9 +105,103 @@ The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs f
 resarch info sa01                        # generation, ABI, activity table
 resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
+resarch detect sa01                      # where and what looks off
 resarch summarize sa01 sa02 --format json
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 09:00-18:00 UTC each day
+resarch show sa01 --activity irq --irq-cpus --format ndjson  # per-CPU interrupt detail
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
+
+For `summarize` and `compare`, `--from` / `--to` narrow **the aggregation period itself**:
+samples outside the range enter neither the mean, the p95, nor the delta totals, and the
+period bounds shrink with them. `detect` reads the same two options differently — they
+narrow what gets reported, not the material its comparison basis is built from.
+All native commands interpret `hh:mm[:ss]` as **UTC**; 10-digit epoch seconds are also
+accepted. `compare` JSON contains `comparisons` and `skipped_metrics`, including the
+hosts missing each skipped metric. IRQ rows carry a `cpu` dimension (`all` or a zero-based
+CPU number); old files without CPU detail emit only `all`.
+
+### Finding what went wrong
+
+`resarch detect` takes a file and tells you **when** and **what** looks off, without
+needing you to know what to look for. It runs three views over every series it can
+evaluate — fixed conditions on values whose meaning is established, deviation from the
+file's own median and MAD, and level changes between adjacent windows — and groups
+what fires into episodes.
+
+What it will not do is dress up a guess as a measurement:
+
+- **No confidence percentages.** A calibrated probability cannot be built from one host's
+  144 samples. You get an ordinal investigation priority and, separately, how much
+  evidence backed it.
+- **It says when its own yardstick is suspect.** The comparison basis comes from the input
+  itself, so if the anomaly dominates the file, the basis moves with it. When the median
+  itself satisfies a fixed condition, the report says the deviation check for that series
+  cannot be trusted.
+- **`MAD = 0` is not divided by epsilon.** A series that barely moves has unmeasurable
+  spread, which is reported as such rather than turned into an enormous score.
+- **Sampling is not disguised as duration.** Three high readings are "high across 3
+  samples spanning 20 minutes", never "high for 20 minutes". What happened between
+  samples was not observed.
+- **"Not evaluated" is not "nothing found".** Every series it could not assess is listed
+  with the reason.
+
+### Converting an old file
+
+```bash
+resarch sadf -c sa01 > sa01-current        # 0x2171 / 0x2173 → 0x2175
+resarch sadf -c sa01 -O hz=250 > out       # override the assumed HZ
+```
+
+Old headers do not record the tick frequency. reSARch uses **USER_HZ=100** by default,
+matching Linux on common architectures and the direct-reading path. This is the unit of
+`/proc/stat`, independent of the kernel's `CONFIG_HZ`. Only `-O hz=` overrides it for an
+input with a known different tick frequency; wall-clock gaps and suspend never change it.
+The chosen value and its source are reported on stderr.
+
+## Use it from an AI agent
+
+`resarch` ships a skill describing its own commands, so an agent knows when to reach for it
+and — more importantly — how to read what comes back.
+
+```bash
+resarch skill-install claude    # ~/.claude/skills/resarch/SKILL.md
+resarch skill-install codex     # ~/.codex/skills/resarch/SKILL.md
+```
+
+`make install` does both alongside the binary. The skill text is embedded in the binary, so
+a release download is enough — no checkout, no network.
+
+The skill spends most of its length on how to read `detect` output, because that is where an
+agent is most likely to overclaim: the caveats are load-bearing. It also states the property
+that matters most for any analysis built on top — **an empty value in reSARch's own formats
+is not a zero** — and lists which `--from` / `--to` means what in which subcommand.
+
+## How the output is verified
+
+Every expected-output file that `sysstat` keeps in its own test suite is compared
+**line by line** against what reSARch produces — 21 cases in total:
+
+| | |
+|---|---:|
+| Byte-identical | 16 |
+| Identical after masking | 4 |
+| Mismatched | 0 |
+| Not comparable | 1 |
+
+The four masked cases mask exactly one thing: the `A_DISK` device-name column.
+Upstream resolves `major:minor` through the **reading host's** `/dev` and `/sys`, so
+`sda1` is a property of the machine that produced the expected output, not of the file.
+reSARch deliberately prints `dev8-1` instead rather than inventing a name that would be
+wrong for a log collected elsewhere.
+
+SVG (`sadf -g`) uses reSARch's own drawing with the shared computed values. Its decoration
+and coordinates are outside the byte comparison contract, so one SVG golden remains
+explicitly excluded. Separate tests check chart values, selections, XML escaping, and
+line breaks at missing samples and restarts.
+
+Mismatches are never tolerated: a single one fails the suite. "Hard to implement" and
+"the number doesn't match" are not accepted reasons to mask something.
 
 ## What "sar compatible" means here
 
@@ -104,9 +214,19 @@ than implying all of them:
 | **Computation and output** | Which `sar` / `sadf` version's rendering is reproduced |
 | **CLI compatibility** | Which options and calling conventions are accepted |
 
-reSARch is a **reader**. Live collection (`sadc`) is out of scope.
+reSARch never collects: live sampling (`sadc`) is out of scope. The only thing it writes
+is a re-encoding of a file it just read (`sadf -c`), and that leaves every value alone.
 The generation of the file being read and the output format being reproduced are separate
 settings: a v10 file can be rendered in v12 `sar` style, and vice versa.
+
+Options that are parsed but not yet acted upon are rejected at run time with a reason:
+
+| Option | Status |
+|---|---|
+| `sar -o` / `--sadc` | Collection is out of scope — rejected explicitly |
+| `sadf -l` | PCP output is not implemented |
+| `sadf -g -O autoscale,packed,customcol` | These SVG options are explicitly rejected; skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday are supported |
+| `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
 
 ## Design notes
 
@@ -131,6 +251,9 @@ make test         # unit and integration tests
 make check        # clippy + fmt
 make fixtures     # fetch upstream test data (see below)
 make release      # optimised build
+make install      # install the binary and the agent skill (claude + codex)
+make install-bin  # binary only
+make uninstall    # remove both
 ```
 
 Upstream `sysstat` is GPL-licensed, so **none of its test data or expected output is

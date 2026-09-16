@@ -142,6 +142,7 @@ use the existing comparison mask.
 ### Its own commands
 
 ```bash
+resarch identify sa01 sa02               # which sysstat wrote each file
 resarch info sa01                        # generation, ABI, activity table
 resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline

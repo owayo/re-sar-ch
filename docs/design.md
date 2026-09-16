@@ -741,6 +741,9 @@ resarch detect sa01
 # ホスト比較
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 
+# どの世代・どのバージョンが書いたファイルか (読めない世代でも答える)
+resarch identify sa01 sa02
+
 # ヘッダのみ
 resarch info sa01
 

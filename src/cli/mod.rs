@@ -39,13 +39,14 @@ pub use sar_args::{
 /// ルートが受け付けるサブコマンド名。
 ///
 /// 先頭引数がこのいずれでもなければ `sar` 互換として解釈する。
-pub const SUBCOMMAND_NAMES: [&str; 9] = [
+pub const SUBCOMMAND_NAMES: [&str; 10] = [
     "sa2sar",
     "show",
     "summarize",
     "detect",
     "compare",
     "info",
+    "identify",
     "skill-install",
     "sar",
     "sadf",
@@ -414,6 +415,23 @@ pub struct InfoArgs {
     pub no_mmap: bool,
 }
 
+/// `resarch identify` の引数。
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct IdentifyArgs {
+    // `SummarizeArgs::help` と同じ理由で自前の `--help` を持つ。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
+    /// 判定対象の `sa` ファイル。
+    #[arg(value_name = "FILE", required = true, num_args = 1..)]
+    pub files: Vec<PathBuf>,
+
+    /// 出力形式。
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
 /// `resarch sa2sar` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Sa2SarArgs {
@@ -508,6 +526,14 @@ pub enum Commands {
     // `--help` の扱いは [`Commands::Summarize`] と同じ。
     #[command(disable_help_flag = true)]
     Info(InfoArgs),
+    /// どの世代・どのバージョンの sysstat が書いたファイルかを判定する。
+    ///
+    /// ヘッダを解釈できない世代でも判定結果を返す点が `info` と違う。
+    /// 読めないことは失敗ではないので、終了コードも 0 のままにする。
+    //
+    // `--help` の扱いは [`Commands::Summarize`] と同じ。
+    #[command(disable_help_flag = true)]
+    Identify(IdentifyArgs),
     /// AI エージェント向けのスキルをインストールする。
     //
     // `--help` の扱いは [`Commands::Summarize`] と同じ。

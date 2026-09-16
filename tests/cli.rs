@@ -667,6 +667,63 @@ fn info_json_is_parseable() {
     assert!(v["activities"].is_array(), "{v:.200}");
 }
 
+// ===========================================================================
+// identify
+// ===========================================================================
+
+/// `identify` は**読めない世代でも成功する**。
+///
+/// 「どの sysstat が書いたか分かった」ことと「統計まで読める」ことは別で、
+/// 前者を失敗として返すと「sysstat のファイルではない」と区別がつかなくなる。
+#[test]
+fn identify_succeeds_for_a_generation_it_cannot_read() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let p = dir.path().join("legacy");
+
+    // 0x2169 (sysstat 6.1.3〜7.0.4): magic@36 / sa_st_size@38 = 464 / ヘッダ 240。
+    // 値は docs/format/01-file-format.md §2.8 から独立に書き写す。
+    let mut b = vec![0u8; 240 + 464];
+    b[36..38].copy_from_slice(&0x2169u16.to_le_bytes());
+    b[38..40].copy_from_slice(&464u16.to_le_bytes());
+    std::fs::write(&p, &b).expect("書き出せること");
+
+    let out = run_ok(&["identify", as_str(&p)]); // 終了コード 0 であること
+    assert!(out.contains("0x2169"), "{out:.400}");
+    assert!(out.contains("6.1.3"), "{out:.400}");
+    assert!(out.contains("未実装"), "{out:.400}");
+}
+
+/// 判定できない入力でも `identify` は落ちない (これも結果である)。
+#[test]
+fn identify_reports_a_non_sysstat_file_without_failing() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let p = dir.path().join("alien");
+    std::fs::write(&p, b"PK\x03\x04not a sysstat file at all").expect("書き出せること");
+
+    let out = run_ok(&["identify", as_str(&p)]);
+    assert!(
+        out.contains("sysstat のデータファイルではない"),
+        "{out:.400}"
+    );
+}
+
+/// 読める世代では、**magic から分かる範囲**とは別に
+/// **ファイル自身が記録しているバージョン**も返す。
+#[test]
+fn identify_reports_the_recorded_version_as_json() {
+    let Some(f) = main_fixture() else { return };
+    let out = run_ok(&["identify", as_str(&f), "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("妥当な JSON であること");
+    let first = &v[0];
+    assert_eq!(first["format_magic"], "0x2175", "{v:.300}");
+    assert_eq!(first["readable"], true, "{v:.300}");
+    assert!(
+        first["recorded_version"].is_string(),
+        "file_magic を持つ世代は書き手のバージョンを記録している: {v:.300}"
+    );
+    assert_eq!(first["magic_at"], "file_magic@2", "{v:.300}");
+}
+
 /// `-o` (採取) は reSARch の対象外なので明示的に拒否する。
 #[test]
 fn collection_option_is_rejected_with_an_explanation() {

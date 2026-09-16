@@ -36,9 +36,9 @@ use re_sar_ch::analyze::{
 };
 use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
-    DetectFormat, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg, Sa2SarArgs,
-    SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate, SarInput,
-    SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
+    DetectFormat, IdentifyArgs, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg,
+    Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate,
+    SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
@@ -91,6 +91,7 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
         Invocation::Native(cmd) => match *cmd {
             Commands::Sa2Sar(args) => run_sa2sar(args),
             Commands::Info(args) => run_info(args),
+            Commands::Identify(args) => run_identify(args),
             Commands::SkillInstall(args) => run_skill_install(args),
             Commands::Show(args) => run_show(args),
             Commands::Summarize(args) => run_summarize(args),
@@ -1756,6 +1757,278 @@ fn expand_host_path(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
         bail!("{}: sa ファイルが見つかりません", path.display());
     }
     Ok(files)
+}
+
+// ===========================================================================
+// `resarch identify`
+// ===========================================================================
+
+/// `identify` が読むファイル先頭のバイト数。
+///
+/// 世代の判定に必要なのは先頭だけである。最も後ろを見る世代 (`0x216f`) でも
+/// `sa_st_size` は 40 バイト目、ヘッダ長の検証に使う値は 312 バイト目までに収まる。
+/// 余裕を見て 1 KiB 読む。全体を mmap する必要はない。
+const IDENTIFY_HEAD_BYTES: usize = 1024;
+
+/// `identify` の 1 ファイル分の判定結果。
+///
+/// **「読めない」と「判定できない」を分ける。** 旧世代のファイルはヘッダを
+/// 解釈できないが、どの世代が書いたかは分かる。それを失敗として報告すると
+/// 「そもそも sysstat のファイルではない」との区別がつかなくなる。
+struct Identified {
+    path: String,
+    format_magic: Option<u16>,
+    /// magic から分かる sysstat のバージョン範囲。
+    versions: Option<&'static str>,
+    /// ファイル自身が記録しているバージョン。
+    ///
+    /// **`file_magic` を持たない世代 (`0x216e` 以前) には記録されていない。**
+    /// 「記録が無い」と「読み取れなかった」を混同しないよう `Option` で持つ。
+    recorded: Option<String>,
+    endian: Option<&'static str>,
+    /// 統計まで読み取れる世代か。
+    readable: Option<bool>,
+    /// 判定の根拠 (どこにある magic を見たか)。
+    magic_at: Option<String>,
+    /// 判定できなかった / 曖昧だったときの理由。
+    note: Option<String>,
+}
+
+/// ファイル先頭だけを読む。短いファイルでもエラーにしない。
+fn read_head(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("{}: 開けません", path.display()))?;
+    let mut buf = vec![0u8; IDENTIFY_HEAD_BYTES];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).with_context(|| format!("{}: 読めません", path.display())),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+fn identify_one(path: &Path) -> anyhow::Result<Identified> {
+    use re_sar_ch::format::registry::{self, MagicLocation, Probe};
+
+    let head = read_head(path)?;
+    let mut out = Identified {
+        path: path.display().to_string(),
+        format_magic: None,
+        versions: None,
+        recorded: None,
+        endian: None,
+        readable: None,
+        magic_at: None,
+        note: None,
+    };
+
+    match registry::probe(&head) {
+        Probe::Identified { magic, endian } => {
+            let Some(spec) = registry::lookup(magic) else {
+                out.format_magic = Some(magic);
+                out.note = Some("判定できたが世代の定義が無い (内部不整合)".into());
+                return Ok(out);
+            };
+            out.format_magic = Some(magic);
+            out.versions = Some(spec.versions);
+            out.endian = Some(match endian {
+                re_sar_ch::format::Endian::Little => "little",
+                re_sar_ch::format::Endian::Big => "big",
+            });
+            out.readable = Some(spec.is_readable());
+            out.magic_at = Some(match spec.magic_at {
+                MagicLocation::FileMagic(_) => "file_magic@2".to_string(),
+                MagicLocation::Embedded { offset } => format!("file_hdr@{offset}"),
+            });
+            // `file_magic` を持つ世代だけが、書き手のバージョンを記録している。
+            if matches!(spec.magic_at, MagicLocation::FileMagic(_)) && head.len() >= 8 {
+                let (v, p, s, e) = (head[4], head[5], head[6], head[7]);
+                out.recorded = Some(if e == 0 {
+                    format!("{v}.{p}.{s}")
+                } else {
+                    format!("{v}.{p}.{s}.{e}")
+                });
+            }
+            if !spec.is_readable() {
+                out.note = Some("この世代の読み取りは未実装".into());
+            }
+        }
+        Probe::Ambiguous { first, second } => {
+            out.note = Some(format!(
+                "複数の形式が同時に成立 (0x{first:04x} と 0x{second:04x})"
+            ));
+        }
+        Probe::Unknown => {
+            // 先頭が sysstat の識別子なら「まだ知らない世代」、そうでなければ別のファイル。
+            let magic_le = head
+                .get(0..2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0);
+            let magic_be = magic_le.swap_bytes();
+            const SYSSTAT_MAGIC: u16 = 0xd596;
+            if magic_le == SYSSTAT_MAGIC || magic_be == SYSSTAT_MAGIC {
+                let big = magic_be == SYSSTAT_MAGIC;
+                let fm = head
+                    .get(2..4)
+                    .map(|b| {
+                        if big {
+                            u16::from_be_bytes([b[0], b[1]])
+                        } else {
+                            u16::from_le_bytes([b[0], b[1]])
+                        }
+                    })
+                    .unwrap_or(0);
+                out.format_magic = Some(fm);
+                out.endian = Some(if big { "big" } else { "little" });
+                out.readable = Some(false);
+                out.note = Some(match registry::lookup(fm) {
+                    // magic は登録済みなのに確定しなかった = 構造の検証に落ちた。
+                    // 「知らない世代」と一緒にすると、壊れたファイルを見落とす。
+                    Some(spec) => {
+                        out.versions = Some(spec.versions);
+                        format!(
+                            "sysstat {} の magic だが、ヘッダの構造が一致しない",
+                            spec.versions
+                        )
+                    }
+                    None => "sysstat のファイルだが、この format_magic は未知".into(),
+                });
+            } else {
+                out.note = Some("sysstat のデータファイルではない".into());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 端末での表示幅。全角を 2 として数える。
+///
+/// `output::table` は列名もデバイス名もほぼ ASCII なので文字数で足りるが、
+/// ここは世代の説明に全角が入るため、幅で数えないと列が崩れる。
+fn term_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let u = c as u32;
+            let wide = matches!(u,
+                0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3
+                | 0xF900..=0xFAFF | 0xFE30..=0xFE6F | 0xFF00..=0xFF60
+                | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x20000..=0x3FFFD);
+            if wide { 2 } else { 1 }
+        })
+        .sum()
+}
+
+fn pad_to(s: &str, width: usize) -> String {
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(width.saturating_sub(term_width(s))));
+    out
+}
+
+fn identify_json_value(r: &Identified) -> serde_json::Value {
+    serde_json::json!({
+        "file": r.path,
+        "format_magic": r.format_magic.map(|m| format!("0x{m:04x}")),
+        "sysstat_versions": r.versions,
+        "recorded_version": r.recorded,
+        "endian": r.endian,
+        "readable": r.readable,
+        "magic_at": r.magic_at,
+        "note": r.note,
+    })
+}
+
+fn run_identify(args: IdentifyArgs) -> anyhow::Result<ExitCode> {
+    let mut out = stdout_writer();
+    let mut failed = false;
+    let mut rows: Vec<Identified> = Vec::new();
+
+    for path in &args.files {
+        match identify_one(path) {
+            Ok(r) => rows.push(r),
+            Err(e) => {
+                // ファイルが開けない場合だけ失敗。判定できないことは失敗ではない。
+                eprintln!("resarch: {e:#}");
+                failed = true;
+            }
+        }
+    }
+
+    match args.format {
+        OutputFormat::Json | OutputFormat::SadfJson => {
+            let v: Vec<_> = rows.iter().map(identify_json_value).collect();
+            writeln!(out, "{}", serde_json::to_string_pretty(&v)?)?;
+        }
+        OutputFormat::Ndjson => {
+            for r in &rows {
+                writeln!(out, "{}", identify_json_value(r))?;
+            }
+        }
+        _ => {
+            // 世代の説明には全角 (「〜」や日本語) が入るので、文字数ではなく
+            // 表示幅で揃える。`{:<N$}` は文字数で数えるため使えない。
+            let cells: Vec<[String; 7]> = rows
+                .iter()
+                .map(|r| {
+                    [
+                        r.path.clone(),
+                        r.format_magic
+                            .map(|m| format!("0x{m:04x}"))
+                            .unwrap_or_else(|| "-".into()),
+                        r.versions.unwrap_or("-").to_string(),
+                        r.recorded.clone().unwrap_or_else(|| "-".into()),
+                        r.endian.unwrap_or("-").to_string(),
+                        match r.readable {
+                            Some(true) => "yes",
+                            Some(false) => "no",
+                            None => "-",
+                        }
+                        .to_string(),
+                        r.note.clone().unwrap_or_default(),
+                    ]
+                })
+                .collect();
+
+            let header = [
+                "FILE", "FORMAT", "SYSSTAT", "RECORDED", "ENDIAN", "READ", "NOTE",
+            ];
+            let mut widths: [usize; 7] = header.map(term_width);
+            for row in &cells {
+                for (i, c) in row.iter().enumerate() {
+                    widths[i] = widths[i].max(term_width(c));
+                }
+            }
+
+            let line = |row: &[String; 7]| {
+                let mut s = String::new();
+                for (i, c) in row.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str("  ");
+                    }
+                    // 最終列は右側を埋めない (行末の空白を残さない)。
+                    if i + 1 == row.len() {
+                        s.push_str(c);
+                    } else {
+                        s.push_str(&pad_to(c, widths[i]));
+                    }
+                }
+                s
+            };
+
+            writeln!(out, "{}", line(&header.map(String::from)))?;
+            for row in &cells {
+                writeln!(out, "{}", line(row))?;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(exit_code(failed))
 }
 
 // ===========================================================================

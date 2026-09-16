@@ -141,6 +141,7 @@ resarch sa2sar sa13                     # 標準出力へ (パイプでも使え
 ### 独自のサブコマンド
 
 ```bash
+resarch identify sa01 sa02               # どの sysstat が書いたファイルか
 resarch info sa01                        # 世代・ABI・activity 一覧
 resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # エージェントやパイプラインへ流すとき

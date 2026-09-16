@@ -4,9 +4,12 @@ description: >-
   sysstat の sa バイナリ (/var/log/sa/saXX) を sar/sadf/libc なしで解析する CLI。
   「いつ・何に異変があったか」を当てる resarch detect、エージェント向け構造化出力の
   show --format ndjson、期間集計の summarize、ホスト比較の compare を提供。
-  sar / sadf 互換出力 (-d -p -r -j -x) も本家と全文一致。旧世代 (0x2170〜0x2173) の
-  ファイルも直読でき、32bit / big-endian で採取されたものも読める。
-  sa ファイル・sar ログ・sadf・性能障害の事後調査・リソース異変の切り分けの場面で発動。
+  sar / sadf 互換出力 (-d -p -r -j -x) も本家と全文一致。旧世代 (0x1170 / 0x2170 /
+  0x2171 / 0x2173) のファイルも直読でき、32bit / big-endian で採取されたものも読める。
+  どのバージョンの sysstat が書いたファイルかは resarch identify が答える
+  (読めない最古世代 0x115a〜0x216f も識別できる)。
+  sa ファイル・sar ログ・sadf・性能障害の事後調査・リソース異変の切り分け、
+  「このファイルはどの sysstat のものか」「sar が読めないと言う」場面で発動。
 allowed-tools: Bash(resarch:*)
 ---
 
@@ -26,6 +29,7 @@ macOS や Windows で Linux のログを読める。
 | 構造化データを取り出してエージェント自身で分析する | `resarch show <file> --format ndjson` |
 | 期間全体の平均・p95・ボトルネック判定 | `resarch summarize <file> --format json` |
 | 複数ホストを同じ時間窓で比べる | `resarch compare --host a=<f1> --host b=<f2>` |
+| **どのバージョンの sysstat が書いたファイルか調べる** | `resarch identify <file>...` |
 | ファイルの世代・ABI・収録 activity を知る | `resarch info <file>` |
 | 既存のツールやスクリプトに食わせる (本家と同じテキスト) | `resarch -u -f <file>` / `resarch sadf -j <file>` |
 | 旧世代のファイルを他ツールへ渡せる形に変換する | `resarch sadf -c <file> > out` |
@@ -36,8 +40,38 @@ macOS や Windows で Linux のログを読める。
 保存先は上書きせず、失敗時も途中までのファイルを保存先に残さない。
 
 **`sar` が「読めない」と言ったファイルでも読める。** `sar` は `format_magic` が現行と
-違うと即エラーにするが、`resarch` は 4 世代すべてを直読する。
-32bit / big-endian で採取されたファイル (PowerPC など) も同じように開く。
+違うと即エラーにするが、`resarch` は 5 世代 (`0x1170` / `0x2170` / `0x2171` / `0x2173` /
+`0x2175`) を直読する。32bit / big-endian で採取されたファイル (PowerPC など) も同じように開く。
+
+## どのバージョンの sysstat が書いたファイルか調べる
+
+```bash
+resarch identify /var/log/sa/sa07
+resarch identify sa*.bin --format json      # 機械可読
+```
+
+```
+FILE                   FORMAT  SYSSTAT                       RECORDED  ENDIAN  READ  NOTE
+sa01                   0x1170  9.0.4 (RHEL/CentOS 6.5 以降)  9.0.4     little  yes
+sa07                   0x2169  6.1.3〜7.0.4                  -         little  no    この世代の読み取りは未実装
+broken.bin             -       -                             -         -       -     sysstat のデータファイルではない
+```
+
+読めない世代でも判定結果を返し、**終了コードは 0 のまま**である
+(「読めない」ことは失敗ではない)。ファイル自体が開けないときだけ非ゼロになる。
+`info` との違いは、`info` がヘッダを解釈できるファイルしか扱えないのに対し、
+`identify` は**先頭 1 KiB だけを読んで「何のファイルか」に答える**点にある。
+
+列の意味で取り違えやすいのは次の 2 つである。
+
+- **`SYSSTAT` は magic から分かる範囲**であって、書き手のバージョンそのものではない。
+  1 つの magic が複数バージョンに跨る (例: `0x2169` は 6.1.3〜7.0.4 の 4 リリース)。
+- **`RECORDED` はファイル自身が記録しているバージョン**。`file_magic` を持つ世代
+  (`0x216f` 以降) にしか無いので、それ以前は `-` になる。**「記録が無い」であって
+  「読み取れなかった」ではない。**
+
+`NOTE` が「ヘッダの構造が一致しない」なら、magic は既知だがヘッダが壊れているか
+途中で切れている。「この format_magic は未知」なら、こちらがまだ知らない世代である。
 
 ## まず detect を打つ
 
@@ -208,7 +242,8 @@ resarch sadf -c sa07 -O hz=250 > out       # 仮定する HZ を上書き
 ## 調査の流れ (例)
 
 ```bash
-# 1. どんなファイルか
+# 1. どんなファイルか (読めない世代でも答える)
+resarch identify /var/log/sa/sa07
 resarch info /var/log/sa/sa07
 
 # 2. 当たりを付ける。ここで時刻と指標が分かる

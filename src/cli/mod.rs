@@ -39,8 +39,9 @@ pub use sar_args::{
 /// ルートが受け付けるサブコマンド名。
 ///
 /// 先頭引数がこのいずれでもなければ `sar` 互換として解釈する。
-pub const SUBCOMMAND_NAMES: [&str; 10] = [
+pub const SUBCOMMAND_NAMES: [&str; 11] = [
     "sa2sar",
+    "tui",
     "show",
     "summarize",
     "detect",
@@ -432,6 +433,31 @@ pub struct IdentifyArgs {
     pub format: OutputFormat,
 }
 
+/// `resarch tui` の引数。
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct TuiArgs {
+    // `SummarizeArgs::help` と同じ理由で自前の `--help` を持つ。
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
+    /// 閲覧する `sa` ファイル。
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// 表示する activity を絞る (既定は収録されている全部)。
+    #[arg(long, value_delimiter = ',')]
+    pub activity: Vec<String>,
+
+    /// 回復可能な破損を診断付きで読み飛ばす。
+    #[arg(long)]
+    pub lenient: bool,
+
+    /// mmap を使わず BufReader で読む。
+    #[arg(long)]
+    pub no_mmap: bool,
+}
+
 /// `resarch sa2sar` の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Sa2SarArgs {
@@ -534,6 +560,16 @@ pub enum Commands {
     // `--help` の扱いは [`Commands::Summarize`] と同じ。
     #[command(disable_help_flag = true)]
     Identify(IdentifyArgs),
+    /// sa ファイルを対話的に閲覧する (TUI)。
+    //
+    // `--help` の扱いは [`Commands::Summarize`] と同じ。
+    //
+    // **`skills/SKILL.md` には意図的に載せていない。** スキルは AI エージェントが
+    // 読むものだが、TUI は対話端末を必要とするのでエージェントからは使えない。
+    // 載せると選択肢として検討され、端末の無い環境で失敗する経路が増えるだけになる。
+    // 「サブコマンドを足したのに skill が未更新」ではなく、載せない判断である。
+    #[command(disable_help_flag = true)]
+    Tui(TuiArgs),
     /// AI エージェント向けのスキルをインストールする。
     //
     // `--help` の扱いは [`Commands::Summarize`] と同じ。

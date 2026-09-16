@@ -38,7 +38,8 @@ use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
     DetectFormat, IdentifyArgs, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg,
     Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate,
-    SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, ValueKind,
+    SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, TuiArgs,
+    ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
@@ -92,6 +93,7 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
             Commands::Sa2Sar(args) => run_sa2sar(args),
             Commands::Info(args) => run_info(args),
             Commands::Identify(args) => run_identify(args),
+            Commands::Tui(args) => run_tui(args),
             Commands::SkillInstall(args) => run_skill_install(args),
             Commands::Show(args) => run_show(args),
             Commands::Summarize(args) => run_summarize(args),
@@ -1757,6 +1759,30 @@ fn expand_host_path(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
         bail!("{}: sa ファイルが見つかりません", path.display());
     }
     Ok(files)
+}
+
+// ===========================================================================
+// `resarch tui`
+// ===========================================================================
+
+/// `resarch tui` — sa ファイルを対話的に閲覧する。
+///
+/// 値は `series` が確定させたものを `output::json` のデータモデル経由で受け取る。
+/// **TUI 側で計算し直さない** (`src/tui/mod.rs` の層の位置づけを参照)。
+fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
+    let options = open_options(args.lenient, args.no_mmap);
+    let file = SaFile::open_with(&args.file, options)?;
+    let cfg = CustomConfig {
+        selection: selection_from(&args.activity)?,
+        // 閲覧では派生値 (レート・割合) を見たいので、`show` の既定と揃える。
+        values: ValueScope::Rates,
+        // 時刻フィルタは持たない。範囲を絞ると差分の基準サンプルを失う
+        // (絞り込みは TUI 内のスクロールで行う)。
+        time_filter: Default::default(),
+        irq_cpus: false,
+    };
+    re_sar_ch::tui::run(&args.file, &cfg, &file)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 // ===========================================================================

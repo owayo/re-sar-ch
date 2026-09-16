@@ -142,6 +142,7 @@ use the existing comparison mask.
 ### Its own commands
 
 ```bash
+resarch tui sa01                         # browse interactively (TUI)
 resarch identify sa01 sa02               # which sysstat wrote each file
 resarch info sa01                        # generation, ABI, activity table
 resarch show sa01 --activity cpu,disk --format table
@@ -161,6 +162,36 @@ All native commands interpret `hh:mm[:ss]` as **UTC**; 10-digit epoch seconds ar
 accepted. `compare` JSON contains `comparisons` and `skipped_metrics`, including the
 hosts missing each skipped metric. IRQ rows carry a `cpu` dimension (`all` or a zero-based
 CPU number); old files without CPU detail emit only `all`.
+
+### Browsing interactively (TUI)
+
+```bash
+resarch tui sa01
+resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
+```
+
+Recorded activities become tabs; pick an item and read its time series as a table.
+
+| Key | Action |
+|---|---|
+| `←` / `→` | switch activity |
+| `↑` / `↓`, `PgUp` / `PgDn` | move through time |
+| `g` / `G` | first / last |
+| `i` | pick an item (device, interface, CPU) |
+| `/` | filter items by name |
+| `?` | key reference |
+| `q`, `Ctrl-C` | quit |
+
+It follows the same rules as every other output:
+
+- **`—` means the value is absent, not zero.** Fields the source generation never had,
+  missing samples and intervals where no delta can be taken are never filled with 0.
+- **`!` before a timestamp marks a discontinuity**, `R` a restart, `C` a comment.
+  What happened between two samples was not observed, so points are not joined.
+- Timestamps are **UTC**, and the screen says so.
+
+The TUI needs an interactive terminal. Piped or redirected, it tells you to use
+`resarch show` / `resarch sar` instead.
 
 ### Finding what went wrong
 

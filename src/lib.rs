@@ -14,5 +14,6 @@ pub mod multi;
 pub mod output;
 pub mod series;
 pub mod skill;
+pub mod tui;
 
 pub use error::{Error, Result};

@@ -141,6 +141,7 @@ resarch sa2sar sa13                     # 標準出力へ (パイプでも使え
 ### 独自のサブコマンド
 
 ```bash
+resarch tui sa01                         # 対話的に閲覧する (TUI)
 resarch identify sa01 sa02               # どの sysstat が書いたファイルか
 resarch info sa01                        # 世代・ABI・activity 一覧
 resarch show sa01 --activity cpu,disk --format table
@@ -160,6 +161,48 @@ resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 `compare` の JSON は `comparisons` と `skipped_metrics` を持ち、`skipped_metrics` には
 比較できなかった指標と、その指標の観測値が無いホストが並びます。割り込みの行は `cpu`
 (`all` または 0 始まりの CPU 番号) を持ち、CPU 別の内訳が無い旧ファイルでは `all` だけを出します。
+
+### 対話的に閲覧する (TUI)
+
+```bash
+resarch tui sa01
+resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
+```
+
+収録されている activity がタブになり、選んだ item の時系列を表で読めます。
+
+```
+<host>  Linux 2.6.32-696.1.1.el6.x86_64 / x86_64  (2 CPU)
+2026-08-31  sa01  時刻は UTC  (144 サンプル)
+ CPU   PCSW   SWAP   PAGE   IO   MEMORY   KTABLES   QUEUE   SERIAL   DISK   NET_DEV   ...
+┌ A_CPU — CPU 使用率  [all]  ───────────────────────────────────────────────────────┐
+│time       user     nice     system   iowait   steal    idle     usr      ...       │
+│ 15:10:01  0.14     0.00     0.12     0.03     0.00     99.71    0.14     ...       │
+│ 15:20:01  0.13     0.00     0.09     0.02     0.00     99.75    0.13     ...       │
+└───────────────────────────────────────────────────────────────────────────────────┘
+←→ activity   ↑↓ 時刻   i item (3)   / 絞り込み   g/G 先頭末尾   ? help   q 終了
+```
+
+| キー | 動作 |
+|---|---|
+| `←` / `→` | activity を切り替える |
+| `↑` / `↓`、`PgUp` / `PgDn` | 時刻を移動する |
+| `g` / `G` | 先頭 / 末尾 |
+| `i` | item (デバイス・インターフェース・CPU) を選ぶ |
+| `/` | item を名前で絞り込む |
+| `?` | キー操作の一覧 |
+| `q`、`Ctrl-C` | 終了 |
+
+表示の規律は他の出力と同じです。
+
+- **`—` は値が無いことで、0 ではありません。** その世代に無いフィールド、
+  欠測、差分が取れない区間を、ゼロで埋めません。
+- **時刻の前の `!` は不連続**、`R` は再起動、`C` はコメントです。
+  採取と採取の間に何が起きたかは観測されていないので、点を線で結びません。
+- 時刻は **UTC** で、画面にもそう明記します。
+
+TUI は対話端末でのみ動きます。パイプやファイルへ出す場合は `resarch show` /
+`resarch sar` を使ってください (その旨のエラーを返します)。
 
 ### 異変の当たりを付ける
 

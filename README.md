@@ -251,7 +251,7 @@ Every format generation, verified byte-for-byte against upstream's own test corp
 
 | `format_magic` | sysstat versions | notes |
 |---|---|---|
-| `0x2170` | … 9.1.5 | oldest upstream generation; upstream itself cannot convert these |
+| `0x2170` | … 9.1.5 | oldest upstream generation reSARch can read; upstream itself cannot convert these |
 | `0x1170` | 9.0.4 (RHEL/CentOS 6.5+) | **vendor variant** — Red Hat renumbered the magic to a value no upstream release uses; `stats_io` is 80 bytes instead of 20 |
 | `0x2171` | 9.1.6 … 10.2 | 8-byte file magic, no RESTART payload |
 | `0x2173` | 10.3 … 11.6 | RESTART records carry a volatile-activity list that changes item counts |
@@ -266,9 +266,14 @@ identifies the variant.
 ### Older generations — identified, not yet readable
 
 sysstat 3.2.4 through 8.1.2 (`0x115a` … `0x216f`) use a fundamentally different layout:
-no `file_magic` at the head of the file, no `file_activity[]` array, no `record_header`.
-The magic lives *inside* `file_hdr`, and **its offset moves across generations** (4 → 36 → 32),
-so "read the first two bytes" does not identify these files at all.
+no `file_activity[]` array, no `record_header`, and — up to `0x216e` — no `file_magic` at
+the head of the file either. In those generations the magic lives *inside* `file_hdr`, and
+**its offset moves across generations** (4 → 36 → 32), so "read the first two bytes" does
+not identify them at all.
+
+`0x216f` (8.1.1 / 8.1.2) is a **transitional** generation: it gained `file_magic` at the head
+of the file while the body was still the old layout. The switch to `file_activity[]` only
+happens in `0x2170`.
 
 reSARch identifies them and reports which sysstat wrote the file:
 

@@ -404,6 +404,11 @@ fn activities_are_planned_in_generations_without_activity_magic() {
     // **`0x2170` だけで試しても、この回帰は捕まえられない。**
     // かつての判定は `format_magic != 0x2170` だったので `0x2170` では正しく動き、
     // **`0x1170` のファイルでだけ全 activity が消えた**。必ず両方を通すこと。
+    // 読めなかった ABI を飛ばすので、**何件を実際に検査したか**を数えて固定する。
+    // 数えないと「全ケースが開けず、1 つも検査しないまま成功」を見逃す
+    // (例: probe が `0x1170` を認識しなくなる退行)。
+    let mut checked: Vec<String> = Vec::new();
+
     for magic in [0x2170u16, 0x1170] {
         for abi in FixtureAbi::ALL {
             let fx = fixtures::minimal(Generation::G2170, abi);
@@ -446,8 +451,58 @@ fn activities_are_planned_in_generations_without_activity_magic() {
                 !planned.plans.is_empty(),
                 "{label}: activity が 1 つも残っていない"
             );
+            checked.push(label);
         }
     }
+
+    // 両世代とも、少なくとも 1 つの ABI で実際に検査されていること。
+    for magic in ["2170", "1170"] {
+        assert!(
+            checked.iter().any(|l| l.starts_with(magic)),
+            "0x{magic} が 1 度も検査されていない (検査済み: {checked:?})"
+        );
+    }
+}
+
+/// **回帰テスト**: 世代判定の結末が、それぞれ別のエラー種別で報告されること。
+///
+/// 「まだ読めない世代」「未対応のフォーマット」「そもそも sysstat ではない」を
+/// 混同すると、原因調査が遠回りになる。実際、旧世代のファイルが
+/// 「sysstat のデータファイルではありません」と報告されていた。
+#[test]
+fn the_three_outcomes_of_generation_probing_are_reported_distinctly() {
+    let variant = |bytes: Vec<u8>| -> String {
+        let err = SaFile::from_bytes("synthetic", bytes).expect_err("開けないこと");
+        fixtures::error_variant(&err).to_string()
+    };
+
+    // (1) 旧世代 = 識別できるが読み取りは未実装。
+    //     値は docs/format/01-file-format.md §2.8 から独立に書き写す
+    //     (0x2169: magic@36 / sa_st_size@38 = 464 / ヘッダ 240)。
+    let mut legacy = vec![0u8; 240 + 464];
+    legacy[36..38].copy_from_slice(&0x2169u16.to_le_bytes());
+    legacy[38..40].copy_from_slice(&464u16.to_le_bytes());
+    assert_eq!(variant(legacy), "UnreadableGeneration");
+
+    // (2) 先頭は sysstat の識別子だが、format_magic が未知 = 未対応フォーマット。
+    let mut future = vec![0u8; 400];
+    future[0..2].copy_from_slice(&0xd596u16.to_le_bytes());
+    future[2..4].copy_from_slice(&0x2177u16.to_le_bytes());
+    assert_eq!(variant(future), "UnsupportedFormat");
+
+    // (3) sysstat のファイルですらない。
+    let mut alien = vec![0u8; 400];
+    alien[0..4].copy_from_slice(b"PK\x03\x04");
+    assert_eq!(variant(alien), "NotSysstatFile");
+
+    // (4) 検証を通った候補が 2 つ = どちらとも決められない。
+    //     0x215d (magic@4 / st_size@6 = 264) と 0x2169 (magic@36 / st_size@38 = 464)。
+    let mut ambiguous = vec![0u8; 240 + 464];
+    ambiguous[4..6].copy_from_slice(&0x215du16.to_le_bytes());
+    ambiguous[6..8].copy_from_slice(&264u16.to_le_bytes());
+    ambiguous[36..38].copy_from_slice(&0x2169u16.to_le_bytes());
+    ambiguous[38..40].copy_from_slice(&464u16.to_le_bytes());
+    assert_eq!(variant(ambiguous), "AmbiguousFormat");
 }
 
 /// **回帰テスト**: RHEL 派生 (`0x1170`) の `stats_io` は 80 バイトで、

@@ -170,6 +170,14 @@ pub enum StructSource {
     Legacy {
         /// 最初のレコードが始まるファイルオフセット (= 書き込まれるヘッダのバイト数)。
         header_size: usize,
+        /// `sa_st_size` (1 レコードの固定部のサイズ) の**ファイル先頭からの**オフセット。
+        st_size_at: usize,
+        /// `sa_st_size` の期待値。
+        ///
+        /// **magic の 2 バイト一致だけでは候補として弱い。** 正常なファイルの
+        /// 未使用領域 (`sa_sysname` の末尾など) に偶然同じ 2 バイトが並ぶだけで、
+        /// 別世代として成立してしまう。レコード長の申告値まで一致して初めて候補と認める。
+        st_size: u16,
     },
     /// magic は判明しているが、構造体レイアウトを実測できていない世代。
     ///
@@ -251,7 +259,11 @@ pub const FORMATS: &[FormatSpec] = &[
         versions: "3.3.6〜4.0.7",
         magic_at: MagicLocation::Embedded { offset: 4 },
         // sizeof は 232 だが、書き出されるのは 229 バイト。
-        structs: StructSource::Legacy { header_size: 229 },
+        structs: StructSource::Legacy {
+            header_size: 229,
+            st_size_at: 6,
+            st_size: 264,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -267,7 +279,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "2163",
         versions: "4.1.7〜5.0.6",
         magic_at: MagicLocation::Embedded { offset: 4 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 6,
+            st_size: 288,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -275,7 +291,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "2165",
         versions: "5.1.3",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 384,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -283,7 +303,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "2166",
         versions: "5.1.4〜5.1.5",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 448,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -291,7 +315,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "2167",
         versions: "6.0.0〜6.0.2",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 448,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -299,7 +327,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "2168",
         versions: "6.1.1〜6.1.2",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 464,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -307,7 +339,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "2169",
         versions: "6.1.3〜7.0.4",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 464,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -315,7 +351,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "216a",
         versions: "7.1.2",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 464,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -323,7 +363,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "216b",
         versions: "7.1.3〜7.1.4",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 464,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -331,7 +375,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "216c",
         versions: "7.1.5",
         magic_at: MagicLocation::Embedded { offset: 36 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 464,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -339,7 +387,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "216d",
         versions: "7.1.6",
         magic_at: MagicLocation::Embedded { offset: 32 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 34,
+            st_size: 496,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -347,7 +399,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "216e",
         versions: "8.0.0〜8.0.4",
         magic_at: MagicLocation::Embedded { offset: 32 },
-        structs: StructSource::Legacy { header_size: 240 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 34,
+            st_size: 480,
+        },
         restart_payload: RestartPayload::None,
     },
     // `file_magic` が頭に付いた最初の世代。ただし**本体は旧形式のまま**で、
@@ -360,6 +416,9 @@ pub const FORMATS: &[FormatSpec] = &[
         magic_at: MagicLocation::FileMagic(layouts::FILE_MAGIC_G1),
         structs: StructSource::Legacy {
             header_size: 8 + 304,
+            // `file_magic` 8 バイトの後に `file_hdr`。`sa_st_size` はその内側 32。
+            st_size_at: 8 + 32,
+            st_size: 528,
         },
         restart_payload: RestartPayload::None,
     },
@@ -519,27 +578,46 @@ pub enum Probe {
 /// そこで全候補を列挙し、**成立したものがちょうど 1 つのときだけ確定する**。
 /// これは `docs/design.md` §3.3 の「複数候補が成立したら曖昧として扱う。
 /// 都合のよい候補を選ばない」を、ABI 判定だけでなく形式判定にも適用したものである。
+/// # magic の一致は「候補」でしかない
+///
+/// 旧世代の根拠は `file_hdr` の内側にある 2 バイトだけである。正常なファイルの
+/// 未使用領域 (`sa_sysname` の末尾など) に偶然同じ 2 バイトが並ぶことは実際に起きる。
+/// **magic が当たった候補は構造まで検証し、検証を通った候補だけで一意性を判断する。**
+/// 検証材料を持たない世代 (レイアウト未実測) を、検証済みの候補と同列に数えない。
 pub fn probe(bytes: &[u8]) -> Probe {
-    let mut first: Option<(u16, Endian)> = None;
-    let mut second: Option<u16> = None;
+    // 構造検証まで通った候補と、magic しか照合できなかった候補を分けて数える。
+    let mut strong: Option<(u16, Endian)> = None;
+    let mut strong_2nd: Option<u16> = None;
+    let mut weak: Option<(u16, Endian)> = None;
+    let mut weak_2nd: Option<u16> = None;
 
     for spec in FORMATS {
         for endian in [Endian::Little, Endian::Big] {
             if !magic_matches(bytes, spec, endian) {
                 continue;
             }
-            match first {
-                None => first = Some((spec.magic, endian)),
-                Some((m, _)) if m == spec.magic && second.is_none() => {
-                    // 同じ magic が両エンディアンで成立する = バイト反転しても
-                    // 同じ値になる回文。区別できないので曖昧として扱う。
-                    second = Some(spec.magic);
-                }
-                Some(_) if second.is_none() => second = Some(spec.magic),
+            let (slot, slot_2nd) = match verify(bytes, spec, endian) {
+                // 検証に落ちた候補は数えない (偶然の 2 バイト一致)。
+                MagicVerdict::Rejected => continue,
+                MagicVerdict::Verified => (&mut strong, &mut strong_2nd),
+                MagicVerdict::MagicOnly => (&mut weak, &mut weak_2nd),
+            };
+            match *slot {
+                None => *slot = Some((spec.magic, endian)),
+                // 同じ magic が両エンディアンで成立する = バイト反転しても同じ値になる
+                // 回文。区別できないので曖昧として扱う。
+                Some(_) if slot_2nd.is_none() => *slot_2nd = Some(spec.magic),
                 _ => {}
             }
         }
     }
+
+    // 検証を通った候補があれば、それだけで判断する。
+    let (first, second) = if strong.is_some() {
+        (strong, strong_2nd)
+    } else {
+        (weak, weak_2nd)
+    };
 
     match (first, second) {
         (Some((magic, endian)), None) => Probe::Identified { magic, endian },
@@ -548,6 +626,43 @@ pub fn probe(bytes: &[u8]) -> Probe {
             second: s,
         },
         (None, _) => Probe::Unknown,
+    }
+}
+
+/// magic が当たった候補を、構造まで見て裏付けられるか。
+enum MagicVerdict {
+    /// 構造の検証も通った。
+    Verified,
+    /// magic は一致したが、構造を検証する材料を持たない世代。
+    MagicOnly,
+    /// 構造の検証に落ちた。偶然の一致なので候補にしない。
+    Rejected,
+}
+
+fn verify(bytes: &[u8], spec: &FormatSpec, endian: Endian) -> MagicVerdict {
+    match spec.structs {
+        // `file_magic` を先頭に持つ世代は、`sysstat_magic` と `format_magic` の
+        // 4 バイトが所定の位置で一致している (`magic_matches` が両方を要求する)。
+        // 偶然そうなる確率は旧世代の 2 バイト一致より桁違いに低い。
+        StructSource::Fixed { .. } | StructSource::SelfDescribing => MagicVerdict::Verified,
+        StructSource::Legacy {
+            header_size,
+            st_size_at,
+            st_size,
+        } => {
+            // ヘッダが入りきらない長さなら、その世代ではありえない。
+            if bytes.len() < header_size {
+                return MagicVerdict::Rejected;
+            }
+            // レコード長の申告値まで一致して初めて候補と認める。
+            match read_u16(bytes, st_size_at, endian) {
+                Some(v) if v == st_size => MagicVerdict::Verified,
+                _ => MagicVerdict::Rejected,
+            }
+        }
+        // レイアウトを実測できていない世代。裏付ける材料が無いので、
+        // 検証済みの候補があればそちらに譲る。
+        StructSource::Unverified => MagicVerdict::MagicOnly,
     }
 }
 
@@ -625,6 +740,26 @@ mod tests {
         }
     }
 
+    /// 読める世代は必ず `file_magic` を持つ。
+    ///
+    /// `magic_at` と `structs` は独立したフィールドなので、型としては
+    /// 「`Embedded` なのに `Fixed`」という組み合わせを書けてしまう。その状態だと
+    /// `is_readable()` が真なのに `file_magic_layout()` が `None` を返し、
+    /// 呼び出し側に到達しないはずの分岐が残る。
+    /// **型で排除しきれていない不変条件なので、ここで機械的に守る。**
+    #[test]
+    fn readable_generations_always_carry_a_file_magic() {
+        for spec in FORMATS {
+            if spec.is_readable() {
+                assert!(
+                    spec.file_magic_layout().is_some(),
+                    "{}: 読める世代は file_magic を持つこと",
+                    spec.label
+                );
+            }
+        }
+    }
+
     /// magic の在処は世代で 3 回動く。ここを取り違えると別世代として誤認する。
     #[test]
     fn legacy_generations_carry_the_magic_inside_the_header() {
@@ -651,14 +786,42 @@ mod tests {
         assert!(!lookup(0x216f).unwrap().is_readable());
     }
 
+    /// 旧世代の probe ケース。
+    /// `(magic, magic のオフセット, sa_st_size のオフセット, sa_st_size, ヘッダ長)`
+    ///
+    /// **値は `docs/format/01-file-format.md` §2.8 の実測表から独立に書き写す。**
+    /// `FORMATS` から読み出して組み立てると、登録値が誤っていても
+    /// テストが一緒に誤るので検出できない。
+    const LEGACY_PROBE_CASES: &[(u16, usize, usize, u16, usize)] = &[
+        (0x215d, 4, 6, 264, 229),
+        (0x2163, 4, 6, 288, 240),
+        (0x2169, 36, 38, 464, 240),
+        (0x216e, 32, 34, 480, 240),
+    ];
+
+    fn legacy_bytes(case: (u16, usize, usize, u16, usize), endian: Endian) -> Vec<u8> {
+        let (magic, magic_at, st_at, st_size, header_size) = case;
+        let mut b = vec![0u8; header_size];
+        let put = |b: &mut Vec<u8>, at: usize, v: u16| {
+            let raw = match endian {
+                Endian::Little => v.to_le_bytes(),
+                Endian::Big => v.to_be_bytes(),
+            };
+            b[at..at + 2].copy_from_slice(&raw);
+        };
+        put(&mut b, magic_at, magic);
+        put(&mut b, st_at, st_size);
+        b
+    }
+
     /// 旧世代は `file_hdr` の内側に magic を持つ。
     /// 「先頭 2 バイトが `0xd596`」を前提にすると、これらは
     /// 「sysstat のファイルではない」という**誤った診断**になる。
     #[test]
     fn legacy_generations_are_identified_by_their_embedded_magic() {
-        for (magic, offset) in [(0x215du16, 4usize), (0x2163, 4), (0x2169, 36), (0x216e, 32)] {
-            let mut bytes = vec![0u8; 64];
-            bytes[offset..offset + 2].copy_from_slice(&magic.to_le_bytes());
+        for &case in LEGACY_PROBE_CASES {
+            let (magic, offset, ..) = case;
+            let bytes = legacy_bytes(case, Endian::Little);
             assert_eq!(
                 probe(&bytes),
                 Probe::Identified {
@@ -673,14 +836,61 @@ mod tests {
     /// big-endian で書かれた旧世代も同じ規則で同定できる。
     #[test]
     fn legacy_generations_are_identified_in_big_endian_too() {
-        let mut bytes = vec![0u8; 64];
-        bytes[36..38].copy_from_slice(&0x2169u16.to_be_bytes());
+        for &case in LEGACY_PROBE_CASES {
+            let magic = case.0;
+            let bytes = legacy_bytes(case, Endian::Big);
+            assert_eq!(
+                probe(&bytes),
+                Probe::Identified {
+                    magic,
+                    endian: Endian::Big
+                },
+                "0x{magic:04x} (big endian)"
+            );
+        }
+    }
+
+    /// **magic の 2 バイトが一致しただけでは候補にしない。**
+    ///
+    /// 正常なファイルの未使用領域に偶然同じ 2 バイトが並ぶことは実際に起きる
+    /// (`sa_sysname` の "Linux" の後ろなど)。レコード長の申告値まで
+    /// 一致しなければ、その世代として成立させてはいけない。
+    #[test]
+    fn a_bare_magic_match_without_the_declared_record_size_is_not_a_candidate() {
+        for &case in LEGACY_PROBE_CASES {
+            let (magic, magic_at, st_at, ..) = case;
+            let mut bytes = legacy_bytes(case, Endian::Little);
+            // レコード長の申告だけを壊す。
+            bytes[st_at..st_at + 2].copy_from_slice(&0u16.to_le_bytes());
+            assert_eq!(
+                probe(&bytes),
+                Probe::Unknown,
+                "0x{magic:04x}: magic (@{magic_at}) だけの一致で成立してはいけない"
+            );
+        }
+    }
+
+    /// **回帰テスト**: 正常な現行世代のファイルの未使用領域に旧 magic が紛れても、
+    /// 曖昧にならず正しく読めること。
+    ///
+    /// 実データ (`0x1170`) の `sa_sysname` の "Linux" の後ろ (オフセット 32) に
+    /// `0x216d` を置くだけで `AmbiguousFormat` になり、**正常なファイルが
+    /// 読めなくなる**という退行を実際に踏んだ。magic の一致を候補抽出に
+    /// 降格し、構造検証を通った候補だけで判断することで防ぐ。
+    #[test]
+    fn a_stray_legacy_magic_inside_a_modern_header_does_not_make_it_ambiguous() {
+        let mut bytes = vec![0u8; 512];
+        bytes[0..2].copy_from_slice(&super::super::file::SYSSTAT_MAGIC.to_le_bytes());
+        bytes[2..4].copy_from_slice(&0x1170u16.to_le_bytes());
+        // `sa_sysname` 相当の未使用領域に旧 magic が紛れている状況。
+        bytes[32..34].copy_from_slice(&0x216du16.to_le_bytes());
         assert_eq!(
             probe(&bytes),
             Probe::Identified {
-                magic: 0x2169,
-                endian: Endian::Big
-            }
+                magic: 0x1170,
+                endian: Endian::Little
+            },
+            "検証を通った候補が 1 つなら、magic だけ当たった候補に引きずられない"
         );
     }
 
@@ -707,12 +917,18 @@ mod tests {
     /// どちらが正しいかを裏付ける根拠が仕様のどこにも無いため。
     #[test]
     fn two_simultaneous_matches_are_reported_as_ambiguous() {
-        let mut bytes = vec![0u8; 64];
-        bytes[4..6].copy_from_slice(&0x215du16.to_le_bytes()); // 旧世代 A
-        bytes[36..38].copy_from_slice(&0x2169u16.to_le_bytes()); // 旧世代 B
+        // **どちらも構造検証まで通る**ように組む。片方が magic だけの一致なら
+        // それは曖昧ではなく、検証を通った側に決まる (上のテスト)。
+        let mut bytes = vec![0u8; 240];
+        // 旧世代 A: magic@4 / st_size@6 = 264
+        bytes[4..6].copy_from_slice(&0x215du16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&264u16.to_le_bytes());
+        // 旧世代 B: magic@36 / st_size@38 = 464
+        bytes[36..38].copy_from_slice(&0x2169u16.to_le_bytes());
+        bytes[38..40].copy_from_slice(&464u16.to_le_bytes());
         assert!(
             matches!(probe(&bytes), Probe::Ambiguous { .. }),
-            "同時成立は曖昧として拒否すること"
+            "検証を通った候補が 2 つあるなら曖昧として拒否すること"
         );
     }
 

@@ -1906,6 +1906,8 @@ pub fn error_variant(err: &re_sar_ch::Error) -> &'static str {
         E::Io { .. } => "Io",
         E::NotSysstatFile { .. } => "NotSysstatFile",
         E::UnsupportedFormat { .. } => "UnsupportedFormat",
+        E::UnreadableGeneration { .. } => "UnreadableGeneration",
+        E::AmbiguousFormat { .. } => "AmbiguousFormat",
         E::Truncated { .. } => "Truncated",
         E::AmbiguousAbi { .. } => "AmbiguousAbi",
         E::InconsistentHeader { .. } => "InconsistentHeader",

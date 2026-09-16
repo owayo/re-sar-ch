@@ -383,30 +383,71 @@ impl SaFile {
                 have: bytes.len(),
             });
         }
-        let head = [bytes[0], bytes[1]];
-        let endian = if u16::from_le_bytes(head) == SYSSTAT_MAGIC {
-            Endian::Little
-        } else if u16::from_be_bytes(head) == SYSSTAT_MAGIC {
-            Endian::Big
-        } else {
-            return Err(Error::NotSysstatFile {
-                path,
-                found: u16::from_le_bytes(head),
-                expected: SYSSTAT_MAGIC,
-            });
-        };
-
         // --- 2. 世代の判定 ---
-        let format_magic = endian.u16_from([bytes[2], bytes[3]]);
+        //
+        // 「先頭 2 バイトが 0xd596」は全世代の規則ではない。`struct file_magic` が
+        // 導入されたのは 8.1.1 (`0x216f`) で、それ以前は magic が `file_hdr` の内側に
+        // あり、位置も世代で動く。判定はレジストリの候補列挙に委ねる (§3.3)。
+        let head = [bytes[0], bytes[1]];
+        let (format_magic, endian) = match registry::probe(bytes) {
+            registry::Probe::Identified { magic, endian } => (magic, endian),
+            registry::Probe::Ambiguous { first, second } => {
+                return Err(Error::AmbiguousFormat {
+                    path,
+                    first,
+                    second,
+                });
+            }
+            registry::Probe::Unknown => {
+                // 先頭が sysstat の識別子なら「まだ知らない世代」、
+                // そうでなければ「そもそも別のファイル」。混同すると原因調査が遠回りになる。
+                let le = u16::from_le_bytes(head);
+                let be = u16::from_be_bytes(head);
+                if le == SYSSTAT_MAGIC || be == SYSSTAT_MAGIC {
+                    let endian = if le == SYSSTAT_MAGIC {
+                        Endian::Little
+                    } else {
+                        Endian::Big
+                    };
+                    return Err(Error::UnsupportedFormat {
+                        path,
+                        format_magic: endian.u16_from([bytes[2], bytes[3]]),
+                        version: format!("{}.{}.{}", bytes[4], bytes[5], bytes[6]),
+                    });
+                }
+                return Err(Error::NotSysstatFile {
+                    path,
+                    found: le,
+                    expected: SYSSTAT_MAGIC,
+                });
+            }
+        };
         let spec = registry::lookup(format_magic).ok_or_else(|| Error::UnsupportedFormat {
             path: path.clone(),
             format_magic,
             version: format!("{}.{}.{}", bytes[4], bytes[5], bytes[6]),
         })?;
 
+        // 世代は特定できたが読み取りが未実装、という状態を明示的に区別する。
+        // 「壊れている」とも「sysstat のファイルではない」とも言わない。
+        if !spec.is_readable() {
+            return Err(Error::UnreadableGeneration {
+                path,
+                format_magic,
+                versions: spec.versions,
+            });
+        }
+
         // file_magic 自体は `unsigned long` を含まないので、暫定 ABI で解決できる。
         let probe_enc = SourceEncoding::new(endian, LayoutAbi::LP64);
-        let magic_layout = spec.file_magic.resolve(&probe_enc)?;
+        let file_magic_layout =
+            spec.file_magic_layout()
+                .ok_or_else(|| Error::UnreadableGeneration {
+                    path: path.clone(),
+                    format_magic,
+                    versions: spec.versions,
+                })?;
+        let magic_layout = file_magic_layout.resolve(&probe_enc)?;
         let cur = Cursor::new(bytes, endian);
         let oob = |e: OutOfBounds, ctx: &str| Error::Truncated {
             path: path.clone(),
@@ -1482,6 +1523,14 @@ fn resolve_file_header(
             let declared = magic.header_size.unwrap_or(0) as usize;
             selfdesc::resolve_file_header(types, declared, enc)
         }
+        // 旧世代の `file_hdr` は別物 (レイアウトが世代ごとに違い、magic を内側に持つ)。
+        // `FormatSpec::is_readable()` で先に弾いているのでここには来ない。
+        StructSource::Legacy { .. } | StructSource::Unverified => {
+            Err(crate::error::LayoutError::NoSuchStruct {
+                magic: spec.magic,
+                layout: "file_header",
+            })
+        }
     }
 }
 
@@ -1496,6 +1545,14 @@ fn resolve_file_activity(
             let types = TypesNr(header.act_types_nr.unwrap_or([0, 0, 9]));
             selfdesc::resolve_file_activity(types, enc)
         }
+        // 旧世代に `file_activity[]` は無い。記録されている統計は
+        // `file_hdr.sa_actflag` のビットマスクで表される。
+        StructSource::Legacy { .. } | StructSource::Unverified => {
+            Err(crate::error::LayoutError::NoSuchStruct {
+                magic: spec.magic,
+                layout: "file_activity",
+            })
+        }
     }
 }
 
@@ -1509,6 +1566,14 @@ fn resolve_record_header(
         StructSource::SelfDescribing => {
             let types = TypesNr(header.rec_types_nr.unwrap_or([2, 0, 1]));
             selfdesc::resolve_record_header(types, enc)
+        }
+        // 旧世代に `record_header` は無い。レコードは固定長 `file_stats` で始まり、
+        // `record_type` はその構造体の中にある (位置も世代で動く)。
+        StructSource::Legacy { .. } | StructSource::Unverified => {
+            Err(crate::error::LayoutError::NoSuchStruct {
+                magic: spec.magic,
+                layout: "record_header",
+            })
         }
     }
 }

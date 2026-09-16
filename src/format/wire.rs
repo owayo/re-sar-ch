@@ -166,6 +166,15 @@ impl WireLayout {
         self
     }
 
+    /// 指定した名前のフィールドを持つか。
+    ///
+    /// 「この世代はこのフィールドを書くか」の判定を `format_magic` の値比較ではなく
+    /// レイアウト記述そのものから導くために使う。値比較にすると、同じ構造を持つ
+    /// 世代を足したときに判定側の更新を忘れ、フィールドが無いのに「ある」と誤認する。
+    pub fn has_field(&self, name: &str) -> bool {
+        self.fields.iter().any(|f| f.name == name)
+    }
+
     /// 配置を解決する。
     pub fn resolve(&self, enc: &SourceEncoding) -> Result<ResolvedLayout, LayoutError> {
         resolve_fields(self.name, self.fields, self.struct_align, enc)

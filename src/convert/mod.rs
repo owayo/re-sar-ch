@@ -380,7 +380,13 @@ impl SourceLayouts {
         };
         let file_header = file_header.resolve(enc)?;
         let record_header = record_header.resolve(enc)?;
-        let header_offset = file.spec().file_magic.resolve(enc)?.size;
+        let Some(magic_layout) = file.spec().file_magic_layout() else {
+            // 同上。固定レイアウト世代は必ず `file_magic` を持つ。
+            return Err(Error::Other(
+                "変換対象の世代は file_magic を持つはずだが持っていなかった".to_string(),
+            ));
+        };
+        let header_offset = magic_layout.resolve(enc)?.size;
         let rec_stride = record_header.size;
         Ok(Self {
             file_header,

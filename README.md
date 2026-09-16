@@ -251,10 +251,34 @@ Every format generation, verified byte-for-byte against upstream's own test corp
 
 | `format_magic` | sysstat versions | notes |
 |---|---|---|
-| `0x2170` | … 9.1.5 | oldest known; upstream itself cannot convert these |
+| `0x2170` | … 9.1.5 | oldest upstream generation; upstream itself cannot convert these |
+| `0x1170` | 9.0.4 (RHEL/CentOS 6.5+) | **vendor variant** — Red Hat renumbered the magic to a value no upstream release uses; `stats_io` is 80 bytes instead of 20 |
 | `0x2171` | 9.1.6 … 10.2 | 8-byte file magic, no RESTART payload |
 | `0x2173` | 10.3 … 11.6 | RESTART records carry a volatile-activity list that changes item counts |
 | `0x2175` | 11.7 … 12.8 | self-describing layout, `extra_desc` chains, three internal variants |
+
+`0x1170` does not exist in any upstream release. Red Hat changed the on-disk layout of
+`stats_io` in RHEL 6.3 without bumping the format version, which made the new `sar`
+silently misread older files; the fix in RHEL 6.5 renumbered the magic instead. Since no
+upstream build ever emits a 20-byte-vs-80-byte ambiguity, the declared item size alone
+identifies the variant.
+
+### Older generations — identified, not yet readable
+
+sysstat 3.2.4 through 8.1.2 (`0x115a` … `0x216f`) use a fundamentally different layout:
+no `file_magic` at the head of the file, no `file_activity[]` array, no `record_header`.
+The magic lives *inside* `file_hdr`, and **its offset moves across generations** (4 → 36 → 32),
+so "read the first two bytes" does not identify these files at all.
+
+reSARch identifies them and reports which sysstat wrote the file:
+
+```
+sa07: sysstat 6.1.3〜7.0.4 が書いた形式です (format_magic=0x2169)。この世代の読み取りは未実装です
+```
+
+That is deliberately distinct from "not a sysstat file" and from "unsupported format" —
+confusing the three sends you down the wrong debugging path. Decoding these generations
+is not implemented yet.
 
 Also handled:
 

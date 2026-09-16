@@ -14,12 +14,6 @@ use crate::model::{ActivityId, Availability};
 
 use super::delta::interval_cs;
 
-/// `file_activity` に activity magic フィールドが無い世代 (`format_magic`)。
-///
-/// この世代だけは magic による互換性確認ができない (デコード結果は常に 0 になる)。
-/// magic を持つ世代と同じ扱いにすると、全 activity が「未知 magic」になってしまう。
-const FORMAT_MAGIC_WITHOUT_ACTIVITY_MAGIC: u16 = 0x2170;
-
 /// item 1 個分のデコード結果。
 #[derive(Debug, Clone, Default)]
 pub struct ItemSnapshot {
@@ -230,9 +224,10 @@ pub struct PlanSet {
 /// 本家も magic 不一致の activity は読み飛ばす
 /// (`docs/format/02-activities.md` §8.1)。
 pub fn plan_activities(file: &SaFile, selection: &Selection) -> Result<PlanSet> {
-    // `0x2170` 世代の `file_activity` には magic フィールドが無い (§3.4 の表)。
+    // `0x2170` 系の `file_activity` には magic フィールドが無い (§3.4 の表)。
     // デコード結果が 0 になるだけなので、「magic が無い」ことを明示的に区別する。
-    let has_activity_magic = file.spec().magic != FORMAT_MAGIC_WITHOUT_ACTIVITY_MAGIC;
+    // 判定は世代のレイアウト記述から導く (magic 値の直接比較は世代追加時に破綻する)。
+    let has_activity_magic = file.spec().has_activity_magic();
 
     let mut out = PlanSet::default();
     for (index, act) in file.activities().iter().enumerate() {

@@ -584,6 +584,23 @@ const IO_FIELDS_A5: &[WireField] = &[
     WireField::packed("dk_drive_wblk", FieldTy::U64),
 ];
 
+/// RHEL / CentOS 6.5 以降のベンダー派生 (`format_magic = 0x1170`、sysstat 9.0.4-22〜)。
+///
+/// Red Hat の `sysstat-9.0.4-diskstats.patch` が 5 フィールドすべてを
+/// `unsigned long long __attribute__((aligned (16)))` に変えたため、
+/// upstream 9.0.4 の 20 バイトに対し **80 バイト**になる。
+/// 各フィールドは 16 バイトスロットの先頭 8 バイトが値で、残り 8 バイトはパディング。
+///
+/// upstream にこのサイズの `stats_io` は存在しないので、`0x2170` 世代に
+/// activity magic が無くても申告サイズだけで一意に判別できる。
+const IO_FIELDS_RH5: &[WireField] = &[
+    WireField::aligned("dk_drive", FieldTy::U64, 16),
+    WireField::aligned("dk_drive_rio", FieldTy::U64, 16),
+    WireField::aligned("dk_drive_wio", FieldTy::U64, 16),
+    WireField::aligned("dk_drive_rblk", FieldTy::U64, 16),
+    WireField::aligned("dk_drive_wblk", FieldTy::U64, 16),
+];
+
 /// 時代 A (v9.1.5〜v10.0.5)。5 フィールドが `unsigned int` で 20 バイト (§9.4)。
 const IO_FIELDS_A5_U32: &[WireField] = &[
     WireField::aligned("dk_drive", FieldTy::U32, 4),
@@ -625,6 +642,14 @@ const IO_REVISIONS: &[WireRevision] = &[
         size_lp64: 20,
         layout: WireLayout::new("stats_io@0x8a", IO_FIELDS_A5_U32),
         since: "9.1.5",
+    },
+    WireRevision {
+        magic: 0x8a,
+        self_describing: false,
+        types_nr: [5, 0, 0],
+        size_lp64: 80,
+        layout: WireLayout::new("stats_io@rhel6", IO_FIELDS_RH5),
+        since: "9.0.4-22 (RHEL/CentOS 6.5)",
     },
 ];
 

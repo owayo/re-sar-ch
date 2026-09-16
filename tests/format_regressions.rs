@@ -386,3 +386,126 @@ fn unrecognized_old_magic_does_not_reject_other_activities() {
     assert_eq!(plans.plans[0].id, ActivityId::PCSW);
     assert!(file.scan(|_| Ok(ScanControl::Continue)).unwrap().is_exact());
 }
+
+/// **回帰テスト**: `file_activity` に activity magic を持たない世代でも、
+/// activity がデコード計画まで到達すること。
+///
+/// `series::snapshot` が「この世代は activity magic を持つか」を
+/// `format_magic != 0x2170` という**値比較**で判定していたため、同じ構造を持つ
+/// 世代 (`0x1170` = RHEL/CentOS 6.5 以降の派生) を足した瞬間に
+/// 「magic を持つ世代」と誤認し、**全 activity が「未知 magic」として無言で消えた**。
+///
+/// この壊れ方は見つけにくい。`SaFile::open` は成功し、ヘッダ表示も
+/// activity 一覧も正常に出て、終了コードも 0 のままで、
+/// **統計が 1 行も出ないことにしか現れない**。
+/// 判定をレイアウト記述から導く形に直したので、ここで固定する。
+#[test]
+fn activities_are_planned_in_generations_without_activity_magic() {
+    // **`0x2170` だけで試しても、この回帰は捕まえられない。**
+    // かつての判定は `format_magic != 0x2170` だったので `0x2170` では正しく動き、
+    // **`0x1170` のファイルでだけ全 activity が消えた**。必ず両方を通すこと。
+    for magic in [0x2170u16, 0x1170] {
+        for abi in FixtureAbi::ALL {
+            let fx = fixtures::minimal(Generation::G2170, abi);
+            let label = format!("{magic:04x}/{}", abi.name());
+
+            // `0x1170` のヘッダ 4 構造体は `0x2170` と完全に同一なので
+            // (`docs/format/01-file-format.md` §2.7)、`file_magic.format_magic`
+            // (オフセット 2..4) の 2 バイトを差し替えるだけで有効な
+            // `0x1170` ファイルになる。
+            let mut bytes = fx.bytes.clone();
+            let raw = if abi.is_big_endian() {
+                magic.to_be_bytes()
+            } else {
+                magic.to_le_bytes()
+            };
+            bytes[2..4].copy_from_slice(&raw);
+
+            // 自作 fixture が読めない ABI があっても、ここで見たいのは
+            // 「読めたファイルで activity が消えないこと」なので飛ばす。
+            let Ok(file) = SaFile::from_bytes(&label, bytes) else {
+                continue;
+            };
+            assert_eq!(file.magic().format_magic, magic, "{label}: 世代の取り違え");
+
+            let planned = re_sar_ch::series::snapshot::plan_activities(
+                &file,
+                &re_sar_ch::series::Selection::All,
+            )
+            .expect("計画を作れること");
+            assert!(
+                planned.skipped.is_empty(),
+                "{label}: activity が読み飛ばされた: {:?}",
+                planned
+                    .skipped
+                    .iter()
+                    .map(|s| s.reason.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !planned.plans.is_empty(),
+                "{label}: activity が 1 つも残っていない"
+            );
+        }
+    }
+}
+
+/// **回帰テスト**: RHEL 派生 (`0x1170`) の `stats_io` は 80 バイトで、
+/// 5 フィールドすべてが 16 バイト境界に並ぶ。
+///
+/// upstream 9.0.4 の `stats_io` は `unsigned int` × 5 の 20 バイトだが、
+/// Red Hat の `sysstat-9.0.4-diskstats.patch` が
+/// `unsigned long long __attribute__((aligned (16)))` × 5 に差し替えている。
+/// `0x2170` 系には activity magic が無いため、**申告サイズだけが手がかり**になる。
+/// 20 バイト版と取り違えると、`dk_drive` 以外の全列が隣のフィールドを読む。
+#[test]
+fn rhel_variant_stats_io_has_eighty_byte_layout() {
+    use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
+
+    let def = registry::lookup(ActivityId::IO).expect("A_IO の定義がある");
+    let shape = DeclaredShape {
+        magic: None, // `0x2170` 系は activity magic を持たない
+        size: 80,
+        types_nr: None,
+    };
+    let rev = select_revision(def, &shape).expect("80 バイトの revision が選べること");
+    assert_eq!(
+        rev.size_lp64, 80,
+        "申告サイズと一致する revision を選ぶこと"
+    );
+
+    let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+    let resolved = rev.layout.resolve(&enc).expect("配置を解決できる");
+    assert_eq!(resolved.size, 80);
+
+    // 16 バイトスロットの先頭 8 バイトが値、残り 8 バイトはパディング。
+    for (name, want) in [
+        ("dk_drive", 0usize),
+        ("dk_drive_rio", 16),
+        ("dk_drive_wio", 32),
+        ("dk_drive_rblk", 48),
+        ("dk_drive_wblk", 64),
+    ] {
+        assert_eq!(
+            resolved.field(name).expect("フィールドがある").offset,
+            want,
+            "{name} の位置"
+        );
+    }
+
+    // upstream 20 バイト版と取り違えていないこと。
+    let upstream = select_revision(
+        def,
+        &DeclaredShape {
+            magic: None,
+            size: 20,
+            types_nr: None,
+        },
+    )
+    .expect("20 バイトの revision も引けること");
+    assert_eq!(upstream.size_lp64, 20);
+    assert_ne!(
+        upstream.layout.name, rev.layout.name,
+        "20 バイト版と 80 バイト版は別のレイアウトでなければならない"
+    );
+}

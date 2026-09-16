@@ -35,6 +35,34 @@ pub enum Error {
         version: String,
     },
 
+    /// 複数の世代が同時に成立した。
+    ///
+    /// 旧世代は magic の位置が世代ごとに違うため、別々の位置で別々の magic が
+    /// 偶然一致することがありうる。**都合のよい方を選ばず、読まない。**
+    #[error(
+        "{path}: 複数の形式が同時に成立しました (0x{first:04x} と 0x{second:04x})。\
+         どちらの世代か判断できないため読み取りません"
+    )]
+    AmbiguousFormat {
+        path: PathBuf,
+        first: u16,
+        second: u16,
+    },
+
+    /// 世代は特定できたが、その世代の読み取りが未実装。
+    ///
+    /// 「壊れている」でも「sysstat のファイルではない」でもないことを
+    /// はっきり伝えるために、`NotSysstatFile` / `UnsupportedFormat` と分けている。
+    #[error(
+        "{path}: sysstat {versions} が書いた形式です (format_magic=0x{format_magic:04x})。\
+         この世代の読み取りは未実装です"
+    )]
+    UnreadableGeneration {
+        path: PathBuf,
+        format_magic: u16,
+        versions: &'static str,
+    },
+
     /// ファイルが途中で終わっている。
     #[error("{path}: ファイルが途中で終わっています ({context}: {need} バイト必要, 残り {have})")]
     Truncated {
@@ -98,6 +126,14 @@ pub enum LayoutError {
 
     #[error("{layout}: 構造体アラインメント {align} が 2 の冪ではありません")]
     StructAlignNotPowerOfTwo { layout: &'static str, align: u16 },
+
+    /// その世代にその構造体が存在しない。
+    ///
+    /// 旧モノリシック世代 (`0x216f` 以前) は `file_activity` / `record_header` を
+    /// 持たない。現行世代向けの解決経路へ迷い込んだことを示す内部エラーで、
+    /// ファイルの破損ではない。
+    #[error("format_magic=0x{magic:04x} の世代に {layout} は存在しません")]
+    NoSuchStruct { magic: u16, layout: &'static str },
 
     #[error("{layout}: サイズ計算が桁溢れしました (field={field})")]
     SizeOverflow {

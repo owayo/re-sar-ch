@@ -599,6 +599,14 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
+    let y_label_w = view
+        .y_labels()
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let plot_width = area.width.saturating_sub(y_label_w + 3);
+
     let chart = Chart::new(datasets)
         .block(
             Block::bordered()
@@ -609,7 +617,9 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
                 .bounds(view.x_bounds)
-                .labels(view.x_labels(app.tz)),
+                // 軸に使える幅は、枠 (2) と Y 軸ラベルの分を引いた残り。
+                // ここを渡さないと刻みが幅に追従せず、広い画面でも両端だけになる。
+                .labels(view.x_labels(app.tz, plot_width)),
         )
         .y_axis(
             Axis::default()

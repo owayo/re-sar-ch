@@ -131,12 +131,30 @@ impl GraphView {
             .join(", ")
     }
 
-    /// X 軸のラベル (左端・中央・右端の 3 つ)。
-    pub fn x_labels(&self, tz: DisplayTz) -> Vec<String> {
+    /// X 軸のラベル。**軸の幅に入るだけ刻む。**
+    ///
+    /// 両端だけでは、山や谷が何時ごろのことなのか読み取れない。
+    /// 幅が許すかぎり刻みを増やし、入らなくなったら本数を減らす。
+    ///
+    /// 表示範囲が 1 時間を超えたら秒を落として `HH:MM` にする。
+    /// 10 分間隔の採取で秒まで出しても読み取りの助けにならず、
+    /// 1 本あたり 3 桁を余計に食って刻みが粗くなるだけである。
+    pub fn x_labels(&self, tz: DisplayTz, plot_width: u16) -> Vec<String> {
         let span = self.x_bounds[1] - self.x_bounds[0];
-        [0.0, span / 2.0, span]
-            .iter()
-            .map(|offset| tz.time(self.x_origin + *offset as u64))
+        let minutes_only = span >= 3600.0;
+        let n = x_label_count(plot_width, minutes_only);
+        (0..n)
+            .map(|i| {
+                let offset = span * (i as f64) / ((n - 1) as f64);
+                let at = self.x_origin + offset as u64;
+                let t = tz.time(at);
+                if minutes_only {
+                    // `HH:MM:SS` は ASCII なので、境界で切っても壊れない。
+                    t[..5].to_string()
+                } else {
+                    t
+                }
+            })
             .collect()
     }
 
@@ -147,6 +165,17 @@ impl GraphView {
             super::format_number(self.y_bounds[1]),
         ]
     }
+}
+
+/// 軸に並べるラベルの本数。
+///
+/// ratatui はラベルを軸上に等間隔で置くので、本数がそのまま刻みの細かさになる。
+/// 隣同士がくっつくと読めないため、1 本あたり**ラベル幅 + 余白 4 桁**を見込む。
+/// 両端の 2 本は必ず出す (範囲の始まりと終わりが分からないと図を読めない)。
+fn x_label_count(plot_width: u16, minutes_only: bool) -> usize {
+    let label = if minutes_only { 5 } else { 8 };
+    let per = label + 4;
+    ((plot_width / per) as usize).clamp(2, 12)
 }
 
 /// Y 軸の範囲を決める。
@@ -369,16 +398,54 @@ mod tests {
         ];
         let v = GraphView::build(&samples, "A_CPU", "all", "user");
         // T0 = 2026-01-01 00:00:00 UTC = 09:00:00 JST
+        // 範囲がちょうど 1 時間なので分までの表記になる。
         let jst = DisplayTz::parse("Asia/Tokyo").unwrap();
         assert_eq!(
-            v.x_labels(jst),
-            vec!["09:00:00", "09:30:00", "10:00:00"],
+            v.x_labels(jst, 40),
+            vec!["09:00", "09:20", "09:40", "10:00"],
             "JST"
         );
         assert_eq!(
-            v.x_labels(DisplayTz::Utc),
-            vec!["00:00:00", "00:30:00", "01:00:00"],
+            v.x_labels(DisplayTz::Utc, 40),
+            vec!["00:00", "00:20", "00:40", "01:00"],
             "UTC"
         );
+    }
+
+    /// 軸の刻みは画面幅で増える。両端だけでは時刻を読み取れない。
+    #[test]
+    fn the_time_axis_gets_more_ticks_on_a_wider_screen() {
+        let samples: Vec<_> = (0..24)
+            .map(|i| sample(T0 + i * 600, true, Some(i as f64), Quality::Ok))
+            .collect();
+        let v = GraphView::build(&samples, "A_CPU", "all", "user");
+        let n = |w| v.x_labels(DisplayTz::Utc, w).len();
+
+        // 狭ければ両端だけ。広がるにつれて刻みが増える。
+        assert_eq!(n(10), 2);
+        assert!(n(40) > 2, "40 桁: {}", n(40));
+        assert!(n(120) > n(40), "120 桁: {} > {}", n(120), n(40));
+        // 際限なく増やさない (ラベルで軸が埋まる)
+        assert!(n(400) <= 12, "上限: {}", n(400));
+
+        // 刻みは等間隔で、両端は必ず範囲の端を指す。
+        let labels = v.x_labels(DisplayTz::Utc, 120);
+        assert_eq!(labels.first().unwrap(), "00:00");
+        assert_eq!(
+            labels.last().unwrap(),
+            &DisplayTz::Utc.time(T0 + 23 * 600)[..5]
+        );
+    }
+
+    /// 短い範囲では秒まで出す (分だけでは同じラベルが並ぶ)。
+    #[test]
+    fn a_short_span_keeps_the_seconds() {
+        let samples = vec![
+            sample(T0, true, Some(1.0), Quality::Ok),
+            sample(T0 + 60, true, Some(2.0), Quality::Ok),
+        ];
+        let v = GraphView::build(&samples, "A_CPU", "all", "user");
+        let labels = v.x_labels(DisplayTz::Utc, 60);
+        assert!(labels.iter().all(|l| l.len() == 8), "秒まで: {labels:?}");
     }
 }

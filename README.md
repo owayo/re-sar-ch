@@ -214,7 +214,7 @@ the finger runs the wrong feature instead of doing nothing.
 | `i` | pick an item (device, interface, CPU) |
 | `/` | filter items by name |
 | `c` | choose columns (both the table's and the graph's) |
-| `[` / `]` | previous / next metric |
+| `<` / `>` | previous / next metric |
 | `v` | show or hide the graph |
 | `?` | key reference |
 | `q`, `ctrl-c` | quit |

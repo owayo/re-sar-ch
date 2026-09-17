@@ -931,7 +931,7 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 // **押しても効かないキーを案内しない。** 端末が低くてグラフを
                 // 出せないときは、限られた 1 行をグラフの説明で埋めない。
                 let graph = if app.graph_visible() {
-                    "c 列  [] 送り  v グラフ  "
+                    "c 列  <> 送り  v グラフ  "
                 } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
                     "c 列  v グラフ  "
                 } else {
@@ -1096,7 +1096,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("i           item を選ぶ"),
         Line::from("/           item を名前で絞り込む"),
         Line::from("c           列を選ぶ (表に出す列とグラフの列)"),
-        Line::from("[  ]        グラフの列を前 / 次へ"),
+        Line::from("<  >        グラフの列を前 / 次へ"),
         Line::from("v           グラフの表示を切り替える"),
         Line::from("?           このヘルプ"),
         Line::from("q  ctrl-c   終了"),
@@ -1190,8 +1190,8 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char('i') => app.mode = Mode::PickItem,
             KeyCode::Char('c') => app.open_column_picker(),
             // グラフの列送り。`←` / `→` は activity に使っているので別のキーにする。
-            KeyCode::Char('[') => app.move_col(-1),
-            KeyCode::Char(']') => app.move_col(1),
+            KeyCode::Char('<') => app.move_col(-1),
+            KeyCode::Char('>') => app.move_col(1),
             KeyCode::Char('v') => app.toggle_graph(),
             KeyCode::Char('/') => {
                 app.filter.clear();
@@ -1593,6 +1593,38 @@ mod tests {
             narrow[0] < wide[0],
             "値が短い列に一律の幅を与えない: {narrow:?} < {wide:?}"
         );
+    }
+
+    /// `<` / `>` でグラフの列が送られる。
+    #[test]
+    fn angle_brackets_step_through_the_graph_metric() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        // 描ける列を 3 本にする
+        for s in &mut app.samples {
+            for (name, v) in [("b", 2.0), ("c", 3.0)] {
+                s.activities[0].items[0].rates.push(FieldOut {
+                    name,
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    value: Some(v),
+                    text: None,
+                    quality: Quality::Ok,
+                });
+            }
+        }
+        assert_eq!(app.plottable_columns(), vec!["user", "b", "c"]);
+        assert_eq!(app.selected_column(), Some("user"));
+
+        on_key(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("b"));
+        on_key(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("c"));
+        // 端で巻き戻る (止まると「壊れた」ように見える)
+        on_key(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("user"));
+        on_key(&mut app, KeyCode::Char('<'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("c"));
     }
 
     /// カーソルは観測値と同じ細さで、色で区別する。

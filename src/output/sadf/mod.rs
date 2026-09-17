@@ -397,7 +397,7 @@ fn format_time(h: u32, m: u32, s: u32) -> String {
 ///
 /// レコードは「UTC の epoch 秒」と「収集時ローカルの時分秒」を両方持つので、
 /// 両者の時刻差から UTC オフセットが分かる。±12 時間へ正規化して足す。
-fn shift_to_recorded(ust_time: u64, (h, m, s): (u8, u8, u8)) -> u64 {
+pub(crate) fn shift_to_recorded(ust_time: u64, (h, m, s): (u8, u8, u8)) -> u64 {
     const DAY: i64 = 86_400;
     let utc = utc_of(ust_time);
     let utc_sod = (utc.hour() * 3600 + utc.minute() * 60 + utc.second()) as i64;

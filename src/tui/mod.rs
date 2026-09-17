@@ -218,10 +218,18 @@ struct App {
     shown_cols: Vec<Option<Vec<&'static str>>>,
     /// 列ピッカーで編集中の選択 (確定するまで表へは反映しない)。
     col_draft: Vec<&'static str>,
+    /// タブごとの横スクロール位置 (表に出す列のうち、左端に置く列の添字)。
+    ///
+    /// **`time` 列はスクロールしない。** どの行を見ているかを見失うため。
+    col_offset: Vec<usize>,
     /// グラフを出すか。
     graph: GraphVisibility,
     /// 直近の描画で使った端末の高さ。`v` の判定に使う。
     last_height: u16,
+    /// 直近の描画で表に出せた列数。横スクロールの上限に使う。
+    ///
+    /// 何列入るかは幅と列幅で決まり、描画時にしか分からない。
+    visible_cols: usize,
     table: TableState,
     picker: ListState,
     /// 列ピッカーの選択位置 (`columns()` の添字)。
@@ -249,6 +257,7 @@ impl App {
         }
         let item = vec![0; tabs.len()];
         let graph_col = vec![None; tabs.len()];
+        let col_offset = vec![0; tabs.len()];
         let shown_cols = vec![None; tabs.len()];
         let mut table = TableState::default();
         table.select(Some(0));
@@ -260,8 +269,10 @@ impl App {
             graph_col,
             shown_cols,
             col_draft: Vec::new(),
+            col_offset,
             graph: GraphVisibility::default(),
             last_height: 0,
+            visible_cols: 1,
             col_picker: ListState::default(),
             tabs,
             tab: 0,
@@ -379,6 +390,11 @@ impl App {
         let Some(slot) = slot else { return };
         let cur = *slot as isize;
         *slot = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+        // item が変われば列の顔ぶれも変わる。横位置を持ち越すと、
+        // 前の item の 5 列目に当たる場所から見せることになって意味がない。
+        if let Some(off) = self.col_offset.get_mut(self.tab) {
+            *off = 0;
+        }
     }
 
     /// 全サンプルを通して 1 度でも値が出た列。
@@ -488,6 +504,10 @@ impl App {
         if let Some(slot) = self.shown_cols.get_mut(self.tab) {
             *slot = if slot_is_default { None } else { Some(draft) };
         }
+        // 列を選び直したら左端へ戻す (選んだ列が画面の外だと選んだ実感がない)。
+        if let Some(off) = self.col_offset.get_mut(self.tab) {
+            *off = 0;
+        }
         // カーソル位置の列をグラフ対象にする。ただし
         // **描けない列 (識別子など) と、いま表から外した列は対象にしない。**
         // 外した列をグラフへ回すと、`[` / `]` の巡回からも外れているのに
@@ -541,10 +561,25 @@ impl App {
     fn selected_column(&self) -> Option<&'static str> {
         let plottable = self.plottable_columns();
         match self.graph_col.get(self.tab).copied().flatten() {
-            // 選んだ列が今の item に無ければ (デバイスを替えた等)、先頭へ戻す。
+            // 選んだ列が今の item に無ければ (デバイスを替えた等)、既定へ戻す。
             Some(name) if plottable.contains(&name) => Some(name),
-            _ => plottable.first().copied(),
+            _ => self.default_graph_column(),
         }
+    }
+
+    /// まだ選んでいないときにグラフへ出す列。
+    ///
+    /// **値の出る列を先に探す。** 単に先頭を採ると、その列がその世代に無いだけで
+    /// タブを開いた瞬間「描画できる観測がありません」に当たる。
+    /// 値の出る列が 1 つも無ければ、先頭を返して理由を出させる。
+    fn default_graph_column(&self) -> Option<&'static str> {
+        let plottable = self.plottable_columns();
+        let measured = self.measured_columns();
+        plottable
+            .iter()
+            .find(|c| measured.contains(c))
+            .or(plottable.first())
+            .copied()
     }
 
     /// `[` / `]` で順に送る列。
@@ -577,6 +612,31 @@ impl App {
         if let Some(slot) = self.graph_col.get_mut(self.tab) {
             *slot = Some(steppable[next]);
         }
+    }
+
+    /// 表を横に送る。
+    ///
+    /// **端では止める。** 巻き戻すと「一番右まで見た」ことが分からなくなる
+    /// (縦方向と違い、横は全体像を掴みながら読む動きなので位置が意味を持つ)。
+    fn scroll_cols(&mut self, delta: isize, visible: usize) {
+        let total = self.table_columns().len();
+        // 右端は「最後の列が右に出る位置」まで。それ以上送っても空白が増えるだけ。
+        let max = total.saturating_sub(visible.max(1));
+        let Some(slot) = self.col_offset.get_mut(self.tab) else {
+            return;
+        };
+        let next = (*slot as isize + delta).clamp(0, max as isize);
+        *slot = next as usize;
+    }
+
+    /// いまの横スクロール位置 (列が減っていれば切り詰める)。
+    fn col_offset(&self) -> usize {
+        let total = self.table_columns().len();
+        self.col_offset
+            .get(self.tab)
+            .copied()
+            .unwrap_or(0)
+            .min(total.saturating_sub(1))
     }
 
     /// いま実際にグラフが出ているか。
@@ -875,11 +935,17 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     let chosen = app.table_columns();
     // **潰れた表を出さない。** ratatui の Table は幅が足りないと全列を縮めるので、
     // 23 列を幅 100 へ詰めると 1 列 3 桁になって、どの列の値も読めなくなる。
-    // 入る列だけを出し、入らなかった分は「他 N 列」として数で示す。
-    let widths = app.column_widths(&chosen);
+    // 入る列だけを出し、残りは横スクロール (`shift + ← →`) で見せる。
+    let all_widths = app.column_widths(&chosen);
+    let offset = app.col_offset().min(chosen.len().saturating_sub(1));
+    let widths: Vec<u16> = all_widths.iter().skip(offset).copied().collect();
     let fit = fit_column_count(&widths, area.width);
-    let cols: Vec<&'static str> = chosen.iter().take(fit).copied().collect();
-    let hidden = app.columns().len().saturating_sub(cols.len());
+    let cols: Vec<&'static str> = chosen.iter().skip(offset).take(fit).copied().collect();
+    // 次の描画で `shift + →` の上限を決めるのに使う (幅は描画側でしか分からない)。
+    app.visible_cols = cols.len();
+    let shown_total = chosen.len();
+    // 表から外している列 (値なしや利用者の選択) は、スクロールしても出てこない。
+    let dropped = app.columns().len().saturating_sub(shown_total);
     // 行の描画で参照するので、可変借用に入る前に切り出しておく。
     let marks: Vec<Mark> = app
         .marks
@@ -895,10 +961,17 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         Some(n) => format!(" {} — {}  [{}] ", act, app.tabs[app.tab].label, n),
         None => format!(" {} — {} ", act, app.tabs[app.tab].label),
     };
-    if hidden > 0 {
+    // **いま何列目を見ているかを出す。** 出さないと、右にまだ列があることに
+    // 気づけないまま「値が無い」と読み違える。
+    if shown_total > cols.len() {
+        let from = offset + 1;
+        let to = offset + cols.len();
+        title.push_str(&format!(" {from}-{to}/{shown_total} 列 "));
+    }
+    if dropped > 0 {
         // **外したことを黙らない。** 「その列が無い」と読まれると、
         // 観測できなかった事実まで消えてしまう。出し方も一緒に書く。
-        title.push_str(&format!(" 他 {hidden} 列 (c で選ぶ) "));
+        title.push_str(&format!(" 他 {dropped} 列 (c で選ぶ) "));
     }
 
     // グラフに描いている列は、表の見出しも同じ色にする。
@@ -1155,6 +1228,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     // 打ち間違いが「別の機能が動く」形で出る。
     let lines = vec![
         Line::from("←  →        activity を切り替える"),
+        Line::from("shift + ← → 表を横に送る"),
         Line::from("↑  ↓        時刻を移動する"),
         Line::from("pgup pgdn   10 行ずつ移動する"),
         Line::from("home end    先頭 / 末尾"),
@@ -1239,6 +1313,14 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match code {
             KeyCode::Char('q') => app.quit = true,
+            // `shift` 付きの矢印は表の横送り。activity の切り替えと
+            // 同じ方向キーに載せるのは、どちらも「横に動く」操作だから。
+            KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
+                app.scroll_cols(-1, app.visible_cols);
+            }
+            KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => {
+                app.scroll_cols(1, app.visible_cols);
+            }
             KeyCode::Left => app.move_tab(-1),
             KeyCode::Right => app.move_tab(1),
             KeyCode::Up => app.move_row(-1),
@@ -1690,6 +1772,131 @@ mod tests {
         assert_eq!(app.selected_column(), Some("user"));
         on_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
         assert_eq!(app.selected_column(), Some("c"));
+    }
+
+    /// 幅に入らない列は `shift + ←/→` で送って見られる。
+    #[test]
+    fn the_table_scrolls_sideways_through_columns() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for i in 0..9 {
+            let name: &'static str = Box::leak(format!("col{i}").into_boxed_str());
+            for s in &mut app.samples {
+                s.activities[0].items[0].rates.push(FieldOut {
+                    name,
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    // 幅を食わせて、狭い画面に全部は入らないようにする
+                    value: Some(11_111_111.0 + i as f64),
+                    text: None,
+                    quality: Quality::Ok,
+                });
+            }
+        }
+        assert_eq!(app.table_columns().len(), 10);
+        // グラフを隠す。タイトルに列名が出るので、表だけを見て確かめたい。
+        // `v` は直近の描画で分かった高さを見るので、先に 1 度描く。
+        render(&mut app, 60, 40);
+        on_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        render(&mut app, 60, 40);
+        assert!(!app.graph_visible());
+
+        // 狭い画面では右の列が出ない
+        let first = render(&mut app, 60, 40);
+        assert!(shows(&first, "user"), "{first}");
+        assert!(!shows(&first, "col8"), "右端はまだ出ない: {first}");
+        // **何列目を見ているかを出す** (出さないと右に続きがあると気づけない)
+        assert!(shows(&first, "/10 列"), "{first}");
+
+        // 右へ送ると、左端が隠れて右の列が出る
+        for _ in 0..9 {
+            on_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        }
+        let scrolled = render(&mut app, 60, 40);
+        assert!(shows(&scrolled, "col8"), "{scrolled}");
+        assert!(!shows(&scrolled, "user"), "左端は流れた: {scrolled}");
+
+        // 右端では止まる (巻き戻さない)
+        let at_end = app.col_offset();
+        on_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        render(&mut app, 60, 40);
+        assert_eq!(app.col_offset(), at_end, "右端で止まる");
+
+        // 左へ戻せば元に戻る
+        for _ in 0..20 {
+            on_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        }
+        assert_eq!(app.col_offset(), 0, "左端でも止まる");
+        let back = render(&mut app, 60, 40);
+        assert!(shows(&back, "user"), "{back}");
+    }
+
+    /// `shift` の無い矢印は activity の切り替えのまま。
+    #[test]
+    fn a_plain_arrow_still_switches_activity() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        let before = app.tab;
+        on_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        // タブが 1 つしかない fixture では巡回して同じ位置に戻る
+        assert_eq!(app.tab, before);
+        assert_eq!(app.col_offset(), 0, "横位置は動かない");
+    }
+
+    /// item を替えたら横位置は左端へ戻す。
+    #[test]
+    fn changing_the_item_resets_the_horizontal_position() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for i in 0..9 {
+            let name: &'static str = Box::leak(format!("col{i}").into_boxed_str());
+            for s in &mut app.samples {
+                s.activities[0].items[0].rates.push(FieldOut {
+                    name,
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    value: Some(11_111_111.0),
+                    text: None,
+                    quality: Quality::Ok,
+                });
+            }
+        }
+        render(&mut app, 60, 40);
+        on_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        assert!(app.col_offset() > 0);
+        app.move_item(1);
+        assert_eq!(app.col_offset(), 0);
+    }
+
+    /// 既定のグラフ列は「値の出る最初の列」。
+    ///
+    /// 先頭の列がその世代に無いだけで、開いた瞬間に空のグラフを見せない。
+    #[test]
+    fn the_default_graph_column_is_one_that_has_values() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        // 先頭に「値の出ない列」を挿す
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.insert(
+                0,
+                FieldOut {
+                    name: "never",
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    value: None,
+                    text: None,
+                    quality: Quality::UnsupportedBySource,
+                },
+            );
+        }
+        assert_eq!(app.plottable_columns(), vec!["never", "user"]);
+        assert_eq!(
+            app.selected_column(),
+            Some("user"),
+            "値の出ない先頭を選ばない"
+        );
+
+        let screen = render(&mut app, 80, 40);
+        assert!(!shows(&screen, "描画できる観測がありません"), "{screen}");
     }
 
     /// `[` / `]` は、表に出していない列を飛ばす。

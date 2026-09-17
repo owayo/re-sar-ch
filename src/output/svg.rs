@@ -16,7 +16,7 @@ use super::sadf::access::ActivityPair;
 use super::sadf::dbppc::selected_specs;
 use super::sadf::render::{item_label_in, value_of};
 use super::sadf::spec::{ActivitySpec, Fmt};
-use super::sadf::{FileInfo, SadfConfig, Stamp};
+use super::sadf::{FileInfo, SadfConfig, Stamp, TimeBase};
 use super::time_filter::Admit;
 
 const WIDTH: f64 = 1040.0;
@@ -71,6 +71,74 @@ impl Chart {
             - (value / scale - low / scale) / range * PLOT;
         (x, y)
     }
+}
+
+/// `-O oneday` の軸を切る基準。
+///
+/// 日の境目は時刻基準ごとに違う。**軸だけ別の基準で切らない。**
+#[derive(Debug, Clone)]
+enum DayZone {
+    /// UTC の 0 時で切る (`sadf` の既定と `-U`)。
+    Utc,
+    /// 実行環境のローカル 0 時で切る (`-T`)。
+    Local,
+    /// 採取側のローカル 0 時で切る (`-t`)。オフセットは秒。
+    Recorded { offset: i64, name: String },
+}
+
+impl DayZone {
+    /// 軸に添える基準の名前。
+    fn label(&self) -> String {
+        match self {
+            DayZone::Utc => "UTC".to_string(),
+            DayZone::Local => local_zone_label(),
+            // `sa_tzname` が空のファイルでは名前を出せない。
+            DayZone::Recorded { name, .. } if name.is_empty() => "recorded".to_string(),
+            DayZone::Recorded { name, .. } => name.clone(),
+        }
+    }
+}
+
+/// 実行環境の TZ 名 (取れなければ数値オフセット)。
+fn local_zone_label() -> String {
+    use chrono::Offset;
+    chrono::Local::now().offset().fix().to_string()
+}
+
+/// `-O oneday` の基準を時刻基準から決める。
+///
+/// `recorded_offset` は採取側のローカル時刻と UTC の差 (秒)。
+/// レコードが持つ時分秒から復元した値で、`-t` のときだけ意味を持つ。
+fn one_day_zone(base: TimeBase, info: &FileInfo, recorded_offset: Option<i64>) -> DayZone {
+    match base {
+        // `-U` は epoch 秒表示。日付の概念を持ち込まないので UTC で切る。
+        TimeBase::Utc | TimeBase::SecEpoch => DayZone::Utc,
+        TimeBase::LocalTime => DayZone::Local,
+        TimeBase::TrueTime => DayZone::Recorded {
+            // 統計レコードが 1 つも無ければ差を取れない。UTC 相当に落とす。
+            offset: recorded_offset.unwrap_or(0),
+            name: info.tzname.clone(),
+        },
+    }
+}
+
+/// `ust_time` が属する日の 0 時 (epoch 秒)。
+fn day_start(ust: u64, zone: &DayZone) -> u64 {
+    let shift = match zone {
+        DayZone::Utc => 0,
+        DayZone::Local => {
+            use chrono::{Offset, TimeZone};
+            chrono::Local
+                .timestamp_opt(ust as i64, 0)
+                .single()
+                .map_or(0, |dt| i64::from(dt.offset().fix().local_minus_utc()))
+        }
+        DayZone::Recorded { offset, .. } => *offset,
+    };
+    // 現地時刻へ寄せて日境界で切り、UTC へ戻す。
+    let local = ust as i64 + shift;
+    let floored = local.div_euclid(86_400) * 86_400;
+    (floored - shift).max(0) as u64
 }
 
 fn escaped(text: &str) -> String {
@@ -209,6 +277,9 @@ pub fn write_svg<W: Write>(
     let mut bounds: Option<(u64, u64)> = None;
     let mut first_label = String::new();
     let mut last_label = String::new();
+    // `-t` の日境界を切るのに要る、採取側ローカルと UTC の差 (秒)。
+    // レコードが持つ時分秒から復元する。
+    let mut recorded_offset: Option<i64> = None;
     walk_items(file, &selection, |item| {
         let WalkItem::Sample(view) = item else {
             return Ok(ScanControl::Continue);
@@ -222,6 +293,13 @@ pub fn write_svg<W: Write>(
             return Ok(ScanControl::Continue);
         }
         let t = view.curr.ust_time;
+        if recorded_offset.is_none() {
+            let shifted = super::sadf::shift_to_recorded(
+                t,
+                (view.curr.hour, view.curr.minute, view.curr.second),
+            );
+            recorded_offset = Some(shifted as i64 - t as i64);
+        }
         let stamp = Stamp::new(
             cfg.time_base,
             t,
@@ -308,13 +386,17 @@ pub fn write_svg<W: Write>(
         }
     }
     let (mut start, mut end) = bounds.unwrap_or((0, 1));
+    // `-O oneday` の軸は、**他のラベルと同じ時刻基準で切る。**
+    // ここだけ UTC 固定にすると、`-T` / `-t` を付けたとき軸の 00:00 と
+    // データ点の時刻が別の基準になり、図の中で辻褄が合わなくなる。
+    let day_tz = one_day_zone(cfg.time_base, &info, recorded_offset);
     if options.one_day {
-        // A fixed 24-hour axis anchored at midnight UTC. The axis convention is explicit.
-        start = start / 86_400 * 86_400;
+        start = day_start(start, &day_tz);
         end = start.saturating_add(86_400);
         writeln!(
             out,
-            "<text x=\"32\" y=\"83\">24-hour axis: 00:00–24:00 UTC</text>"
+            "<text x=\"32\" y=\"83\">24-hour axis: 00:00–24:00 {}</text>",
+            escaped(&day_tz.label())
         )?;
     }
     for (key, chart) in &charts {
@@ -350,16 +432,16 @@ pub fn write_svg<W: Write>(
             out,
             "<text x=\"{LEFT}\" y=\"{}\">{}</text><text x=\"{RIGHT}\" y=\"{}\" text-anchor=\"end\">{}</text>",
             y + 185.0,
-            escaped(if options.one_day {
-                "00:00 UTC"
+            escaped(&if options.one_day {
+                format!("00:00 {}", day_tz.label())
             } else {
-                &first_label
+                first_label.clone()
             }),
             y + 185.0,
-            escaped(if options.one_day {
-                "24:00 UTC"
+            escaped(&if options.one_day {
+                format!("24:00 {}", day_tz.label())
             } else {
-                &last_label
+                last_label.clone()
             })
         )?;
         if chart.min.is_none() {

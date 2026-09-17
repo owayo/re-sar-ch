@@ -4,7 +4,7 @@ use fixtures::{ActivitySpec, FixtureAbi, FixtureSpec, Generation, RecordSpec, bu
 use re_sar_ch::cli::{SadfOutputOptions, SvgPalette};
 use re_sar_ch::format::file::SaFile;
 use re_sar_ch::model::ActivityId;
-use re_sar_ch::output::sadf::SadfConfig;
+use re_sar_ch::output::sadf::{SadfConfig, TimeBase};
 use re_sar_ch::output::sar_text::CpuSelection;
 use re_sar_ch::output::svg::write_svg;
 use re_sar_ch::output::time_filter::{TimeBound, TimeFilter};
@@ -144,6 +144,50 @@ fn svg_options_have_visible_effects_or_return_an_error_before_output() {
         assert!(write_svg(&mut bytes, &file, &SadfConfig::default(), &options).is_err());
         assert!(bytes.is_empty());
     }
+}
+
+/// `-O oneday` の軸は、他のラベルと同じ時刻基準で切る。
+///
+/// ここだけ UTC 固定だと、`-T` を付けたとき軸の 00:00 とデータ点の時刻が
+/// 別の基準になり、図の中で辻褄が合わなくなる。
+#[test]
+fn the_one_day_axis_follows_the_time_base() {
+    let file = sensor_file(&[1, 1]);
+    let options = SadfOutputOptions {
+        one_day: true,
+        ..Default::default()
+    };
+
+    // 既定 (UTC) では UTC で切る。
+    let utc = render(&file, &SadfConfig::default(), &options);
+    assert!(utc.contains("24-hour axis: 00:00–24:00 UTC"), "{utc}");
+    assert!(utc.contains("00:00 UTC"), "{utc}");
+
+    // `-T` (読み手のローカル) では、軸の基準名も UTC ではなくなる。
+    let local = render(
+        &file,
+        &SadfConfig {
+            time_base: TimeBase::LocalTime,
+            ..Default::default()
+        },
+        &options,
+    );
+    assert!(local.contains("24-hour axis:"), "{local}");
+    assert!(
+        !local.contains("24-hour axis: 00:00–24:00 UTC"),
+        "ローカル指定なのに UTC のままになっている: {local}"
+    );
+
+    // `-t` (採取側の記録時刻) でも同じ。
+    let recorded = render(
+        &file,
+        &SadfConfig {
+            time_base: TimeBase::TrueTime,
+            ..Default::default()
+        },
+        &options,
+    );
+    assert!(recorded.contains("24-hour axis:"), "{recorded}");
 }
 
 #[test]

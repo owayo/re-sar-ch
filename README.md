@@ -209,6 +209,7 @@ the finger runs the wrong feature instead of doing nothing.
 | Key | Action |
 |---|---|
 | `←` / `→` | switch activity |
+| `shift` + `←` / `→` | scroll the table sideways |
 | `↑` / `↓`, `pgup` / `pgdn` | move through time |
 | `home` / `end` | first / last |
 | `i` | pick an item (device, interface, CPU) |
@@ -229,8 +230,9 @@ squash to a few digits each and none of them stay readable. The table narrows th
 - **Columns that never carried a value are dropped by default.** Fields the source
   generation never had, and metrics that are not implemented, show `—` on every row and do
   nothing but push the columns you wanted off the screen.
-- **Columns that do not fit the width are dropped rather than squashed.** The count is
-  stated in the title (`他 15 列 (c で選ぶ)`), so nothing disappears silently.
+- **Columns that do not fit the width are dropped rather than squashed.** `shift` + `←` /
+  `→` scrolls to the rest, and the title shows the position (`9-18/23 列`) so it is clear
+  more follow to the right. Columns held back from the table are counted separately.
 
 `c` opens the column list. Columns without values are listed too, greyed out and
 annotated as such. Widths are computed from every sample, so scrolling through rows never

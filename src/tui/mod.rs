@@ -20,7 +20,7 @@
 //!   その理由 (`Quality`) を選択時に表示する。
 //! - **点を線で結ばない。** 不連続 (再起動・欠測・item の入れ替え) をまたぐ区間は
 //!   表で印を付ける。採取と採取の間に何が起きたかは観測されていない。
-//! - **時刻は UTC** で、画面にそう明記する。独自出力の既定と揃える。
+//! - **時刻の基準を画面に明記する** (`--timezone`、既定はローカル)。独自出力の既定と揃える。
 
 use std::path::Path;
 
@@ -35,6 +35,7 @@ use ratatui::{Frame, Terminal, prelude::Backend};
 
 use crate::error::Result;
 use crate::format::{SaFile, ScanControl};
+use crate::model::DisplayTz;
 use crate::output::json::{BootCounter, CustomConfig, FieldOut, HostOut, Quality, SampleOut};
 use crate::series::{RecordEvent, WalkItem, walk_items};
 
@@ -60,6 +61,8 @@ struct Collected {
     host: HostOut,
     samples: Vec<SampleOut>,
     marks: Vec<Mark>,
+    /// 時刻の表示に使うタイムゾーン (`--timezone`、既定はローカル)。
+    tz: DisplayTz,
 }
 
 /// ファイルを 1 回走査して観測値を集める。
@@ -67,7 +70,7 @@ struct Collected {
 /// 描画のたびにファイルを読まない。静的なファイルなので、
 /// 開いた時点の内容がすべてである。
 fn collect(file: &SaFile, cfg: &CustomConfig) -> Result<Collected> {
-    let host = HostOut::new(file);
+    let host = HostOut::new(file, cfg.tz);
     let mut samples = Vec::new();
     let mut marks = Vec::new();
     let mut boot = BootCounter::default();
@@ -103,6 +106,7 @@ fn collect(file: &SaFile, cfg: &CustomConfig) -> Result<Collected> {
         host,
         samples,
         marks,
+        tz: cfg.tz,
     })
 }
 
@@ -135,6 +139,8 @@ struct App {
     host: HostOut,
     samples: Vec<SampleOut>,
     marks: Vec<Mark>,
+    /// 時刻の表示に使うタイムゾーン。画面にも明記する。
+    tz: DisplayTz,
     tabs: Vec<TabInfo>,
     /// 選択中のタブ。
     tab: usize,
@@ -170,6 +176,7 @@ impl App {
             host: c.host,
             samples: c.samples,
             marks: c.marks,
+            tz: c.tz,
             tabs,
             tab: 0,
             item,
@@ -348,9 +355,12 @@ fn quality_style(q: Quality) -> Style {
     }
 }
 
-fn hhmmss(epoch: u64) -> String {
-    let s = epoch % 86_400;
-    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+/// 表示用の `HH:MM:SS`。
+///
+/// **`epoch % 86_400` で日内秒を出さない。** それは UTC 固定の時刻であり、
+/// 画面のタイムゾーン表記と食い違う。
+fn hhmmss(tz: DisplayTz, epoch: u64) -> String {
+    tz.time(epoch)
 }
 
 // ===========================================================================
@@ -393,9 +403,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     ]);
     let l2 = Line::from(Span::styled(
         format!(
-            "{}  {}  時刻は UTC  ({} サンプル)",
+            "{}  {}  時刻は {}  ({} サンプル)",
             h.file_date,
             h.source,
+            // 先頭サンプルの時点で解決する (夏時間のある地域では時期で変わる)
+            app.tz
+                .label_at(app.samples.first().map_or(0, |s| s.end_epoch)),
             app.samples.len()
         ),
         Style::default().fg(Color::DarkGray),
@@ -475,7 +488,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
                 (None, false, _) => ("!", Style::default().fg(Color::Yellow)),
                 (None, true, _) => (" ", Style::default()),
             };
-            cells.push(Cell::from(format!("{mark}{}", hhmmss(s.end_epoch))).style(style));
+            cells.push(Cell::from(format!("{mark}{}", hhmmss(app.tz, s.end_epoch))).style(style));
 
             let found = item_name.as_ref().and_then(|want| {
                 s.activities
@@ -528,7 +541,7 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
         _ => {
             // 選択中の区間に注記があれば、キーヒントより先にそれを見せる。
             if let Some(note) = app.note_at_selection() {
-                format!("{}  {}", hhmmss(note.epoch), note.text)
+                format!("{}  {}", hhmmss(app.tz, note.epoch), note.text)
             } else {
                 let n = app.filtered_items().len();
                 format!(
@@ -742,9 +755,19 @@ mod tests {
 
     #[test]
     fn hhmmss_wraps_within_a_day() {
-        assert_eq!(hhmmss(0), "00:00:00");
-        assert_eq!(hhmmss(3661), "01:01:01");
-        assert_eq!(hhmmss(86_399), "23:59:59");
-        assert_eq!(hhmmss(86_400), "00:00:00");
+        let utc = DisplayTz::Utc;
+        assert_eq!(hhmmss(utc, 0), "00:00:00");
+        assert_eq!(hhmmss(utc, 3661), "01:01:01");
+        assert_eq!(hhmmss(utc, 86_399), "23:59:59");
+        assert_eq!(hhmmss(utc, 86_400), "00:00:00");
+    }
+
+    /// 表示タイムゾーンが時刻に効く (`epoch % 86_400` では効かない)。
+    #[test]
+    fn hhmmss_follows_the_display_timezone() {
+        let jst = DisplayTz::parse("Asia/Tokyo").unwrap();
+        // 2019-06-30 05:39:33 UTC = 同日 14:39:33 JST
+        assert_eq!(hhmmss(jst, 1_561_873_173), "14:39:33");
+        assert_eq!(hhmmss(DisplayTz::Utc, 1_561_873_173), "05:39:33");
     }
 }

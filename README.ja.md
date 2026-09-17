@@ -148,7 +148,7 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # エージェントやパイプラインへ流すとき
 resarch detect sa01                      # いつ・何に異変があったか
 resarch summarize sa01 sa02 --format json
-resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 各日の UTC 9〜18 時を集計
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 各日のローカル 9〜18 時を集計
 resarch show sa01 --activity irq --irq-cpus --format ndjson  # 割り込みの CPU 別内訳も表示
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
@@ -157,10 +157,39 @@ resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 範囲外のサンプルは平均・p95・差分合計のどれにも入らず、期間の端点も範囲内のサンプルに
 合わせて縮まります。`detect` では同じ 2 つのオプションの意味が変わり、報告する範囲だけを
 絞って、比較基準を組み立てる材料は絞りません。
-独自コマンドの `hh:mm[:ss]` はすべて **UTC** です。10 桁の epoch 秒も指定できます。
+独自コマンドの `hh:mm[:ss]` は**時刻表示と同じタイムゾーン**で比較します
+(既定は実行環境のローカル)。10 桁の epoch 秒も指定できます。
 `compare` の JSON は `comparisons` と `skipped_metrics` を持ち、`skipped_metrics` には
 比較できなかった指標と、その指標の観測値が無いホストが並びます。割り込みの行は `cpu`
 (`all` または 0 始まりの CPU 番号) を持ち、CPU 別の内訳が無い旧ファイルでは `all` だけを出します。
+
+#### 時刻のタイムゾーン
+
+独自サブコマンド (`show` / `summarize` / `detect` / `compare` / `tui`) は、時刻を
+**実行環境のローカルタイムゾーン**で表示します。`--timezone <TZ>` で基準を変えられ、
+`local` (既定) / `utc` / `Asia/Tokyo` のような IANA 名を受け付けます。`--utc` は
+`--timezone utc` の別名で、`--timezone` との同時指定はエラーです。
+
+```bash
+resarch summarize sa01                        # 2026-08-31 15:10:01+09:00
+resarch summarize sa01 --utc                  # 2026-08-31 06:10:01Z
+resarch summarize sa01 --timezone Asia/Tokyo  # 実行環境によらず日本時間で読む
+```
+
+同じ基準を `--from` / `--to` の `hh:mm[:ss]` の解釈にも使うので、画面に出ている 09:00 と
+`--from 09:00` が食い違いません。10 桁の epoch 秒はタイムゾーンの影響を受けません。
+タイムゾーンは IANA 名 (`Asia/Tokyo`) で表示し、IANA 名を特定できない環境では数値オフセット
+(`+09:00`) になります。`JST` のような略称は使いません (重複があるうえ、夏時間の切り替え日に
+同じ壁時計が 2 度現れたとき区別できないためです)。
+
+機械可読形式 (json / ndjson / csv) の `start_epoch` / `end_epoch` は epoch 秒のままで、
+`--timezone` では変わりません。`detect --format json` / `--format ndjson` だけが
+`report_timezone` を持ち、`--from` / `--to` をどの壁時計として読んだかを示します。
+
+`info` / `identify` にはこのオプションがありません (ファイルヘッダに書かれた値を
+そのまま出すコマンドで、読み手のタイムゾーンで開き直す対象がないためです)。
+互換入口 (`resarch sar` / `resarch sadf` / `resarch sa2sar`) も本家 sysstat の規則のままで、
+`--timezone` の影響を受けません。
 
 ### 対話的に閲覧する (TUI)
 
@@ -173,7 +202,7 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 
 ```
 <host>  Linux 2.6.32-696.1.1.el6.x86_64 / x86_64  (2 CPU)
-2026-08-31  sa01  時刻は UTC  (144 サンプル)
+2026-08-31  sa01  時刻は Asia/Tokyo  (144 サンプル)
  CPU   PCSW   SWAP   PAGE   IO   MEMORY   KTABLES   QUEUE   SERIAL   DISK   NET_DEV   ...
 ┌ A_CPU — CPU 使用率  [all]  ───────────────────────────────────────────────────────┐
 │time       user     nice     system   iowait   steal    idle     usr      ...       │
@@ -199,7 +228,7 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
   欠測、差分が取れない区間を、ゼロで埋めません。
 - **時刻の前の `!` は不連続**、`R` は再起動、`C` はコメントです。
   採取と採取の間に何が起きたかは観測されていないので、点を線で結びません。
-- 時刻は **UTC** で、画面にもそう明記します。
+- 時刻は `--timezone` の基準 (既定は実行環境のローカル) で、画面にもそう明記します。
 
 TUI は対話端末でのみ動きます。パイプやファイルへ出す場合は `resarch show` /
 `resarch sar` を使ってください (その旨のエラーを返します)。
@@ -237,7 +266,8 @@ resarch detect sa13 sa14 --activity cpu,disk --from 09:00 --to 10:00 \
 検知した**ホスト・リソース・指標ごと**に、検知範囲とその前後だけを切り出して SVG を作成します。
 前後幅は既定で各 30 分。`300s` / `15m` / `1h` / `0` で変更できます。
 同じ指標の表示範囲が重なれば 1 枚にまとめ、離れた検知や別の起動区間は分けます。
-グラフの時刻は UTC 表示です。`--from` / `--to` の範囲外でも、入力にサンプルがあれば
+グラフの時刻には `--timezone` の基準 (既定は実行環境のローカル) を添えます。
+`index.json` の `timezone` は実際に使った基準名です。`--from` / `--to` の範囲外でも、入力にサンプルがあれば
 前後の文脈として含めます。グラフ関連のオプションを付けても、検知の閾値や比較基準は
 変わりません。
 

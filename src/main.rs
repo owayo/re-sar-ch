@@ -38,13 +38,13 @@ use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
     DetectFormat, IdentifyArgs, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg,
     Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate,
-    SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, TuiArgs,
-    ValueKind,
+    SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, TimeZoneArgs,
+    TuiArgs, ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
-use re_sar_ch::model::{ActivityId, KNOWN_ACTIVITIES};
+use re_sar_ch::model::{ActivityId, DisplayTz, KNOWN_ACTIVITIES};
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
@@ -728,7 +728,8 @@ fn parse_activity_name(name: &str) -> anyhow::Result<ActivityId> {
 /// `--from` / `--to` を解釈する。
 ///
 /// 受け付ける形は `sar -s` / `-e` と同じ (`hh:mm` / `hh:mm:ss` / 10 桁 epoch)。
-/// 比較は独自出力が表示する時刻 (UTC / epoch) に合わせる。
+/// `hh:mm[:ss]` は独自出力が表示する時刻 (`--timezone`、既定はローカル) で
+/// 比べる。10 桁の epoch 秒はタイムゾーンによらず `ust_time` と直接比べる。
 fn parse_time_arg(opt: &str, value: &str) -> anyhow::Result<TimeBound> {
     let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
     if value.len() == 10 && digits(value) {
@@ -761,11 +762,16 @@ fn parse_time_arg(opt: &str, value: &str) -> anyhow::Result<TimeBound> {
     })
 }
 
+/// `--timezone` / `--utc` を表示タイムゾーンへ解決する。
+fn display_tz(args: &TimeZoneArgs) -> anyhow::Result<DisplayTz> {
+    args.resolve().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// `--from` / `--to` を独自出力のフィルタへ写す。
 ///
 /// `check_time_limits()` と同じ日跨ぎ補正を入れる
 /// (`hh:mm:ss` 形式で `--to` < `--from` なら翌日まで)。
-fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
+fn custom_time_filter(common: &CommonArgs, tz: DisplayTz) -> anyhow::Result<TimeFilter> {
     let start = match &common.from {
         Some(v) => parse_time_arg("--from", v)?,
         None => TimeBound::None,
@@ -797,8 +803,9 @@ fn custom_time_filter(common: &CommonArgs) -> anyhow::Result<TimeFilter> {
     Ok(TimeFilter {
         start,
         end,
-        // 独自出力は UTC / epoch で時刻を出すので、比較も UTC で行う。
-        basis: TimeBasis::Utc,
+        // **表示と同じ基準で比べる。** 片方だけ動かすと、
+        // 画面に出ている 09:00 と `--from 09:00` が食い違う。
+        basis: TimeBasis::Zone(tz),
         cross_day: CrossDayRule::Sar,
     })
 }
@@ -846,7 +853,8 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
     }
     let options = open_options(common.lenient, common.no_mmap);
     let selection = selection_from(&common.activity)?;
-    let filter = custom_time_filter(common)?;
+    let tz = display_tz(&common.timezone)?;
+    let filter = custom_time_filter(common, tz)?;
 
     // 複数ファイルはヘッダだけ先に読み、**日付 → 作成時刻 → パス**の決定的な
     // 順序へ並べ替えてから流す (`multi.rs` の方針 §6.3)。
@@ -858,6 +866,7 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
         values: value_scope(args.values),
         time_filter: filter,
         irq_cpus: args.irq_cpus,
+        tz,
     };
     // 独自 JSON は 1 ファイル 1 文書なので、複数ファイルは配列で包む。
     let wrap_json = matches!(common.format, OutputFormat::Json) && paths.len() > 1;
@@ -1067,7 +1076,8 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
             Err(e) => return Err(e.into()),
         }
     }
-    let opts = detect_options(&args)?;
+    let tz = display_tz(&args.timezone)?;
+    let opts = detect_options(&args, tz)?;
     let mopts = detect_multi_options(&args)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
     report_incomplete_files(&analysis);
@@ -1100,7 +1110,7 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
     }
 
     if let Some(dir) = &args.svg_dir {
-        save_detect_graphs(dir, &charts, &assessments, &analysis)?;
+        save_detect_graphs(dir, &charts, &assessments, &analysis, tz)?;
         eprintln!(
             "resarch: SVG {} 件と index.json / report.json を保存: {}",
             charts.len(),
@@ -1111,14 +1121,14 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
     let mut out = stdout_writer();
     match args.format {
         // JSON は起動区間をまとめて 1 ドキュメントにする
-        DetectFormat::Json => detect_report::write_json(&mut out, &assessments)?,
-        DetectFormat::Ndjson => detect_report::write_ndjson(&mut out, &assessments)?,
+        DetectFormat::Json => detect_report::write_json(&mut out, &assessments, tz)?,
+        DetectFormat::Ndjson => detect_report::write_ndjson(&mut out, &assessments, tz)?,
         DetectFormat::Text => {
             for (i, a) in assessments.iter().enumerate() {
                 if i > 0 {
                     writeln!(out)?;
                 }
-                detect_report::write_text(&mut out, a)?;
+                detect_report::write_text(&mut out, a, tz)?;
             }
         }
     }
@@ -1153,6 +1163,7 @@ fn save_detect_graphs(
     charts: &[detect_svg::Chart],
     assessments: &[Assessment],
     analysis: &multi::MultiFileAnalysis,
+    tz: DisplayTz,
 ) -> anyhow::Result<()> {
     let parent = dir
         .parent()
@@ -1167,7 +1178,7 @@ fn save_detect_graphs(
         let mut temp = tempfile::NamedTempFile::new_in(stage.path())?;
         {
             let mut out = BufWriter::new(temp.as_file_mut());
-            detect_svg::write_svg(&mut out, chart)?;
+            detect_svg::write_svg(&mut out, chart, tz)?;
             out.flush()?;
         }
         entries.push(serde_json::json!({
@@ -1183,7 +1194,8 @@ fn save_detect_graphs(
     let manifest = serde_json::json!({
         "schema_version": re_sar_ch::model::NATIVE_SCHEMA_VERSION,
         "kind": "detect_svg_index", "status": if partial { "partial" } else { "complete" },
-        "timezone": "UTC", "report": "report.json", "charts": entries,
+        "timezone": tz.label_at(charts.first().map_or(0, |c| c.window_start_ust)),
+        "report": "report.json", "charts": entries,
         "skipped_files": analysis.skipped, "incomplete_files": analysis.incomplete_files,
     });
     for name in ["report.json", "index.json"] {
@@ -1191,7 +1203,7 @@ fn save_detect_graphs(
         {
             let mut out = BufWriter::new(temp.as_file_mut());
             if name == "report.json" {
-                detect_report::write_json(&mut out, assessments)?;
+                detect_report::write_json(&mut out, assessments, tz)?;
             } else {
                 serde_json::to_writer_pretty(&mut out, &manifest)?;
                 writeln!(out)?;
@@ -1218,7 +1230,7 @@ fn save_detect_graphs(
     Ok(())
 }
 
-fn detect_options(args: &DetectArgs) -> anyhow::Result<DetectOptions> {
+fn detect_options(args: &DetectArgs, tz: DisplayTz) -> anyhow::Result<DetectOptions> {
     let report_from = report_bound("--from", args.from.as_deref())?;
     let report_to = report_bound("--to", args.to.as_deref())?;
     if matches!((report_from, report_to), (ReportBound::Epoch(s), ReportBound::Epoch(e)) if e < s) {
@@ -1231,6 +1243,7 @@ fn detect_options(args: &DetectArgs) -> anyhow::Result<DetectOptions> {
         },
         report_from,
         report_to,
+        tz,
         selected_activities: match selection_from(&args.activity)? {
             Selection::All => None,
             Selection::Only(ids) => Some(ids),
@@ -1339,7 +1352,8 @@ fn report_empty_window(analysis: &multi::MultiFileAnalysis, common: &CommonArgs)
 
 fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
-    let mopts = multi_options(common)?;
+    let tz = display_tz(&common.timezone)?;
+    let mopts = multi_options(common, tz)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
     report_incomplete_files(&analysis);
     for s in &analysis.skipped {
@@ -1367,7 +1381,7 @@ fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
                 }
             }
         }
-        _ => write_summarize_text(&mut out, &analysis)?,
+        _ => write_summarize_text(&mut out, &analysis, tz)?,
     }
     out.flush()?;
     Ok(exit_code(
@@ -1384,7 +1398,7 @@ fn report_incomplete_files(analysis: &multi::MultiFileAnalysis) {
     }
 }
 
-fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
+fn multi_options(common: &CommonArgs, tz: DisplayTz) -> anyhow::Result<MultiOptions> {
     Ok(MultiOptions {
         open: open_options(common.lenient, common.no_mmap),
         selection: selection_from(&common.activity)?,
@@ -1402,7 +1416,7 @@ fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
         // `--from` / `--to` は集計期間そのものを絞る。
         // `detect` の報告範囲とは意味が違う (`MultiOptions::time_filter` の doc /
         // `docs/design.md` §9.0)。
-        time_filter: custom_time_filter(common)?,
+        time_filter: custom_time_filter(common, tz)?,
         ..Default::default()
     })
 }
@@ -1410,6 +1424,7 @@ fn multi_options(common: &CommonArgs) -> anyhow::Result<MultiOptions> {
 fn write_summarize_text<W: Write>(
     out: &mut W,
     analysis: &multi::MultiFileAnalysis,
+    tz: DisplayTz,
 ) -> anyhow::Result<()> {
     for (hi, host) in analysis.hosts.iter().enumerate() {
         if hi > 0 {
@@ -1434,20 +1449,26 @@ fn write_summarize_text<W: Write>(
 
         for seg in &host.segments {
             writeln!(out)?;
-            write_segment_text(out, seg)?;
+            write_segment_text(out, seg, tz)?;
         }
     }
     Ok(())
 }
 
-fn write_segment_text<W: Write>(out: &mut W, seg: &BootSegment) -> anyhow::Result<()> {
+fn write_segment_text<W: Write>(
+    out: &mut W,
+    seg: &BootSegment,
+    tz: DisplayTz,
+) -> anyhow::Result<()> {
     let p = &seg.summary.period;
     writeln!(
         out,
         "起動区間 {}  {} → {}  ({} サンプル / 連続 {} 区間 / 不連続 {} 区間)",
         seg.index,
-        p.first_ust.map_or("-".to_string(), format_epoch),
-        p.last_ust.map_or("-".to_string(), format_epoch),
+        p.first_ust
+            .map_or("-".to_string(), |ust| format_epoch(tz, ust)),
+        p.last_ust
+            .map_or("-".to_string(), |ust| format_epoch(tz, ust)),
         p.samples,
         p.continuous_intervals,
         p.broken_intervals
@@ -1548,12 +1569,8 @@ fn format_column(col: &ColumnSummary) -> String {
     )
 }
 
-fn format_epoch(ust: u64) -> String {
-    use chrono::{TimeZone, Utc};
-    match Utc.timestamp_opt(ust as i64, 0).single() {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%SZ").to_string(),
-        None => ust.to_string(),
-    }
+fn format_epoch(tz: DisplayTz, ust: u64) -> String {
+    tz.datetime(ust)
 }
 
 // ===========================================================================
@@ -1562,7 +1579,8 @@ fn format_epoch(ust: u64) -> String {
 
 fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
-    let mopts = multi_options(common)?;
+    let tz = display_tz(&common.timezone)?;
+    let mopts = multi_options(common, tz)?;
 
     // ホストごとに解析し、代表となる起動区間 (最もサンプル数の多い区間) を採る。
     struct HostEntry {
@@ -1684,8 +1702,8 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             writeln!(
                 out,
                 "共通期間 {} → {} ({} 秒区間 × {})",
-                format_epoch(window.start_ust),
-                format_epoch(window.end_ust),
+                format_epoch(tz, window.start_ust),
+                format_epoch(tz, window.end_ust),
                 window.step_secs,
                 window.bucket_count()
             )?;
@@ -1780,6 +1798,7 @@ fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
         // (絞り込みは TUI 内のスクロールで行う)。
         time_filter: Default::default(),
         irq_cpus: false,
+        tz: display_tz(&args.timezone)?,
     };
     re_sar_ch::tui::run(&args.file, &cfg, &file)?;
     Ok(ExitCode::SUCCESS)

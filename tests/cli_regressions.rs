@@ -6,13 +6,63 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn run(args: &[&str], file: &Path) -> Output {
+    run_in_tz("UTC", args, file)
+}
+
+/// 実行環境のタイムゾーンを指定して起動する。
+///
+/// 独自出力の既定は**実行環境のローカルタイムゾーン**なので、
+/// `TZ` を固定しないと期待値が実行機ごとに変わる。
+fn run_in_tz(tz: &str, args: &[&str], file: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_resarch"))
         .args(args)
         .arg(file)
-        .env("TZ", "UTC")
+        .env("TZ", tz)
         .env("LC_ALL", "C")
         .output()
         .unwrap()
+}
+
+/// `TZ=Asia/Tokyo` のときの日内秒。JST に夏時間は無いので固定 +9 時間でよい。
+fn jst_seconds_of_day(epoch: u64) -> u64 {
+    (epoch + 9 * 3600) % 86_400
+}
+
+/// 表に出ている最初の時刻セル (`HH:MM:SS`)。
+///
+/// 期待値に fixture の絶対時刻を書かない。同じ入力を別のタイムゾーンで
+/// 出し直し、**ずれ幅**を突き合わせる (fixture の開始時刻を変えても壊れない)。
+fn first_time_cell(text: &str) -> String {
+    text.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .find(|head| {
+            head.len() == 8
+                && head.as_bytes()[2] == b':'
+                && head.as_bytes()[5] == b':'
+                && head.bytes().filter(u8::is_ascii_digit).count() == 6
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("時刻セルが見つからない: {text}"))
+}
+
+/// `HH:MM:SS` を `offset_secs` だけ進めた表記 (日を跨いでも巻き戻す)。
+fn shifted(cell: &str, offset_secs: u64) -> String {
+    let p: Vec<u64> = cell.split(':').map(|v| v.parse().unwrap()).collect();
+    let s = (p[0] * 3600 + p[1] * 60 + p[2] + offset_secs) % 86_400;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// `show --format table` の最初の時刻セルを、指定タイムゾーンで取る。
+fn first_cell_in_tz(tz: &str, extra: &[&str], file: &Path) -> String {
+    let mut args = vec!["show", "--activity", "cpu"];
+    args.extend_from_slice(extra);
+    let out = run_in_tz(tz, &args, file);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    first_time_cell(&String::from_utf8(out.stdout).unwrap())
 }
 
 fn source(offset_hours: u64, pcsw: bool) -> Vec<u8> {
@@ -187,16 +237,195 @@ fn compare_retains_the_reason_for_skipping_metrics() {
 }
 
 #[test]
-fn native_help_explains_utc() {
+fn native_help_explains_the_time_basis() {
     for command in ["show", "summarize", "compare", "detect"] {
         let out = Command::new(env!("CARGO_BIN_EXE_resarch"))
             .args([command, "--help"])
             .output()
             .unwrap();
         assert!(out.status.success());
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("UTC"),
-            "{command}"
+        let help = String::from_utf8_lossy(&out.stdout);
+        // 既定がローカルであることと、戻す手段の両方が読めること。
+        assert!(help.contains("--timezone"), "{command}: {help}");
+        assert!(help.contains("--utc"), "{command}: {help}");
+        assert!(help.contains("local"), "{command}: {help}");
+    }
+}
+
+/// 独自出力の時刻は実行環境のローカルタイムゾーンで出る。
+#[test]
+fn native_output_uses_the_local_timezone_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "tz.sa", &source(0, false));
+
+    let out = run_in_tz("Asia/Tokyo", &["show", "--activity", "cpu"], &file);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("(time は Asia/Tokyo)"), "{text}");
+    // 同じ行が、UTC で出したときよりちょうど 9 時間進む。
+    let utc_cell = first_cell_in_tz("UTC", &[], &file);
+    assert_eq!(first_time_cell(&text), shifted(&utc_cell, 9 * 3600));
+    assert_ne!(first_time_cell(&text), utc_cell);
+
+    let summarized = run_in_tz("Asia/Tokyo", &["summarize", "--activity", "cpu"], &file);
+    let text = String::from_utf8(summarized.stdout).unwrap();
+    assert!(text.contains("+09:00"), "オフセットを添える: {text}");
+    assert!(!text.contains("Z "), "UTC の Z が残っている: {text}");
+}
+
+/// `--timezone` / `--utc` は実行環境のタイムゾーンより優先される。
+#[test]
+fn the_timezone_option_overrides_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "tz.sa", &source(0, false));
+
+    for args in [
+        vec!["show", "--activity", "cpu", "--utc"],
+        vec!["show", "--activity", "cpu", "--timezone", "utc"],
+    ] {
+        let out = run_in_tz("Asia/Tokyo", &args, &file);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("(time は UTC)"), "{args:?}: {text}");
+        // 実行環境が JST でも、UTC 起動と同じ時刻になる。
+        assert_eq!(
+            first_time_cell(&text),
+            first_cell_in_tz("UTC", &[], &file),
+            "{args:?}"
         );
     }
+
+    // IANA 名の指定も効く (実行環境とも UTC とも違う基準)
+    let out = run_in_tz(
+        "Asia/Tokyo",
+        &["show", "--activity", "cpu", "--timezone", "Asia/Kathmandu"],
+        &file,
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("(time は Asia/Kathmandu)"), "{text}");
+    // +05:45 なので、30 分刻みでないオフセットでも崩れない
+    let cell = first_time_cell(&text);
+    let utc_cell = first_cell_in_tz("UTC", &[], &file);
+    assert_eq!(cell, shifted(&utc_cell, 5 * 3600 + 45 * 60), "{text}");
+}
+
+/// `--timezone` と `--utc` の同時指定は弾く。
+#[test]
+fn timezone_and_utc_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "tz.sa", &source(0, false));
+    let out = run(
+        &["show", "--activity", "cpu", "--timezone", "utc", "--utc"],
+        &file,
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--utc"), "{err}");
+}
+
+/// 知らないタイムゾーン名は、受け付ける形を示して弾く。
+#[test]
+fn an_unknown_timezone_is_rejected_with_the_accepted_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "tz.sa", &source(0, false));
+    let out = run(
+        &["show", "--activity", "cpu", "--timezone", "Asia/Nowhere"],
+        &file,
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Asia/Nowhere"), "{err}");
+    assert!(err.contains("IANA"), "{err}");
+}
+
+/// 日跨ぎフィルタは**表示と同じ基準**で切る。
+///
+/// 同じ `--from 20:00 --to 02:00` でも、実行環境が JST なら JST の 20:00〜02:00
+/// を指す。画面に出ている時刻と `--from` が食い違わないことがこの検証の眼目。
+#[test]
+fn the_overnight_filter_follows_the_display_timezone() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "overnight.sa", &source(0, true));
+    let args = [
+        "show",
+        "--activity",
+        "pcsw",
+        "--format",
+        "ndjson",
+        "--from",
+        "20:00",
+        "--to",
+        "02:00",
+    ];
+
+    let epochs = |out: Output| -> Vec<u64> {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .map(|v| v["end_epoch"].as_u64().unwrap())
+            .collect()
+    };
+
+    let utc = epochs(run_in_tz("UTC", &args, &file));
+    let jst = epochs(run_in_tz("Asia/Tokyo", &args, &file));
+
+    assert!(!utc.is_empty() && !jst.is_empty());
+    // 基準が違えば選ばれる区間も違う (同じなら検証になっていない)
+    assert_ne!(utc, jst);
+
+    for e in &utc {
+        let sod = e % 86_400;
+        assert!(
+            sod >= 20 * 3600 || sod <= 2 * 3600,
+            "UTC 基準から外れた: {e}"
+        );
+    }
+    for e in &jst {
+        let sod = jst_seconds_of_day(*e);
+        assert!(
+            sod >= 20 * 3600 || sod <= 2 * 3600,
+            "JST 基準から外れた: {e}"
+        );
+    }
+}
+
+/// 機械可読形式の epoch 秒はタイムゾーンで動かない。
+#[test]
+fn machine_readable_epochs_do_not_move_with_the_timezone() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "epochs.sa", &source(0, false));
+    let args = ["show", "--activity", "cpu", "--format", "ndjson"];
+
+    let rows = |out: Output| -> Vec<String> {
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    };
+    let utc = rows(run_in_tz("UTC", &args, &file));
+    let jst = rows(run_in_tz("Asia/Tokyo", &args, &file));
+    let honolulu = rows(run_in_tz("Pacific/Honolulu", &args, &file));
+
+    assert!(!utc.is_empty());
+    // `file_date` はローカルの日付で開くため行そのものは一致しないが、
+    // 時点を表す epoch 秒は 1 つも動かない。
+    let epochs = |rows: &[String]| -> Vec<(u64, u64)> {
+        rows.iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| Some((v["start_epoch"].as_u64()?, v["end_epoch"].as_u64()?)))
+            .collect()
+    };
+    assert_eq!(epochs(&utc), epochs(&jst));
+    assert_eq!(epochs(&utc), epochs(&honolulu));
 }

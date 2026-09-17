@@ -61,7 +61,7 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
     let widths = measure(file, cfg)?;
 
     // --- 2 回目: 書き出し ---
-    let host = super::json::HostOut::new(file);
+    let host = super::json::HostOut::new(file, cfg.tz);
     writeln!(
         out,
         "host: {}  ({} {} / {}, {} CPU)",
@@ -88,7 +88,10 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
         if !view.has_prev && cfg.values.wants_rates() {
             return Ok(ScanControl::Continue);
         }
-        let ts = utc_hms(view.curr.ust_time);
+        // 区間終点の時刻。レコードが持つ「収集時ローカルの時分秒」ではなく
+        // epoch 秒から作る。JSON / NDJSON / CSV が出す `end_epoch` と
+        // 同じ時点を指すようにするため。
+        let ts = cfg.tz.time(view.curr.ust_time);
         for id in selected_ids(view, cfg) {
             let Some(w) = widths.get(&id.0) else { continue };
             let Some(pair) = ActivityPair::from_view(view, id) else {
@@ -98,7 +101,7 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
 
             if !printed_header.get(&id.0).copied().unwrap_or(false) {
                 printed_header.insert(id.0, true);
-                write_block_header(out, id, w)?;
+                write_block_header(out, id, w, &cfg.tz.label_at(view.curr.ust_time))?;
             }
 
             for row in custom_items(&pair, cfg) {
@@ -126,10 +129,15 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
     Ok(())
 }
 
-fn write_block_header<W: Write>(out: &mut W, id: ActivityId, w: &Widths) -> Result<()> {
+fn write_block_header<W: Write>(
+    out: &mut W,
+    id: ActivityId,
+    w: &Widths,
+    tz_label: &str,
+) -> Result<()> {
     let label = id.label().unwrap_or("");
     writeln!(out).map_err(super::sadf::wrap_io)?;
-    writeln!(out, "{} — {label}  (time は UTC)", id.display_name())
+    writeln!(out, "{} — {label}  (time は {tz_label})", id.display_name())
         .map_err(super::sadf::wrap_io)?;
 
     let mut head = String::from(INDENT);
@@ -151,19 +159,6 @@ fn write_block_header<W: Write>(out: &mut W, id: ActivityId, w: &Widths) -> Resu
         writeln!(out, "{}", units.trim_end()).map_err(super::sadf::wrap_io)?;
     }
     Ok(())
-}
-
-/// 区間終点の UTC 時刻 (`HH:MM:SS`)。
-///
-/// レコードが持つ「収集時ローカルの時分秒」ではなく epoch 秒から作る。
-/// JSON / NDJSON / CSV が出す `end_epoch` と同じ時点を指すようにするため。
-fn utc_hms(ust_time: u64) -> String {
-    use chrono::{TimeZone, Timelike, Utc};
-    let t = Utc
-        .timestamp_opt(ust_time as i64, 0)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
-    format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second())
 }
 
 /// 1 回目の走査。activity ごとの列幅を決める。

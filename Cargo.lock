@@ -1143,6 +1143,7 @@ dependencies = [
  "clap",
  "criterion",
  "csv",
+ "iana-time-zone",
  "memmap2",
  "predicates",
  "ratatui",

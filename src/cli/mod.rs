@@ -27,6 +27,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
+use crate::model::DisplayTz;
+
 pub use sadf_args::{
     SadfArgError, SadfFormat, SadfImmediate, SadfOptions, SadfOutputOptions, SadfTimeBase,
     SvgPalette, parse_sadf_args,
@@ -127,6 +129,44 @@ fn parse_host_spec(value: &str) -> Result<HostSpec, String> {
 // サブコマンドの引数 (骨格)
 // ============================================================================
 
+/// 独自サブコマンドで共通の時刻基準。
+///
+/// **表示と `--from` / `--to` の比較と `detect` の日内境界は同じ基準を使う。**
+/// 片方だけ動かすと、画面の 09:00 と `--from 09:00` が食い違う。
+///
+/// 互換入口 (`resarch sar` / `resarch sadf` / `resarch sa2sar`) はこの引数を
+/// 持たない。あちらは本家の規則 (`-T` / `-t` / `-U`) に従う。
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct TimeZoneArgs {
+    /// 時刻の表示と `--from` / `--to` の解釈に使うタイムゾーン (既定: local)。
+    ///
+    /// `local` は実行環境のタイムゾーン、`utc` は UTC、ほかに
+    /// `Asia/Tokyo` のような IANA 名を指定できる。
+    /// 機械可読形式 (json / ndjson / csv) の epoch 秒はこの指定で変わらない。
+    #[arg(long, value_name = "TZ", verbatim_doc_comment)]
+    pub timezone: Option<String>,
+
+    /// `--timezone utc` の別名。
+    #[arg(long, conflicts_with = "timezone")]
+    pub utc: bool,
+}
+
+impl TimeZoneArgs {
+    /// 表示・比較に使うタイムゾーンを決める。
+    ///
+    /// 未指定は実行環境のローカルタイムゾーン。
+    pub fn resolve(&self) -> Result<DisplayTz, String> {
+        match (self.timezone.as_deref(), self.utc) {
+            // clap の `conflicts_with` が先に弾くが、
+            // 引数を組み立て直す経路のために意味を落とさず持つ。
+            (Some(_), true) => Err("--timezone と --utc は同時に指定できません".to_string()),
+            (Some(v), false) => DisplayTz::parse(v),
+            (None, true) => Ok(DisplayTz::Utc),
+            (None, false) => Ok(DisplayTz::local()),
+        }
+    }
+}
+
 /// 複数のサブコマンドで共通の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct CommonArgs {
@@ -134,11 +174,17 @@ pub struct CommonArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
+    #[command(flatten)]
+    pub timezone: TimeZoneArgs,
+
     /// 対象 activity をカンマ区切りで絞る (例: `cpu,disk`)。
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     pub activity: Vec<String>,
 
-    /// 開始時刻 (UTC の `hh:mm[:ss]` または 10 桁の epoch 秒)。
+    /// 開始時刻 (`hh:mm[:ss]` または 10 桁の epoch 秒)。
+    ///
+    /// `hh:mm[:ss]` は `--timezone` の基準 (既定は実行環境のローカル
+    /// タイムゾーン) で解釈する。epoch 秒はタイムゾーンの影響を受けない。
     ///
     /// `show` では表示する行、`summarize` / `compare` では**集計期間そのもの**を
     /// 絞る。範囲外のサンプルは平均・最大 / 最小・p95・差分合計のどれにも
@@ -148,14 +194,14 @@ pub struct CommonArgs {
     /// `sar -s` と同じく、**範囲に最初に合致したサンプルは差分の基準として
     /// 消費される** (`show` では表示されず、`summarize` では値に数えない)。
     /// 複数ファイルを渡した場合はファイルごとに引き直すので、
-    /// `--from 09:00 --to 18:00` は「各日の UTC 09:00〜18:00」を意味する。
+    /// `--from 09:00 --to 18:00` は「各日の 09:00〜18:00」を意味する。
     ///
     /// `detect` の `--from` / `--to` は意味が違う (報告範囲だけを絞り、
     /// 比較基準の材料は絞らない)。`resarch detect --help` を参照。
     #[arg(long, value_name = "TIME", verbatim_doc_comment)]
     pub from: Option<String>,
 
-    /// 終了時刻 (UTC の `hh:mm[:ss]` または 10 桁の epoch 秒)。
+    /// 終了時刻 (`hh:mm[:ss]` または 10 桁の epoch 秒)。
     ///
     /// 意味は `--from` と対。`hh:mm[:ss]` 形式で `--to` < `--from` のときは
     /// 翌日までを指す (`sar` と同じ日跨ぎ補正)。
@@ -282,6 +328,9 @@ pub struct DetectArgs {
     #[arg(long, value_enum, default_value_t = DetectFormat::Text)]
     pub format: DetectFormat,
 
+    #[command(flatten)]
+    pub timezone: TimeZoneArgs,
+
     /// 検知したリソース・指標ごとの SVG と一覧を保存する新規ディレクトリ。
     /// 通常の検知レポートも標準出力へ出す。既存ディレクトリは上書きしない。
     #[arg(long, value_name = "DIR")]
@@ -314,11 +363,13 @@ pub struct DetectArgs {
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     pub activity: Vec<String>,
 
-    /// 報告範囲の開始時刻 (UTC の hh:mm[:ss] または epoch 秒)。基準の材料は絞らない。
+    /// 報告範囲の開始時刻 (hh:mm[:ss] または epoch 秒)。基準の材料は絞らない。
+    ///
+    /// `hh:mm[:ss]` は `--timezone` の基準 (既定はローカル) で解釈する。
     #[arg(long, value_name = "TIME")]
     pub from: Option<String>,
 
-    /// 報告範囲の終了時刻 (UTC の hh:mm[:ss] または epoch 秒)。基準の材料は絞らない。
+    /// 報告範囲の終了時刻 (hh:mm[:ss] または epoch 秒)。基準の材料は絞らない。
     #[arg(long, value_name = "TIME")]
     pub to: Option<String>,
 
@@ -403,6 +454,9 @@ pub struct InfoArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
+    // `--timezone` は持たない。`info` が出す `date` / `timezone` は
+    // **ファイルヘッダに書かれている値そのもの** (採取側が記録した日付と
+    // TZ 名) であり、読み手のタイムゾーンで開き直す対象ではない。
     /// 疑わしいデータをエラーにする (既定)。
     #[arg(long, conflicts_with = "lenient")]
     pub strict: bool,
@@ -448,6 +502,9 @@ pub struct TuiArgs {
     /// 表示する activity を絞る (既定は収録されている全部)。
     #[arg(long, value_delimiter = ',')]
     pub activity: Vec<String>,
+
+    #[command(flatten)]
+    pub timezone: TimeZoneArgs,
 
     /// 回復可能な破損を診断付きで読み飛ばす。
     #[arg(long)]

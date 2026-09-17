@@ -93,7 +93,7 @@ pub struct EventRow<'a> {
 ///
 /// 1 行ずつ書き出す。全レコードを溜めない。
 pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> Result<()> {
-    let host = HostOut::new(file);
+    let host = HostOut::new(file, cfg.tz);
     let mut boot = BootCounter::default();
     let mut cursor = cfg.time_filter.cursor();
 

@@ -21,8 +21,6 @@
 
 use std::io::{self, Write};
 
-use chrono::{TimeZone, Utc};
-
 use crate::analyze::assessment::{
     ASSESSMENT_KIND, AssessedEpisode, Assessment, EvaluationCoverage, RouteStatus, RouteTally,
     describe_detection,
@@ -30,23 +28,17 @@ use crate::analyze::assessment::{
 use crate::detect::episodes::Episode;
 use crate::detect::{DETECT_SCHEMA_VERSION, DETECTOR_VERSION};
 use crate::detect::{DecisionBasis, DetectRoute, Detection, Observation};
+use crate::model::DisplayTz;
 
-/// エポック秒を `YYYY-MM-DD HH:MM:SSZ` へ。
+/// タイムゾーン名を決めるときの基準時刻。
 ///
-/// 独自出力は UTC / epoch で時刻を出す方針に合わせる。
-fn epoch(ust: u64) -> String {
-    match Utc.timestamp_opt(ust as i64, 0).single() {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%SZ").to_string(),
-        None => ust.to_string(),
-    }
-}
-
-/// 時刻だけ (`HH:MM:SS`)。観測列の表示に使う。
-fn hms(ust: u64) -> String {
-    match Utc.timestamp_opt(ust as i64, 0).single() {
-        Some(dt) => dt.format("%H:%M:%S").to_string(),
-        None => ust.to_string(),
-    }
+/// 夏時間のある地域ではオフセットが時期で変わるので、
+/// **入力の先頭サンプル**に合わせる (実行時刻ではない)。
+fn report_anchor(assessments: &[Assessment]) -> u64 {
+    assessments
+        .iter()
+        .find_map(|a| a.period.first_ust)
+        .unwrap_or(0)
 }
 
 fn json_err(e: serde_json::Error) -> io::Error {
@@ -58,8 +50,8 @@ fn json_err(e: serde_json::Error) -> io::Error {
 // ===========================================================================
 
 /// 人が読む形式。
-pub fn write_text<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
-    write_header(out, a)?;
+pub fn write_text<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
+    write_header(out, a, tz)?;
 
     if a.episodes.is_empty() {
         writeln!(out)?;
@@ -70,11 +62,11 @@ pub fn write_text<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     }
     for e in &a.episodes {
         writeln!(out)?;
-        write_episode(out, e)?;
+        write_episode(out, e, tz)?;
     }
 
     writeln!(out)?;
-    write_background(out, a)?;
+    write_background(out, a, tz)?;
 
     writeln!(out)?;
     write_coverage(out, &a.coverage)?;
@@ -87,7 +79,7 @@ pub fn write_text<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     Ok(())
 }
 
-fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
+fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
     let s = &a.source;
     writeln!(
         out,
@@ -104,8 +96,8 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     writeln!(
         out,
         "期間: {} → {}  ({} サンプル / 連続 {} 区間 / 不連続 {} 区間)",
-        p.first_ust.map_or("-".to_string(), epoch),
-        p.last_ust.map_or("-".to_string(), epoch),
+        p.first_ust.map_or("-".to_string(), |ust| tz.datetime(ust)),
+        p.last_ust.map_or("-".to_string(), |ust| tz.datetime(ust)),
         p.samples,
         p.continuous_intervals,
         p.broken_intervals
@@ -124,9 +116,17 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
         }
     )?;
     let s = &a.report_scope;
+    // `hh:mm:ss` 指定を**どの壁時計として読んだか**を添える。これが無いと、
+    // 報告範囲と画面の時刻が同じ基準かどうか読み手に分からない。
+    // epoch 秒と「指定なし」はタイムゾーンによらないので添えない。
+    let scope_tz = if s.from.is_time_of_day() || s.to.is_time_of_day() {
+        format!(" ({})", tz.label_at(a.period.first_ust.unwrap_or(0)))
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "報告範囲: {} → {}  最低優先度: {}  背景の所見に回す割合: 入力の {}% 以上",
+        "報告範囲: {} → {}{scope_tz}  最低優先度: {}  背景の所見に回す割合: 入力の {}% 以上",
         s.from.label(),
         s.to.label(),
         s.min_priority.label(),
@@ -159,7 +159,7 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     writeln!(out, "所見: {}", crate::analyze::describe_assessment(a))
 }
 
-fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode) -> io::Result<()> {
+fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode, tz: DisplayTz) -> io::Result<()> {
     let ep = &e.episode;
     // **2 つの範囲を区別して出す。** 根拠が及ぶ範囲だけを出すと
     // 「その期間まるごとが 1 つの事象で、内側のエピソードはその一部」と
@@ -168,14 +168,14 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode) -> io::Result<()> {
         out,
         "エピソード {}  検出の始まり {} 〜 {}",
         ep.index + 1,
-        epoch(ep.support.start_ust),
-        epoch(ep.last_onset_ust)
+        tz.datetime(ep.support.start_ust),
+        tz.datetime(ep.last_onset_ust)
     )?;
     writeln!(
         out,
         "              根拠が及ぶ範囲 {} → {} (他のエピソードと重なることがある)",
-        epoch(ep.support.start_ust),
-        epoch(ep.support.end_ust)
+        tz.datetime(ep.support.start_ust),
+        tz.datetime(ep.support.end_ust)
     )?;
     writeln!(out, "  {} {}", e.priority.mark(), e.headline)?;
     // **優先度は検出単位。** 見出しの検出について書いていることを明示する
@@ -229,7 +229,7 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode) -> io::Result<()> {
     }
 
     write_series_rollup(out, ep)?;
-    write_detections(out, ep)?;
+    write_detections(out, ep, tz)?;
 
     if !e.possible_interpretations.is_empty() {
         writeln!(out, "     考えられる解釈 (どれとも断定しない)")?;
@@ -299,13 +299,13 @@ fn write_series_rollup<W: Write>(out: &mut W, ep: &Episode) -> io::Result<()> {
 /// 件数が多い場合は**系列ごとに 1 件**へ絞る。同じ系列の区間を
 /// 優先度順に並べると `pgscand` の 18 件が全枠を埋めてしまい、
 /// 他に何が起きていたか分からなくなる。
-fn write_detections<W: Write>(out: &mut W, ep: &Episode) -> io::Result<()> {
+fn write_detections<W: Write>(out: &mut W, ep: &Episode, tz: DisplayTz) -> io::Result<()> {
     let total = ep.detections.len();
     if total <= MAX_DETAILED_DETECTIONS {
         writeln!(out, "     検出の根拠 (全 {total} 件)")?;
         // 時刻順のまま出す (エピソードの並びと一致させる)
         for d in &ep.detections {
-            write_detection(out, d)?;
+            write_detection(out, d, tz)?;
         }
         return Ok(());
     }
@@ -338,12 +338,12 @@ fn write_detections<W: Write>(out: &mut W, ep: &Episode) -> io::Result<()> {
          全件は --format json / --format ndjson で出る)"
     )?;
     for d in best.into_iter().take(MAX_DETAILED_DETECTIONS) {
-        write_detection(out, d)?;
+        write_detection(out, d, tz)?;
     }
     Ok(())
 }
 
-fn write_detection<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
+fn write_detection<W: Write>(out: &mut W, d: &Detection, tz: DisplayTz) -> io::Result<()> {
     writeln!(
         out,
         "     ・[{}] {}",
@@ -435,6 +435,7 @@ fn write_detection<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
         out,
         &d.decision.observations,
         d.decision.observations_truncated,
+        tz,
     )?;
     write_baseline(out, d)
 }
@@ -443,13 +444,14 @@ fn write_observations<W: Write>(
     out: &mut W,
     observations: &[Observation],
     truncated: bool,
+    tz: DisplayTz,
 ) -> io::Result<()> {
     if observations.is_empty() {
         return Ok(());
     }
     let mut line = String::from("         観測:");
     for o in observations {
-        line.push_str(&format!(" {}={:.2}", hms(o.end_ust), o.value));
+        line.push_str(&format!(" {}={:.2}", tz.time(o.end_ust), o.value));
     }
     if truncated {
         line.push_str(" … (以降は省略)");
@@ -486,7 +488,7 @@ fn write_baseline<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
 /// **エピソードと同じ画面に出す。** 「一日中スワップが使われている」を
 /// 別枠にした理由 (いつの手がかりを持たない) と、そのぶん
 /// エピソードから外れていることを読み手へ伝えるため。
-fn write_background<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
+fn write_background<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
     let excluded = a.report_scope.background_excluded_by_priority;
     if a.background.is_empty() {
         writeln!(
@@ -538,7 +540,7 @@ fn write_background<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
             f.sufficiency.material_samples,
             f.sufficiency.required_samples
         )?;
-        write_detection(out, &b.detection)?;
+        write_detection(out, &b.detection, tz)?;
     }
     if excluded > 0 {
         writeln!(out, "  (優先度の下限で {excluded} 件を除外した)")?;
@@ -694,11 +696,18 @@ fn write_tally<W: Write>(out: &mut W, route: DetectRoute, t: &RouteTally) -> io:
 /// **起動区間ごとの所見を 1 つのドキュメントへ収める。**
 /// 区間ごとに独立した JSON を並べると、先頭の 1 件しか読めない
 /// ドキュメント列になってしまう (`summarize --format json` と同じ方針)。
-pub fn write_json<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Result<()> {
+pub fn write_json<W: Write>(
+    out: &mut W,
+    assessments: &[Assessment],
+    tz: DisplayTz,
+) -> io::Result<()> {
     let doc = serde_json::json!({
         "schema_version": DETECT_SCHEMA_VERSION,
         "assessment_kind": ASSESSMENT_KIND,
         "detector_version": DETECTOR_VERSION,
+        // 時刻そのものは epoch 秒で出す。この欄は `report_scope` の
+        // `hh:mm:ss` をどの壁時計として読んだかを示す。
+        "report_timezone": tz.label_at(report_anchor(assessments)),
         // 起動区間ごとに 1 件。区間をまたいだ検出はしない
         "assessments": assessments,
     });
@@ -710,12 +719,19 @@ pub fn write_json<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Resu
 /// + 背景の所見 1 件 = 1 行 + 網羅度 1 行。
 ///
 /// どの行がどの起動区間のものかを `segment` で示す。
-pub fn write_ndjson<W: Write>(out: &mut W, assessments: &[Assessment]) -> io::Result<()> {
+pub fn write_ndjson<W: Write>(
+    out: &mut W,
+    assessments: &[Assessment],
+    tz: DisplayTz,
+) -> io::Result<()> {
+    let zone = tz.label_at(report_anchor(assessments));
     for (segment, a) in assessments.iter().enumerate() {
         let head = serde_json::json!({
             "schema_version": a.schema_version,
             "record": "detect_header",
             "segment": segment,
+            // 時刻は epoch 秒。この欄は `report_scope` の `hh:mm:ss` の基準。
+            "report_timezone": zone,
             "assessment_kind": a.assessment_kind,
             "detector_version": a.detector_version,
             "catalog_version": a.coverage.catalog_version,
@@ -810,9 +826,12 @@ mod tests {
         }
     }
 
+    /// テストの T0 は UTC 基準に置いた値なので、表記も UTC で確かめる。
+    const TZ: DisplayTz = DisplayTz::Utc;
+
     fn render(a: &Assessment) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        write_text(&mut buf, a).expect("書き出し");
+        write_text(&mut buf, a, TZ).expect("書き出し");
         String::from_utf8(buf).expect("UTF-8")
     }
 
@@ -885,7 +904,7 @@ mod tests {
         let a = assessment(&v);
         let mut buf: Vec<u8> = Vec::new();
         // 起動区間が 2 つあっても 1 つのドキュメントに収まること
-        write_json(&mut buf, &[a.clone(), a]).expect("JSON");
+        write_json(&mut buf, &[a.clone(), a], TZ).expect("JSON");
         let text = String::from_utf8(buf).expect("UTF-8");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("パース");
         assert_eq!(parsed["assessment_kind"], "resarch_detect_assessment");
@@ -905,7 +924,7 @@ mod tests {
         v[11] = 2.0;
         let a = assessment(&v);
         let mut buf: Vec<u8> = Vec::new();
-        write_ndjson(&mut buf, std::slice::from_ref(&a)).expect("NDJSON");
+        write_ndjson(&mut buf, std::slice::from_ref(&a), TZ).expect("NDJSON");
         let text = String::from_utf8(buf).expect("UTF-8");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2 + a.episodes.len() + a.background.len());
@@ -951,7 +970,7 @@ mod tests {
 
         // JSON も同じことを持っている (形式間で表現をずらさない)
         let mut buf: Vec<u8> = Vec::new();
-        write_json(&mut buf, std::slice::from_ref(&a)).expect("JSON");
+        write_json(&mut buf, std::slice::from_ref(&a), TZ).expect("JSON");
         let parsed: serde_json::Value =
             serde_json::from_str(&String::from_utf8(buf).expect("UTF-8")).expect("パース");
         let cov = &parsed["assessments"][0]["coverage"];
@@ -983,7 +1002,7 @@ mod tests {
         assert!(text.contains("エピソードなし"), "{text}");
 
         let mut buf: Vec<u8> = Vec::new();
-        write_json(&mut buf, std::slice::from_ref(&a)).expect("JSON");
+        write_json(&mut buf, std::slice::from_ref(&a), TZ).expect("JSON");
         let parsed: serde_json::Value =
             serde_json::from_str(&String::from_utf8(buf).expect("UTF-8")).expect("パース");
         assert_eq!(
@@ -994,7 +1013,7 @@ mod tests {
         );
 
         let mut buf: Vec<u8> = Vec::new();
-        write_ndjson(&mut buf, std::slice::from_ref(&a)).expect("NDJSON");
+        write_ndjson(&mut buf, std::slice::from_ref(&a), TZ).expect("NDJSON");
         let text = String::from_utf8(buf).expect("UTF-8");
         let records: Vec<String> = text
             .lines()
@@ -1024,7 +1043,7 @@ mod tests {
         assert!(text.contains("件数: 入力全体の検出"), "{text}");
 
         let mut buf: Vec<u8> = Vec::new();
-        write_json(&mut buf, std::slice::from_ref(&a)).expect("JSON");
+        write_json(&mut buf, std::slice::from_ref(&a), TZ).expect("JSON");
         let parsed: serde_json::Value =
             serde_json::from_str(&String::from_utf8(buf).expect("UTF-8")).expect("パース");
         let scope = &parsed["assessments"][0]["report_scope"];
@@ -1033,7 +1052,7 @@ mod tests {
         assert!(scope["episodes_excluded_by_priority"].is_number());
 
         let mut buf: Vec<u8> = Vec::new();
-        write_ndjson(&mut buf, std::slice::from_ref(&a)).expect("NDJSON");
+        write_ndjson(&mut buf, std::slice::from_ref(&a), TZ).expect("NDJSON");
         let first = String::from_utf8(buf)
             .expect("UTF-8")
             .lines()

@@ -149,7 +149,7 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
 resarch detect sa01                      # where and what looks off
 resarch summarize sa01 sa02 --format json
-resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 09:00-18:00 UTC each day
+resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 09:00-18:00 local time each day
 resarch show sa01 --activity irq --irq-cpus --format ndjson  # per-CPU interrupt detail
 resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 ```
@@ -158,10 +158,40 @@ For `summarize` and `compare`, `--from` / `--to` narrow **the aggregation period
 samples outside the range enter neither the mean, the p95, nor the delta totals, and the
 period bounds shrink with them. `detect` reads the same two options differently — they
 narrow what gets reported, not the material its comparison basis is built from.
-All native commands interpret `hh:mm[:ss]` as **UTC**; 10-digit epoch seconds are also
-accepted. `compare` JSON contains `comparisons` and `skipped_metrics`, including the
-hosts missing each skipped metric. IRQ rows carry a `cpu` dimension (`all` or a zero-based
-CPU number); old files without CPU detail emit only `all`.
+Native commands interpret `hh:mm[:ss]` in **the same timezone they display**, local by
+default; 10-digit epoch seconds are also accepted. `compare` JSON contains `comparisons`
+and `skipped_metrics`, including the hosts missing each skipped metric. IRQ rows carry a
+`cpu` dimension (`all` or a zero-based CPU number); old files without CPU detail emit
+only `all`.
+
+#### Timestamp timezone
+
+The native subcommands (`show`, `summarize`, `detect`, `compare`, `tui`) display
+timestamps in **the machine's local timezone**. `--timezone <TZ>` changes the basis and
+accepts `local` (the default), `utc`, or an IANA name such as `Asia/Tokyo`. `--utc` is an
+alias for `--timezone utc`; giving both is an error.
+
+```bash
+resarch summarize sa01                        # 2026-08-31 15:10:01+09:00
+resarch summarize sa01 --utc                  # 2026-08-31 06:10:01Z
+resarch summarize sa01 --timezone Asia/Tokyo  # Japan time on any machine
+```
+
+The same basis interprets `hh:mm[:ss]` in `--from` / `--to`, so the 09:00 on screen and
+the `--from 09:00` you type never disagree. 10-digit epoch seconds stay timezone
+independent. Timezones are named by their IANA name (`Asia/Tokyo`), falling back to a
+numeric offset (`+09:00`) where no IANA name can be determined. Abbreviations like `JST`
+are never used: they collide, and on a DST transition day they cannot tell apart the two
+occurrences of the same wall clock.
+
+Machine-readable formats (json / ndjson / csv) keep `start_epoch` / `end_epoch` as epoch
+seconds regardless of `--timezone`. Only `detect --format json` / `--format ndjson` carry
+`report_timezone`, recording which wall clock `--from` / `--to` were read against.
+
+`info` and `identify` have no such option: they print what the file header states, so
+there is nothing to reopen in the reader's timezone. The compatible entry points
+(`resarch sar`, `resarch sadf`, `resarch sa2sar`) keep upstream sysstat's own rules and
+are unaffected by `--timezone` as well.
 
 ### Browsing interactively (TUI)
 
@@ -188,7 +218,7 @@ It follows the same rules as every other output:
   missing samples and intervals where no delta can be taken are never filled with 0.
 - **`!` before a timestamp marks a discontinuity**, `R` a restart, `C` a comment.
   What happened between two samples was not observed, so points are not joined.
-- Timestamps are **UTC**, and the screen says so.
+- Timestamps use the `--timezone` basis (local by default), and the screen says so.
 
 The TUI needs an interactive terminal. Piped or redirected, it tells you to use
 `resarch show` / `resarch sar` instead.
@@ -231,7 +261,9 @@ Each SVG covers a detected **host, resource and metric**, zoomed to the detectio
 and its surrounding context. The default adds 30 minutes on each side; use
 `300s`, `15m`, `1h` or `0` to change it. Overlapping windows for the same metric
 are merged; distant detections and separate boot segments remain separate.
-Charts use UTC and may include input samples outside `--from` / `--to` as context.
+Charts label times with the `--timezone` basis (local by default), and `index.json`
+records the basis actually used in `timezone`. They may include input samples outside
+`--from` / `--to` as context.
 Chart options do not change detection thresholds or baseline selection.
 
 - SVG files show detection ranges, observations and applicable thresholds or

@@ -5,14 +5,13 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-use chrono::{TimeZone, Utc};
 use serde::Serialize;
 
 use crate::analyze::assessment::{AssessedDetection, Assessment, describe_detection};
 use crate::analyze::summary::{NativePeriodSummary, SummarySource};
 use crate::analyze::timeline::{ExclusionReason, MetricKey, MetricPoint};
 use crate::detect::{DecisionBasis, Detection, ObservationOrigin, SeriesKey};
-use crate::model::Unit;
+use crate::model::{DisplayTz, Unit};
 
 /// 1 枚の図に含まれる所見。優先度・充足度・根拠を元の型で保持する。
 #[derive(Debug, Clone, Serialize)]
@@ -184,14 +183,19 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn epoch(ust: u64) -> String {
-    i64::try_from(ust)
-        .ok()
-        .and_then(|t| Utc.timestamp_opt(t, 0).single())
-        .map_or_else(
-            || format!("epoch {ust}"),
-            |t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        )
+/// 図に書く日時。**タイムゾーンを必ず添える。**
+///
+/// SVG は図だけを切り出して共有されるので、どの基準の時刻かが図の中に
+/// 書かれていないと読めない。
+fn epoch(tz: DisplayTz, ust: u64) -> String {
+    if tz.at(ust).is_none() {
+        return format!("epoch {ust}");
+    }
+    if tz.is_utc() {
+        // `datetime()` の末尾 `Z` と名前を重ねない (`...33Z UTC` になる)。
+        return format!("{} {} UTC", tz.date(ust), tz.time(ust));
+    }
+    format!("{} {}", tz.datetime(ust), tz.label_at(ust))
 }
 
 /// 長いホスト名・日本語名・改行を、幅に収まる行へ分ける。
@@ -404,7 +408,7 @@ impl Coordinates {
 }
 
 /// 1 系列・1 前後窓を、外部依存のない SVG にする。
-pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
+pub fn write_svg<W: Write>(out: &mut W, chart: &Chart, tz: DisplayTz) -> io::Result<()> {
     if chart.window_start_ust > chart.window_end_ust {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -429,8 +433,8 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
         ));
         detail_lines.push(format!(
             "検知を裏付けた範囲: {} → {} ({} 回の採取)",
-            epoch(d.support.start_ust),
-            epoch(d.support.end_ust),
+            epoch(tz, d.support.start_ust),
+            epoch(tz, d.support.end_ust),
             d.support.samples
         ));
         detail_lines.push(describe_detection(d));
@@ -447,8 +451,8 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
         if let DecisionBasis::LevelShift { before, after, .. } = &d.decision.basis {
             detail_lines.push(format!(
                 "分割時刻: {} (前窓の末尾: {})。変化の発生時刻を確定したものではない。色帯は後窓。",
-                epoch(after.start_ust),
-                epoch(before.end_ust)
+                epoch(tz, after.start_ust),
+                epoch(tz, before.end_ust)
             ));
         }
         if d.baseline.may_reflect_the_anomaly() {
@@ -482,8 +486,8 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
         out,
         &format!(
             "{} → {} / 前後 {} 秒 (入力・起動区間の端で制限)",
-            epoch(chart.window_start_ust),
-            epoch(chart.window_end_ust),
+            epoch(tz, chart.window_start_ust),
+            epoch(tz, chart.window_end_ust),
             chart.context_secs
         ),
         &mut y,
@@ -537,7 +541,7 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
                 out,
                 "<path class=\"split\" d=\"M {x:.2} {top:.2} V {:.2}\"><title>分割時刻: {}。確定した発生時刻ではない</title></path>",
                 top + PLOT_HEIGHT,
-                escape(&epoch(after.start_ust))
+                escape(&epoch(tz, after.start_ust))
             )?;
         }
     }
@@ -566,19 +570,12 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
             }
             previous_tick = time;
             let x = coords.x(time);
-            let label = i64::try_from(time)
-                .ok()
-                .and_then(|t| Utc.timestamp_opt(t, 0).single())
-                .map_or_else(
-                    || time.to_string(),
-                    |t| {
-                        if chart.window_end_ust - chart.window_start_ust >= 86_400 {
-                            t.format("%m-%d %H:%M").to_string()
-                        } else {
-                            t.format("%H:%M:%S").to_string()
-                        }
-                    },
-                );
+            // 1 日以上に及ぶ窓では日付も出す (同じ時刻が何度も現れるため)
+            let label = if chart.window_end_ust - chart.window_start_ust >= 86_400 {
+                tz.month_day_time(time)
+            } else {
+                tz.time(time)
+            };
             writeln!(
                 out,
                 "<path class=\"axis time-tick\" d=\"M {x:.2} {top:.2} V {:.2}\"/><text x=\"{x:.2}\" y=\"{:.2}\" text-anchor=\"middle\">{}</text>",
@@ -613,7 +610,7 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
             writeln!(
                 out,
                 "<desc>欠測: {} ({})</desc>",
-                escape(&epoch(p.end_ust)),
+                escape(&epoch(tz, p.end_ust)),
                 p.reason.map_or("値なし", ExclusionReason::as_str)
             )?;
             continue;
@@ -631,13 +628,13 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
         let duration = if chart.origin.is_instant() {
             "瞬時値".into()
         } else {
-            format!("区間 {} → {}", epoch(p.start_ust), epoch(p.end_ust))
+            format!("区間 {} → {}", epoch(tz, p.start_ust), epoch(tz, p.end_ust))
         };
         writeln!(
             out,
             "<circle class=\"sample\" cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"3\" fill=\"#0369a1\" data-time=\"{}\" data-value=\"{value}\"><title>{}: {value}{} ({})</title></circle>",
             p.end_ust,
-            escape(&epoch(p.end_ust)),
+            escape(&epoch(tz, p.end_ust)),
             escape(unit_symbol(chart.unit)),
             escape(&duration)
         )?;
@@ -660,9 +657,9 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart) -> io::Result<()> {
         out,
         "<text x=\"{LEFT}\" y=\"{:.2}\">{}</text><text x=\"{RIGHT}\" y=\"{:.2}\" text-anchor=\"end\">{}</text>",
         top + PLOT_HEIGHT + 25.0,
-        escape(&epoch(chart.window_start_ust)),
+        escape(&epoch(tz, chart.window_start_ust)),
         top + PLOT_HEIGHT + 25.0,
-        escape(&epoch(chart.window_end_ust))
+        escape(&epoch(tz, chart.window_end_ust))
     )?;
     writeln!(
         out,
@@ -714,9 +711,12 @@ mod tests {
         (summary, assessment)
     }
 
+    /// テストの T0 は UTC 基準に置いた値なので、描画も UTC で確かめる。
+    const TZ: DisplayTz = DisplayTz::Utc;
+
     fn rendered(chart: &Chart) -> String {
         let mut bytes = Vec::new();
-        write_svg(&mut bytes, chart).unwrap();
+        write_svg(&mut bytes, chart, TZ).unwrap();
         String::from_utf8(bytes).unwrap()
     }
 
@@ -942,8 +942,8 @@ mod tests {
         assert_eq!(svg.matches("class=\"axis time-tick\"").count(), 3);
         assert!(svg.contains(&format!(
             "検知を裏付けた範囲: {} → {}",
-            epoch(T0 + 10 * STEP_SECS),
-            epoch(T0 + 12 * STEP_SECS)
+            epoch(TZ, T0 + 10 * STEP_SECS),
+            epoch(TZ, T0 + 12 * STEP_SECS)
         )));
     }
 

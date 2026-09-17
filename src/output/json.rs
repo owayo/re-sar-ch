@@ -29,7 +29,7 @@ use super::sadf::{FileInfo, spec};
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
 use crate::layout::registry::{ActivityDef, ColumnMeta};
-use crate::model::{ActivityId, Availability, ValueKind};
+use crate::model::{ActivityId, Availability, DisplayTz, ValueKind};
 use crate::output::time_filter::{Admit, TimeFilter};
 use crate::series::compute::ComputeIssue;
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
@@ -78,6 +78,12 @@ pub struct CustomConfig {
     pub time_filter: TimeFilter,
     /// IRQ の集約行に加えて、記録されている CPU 別内訳を出す。
     pub irq_cpus: bool,
+    /// 時刻の表示と `--from` / `--to` の解釈に使うタイムゾーン。
+    ///
+    /// **`time_filter.basis` と必ず同じ基準にする。** 表示だけ動かすと、
+    /// 画面に出ている 09:00 と `--from 09:00` が食い違う。
+    /// epoch 秒で出す項目 (`start_epoch` / `end_epoch`) はここで変わらない。
+    pub tz: DisplayTz,
 }
 
 // ===========================================================================
@@ -92,16 +98,19 @@ pub struct HostOut {
     pub release: String,
     pub machine: String,
     pub cpu_count: u32,
-    /// ファイル作成日 (`YYYY-MM-DD`)。
+    /// ファイル作成日 (`YYYY-MM-DD`)。表示タイムゾーンで開いた日付。
     pub file_date: String,
-    /// 収集時のタイムゾーン名。古いファイルでは空。
+    /// **採取したホストの**タイムゾーン名 (`sa_tzname`)。古いファイルでは空。
+    ///
+    /// 表示に使っているタイムゾーンではない。読み手側の基準は `--timezone`
+    /// が決める (既定はローカル)。両者は普通は違う。
     pub timezone: String,
     /// 出典 (読み込んだファイルのパス)。
     pub source: String,
 }
 
 impl HostOut {
-    pub fn new(file: &SaFile) -> Self {
+    pub fn new(file: &SaFile, tz: DisplayTz) -> Self {
         let info = FileInfo::from_file(file);
         Self {
             hostname: info.nodename,
@@ -109,7 +118,9 @@ impl HostOut {
             release: info.release,
             machine: info.machine,
             cpu_count: info.cpu_count,
-            file_date: info.file_date,
+            // `FileInfo::file_date` は sadf 既定 (UTC) の日付なので使わない。
+            // 独自出力の日付は表示タイムゾーンで開く。
+            file_date: tz.date(info.ust_time),
             timezone: info.tzname,
             source: file.path().display().to_string(),
         }
@@ -545,7 +556,7 @@ pub fn selected_ids(view: &IntervalView<'_>, _cfg: &CustomConfig) -> Vec<Activit
 /// 文書全体を組み立ててから書くのではなく、**サンプル 1 つずつ**直列化する。
 /// 保持するのは 1 レコード分だけ。
 pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> Result<()> {
-    let host = HostOut::new(file);
+    let host = HostOut::new(file, cfg.tz);
     let head = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "host": host,

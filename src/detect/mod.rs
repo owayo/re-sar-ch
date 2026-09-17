@@ -92,7 +92,7 @@ use serde::Serialize;
 use crate::analyze::assessment::SeriesEvaluation;
 use crate::analyze::metric_catalog::{self, CatalogEntry, ShiftMagnitude};
 use crate::analyze::timeline::{MetricKey, MetricTimeline, Timelines};
-use crate::model::{ActivityId, Unit, ValueKind};
+use crate::model::{ActivityId, DisplayTz, Unit, ValueKind};
 
 /// 検出出力のスキーマ版。出力契約として固定する (`docs/design.md` §11)。
 pub const DETECT_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
@@ -928,7 +928,7 @@ pub enum ReportBound {
     None,
     /// エポック秒。
     Epoch(u64),
-    /// 時刻 (UTC)。UTC の毎日の時刻として比較する。
+    /// 時刻。**毎日の壁時計**として比較する ([`ReportWindow::tz`] の基準)。
     TimeOfDay { hour: u8, min: u8, sec: u8 },
 }
 
@@ -969,6 +969,12 @@ impl ReportBound {
 pub struct ReportWindow {
     pub from: ReportBound,
     pub to: ReportBound,
+    /// `hh:mm[:ss]` をどのタイムゾーンの壁時計として読むか。
+    ///
+    /// **レポートの表示と同じ基準にする。** 表示を JST にしたまま
+    /// 日内境界を UTC で切ると、`--from 09:00` が画面の 09:00 と 9 時間ずれる。
+    /// `epoch` 指定の境界はタイムゾーンによらない。
+    pub tz: DisplayTz,
 }
 
 impl ReportWindow {
@@ -1003,8 +1009,14 @@ impl ReportWindow {
         if end_ust.saturating_sub(start_ust) >= 86_400 {
             return true;
         }
-        // 検出区間が占める「時刻」も日跨ぎし得る弧なので、弧同士の重なりを見る
-        arcs_overlap(start_ust % 86_400, end_ust % 86_400, lo, hi)
+        // 検出区間が占める「時刻」も日跨ぎし得る弧なので、弧同士の重なりを見る。
+        // 日内秒は表示と同じタイムゾーンで取る (`% 86_400` は UTC 固定になる)。
+        arcs_overlap(
+            self.tz.seconds_of_day(start_ust),
+            self.tz.seconds_of_day(end_ust),
+            lo,
+            hi,
+        )
     }
 }
 
@@ -1104,6 +1116,10 @@ pub struct DetectOptions {
     pub baseline_scope: BaselineScope,
     pub report_from: ReportBound,
     pub report_to: ReportBound,
+    /// `report_from` / `report_to` の `hh:mm[:ss]` を読むタイムゾーン。
+    ///
+    /// レポート出力に使うものと同じ値を入れる (CLI は `--timezone` で 1 つに決める)。
+    pub tz: DisplayTz,
     pub thresholds: DetectThresholds,
 }
 
@@ -1509,6 +1525,7 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
     let window = ReportWindow {
         from: opts.report_from,
         to: opts.report_to,
+        tz: opts.tz,
     };
 
     let mut seen: Vec<&'static CatalogEntry> = Vec::new();
@@ -2045,6 +2062,8 @@ mod tests {
     #[test]
     fn a_time_of_day_bound_is_not_resolved_against_the_first_day() {
         let w = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::TimeOfDay {
                 hour: 3,
                 min: 0,
@@ -2064,6 +2083,37 @@ mod tests {
         assert!(!w.admits(same_day_1500, same_day_1500 + 600));
     }
 
+    /// 日内境界は**表示と同じタイムゾーン**で切る。
+    ///
+    /// `epoch % 86_400` で日内秒を出すと UTC 固定になり、
+    /// 画面が JST でも `--from 09:00` だけが UTC の 09:00 を指してしまう。
+    #[test]
+    fn the_report_window_cuts_the_day_in_the_display_timezone() {
+        let window = |tz| ReportWindow {
+            tz,
+            from: ReportBound::TimeOfDay {
+                hour: 9,
+                min: 0,
+                sec: 0,
+            },
+            to: ReportBound::TimeOfDay {
+                hour: 10,
+                min: 0,
+                sec: 0,
+            },
+        };
+        // T0 = 2026-01-01 00:00:00 UTC = 同日 09:00 JST。
+        // UTC 基準では 00:00 なので外れ、JST 基準では 09:00 なので当たる。
+        let jst = DisplayTz::parse("Asia/Tokyo").expect("Asia/Tokyo");
+        assert!(!window(DisplayTz::Utc).admits(T0, T0 + 600));
+        assert!(window(jst).admits(T0, T0 + 600));
+
+        // 逆向きも見る。UTC の 09:00 は JST では 18:00 なので範囲外。
+        let utc_0900 = T0 + 9 * 3600;
+        assert!(window(DisplayTz::Utc).admits(utc_0900, utc_0900 + 600));
+        assert!(!window(jst).admits(utc_0900, utc_0900 + 600));
+    }
+
     /// 報告範囲を**包含する**検出を捨てない。
     ///
     /// 08:00〜12:00 に及ぶ検出へ `--from 09:00 --to 10:00` を指定すると、
@@ -2073,6 +2123,8 @@ mod tests {
     #[test]
     fn a_detection_that_contains_the_report_window_is_kept() {
         let by_time = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::TimeOfDay {
                 hour: 9,
                 min: 0,
@@ -2085,6 +2137,8 @@ mod tests {
             },
         };
         let by_epoch = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::Epoch(T0 + 9 * 3600),
             to: ReportBound::Epoch(T0 + 10 * 3600),
         };
@@ -2111,6 +2165,8 @@ mod tests {
     #[test]
     fn overlap_is_detected_across_midnight_on_both_sides() {
         let overnight = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::TimeOfDay {
                 hour: 0,
                 min: 30,
@@ -2127,6 +2183,8 @@ mod tests {
         assert!(overnight.admits(start, start + 4 * 3600));
 
         let window = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::TimeOfDay {
                 hour: 22,
                 min: 0,
@@ -2148,6 +2206,8 @@ mod tests {
     #[test]
     fn an_overnight_window_wraps_around_midnight() {
         let w = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::TimeOfDay {
                 hour: 22,
                 min: 0,
@@ -2179,6 +2239,8 @@ mod tests {
     #[test]
     fn an_epoch_bound_is_compared_absolutely() {
         let w = ReportWindow {
+            // T0 は UTC 基準に置いた値なので、日内境界も UTC で見る
+            tz: DisplayTz::Utc,
             from: ReportBound::Epoch(T0 + 3600),
             to: ReportBound::None,
         };

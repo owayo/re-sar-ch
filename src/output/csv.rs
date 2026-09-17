@@ -73,7 +73,7 @@ pub fn write_csv_with<W: Write>(
     cfg: &CustomConfig,
     header: bool,
 ) -> Result<()> {
-    let host = HostOut::new(file);
+    let host = HostOut::new(file, cfg.tz);
     let mut w = csv::WriterBuilder::new().from_writer(out);
     if header {
         w.write_record(HEADER).map_err(csv_err)?;

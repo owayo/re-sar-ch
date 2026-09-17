@@ -965,7 +965,8 @@ pub enum ReportBoundary {
     Unbounded,
     /// エポック秒。
     Epoch { ust: u64 },
-    /// 毎日の時刻 (UTC)。
+    /// 毎日の時刻。どの壁時計として読んだかは報告側が添える
+    /// (`detect` のテキストは表示タイムゾーン、JSON は `report_timezone`)。
     TimeOfDay { hour: u8, min: u8, sec: u8 },
 }
 
@@ -978,6 +979,13 @@ impl ReportBoundary {
                 ReportBoundary::TimeOfDay { hour, min, sec }
             }
         }
+    }
+
+    /// 壁時計として指定されたか (タイムゾーンの表記が要るか)。
+    ///
+    /// epoch 秒と「指定なし」はタイムゾーンによらないので、添えると誤解を招く。
+    pub fn is_time_of_day(self) -> bool {
+        matches!(self, ReportBoundary::TimeOfDay { .. })
     }
 
     /// 1 行の表記。

@@ -22,6 +22,9 @@
 //! 時分秒。epoch 秒 (10 桁) で与えた場合は `record_header.ust_time` と直接
 //! 比較するので TZ の影響を受けない。
 //!
+//! 独自コマンド (`show` / `summarize` / `compare`) は [`TimeBasis::Zone`] を使い、
+//! `--timezone` が決めた表示タイムゾーンでそのまま比べる (既定はローカル)。
+//!
 //! # 日跨ぎ (`cross_day`)
 //!
 //! `hh:mm:ss` 形式で `-e` < `-s` のとき、本家は `tm_end.tm_hour += 24` して
@@ -82,6 +85,14 @@ pub enum TimeBasis {
     Utc,
     /// レコードに焼き込まれた時分秒 (`-t`)。
     Recorded,
+    /// 独自出力の表示タイムゾーン (`--timezone`)。
+    ///
+    /// **独自コマンドはここを使う。** 表示と比較を同じ基準に揃えるため、
+    /// `json::CustomConfig::tz` と必ず同じ値を入れる。
+    /// 互換出力 (`sar` / `sadf`) は上の 3 つのまま — あちらの基準は
+    /// 本家のオプション (`-T` / `-t` / 既定) が決めるので、
+    /// `--timezone` を持ち込むと全文一致が崩れる。
+    Zone(crate::model::DisplayTz),
 }
 
 /// `cross_day` を立てる規則 (§1.9)。
@@ -161,6 +172,15 @@ impl TimeFilter {
                 .timestamp_opt(ust_time as i64, 0)
                 .single()
                 .map(|dt| from(&dt, ust_time))
+                .unwrap_or(recorded),
+            TimeBasis::Zone(tz) => tz
+                .hms(ust_time)
+                .map(|(hour, min, sec)| RecTime {
+                    hour,
+                    min,
+                    sec,
+                    epoch: ust_time,
+                })
                 .unwrap_or(recorded),
         }
     }

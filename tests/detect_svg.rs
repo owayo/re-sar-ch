@@ -114,9 +114,55 @@ fn detects_local_windows_per_resource_and_keeps_the_normal_report() {
         assert!(svg.contains("<svg") && svg.ends_with("</svg>\n"));
         assert!(svg.contains("chart&lt;&amp;host"));
         assert!(!svg.contains("chart<&host"));
-        assert!(svg.contains("UTC"));
+        // 既定は実行環境のタイムゾーン。図は単体で共有されるので、
+        // どの基準の時刻かを図の中に必ず書く。
+        assert!(
+            svg.contains("Pacific/Honolulu"),
+            "図に基準のタイムゾーンが無い"
+        );
         assert!(!svg.contains("NaN") && !svg.contains("Infinity"));
     }
+    // 既定の基準は index.json にも入る。
+    assert_eq!(manifest["timezone"], "Pacific/Honolulu");
+}
+
+/// `--timezone utc` / `--utc` は実行環境のタイムゾーンより優先される。
+#[test]
+fn the_timezone_flag_overrides_the_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = source(temp.path(), "tzhost", true);
+    for flag in [vec!["--timezone", "utc"], vec!["--utc"]] {
+        let dir = temp.path().join(format!("charts-{}", flag.len()));
+        let out = run(&input, &dir, &flag);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let manifest = index(&dir);
+        assert_eq!(manifest["timezone"], "UTC", "{flag:?}");
+        for chart in manifest["charts"].as_array().unwrap() {
+            let file = chart["file"].as_str().unwrap();
+            let svg = std::fs::read_to_string(dir.join(file)).unwrap();
+            assert!(svg.contains("UTC"), "{flag:?}: {file}");
+            assert!(!svg.contains("Pacific/Honolulu"), "{flag:?}: {file}");
+        }
+    }
+}
+
+/// `--timezone` と `--utc` の同時指定は弾く (どちらが勝つか曖昧にしない)。
+#[test]
+fn timezone_and_utc_cannot_be_combined() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = source(temp.path(), "tzhost", true);
+    let out = run(
+        &input,
+        &temp.path().join("charts-conflict"),
+        &["--timezone", "utc", "--utc"],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--utc"), "{err}");
 }
 
 #[test]

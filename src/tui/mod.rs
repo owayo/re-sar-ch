@@ -1066,28 +1066,38 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 format!("{}  {}", hhmmss(app.tz, note.epoch), note.text)
             } else {
                 let n = app.filtered_items().len();
-                // **押しても効かないキーを案内しない。** 端末が低くてグラフを
-                // 出せないときは、限られた 1 行をグラフの説明で埋めない。
-                let graph = if app.graph_visible() {
-                    "c 列  [] 送り  v グラフ  "
-                } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
-                    "c 列  v グラフ  "
+                // **右に続きがあるときだけ横送りを案内する。**
+                // 全部入っているときは押す理由が無いので出さない。逆に切れている
+                // ときは、案内が無いと右に列があること自体に気づけない。
+                let scroll = if app.visible_cols < app.table_columns().len() {
+                    "shift←→ 横  "
                 } else {
-                    "c 列  "
+                    ""
                 };
-                // **横送り (`shift` + 矢印) はここに出さない。**
-                // 列が入り切るかどうかで案内が出たり消えたりすると、
-                // 目の高さにある 1 行の中身が落ち着かない。`?` のヘルプに載せる。
-                let full = format!(
-                    "←→ activity  ↑↓ 時刻  i item ({n})  / 絞り込み  home/end 端  {graph}? help  q 終了"
-                );
-                // 幅に入らないときは短い方を出す。途中で切れて語の途中で
-                // 終わるより、短くても最後まで読める方が案内になる。
-                if text_width(&full) <= area.width as usize {
-                    full
+                let graph_keys = if app.graph_visible() {
+                    "[] 送り  v グラフ  "
+                } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
+                    "v グラフ  "
                 } else {
-                    format!("←→ act  ↑↓ 時刻  i item  {graph}? help  q")
-                }
+                    ""
+                };
+                // **幅に入る最初のものを出す。** 途中で切れて語の途中で終わると、
+                // 案内どころか何のキーか読めない。優先度の低いものから落とす
+                // (最後まで残すのは `?` と `q` — ここから先は調べられる)。
+                let candidates = [
+                    format!(
+                        "←→ activity  ↑↓ 時刻  {scroll}i item ({n})  / 絞り込み  home/end 端  c 列  {graph_keys}? help  q 終了"
+                    ),
+                    format!("←→ act  ↑↓ 時刻  {scroll}i item  c 列  {graph_keys}? help  q"),
+                    format!("←→ act  ↑↓ 時刻  {scroll}i item  c 列  ? help  q"),
+                    format!("←→ act  ↑↓ 時刻  {scroll}? help  q"),
+                    format!("{scroll}? help  q"),
+                    "? help  q".to_string(),
+                ];
+                candidates
+                    .into_iter()
+                    .find(|c| text_width(c) <= area.width as usize)
+                    .unwrap_or_else(|| "?".to_string())
             }
         }
     };
@@ -1565,10 +1575,28 @@ mod tests {
     /// ダンプ文字列の長さからは実際の表示幅を数えられない。
     #[test]
     fn the_hint_fits_the_terminal_width() {
+        // 列を増やして横送りの案内も出る状態にする (行が最も長くなる条件)
         let mut app = app_with(&[Some(1.0), Some(2.0), Some(3.0)], &[]);
-        for w in [80u16, 100, 120] {
+        for i in 0..9 {
+            let name: &'static str = Box::leak(format!("col{i}").into_boxed_str());
+            for s in &mut app.samples {
+                s.activities[0].items[0].rates.push(FieldOut {
+                    name,
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    value: Some(11_111_111.0),
+                    text: None,
+                    quality: Quality::Ok,
+                });
+            }
+        }
+        for w in [40u16, 46, 50, 60, 70, 80, 100, 120] {
+            // 1 度描いて「何列入ったか」を確定させてから測る
+            render(&mut app, w, 40);
             let screen = render(&mut app, w, 40);
             let hint = screen.lines().last().unwrap();
+            // **どの幅でも最後まで読める。** 途中で切れると何のキーか分からない。
             assert!(shows(hint, "q"), "幅 {w} で末尾まで出る: {hint}");
             assert_eq!(
                 hint.chars().last(),
@@ -1834,12 +1862,9 @@ mod tests {
         assert!(shows(&back, "user"), "{back}");
     }
 
-    /// 横送りはヒント行に出さず、ヘルプに載せる。
-    ///
-    /// 列が入り切るかどうかで案内が出たり消えたりすると、
-    /// 目の高さにある 1 行の中身が落ち着かない。
+    /// 横送りの案内は、右に続きがあるときだけヒント行に出す。
     #[test]
-    fn sideways_scrolling_lives_in_the_help_not_the_hint_line() {
+    fn the_hint_mentions_sideways_scrolling_only_when_columns_are_cut_off() {
         let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
         for i in 0..9 {
             let name: &'static str = Box::leak(format!("col{i}").into_boxed_str());
@@ -1863,12 +1888,23 @@ mod tests {
             "列は入り切らない"
         );
         let hint = screen.lines().last().unwrap();
-        assert!(!shows(hint, "shift"), "ヒント行には出さない: {hint}");
+        assert!(shows(hint, "shift←→"), "右に続きがあるなら出す: {hint}");
 
-        // ヘルプには載っている
+        // **狭い画面でも消さない。** 狭いほど列は切れるので、そこでこそ要る案内。
+        let screen = render(&mut app, 46, 40);
+        let hint = screen.lines().last().unwrap();
+        assert!(shows(hint, "shift←→"), "短縮版でも残す: {hint}");
+
+        // 列が全部入るなら出さない (押す理由が無い)
+        let mut narrow = app_with(&[Some(1.0), Some(2.0)], &[]);
+        render(&mut narrow, 80, 40);
+        let screen = render(&mut narrow, 80, 40);
+        let hint = screen.lines().last().unwrap();
+        assert!(!shows(hint, "shift"), "全部入るなら出さない: {hint}");
+
+        // ヘルプには常に載っている
         on_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
         let help = render(&mut app, 80, 40);
-        assert!(shows(&help, "shift"), "ヘルプには載せる: {help}");
         assert!(shows(&help, "表を横に送る"), "{help}");
     }
 

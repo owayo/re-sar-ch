@@ -574,8 +574,10 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         datasets.push(
             Dataset::default()
                 .graph_type(GraphType::Line)
-                .marker(symbols::Marker::Bar)
-                .style(Style::default().fg(Color::DarkGray))
+                // 観測値と同じ Braille で細く引く。太いマーカーだと
+                // カーソルが値の線より目立って、形が読み取りにくい。
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::Red))
                 .data(c),
         );
     }
@@ -1216,6 +1218,39 @@ mod tests {
         // 高い端末でも上限を超えて広げない
         assert_eq!(graph_height(GraphVisibility::Auto, 200), 14);
         assert_eq!(graph_height(GraphVisibility::Auto, 30), 7);
+    }
+
+    /// カーソルは観測値と同じ細さで、色で区別する。
+    #[test]
+    fn the_cursor_is_thin_and_red() {
+        let mut app = app_with(&[Some(1.0), Some(2.0), Some(3.0)], &[]);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let mut red = 0usize;
+        let mut cyan = 0usize;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                // Braille (U+28xx) で描かれた点だけを数える。
+                let braille = cell
+                    .symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+                if !braille {
+                    continue;
+                }
+                match cell.style().fg {
+                    Some(Color::Red) => red += 1,
+                    Some(Color::Cyan) => cyan += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(red > 0, "選択時刻のカーソルが赤で出る");
+        assert!(cyan > 0, "観測値の線は別の色で出る");
     }
 
     /// 実ファイルの描画を目で見るための一時確認。

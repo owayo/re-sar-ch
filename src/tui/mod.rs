@@ -48,6 +48,18 @@ use crate::series::{RecordEvent, WalkItem, walk_items};
 /// 値が無いことを表す記号。**0 とは別物**。
 const ABSENT: &str = "—";
 
+/// グラフの観測値の線の色。
+///
+/// **表の見出しと共有する。** グラフに描いている列がどれなのかを、
+/// 上の線と下の列名で同じ色にして結びつける。
+const GRAPH_LINE_COLOR: Color = Color::Cyan;
+
+/// 表で選んでいる時刻を指すカーソルの色。
+///
+/// 観測値の線と補色に近いものを選ぶ。赤と緑の対比は避ける
+/// (色覚によっては区別できない)。
+const GRAPH_CURSOR_COLOR: Color = Color::Red;
+
 // ===========================================================================
 // 収集
 // ===========================================================================
@@ -711,7 +723,7 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
                 // 観測値と同じ Braille で細く引く。太いマーカーだと
                 // カーソルが値の線より目立って、形が読み取りにくい。
                 .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(GRAPH_CURSOR_COLOR))
                 .data(c),
         );
     }
@@ -720,7 +732,7 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
             Dataset::default()
                 .graph_type(GraphType::Line)
                 .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Cyan))
+                .style(Style::default().fg(GRAPH_LINE_COLOR))
                 .data(seg),
         );
     }
@@ -851,8 +863,23 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         title.push_str(&format!(" 他 {hidden} 列 (c で選ぶ) "));
     }
 
+    // グラフに描いている列は、表の見出しも同じ色にする。
+    // **グラフの線と同じ色を使う** — 「どの列が上の線なのか」を色で結びつける。
+    // グラフが出ていないときは色を付けない (対応する線が無い)。
+    let graphed = app.graph_visible().then(|| app.selected_column()).flatten();
     let mut header: Vec<Cell> = vec![Cell::from("time")];
-    header.extend(cols.iter().map(|c| Cell::from(*c)));
+    header.extend(cols.iter().map(|c| {
+        let cell = Cell::from(*c);
+        if Some(*c) == graphed {
+            cell.style(
+                Style::default()
+                    .fg(GRAPH_LINE_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            cell
+        }
+    }));
 
     let rows: Vec<Row> = app
         .samples
@@ -931,7 +958,7 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 // **押しても効かないキーを案内しない。** 端末が低くてグラフを
                 // 出せないときは、限られた 1 行をグラフの説明で埋めない。
                 let graph = if app.graph_visible() {
-                    "c 列  <> 送り  v グラフ  "
+                    "c 列  [] 送り  v グラフ  "
                 } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
                     "c 列  v グラフ  "
                 } else {
@@ -1096,7 +1123,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("i           item を選ぶ"),
         Line::from("/           item を名前で絞り込む"),
         Line::from("c           列を選ぶ (表に出す列とグラフの列)"),
-        Line::from("<  >        グラフの列を前 / 次へ"),
+        Line::from("[  ]        グラフの列を前 / 次へ"),
         Line::from("v           グラフの表示を切り替える"),
         Line::from("?           このヘルプ"),
         Line::from("q  ctrl-c   終了"),
@@ -1190,8 +1217,8 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char('i') => app.mode = Mode::PickItem,
             KeyCode::Char('c') => app.open_column_picker(),
             // グラフの列送り。`←` / `→` は activity に使っているので別のキーにする。
-            KeyCode::Char('<') => app.move_col(-1),
-            KeyCode::Char('>') => app.move_col(1),
+            KeyCode::Char('[') => app.move_col(-1),
+            KeyCode::Char(']') => app.move_col(1),
             KeyCode::Char('v') => app.toggle_graph(),
             KeyCode::Char('/') => {
                 app.filter.clear();
@@ -1595,9 +1622,9 @@ mod tests {
         );
     }
 
-    /// `<` / `>` でグラフの列が送られる。
+    /// `[` / `]` でグラフの列が送られる。
     #[test]
-    fn angle_brackets_step_through_the_graph_metric() {
+    fn brackets_step_through_the_graph_metric() {
         let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
         // 描ける列を 3 本にする
         for s in &mut app.samples {
@@ -1616,15 +1643,64 @@ mod tests {
         assert_eq!(app.plottable_columns(), vec!["user", "b", "c"]);
         assert_eq!(app.selected_column(), Some("user"));
 
-        on_key(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
         assert_eq!(app.selected_column(), Some("b"));
-        on_key(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
         assert_eq!(app.selected_column(), Some("c"));
         // 端で巻き戻る (止まると「壊れた」ように見える)
-        on_key(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
         assert_eq!(app.selected_column(), Some("user"));
-        on_key(&mut app, KeyCode::Char('<'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
         assert_eq!(app.selected_column(), Some("c"));
+    }
+
+    /// グラフに描いている列は、表の見出しも同じ色にする。
+    #[test]
+    fn the_graphed_column_is_highlighted_in_the_table_header() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.push(FieldOut {
+                name: "other",
+                unit: "percent",
+                kind: "counter",
+                raw: None,
+                value: Some(5.0),
+                text: None,
+                quality: Quality::Ok,
+            });
+        }
+        assert_eq!(app.selected_column(), Some("user"));
+
+        let fg_of = |app: &mut App, needle: &str| -> Option<Color> {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 40)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // 表の見出し行を探す (time 列の右に列名が並ぶ行)
+            for y in 0..buf.area.height {
+                let line: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>();
+                if line.contains("time") && line.contains(needle) {
+                    let x = line.find(needle).unwrap() as u16;
+                    return buf[(x, y)].style().fg;
+                }
+            }
+            None
+        };
+        // グラフに出ている列だけが線と同じ色になる
+        assert_eq!(fg_of(&mut app, "user"), Some(GRAPH_LINE_COLOR));
+        assert_ne!(fg_of(&mut app, "other"), Some(GRAPH_LINE_COLOR));
+
+        // 列を送れば、色が付く列も移る
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("other"));
+        assert_eq!(fg_of(&mut app, "other"), Some(GRAPH_LINE_COLOR));
+        assert_ne!(fg_of(&mut app, "user"), Some(GRAPH_LINE_COLOR));
+
+        // グラフを隠せば色は付かない (対応する線が無い)
+        on_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(!app.graph_visible());
+        assert_ne!(fg_of(&mut app, "other"), Some(GRAPH_LINE_COLOR));
     }
 
     /// カーソルは観測値と同じ細さで、色で区別する。

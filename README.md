@@ -214,7 +214,7 @@ the finger runs the wrong feature instead of doing nothing.
 | `i` | pick an item (device, interface, CPU) |
 | `/` | filter items by name |
 | `c` | choose columns (both the table's and the graph's) |
-| `<` / `>` | previous / next metric |
+| `[` / `]` | previous / next metric |
 | `v` | show or hide the graph |
 | `?` | key reference |
 | `q`, `ctrl-c` | quit |
@@ -236,9 +236,10 @@ squash to a few digits each and none of them stay readable. The table narrows th
 annotated as such. Widths are computed from every sample, so scrolling through rows never
 makes them jump.
 
-The graph plots one series — the selected activity, item and metric. A vertical cursor
-marks the timestamp selected in the table, so both halves of the screen point at the same
-moment. On short terminals (24 rows or fewer) it stays hidden by default: a table reduced
+The graph plots one series — the selected activity, item and metric. **The header of the
+graphed column is drawn in the same colour as the line**, so it is obvious which column is
+on the chart. A vertical cursor marks the timestamp selected in the table, so both halves
+of the screen point at the same moment. On short terminals (24 rows or fewer) it stays hidden by default: a table reduced
 to a couple of rows can no longer be navigated. `v` forces it down to 18 rows; below that
 it cannot be shown at all.
 

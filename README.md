@@ -210,11 +210,25 @@ graph above it.
 | `g` / `G` | first / last |
 | `i` | pick an item (device, interface, CPU) |
 | `/` | filter items by name |
+| `C` | choose which columns the table shows (`Space` toggles, `a` all) |
 | `c` | pick the metric to graph |
 | `[` / `]` | previous / next metric |
 | `v` | show or hide the graph |
 | `?` | key reference |
 | `q`, `Ctrl-C` | quit |
+
+Activities with many columns (MEMORY has 19) cannot all fit: laid out side by side they
+squash to a few digits each and none of them stay readable. The table narrows them two ways.
+
+- **Columns that never carried a value are dropped by default.** Fields the source
+  generation never had, and metrics that are not implemented, show `—` on every row and do
+  nothing but push the columns you wanted off the screen.
+- **Columns that do not fit the width are dropped rather than squashed.** The count is
+  stated in the title (`他 15 列 (C で選ぶ)`), so nothing disappears silently.
+
+`C` opens the column list: `Space` toggles one, `a` switches between every column and the
+default, `Enter` applies. Columns without values are listed too, annotated as such. Widths
+are computed from every sample, so scrolling through rows never makes them jump.
 
 The graph plots one series — the selected activity, item and metric. A vertical cursor
 marks the timestamp selected in the table, so both halves of the screen point at the same

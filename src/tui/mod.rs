@@ -127,8 +127,10 @@ enum Mode {
     Normal,
     /// item 選択のポップアップ。
     PickItem,
-    /// グラフに描く列を選ぶポップアップ。
+    /// グラフに描く列を選ぶポップアップ (1 列)。
     PickColumn,
+    /// 表に出す列を選ぶポップアップ (複数)。
+    PickTableColumns,
     /// 絞り込み入力中。**ここでは `q` は文字であって終了ではない**。
     Filter,
     /// ヘルプ。
@@ -205,8 +207,10 @@ struct App {
     last_height: u16,
     table: TableState,
     picker: ListState,
-    /// 列ピッカーの選択位置。
+    /// グラフ列ピッカーの選択位置。
     col_picker: ListState,
+    /// 表の列ピッカーの選択位置。
+    table_col_picker: ListState,
     mode: Mode,
     filter: String,
     /// 終了要求。
@@ -244,6 +248,7 @@ impl App {
             graph: GraphVisibility::default(),
             last_height: 0,
             col_picker: ListState::default(),
+            table_col_picker: ListState::default(),
             tabs,
             tab: 0,
             item,
@@ -375,9 +380,8 @@ impl App {
         all.into_iter()
             .filter(|name| {
                 self.samples.iter().any(|s| {
-                    graph::find_field(s, act, &want, name).is_some_and(|f| {
-                        f.value.is_some() || f.text.is_some() || f.raw.is_some()
-                    })
+                    graph::find_field(s, act, &want, name)
+                        .is_some_and(|f| f.value.is_some() || f.text.is_some() || f.raw.is_some())
                 })
             })
             .collect()
@@ -395,24 +399,50 @@ impl App {
         }
     }
 
-    /// 表から外れている列の数。
-    fn hidden_column_count(&self) -> usize {
-        self.columns().len().saturating_sub(self.table_columns().len())
+    /// 各列の表示幅。
+    ///
+    /// **列名の長さだけで決めない。** `kbmemfree` のような列は値が
+    /// 8 桁まで伸びるので、列名に合わせると値が切れる。逆に値が短い列に
+    /// 一律 8 桁を与えると、その分だけ他の列が画面から押し出される。
+    /// 全サンプルを見て決めるので、行をスクロールしても幅が揺れない。
+    fn column_widths(&self, cols: &[&'static str]) -> Vec<u16> {
+        let (Some(act), Some(want)) = (self.current_activity(), self.selected_item_name()) else {
+            return cols.iter().map(|c| c.chars().count() as u16).collect();
+        };
+        cols.iter()
+            .map(|name| {
+                let widest = self
+                    .samples
+                    .iter()
+                    .map(|s| {
+                        let f = graph::find_field(s, act, &want, name);
+                        cell_text(f).chars().count()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                (name.chars().count().max(widest) as u16).max(3)
+            })
+            .collect()
     }
 
     /// 列ピッカーを開く (いまの表示列を下書きに写す)。
     fn open_column_picker(&mut self) {
         self.col_draft = self.table_columns();
-        let pos = self.col_picker.selected().unwrap_or(0);
-        self.col_picker
+        let pos = self.table_col_picker.selected().unwrap_or(0);
+        self.table_col_picker
             .select(Some(pos.min(self.columns().len().saturating_sub(1))));
-        self.mode = Mode::PickColumn;
+        self.mode = Mode::PickTableColumns;
     }
 
     /// 下書きの列を 1 つ出し入れする。
     fn toggle_draft_column(&mut self) {
         let all = self.columns();
-        let Some(name) = self.col_picker.selected().and_then(|i| all.get(i)).copied() else {
+        let Some(name) = self
+            .table_col_picker
+            .selected()
+            .and_then(|i| all.get(i))
+            .copied()
+        else {
             return;
         };
         match self.col_draft.iter().position(|c| *c == name) {
@@ -450,9 +480,9 @@ impl App {
         if n == 0 {
             return;
         }
-        let cur = self.col_picker.selected().unwrap_or(0) as isize;
+        let cur = self.table_col_picker.selected().unwrap_or(0) as isize;
         let next = (((cur + delta) % n as isize) + n as isize) % n as isize;
-        self.col_picker.select(Some(next as usize));
+        self.table_col_picker.select(Some(next as usize));
     }
 
     /// グラフに描ける列。**数値でない列は除く** (デバイス名などは線にならない)。
@@ -614,6 +644,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::PickItem => draw_picker(f, area, app),
         Mode::PickColumn => draw_column_picker(f, area, app),
+        Mode::PickTableColumns => draw_table_column_picker(f, area, app),
         Mode::Help => draw_help(f, area),
         _ => {}
     }
@@ -793,7 +824,14 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
     let item_name = app.selected_item_name();
-    let cols = app.columns();
+    let chosen = app.table_columns();
+    // **潰れた表を出さない。** ratatui の Table は幅が足りないと全列を縮めるので、
+    // 23 列を幅 100 へ詰めると 1 列 3 桁になって、どの列の値も読めなくなる。
+    // 入る列だけを出し、入らなかった分は「他 N 列」として数で示す。
+    let widths = app.column_widths(&chosen);
+    let fit = fit_column_count(&widths, area.width);
+    let cols: Vec<&'static str> = chosen.iter().take(fit).copied().collect();
+    let hidden = app.columns().len().saturating_sub(cols.len());
     // 行の描画で参照するので、可変借用に入る前に切り出しておく。
     let marks: Vec<Mark> = app
         .marks
@@ -805,10 +843,15 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let title = match &item_name {
-        Some(n) => format!(" {} — {}  [{}]  ", act, app.tabs[app.tab].label, n),
+    let mut title = match &item_name {
+        Some(n) => format!(" {} — {}  [{}] ", act, app.tabs[app.tab].label, n),
         None => format!(" {} — {} ", act, app.tabs[app.tab].label),
     };
+    if hidden > 0 {
+        // **外したことを黙らない。** 「その列が無い」と読まれると、
+        // 観測できなかった事実まで消えてしまう。出し方も一緒に書く。
+        title.push_str(&format!(" 他 {hidden} 列 (C で選ぶ) "));
+    }
 
     let mut header: Vec<Cell> = vec![Cell::from("time")];
     header.extend(cols.iter().map(|c| Cell::from(*c)));
@@ -866,13 +909,10 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let mut widths = vec![Constraint::Length(10)];
-    widths.extend(
-        cols.iter()
-            .map(|c| Constraint::Length((c.len() as u16).max(8))),
-    );
+    let mut constraints = vec![Constraint::Length(TIME_COL_WIDTH)];
+    constraints.extend(widths.iter().take(fit).map(|w| Constraint::Length(*w)));
 
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, constraints)
         .header(Row::new(header).style(Style::default().add_modifier(Modifier::BOLD)))
         .block(Block::bordered().title(title))
         .row_highlight_style(Style::default().bg(Color::DarkGray))
@@ -962,6 +1002,77 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, r, &mut app.picker);
 }
 
+/// `time` 列の幅 (`HH:MM:SS` + 不連続の印 1 桁 + 余白)。
+const TIME_COL_WIDTH: u16 = 10;
+
+/// 幅に入る列数。
+///
+/// 1 列も入らない場合でも 1 は返す (空の表より 1 列でも読める方がよい)。
+fn fit_column_count(widths: &[u16], area_width: u16) -> usize {
+    // 枠 2 + `time` 列 + 列間の空白 1。
+    let mut used = 2 + TIME_COL_WIDTH + 1;
+    let mut n = 0;
+    for w in widths {
+        if used + w > area_width {
+            break;
+        }
+        used += w + 1;
+        n += 1;
+    }
+    n.max(1)
+}
+
+/// 表に出す列を選ぶポップアップ (複数選択)。
+///
+/// **値が出なかった列も一覧には出す。** 既定で表から外しているだけで、
+/// その列が無いわけではない。外した理由が分かるよう印を付ける。
+fn draw_table_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let all = app.columns();
+    if all.is_empty() {
+        return;
+    }
+    let measured = app.measured_columns();
+    let rows: Vec<ListItem> = all
+        .iter()
+        .map(|name| {
+            let on = if app.col_draft.contains(name) {
+                "x"
+            } else {
+                " "
+            };
+            let note = if measured.contains(name) {
+                ""
+            } else {
+                "  (全時刻で値なし)"
+            };
+            let style = if measured.contains(name) {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("[{on}] {name}{note}"),
+                style,
+            )))
+        })
+        .collect();
+    let h = (rows.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let w = all
+        .iter()
+        .map(|s| s.chars().count() as u16 + 22)
+        .max()
+        .unwrap_or(24)
+        .clamp(28, area.width.saturating_sub(4));
+    let r = centered(area, w, h);
+    f.render_widget(Clear, r);
+    let list = List::new(rows)
+        .block(Block::bordered().title(" 表の列 (Space 切替 / a 全部 / Enter 決定 / Esc 取消) "))
+        .highlight_style(Style::default().bg(Color::DarkGray));
+    f.render_stateful_widget(list, r, &mut app.table_col_picker);
+}
+
 /// グラフに描く列を選ぶポップアップ。
 ///
 /// **描ける列だけを並べる。** デバイス名のような識別子の列を混ぜると、
@@ -1007,6 +1118,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("g / G      先頭 / 末尾"),
         Line::from("i          item を選ぶ"),
         Line::from("/          item を名前で絞り込む"),
+        Line::from("C          表に出す列を選ぶ"),
         Line::from("c          グラフに描く列を選ぶ"),
         Line::from("[ / ]      グラフの列を前 / 次へ"),
         Line::from("v          グラフの表示を切り替える"),
@@ -1015,6 +1127,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(format!("{ABSENT} は値が無いこと。0 ではない。")),
         Line::from("時刻の前の ! は、直前との間に不連続があること。"),
+        Line::from("表は既定で「全時刻で値が出なかった列」を外す。C で出せる。"),
         Line::from("グラフの線は、不連続と欠測のところで切れる。"),
         Line::from("切れ目を飛び越えて結ばないのは、その間を観測していないため。"),
     ];
@@ -1066,6 +1179,22 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Down => app.move_col(1),
             _ => {}
         },
+        Mode::PickTableColumns => match code {
+            // Esc は下書きを捨てる (表は元のまま)。
+            KeyCode::Esc => {
+                app.col_draft.clear();
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Enter => {
+                app.commit_columns();
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Up => app.move_col_picker(-1),
+            KeyCode::Down => app.move_col_picker(1),
+            KeyCode::Char(' ') => app.toggle_draft_column(),
+            KeyCode::Char('a') => app.toggle_draft_all(),
+            _ => {}
+        },
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match code {
             KeyCode::Char('q') => app.quit = true,
@@ -1082,6 +1211,7 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             KeyCode::Char('i') => app.mode = Mode::PickItem,
             KeyCode::Char('c') => app.mode = Mode::PickColumn,
+            KeyCode::Char('C') => app.open_column_picker(),
             // グラフの列送り。`←` / `→` は activity に使っているので別のキーにする。
             KeyCode::Char('[') => app.move_col(-1),
             KeyCode::Char(']') => app.move_col(1),
@@ -1333,6 +1463,105 @@ mod tests {
         // 高い端末でも上限を超えて広げない
         assert_eq!(graph_height(GraphVisibility::Auto, 200), 14);
         assert_eq!(graph_height(GraphVisibility::Auto, 30), 7);
+    }
+
+    /// 値が出ない列は既定で表から外す。
+    #[test]
+    fn columns_without_any_value_are_dropped_by_default() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        // 全時刻で値の無い列を足す
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.push(FieldOut {
+                name: "never",
+                unit: "percent",
+                kind: "counter",
+                raw: None,
+                value: None,
+                text: None,
+                quality: Quality::UnsupportedBySource,
+            });
+        }
+        assert_eq!(app.columns(), vec!["user", "never"]);
+        assert_eq!(app.table_columns(), vec!["user"], "値の無い列は外す");
+
+        let screen = render(&mut app, 80, 40);
+        assert!(!shows(&screen, "never"), "表には出ない: {screen}");
+        // **黙って消さない。** 何列外したかと、出し方を書く。
+        assert!(shows(&screen, "他 1 列"), "{screen}");
+        assert!(shows(&screen, "C で選ぶ"), "{screen}");
+    }
+
+    /// `C` で選べば、値の無い列も表に出せる。
+    #[test]
+    fn the_picker_can_bring_back_a_column_without_values() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.push(FieldOut {
+                name: "never",
+                unit: "percent",
+                kind: "counter",
+                raw: None,
+                value: None,
+                text: None,
+                quality: Quality::UnsupportedBySource,
+            });
+        }
+        on_key(&mut app, KeyCode::Char('C'), KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::PickTableColumns);
+        // 一覧には値の無い列も並ぶ (外しただけで、無いわけではない)
+        let picker = render(&mut app, 80, 40);
+        assert!(shows(&picker, "never"), "{picker}");
+        assert!(shows(&picker, "全時刻で値なし"), "理由を書く: {picker}");
+
+        // `a` で全列、Enter で確定
+        on_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.table_columns(), vec!["user", "never"]);
+        let screen = render(&mut app, 80, 40);
+        assert!(shows(&screen, "never"), "{screen}");
+    }
+
+    /// Esc は下書きを捨てる (表は元のまま)。
+    #[test]
+    fn escaping_the_picker_keeps_the_table_unchanged() {
+        let mut app = app_with(&[Some(1.0)], &[]);
+        let before = app.table_columns();
+        on_key(&mut app, KeyCode::Char('C'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.table_columns(), before);
+        assert!(app.col_draft.is_empty());
+    }
+
+    /// 幅に入らない列は潰さずに落とす。
+    #[test]
+    fn columns_are_dropped_rather_than_squashed() {
+        // 幅 20 の列を 3 本
+        let widths = vec![20u16, 20, 20];
+        assert_eq!(fit_column_count(&widths, 80), 3);
+        assert_eq!(fit_column_count(&widths, 60), 2);
+        assert_eq!(fit_column_count(&widths, 40), 1);
+        // 1 列も入らなくても、空の表にはしない
+        assert_eq!(fit_column_count(&widths, 10), 1);
+    }
+
+    /// 列幅は値の桁で決まる (列名だけで決めない)。
+    #[test]
+    fn column_width_follows_the_widest_value() {
+        let app = app_with(&[Some(1.0), Some(123_456.0)], &[]);
+        // `user` は 4 文字だが、値は `123456` まで伸びる
+        let wide = app.column_widths(&["user"]);
+        assert!(wide[0] >= 6, "値の桁に合わせる: {wide:?}");
+        assert!(wide[0] > 4, "列名の長さだけで決めない: {wide:?}");
+
+        // 逆に値が短ければ、列名の長さで足りる
+        let small = app_with(&[Some(1.0), Some(2.0)], &[]);
+        let narrow = small.column_widths(&["user"]);
+        assert!(
+            narrow[0] < wide[0],
+            "値が短い列に一律の幅を与えない: {narrow:?} < {wide:?}"
+        );
     }
 
     /// カーソルは観測値と同じ細さで、色で区別する。

@@ -127,10 +127,11 @@ enum Mode {
     Normal,
     /// item 選択のポップアップ。
     PickItem,
-    /// グラフに描く列を選ぶポップアップ (1 列)。
+    /// 列を選ぶポップアップ。
+    ///
+    /// **表に出す列とグラフに描く列を 1 つの画面で扱う。** 別々のキーへ
+    /// 割り当てると「どちらが表でどちらがグラフか」を覚える羽目になる。
     PickColumn,
-    /// 表に出す列を選ぶポップアップ (複数)。
-    PickTableColumns,
     /// 絞り込み入力中。**ここでは `q` は文字であって終了ではない**。
     Filter,
     /// ヘルプ。
@@ -207,10 +208,8 @@ struct App {
     last_height: u16,
     table: TableState,
     picker: ListState,
-    /// グラフ列ピッカーの選択位置。
+    /// 列ピッカーの選択位置 (`columns()` の添字)。
     col_picker: ListState,
-    /// 表の列ピッカーの選択位置。
-    table_col_picker: ListState,
     mode: Mode,
     filter: String,
     /// 終了要求。
@@ -248,7 +247,6 @@ impl App {
             graph: GraphVisibility::default(),
             last_height: 0,
             col_picker: ListState::default(),
-            table_col_picker: ListState::default(),
             tabs,
             tab: 0,
             item,
@@ -428,21 +426,22 @@ impl App {
     /// 列ピッカーを開く (いまの表示列を下書きに写す)。
     fn open_column_picker(&mut self) {
         self.col_draft = self.table_columns();
-        let pos = self.table_col_picker.selected().unwrap_or(0);
-        self.table_col_picker
-            .select(Some(pos.min(self.columns().len().saturating_sub(1))));
-        self.mode = Mode::PickTableColumns;
+        // カーソルは**いまグラフに出ている列**に合わせる。確定時にカーソル位置の
+        // 列をグラフ対象にするので、動かさなければグラフは変わらない
+        // (「表の列だけ直したらグラフまで変わった」を防ぐ)。
+        let all = self.columns();
+        let pos = self
+            .selected_column()
+            .and_then(|c| all.iter().position(|n| *n == c))
+            .unwrap_or(0);
+        self.col_picker.select(Some(pos));
+        self.mode = Mode::PickColumn;
     }
 
     /// 下書きの列を 1 つ出し入れする。
     fn toggle_draft_column(&mut self) {
         let all = self.columns();
-        let Some(name) = self
-            .table_col_picker
-            .selected()
-            .and_then(|i| all.get(i))
-            .copied()
-        else {
+        let Some(name) = self.col_picker.selected().and_then(|i| all.get(i)).copied() else {
             return;
         };
         match self.col_draft.iter().position(|c| *c == name) {
@@ -480,9 +479,9 @@ impl App {
         if n == 0 {
             return;
         }
-        let cur = self.table_col_picker.selected().unwrap_or(0) as isize;
+        let cur = self.col_picker.selected().unwrap_or(0) as isize;
         let next = (((cur + delta) % n as isize) + n as isize) % n as isize;
-        self.table_col_picker.select(Some(next as usize));
+        self.col_picker.select(Some(next as usize));
     }
 
     /// グラフに描ける列。**数値でない列は除く** (デバイス名などは線にならない)。
@@ -644,7 +643,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::PickItem => draw_picker(f, area, app),
         Mode::PickColumn => draw_column_picker(f, area, app),
-        Mode::PickTableColumns => draw_table_column_picker(f, area, app),
         Mode::Help => draw_help(f, area),
         _ => {}
     }
@@ -850,7 +848,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     if hidden > 0 {
         // **外したことを黙らない。** 「その列が無い」と読まれると、
         // 観測できなかった事実まで消えてしまう。出し方も一緒に書く。
-        title.push_str(&format!(" 他 {hidden} 列 (C で選ぶ) "));
+        title.push_str(&format!(" 他 {hidden} 列 (c で選ぶ) "));
     }
 
     let mut header: Vec<Cell> = vec![Cell::from("time")];
@@ -933,14 +931,14 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 // **押しても効かないキーを案内しない。** 端末が低くてグラフを
                 // 出せないときは、限られた 1 行をグラフの説明で埋めない。
                 let graph = if app.graph_visible() {
-                    "c/[] 列  v グラフ  "
+                    "c 列  [] 送り  v グラフ  "
                 } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
-                    "v グラフ  "
+                    "c 列  v グラフ  "
                 } else {
-                    ""
+                    "c 列  "
                 };
                 let full = format!(
-                    "←→ activity  ↑↓ 時刻  i item ({n})  / 絞り込み  g/G 先頭末尾  {graph}? help  q 終了"
+                    "←→ activity  ↑↓ 時刻  i item ({n})  / 絞り込み  home/end 端  {graph}? help  q 終了"
                 );
                 // 幅に入らないときは短い方を出す。途中で切れて語の途中で
                 // 終わるより、短くても最後まで読める方が案内になる。
@@ -1021,17 +1019,22 @@ fn fit_column_count(widths: &[u16], area_width: u16) -> usize {
     }
     n.max(1)
 }
-
-/// 表に出す列を選ぶポップアップ (複数選択)。
+/// 列を選ぶポップアップ。
 ///
-/// **値が出なかった列も一覧には出す。** 既定で表から外しているだけで、
-/// その列が無いわけではない。外した理由が分かるよう印を付ける。
-fn draw_table_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
+/// **表に出す列とグラフに描く列を 1 つの画面で扱う。** 別々のキーに割り当てると
+/// 「どちらが表でどちらがグラフか」を覚える必要が出る。
+///
+/// - `[x]` が表に出す列。`space` で出し入れする
+/// - カーソルの行が、確定したときにグラフへ描かれる列になる
+/// - **値が出ない列も一覧から消さない。** 消すと「その列が無い」と読まれ、
+///   観測できなかった事実まで隠れる。灰色と注記で「選んでも線は出ない」と示す
+fn draw_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
     let all = app.columns();
     if all.is_empty() {
         return;
     }
     let measured = app.measured_columns();
+    let plottable = app.plottable_columns();
     let rows: Vec<ListItem> = all
         .iter()
         .map(|name| {
@@ -1040,12 +1043,15 @@ fn draw_table_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 " "
             };
-            let note = if measured.contains(name) {
-                ""
-            } else {
+            let has_value = measured.contains(name);
+            let note = if !has_value {
                 "  (全時刻で値なし)"
+            } else if !plottable.contains(name) {
+                "  (グラフ不可)"
+            } else {
+                ""
             };
-            let style = if measured.contains(name) {
+            let style = if has_value {
                 Style::default()
             } else {
                 Style::default().fg(Color::DarkGray)
@@ -1064,92 +1070,50 @@ fn draw_table_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|s| s.chars().count() as u16 + 22)
         .max()
         .unwrap_or(24)
-        .clamp(28, area.width.saturating_sub(4));
+        .clamp(30, area.width.saturating_sub(4));
     let r = centered(area, w, h);
     f.render_widget(Clear, r);
     let list = List::new(rows)
-        .block(Block::bordered().title(" 表の列 (Space 切替 / a 全部 / Enter 決定 / Esc 取消) "))
+        // タイトルは枠幅で切られる。詳しい説明は `?` のヘルプに置き、
+        // ここには操作の骨だけを出す。
+        .block(
+            Block::bordered()
+                .title(" 列 ")
+                .title_bottom(" space 表示  a 全部  enter 決定  esc 取消 "),
+        )
         .highlight_style(Style::default().bg(Color::DarkGray));
-    f.render_stateful_widget(list, r, &mut app.table_col_picker);
-}
-
-/// グラフに描く列を選ぶポップアップ。
-///
-/// **描ける列だけを並べる。** デバイス名のような識別子の列を混ぜると、
-/// 選んでも線が出ない選択肢を見せることになる。
-///
-/// 数値の列でも、全時刻で値が出なければ線は引けない。
-/// **選択肢から消さずに灰色と注記で示す** — 消すと「その列が無い」と
-/// 読まれてしまい、観測できなかった事実まで隠れる (表の列ピッカーと同じ扱い)。
-fn draw_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
-    let cols = app.plottable_columns();
-    if cols.is_empty() {
-        return;
-    }
-    let measured = app.measured_columns();
-    let rows: Vec<ListItem> = cols
-        .iter()
-        .map(|name| {
-            let has_value = measured.contains(name);
-            let note = if has_value {
-                ""
-            } else {
-                "  (全時刻で値なし)"
-            };
-            let style = if has_value {
-                Style::default()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            ListItem::new(Line::from(Span::styled(format!("{name}{note}"), style)))
-        })
-        .collect();
-    let h = (rows.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    let w = cols
-        .iter()
-        .map(|s| s.chars().count() as u16 + 18)
-        .max()
-        .unwrap_or(10)
-        .clamp(20, area.width.saturating_sub(4));
-    let r = centered(area, w + 4, h);
-    f.render_widget(Clear, r);
-    let list = List::new(rows)
-        .block(Block::bordered().title(" グラフの列 (Enter 決定 / Esc 取消) "))
-        .highlight_style(Style::default().bg(Color::DarkGray));
-    app.col_picker.select(Some(
-        app.col
-            .get(app.tab)
-            .copied()
-            .unwrap_or(0)
-            .min(cols.len() - 1),
-    ));
     f.render_stateful_widget(list, r, &mut app.col_picker);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
+    // **すべて小文字と記号。** Shift の有無で別の操作になると、
+    // 打ち間違いが「別の機能が動く」形で出る。
     let lines = vec![
-        Line::from("←/→        activity を切り替える"),
-        Line::from("↑/↓        時刻を移動する"),
-        Line::from("PgUp/PgDn  10 行ずつ移動する"),
-        Line::from("g / G      先頭 / 末尾"),
-        Line::from("i          item を選ぶ"),
-        Line::from("/          item を名前で絞り込む"),
-        Line::from("C          表に出す列を選ぶ"),
-        Line::from("c          グラフに描く列を選ぶ"),
-        Line::from("[ / ]      グラフの列を前 / 次へ"),
-        Line::from("v          グラフの表示を切り替える"),
-        Line::from("?          このヘルプ"),
-        Line::from("q / Ctrl-C 終了"),
+        Line::from("←  →        activity を切り替える"),
+        Line::from("↑  ↓        時刻を移動する"),
+        Line::from("pgup pgdn   10 行ずつ移動する"),
+        Line::from("home end    先頭 / 末尾"),
+        Line::from("i           item を選ぶ"),
+        Line::from("/           item を名前で絞り込む"),
+        Line::from("c           列を選ぶ (表に出す列とグラフの列)"),
+        Line::from("[  ]        グラフの列を前 / 次へ"),
+        Line::from("v           グラフの表示を切り替える"),
+        Line::from("?           このヘルプ"),
+        Line::from("q  ctrl-c   終了"),
+        Line::from(""),
+        Line::from("c のポップアップ:"),
+        Line::from("  space     その列を表に出す / 外す"),
+        Line::from("  a         全部の列 / 値のある列だけ"),
+        Line::from("  enter     決定 (カーソルの列をグラフへ)"),
+        Line::from("  esc       取消"),
         Line::from(""),
         Line::from(format!("{ABSENT} は値が無いこと。0 ではない。")),
         Line::from("時刻の前の ! は、直前との間に不連続があること。"),
-        Line::from("表は既定で「全時刻で値が出なかった列」を外す。C で出せる。"),
+        Line::from("表は既定で「全時刻で値が出なかった列」を外す。c で出せる。"),
         Line::from("グラフの線は、不連続と欠測のところで切れる。"),
         Line::from("切れ目を飛び越えて結ばないのは、その間を観測していないため。"),
     ];
-    let r = centered(area, 60, lines.len() as u16 + 2);
+    let r = centered(area, 62, lines.len() as u16 + 2);
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" キー操作 ")),
@@ -1192,13 +1156,7 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             _ => {}
         },
         Mode::PickColumn => match code {
-            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Enter => app.mode = Mode::Normal,
-            KeyCode::Up => app.move_col(-1),
-            KeyCode::Down => app.move_col(1),
-            _ => {}
-        },
-        Mode::PickTableColumns => match code {
-            // Esc は下書きを捨てる (表は元のまま)。
+            // Esc は下書きを捨てる (表もグラフも元のまま)。
             KeyCode::Esc => {
                 app.col_draft.clear();
                 app.mode = Mode::Normal;
@@ -1222,14 +1180,15 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Down => app.move_row(1),
             KeyCode::PageUp => app.move_row(-10),
             KeyCode::PageDown => app.move_row(10),
-            KeyCode::Char('g') => app.table.select(Some(0)),
-            KeyCode::Char('G') => {
+            // **大文字を使わない。** Shift の有無で別の操作になると、
+            // 打ち間違いが「別の機能が動く」形で表に出る。
+            KeyCode::Home => app.table.select(Some(0)),
+            KeyCode::End => {
                 let last = app.samples.len().saturating_sub(1);
                 app.table.select(Some(last));
             }
             KeyCode::Char('i') => app.mode = Mode::PickItem,
-            KeyCode::Char('c') => app.mode = Mode::PickColumn,
-            KeyCode::Char('C') => app.open_column_picker(),
+            KeyCode::Char('c') => app.open_column_picker(),
             // グラフの列送り。`←` / `→` は activity に使っているので別のキーにする。
             KeyCode::Char('[') => app.move_col(-1),
             KeyCode::Char(']') => app.move_col(1),
@@ -1506,7 +1465,7 @@ mod tests {
         assert!(!shows(&screen, "never"), "表には出ない: {screen}");
         // **黙って消さない。** 何列外したかと、出し方を書く。
         assert!(shows(&screen, "他 1 列"), "{screen}");
-        assert!(shows(&screen, "C で選ぶ"), "{screen}");
+        assert!(shows(&screen, "c で選ぶ"), "{screen}");
     }
 
     /// グラフの列ピッカーも、値の出ない列を灰色と注記で示す。
@@ -1578,8 +1537,8 @@ mod tests {
                 quality: Quality::UnsupportedBySource,
             });
         }
-        on_key(&mut app, KeyCode::Char('C'), KeyModifiers::NONE);
-        assert_eq!(app.mode, Mode::PickTableColumns);
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::PickColumn);
         // 一覧には値の無い列も並ぶ (外しただけで、無いわけではない)
         let picker = render(&mut app, 80, 40);
         assert!(shows(&picker, "never"), "{picker}");
@@ -1599,7 +1558,7 @@ mod tests {
     fn escaping_the_picker_keeps_the_table_unchanged() {
         let mut app = app_with(&[Some(1.0)], &[]);
         let before = app.table_columns();
-        on_key(&mut app, KeyCode::Char('C'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
         on_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
         on_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.table_columns(), before);

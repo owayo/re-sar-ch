@@ -203,19 +203,25 @@ resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
 Recorded activities become tabs; pick an item and read its time series as a table with a
 graph above it.
 
+Every key is lower case or a symbol. When `Shift` selects a different action, a slip of
+the finger runs the wrong feature instead of doing nothing.
+
 | Key | Action |
 |---|---|
 | `←` / `→` | switch activity |
-| `↑` / `↓`, `PgUp` / `PgDn` | move through time |
-| `g` / `G` | first / last |
+| `↑` / `↓`, `pgup` / `pgdn` | move through time |
+| `home` / `end` | first / last |
 | `i` | pick an item (device, interface, CPU) |
 | `/` | filter items by name |
-| `C` | choose which columns the table shows (`Space` toggles, `a` all) |
-| `c` | pick the metric to graph |
+| `c` | choose columns (both the table's and the graph's) |
 | `[` / `]` | previous / next metric |
 | `v` | show or hide the graph |
 | `?` | key reference |
-| `q`, `Ctrl-C` | quit |
+| `q`, `ctrl-c` | quit |
+
+Inside the `c` popup, `space` adds or removes a column from the table, `a` switches
+between every column and the default, and `enter` applies — the row under the cursor
+becomes the graphed metric. `esc` cancels, leaving both the table and the graph alone.
 
 Activities with many columns (MEMORY has 19) cannot all fit: laid out side by side they
 squash to a few digits each and none of them stay readable. The table narrows them two ways.
@@ -224,11 +230,11 @@ squash to a few digits each and none of them stay readable. The table narrows th
   generation never had, and metrics that are not implemented, show `—` on every row and do
   nothing but push the columns you wanted off the screen.
 - **Columns that do not fit the width are dropped rather than squashed.** The count is
-  stated in the title (`他 15 列 (C で選ぶ)`), so nothing disappears silently.
+  stated in the title (`他 15 列 (c で選ぶ)`), so nothing disappears silently.
 
-`C` opens the column list: `Space` toggles one, `a` switches between every column and the
-default, `Enter` applies. Columns without values are listed too, annotated as such. Widths
-are computed from every sample, so scrolling through rows never makes them jump.
+`c` opens the column list. Columns without values are listed too, greyed out and
+annotated as such. Widths are computed from every sample, so scrolling through rows never
+makes them jump.
 
 The graph plots one series — the selected activity, item and metric. A vertical cursor
 marks the timestamp selected in the table, so both halves of the screen point at the same

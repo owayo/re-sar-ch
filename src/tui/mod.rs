@@ -1075,6 +1075,9 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 } else {
                     "c 列  "
                 };
+                // **横送り (`shift` + 矢印) はここに出さない。**
+                // 列が入り切るかどうかで案内が出たり消えたりすると、
+                // 目の高さにある 1 行の中身が落ち着かない。`?` のヘルプに載せる。
                 let full = format!(
                     "←→ activity  ↑↓ 時刻  i item ({n})  / 絞り込み  home/end 端  {graph}? help  q 終了"
                 );
@@ -1829,6 +1832,44 @@ mod tests {
         assert_eq!(app.col_offset(), 0, "左端でも止まる");
         let back = render(&mut app, 60, 40);
         assert!(shows(&back, "user"), "{back}");
+    }
+
+    /// 横送りはヒント行に出さず、ヘルプに載せる。
+    ///
+    /// 列が入り切るかどうかで案内が出たり消えたりすると、
+    /// 目の高さにある 1 行の中身が落ち着かない。
+    #[test]
+    fn sideways_scrolling_lives_in_the_help_not_the_hint_line() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for i in 0..9 {
+            let name: &'static str = Box::leak(format!("col{i}").into_boxed_str());
+            for s in &mut app.samples {
+                s.activities[0].items[0].rates.push(FieldOut {
+                    name,
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    value: Some(11_111_111.0),
+                    text: None,
+                    quality: Quality::Ok,
+                });
+            }
+        }
+        // 右に続きがある状態でも、ヒント行には出さない
+        render(&mut app, 60, 40);
+        let screen = render(&mut app, 60, 40);
+        assert!(
+            app.visible_cols < app.table_columns().len(),
+            "列は入り切らない"
+        );
+        let hint = screen.lines().last().unwrap();
+        assert!(!shows(hint, "shift"), "ヒント行には出さない: {hint}");
+
+        // ヘルプには載っている
+        on_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        let help = render(&mut app, 80, 40);
+        assert!(shows(&help, "shift"), "ヘルプには載せる: {help}");
+        assert!(shows(&help, "表を横に送る"), "{help}");
     }
 
     /// `shift` の無い矢印は activity の切り替えのまま。

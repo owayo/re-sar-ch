@@ -788,9 +788,9 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 // **押しても効かないキーを案内しない。** 端末が低くてグラフを
                 // 出せないときは、限られた 1 行をグラフの説明で埋めない。
                 let graph = if app.graph_visible() {
-                    "c/[] 列  v 図  "
+                    "c/[] 列  v グラフ  "
                 } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
-                    "v 図  "
+                    "v グラフ  "
                 } else {
                     ""
                 };
@@ -1191,7 +1191,7 @@ mod tests {
     fn the_hint_omits_graph_keys_when_the_graph_cannot_fit() {
         let mut app = app_with(&[Some(1.0)], &[]);
         let screen = render(&mut app, 80, 16);
-        assert!(!shows(&screen, "v 図"), "{screen}");
+        assert!(!shows(&screen, "v グラフ"), "{screen}");
         // 使えるキーの案内は残る
         assert!(shows(&screen, "i item"), "{screen}");
     }

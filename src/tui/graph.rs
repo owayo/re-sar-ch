@@ -215,7 +215,7 @@ fn y_bounds_for(segments: &[Vec<(f64, f64)>], unit: &str) -> [f64; 2] {
 }
 
 /// 選択中の activity / item / 列に対応するフィールドを引く。
-fn find_field<'a>(
+pub(super) fn find_field<'a>(
     sample: &'a SampleOut,
     activity: &str,
     item: &str,

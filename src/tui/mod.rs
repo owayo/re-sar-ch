@@ -190,6 +190,15 @@ struct App {
     item: Vec<usize>,
     /// タブごとのグラフ対象列。タブを切り替えても選択を保つ。
     col: Vec<usize>,
+    /// タブごとの「表に出す列」。
+    ///
+    /// `None` は既定 = **全時刻で 1 度も値が出なかった列を隠す**。
+    /// その世代に無いフィールドや未実装の列は全行が `—` になり、
+    /// 読みたい列を画面の外へ押し出すだけなので既定では出さない。
+    /// `Some` は利用者が明示的に選んだ列 (順序は元の列順)。
+    shown_cols: Vec<Option<Vec<&'static str>>>,
+    /// 列ピッカーで編集中の選択 (確定するまで表へは反映しない)。
+    col_draft: Vec<&'static str>,
     /// グラフを出すか。
     graph: GraphVisibility,
     /// 直近の描画で使った端末の高さ。`v` の判定に使う。
@@ -221,6 +230,7 @@ impl App {
         }
         let item = vec![0; tabs.len()];
         let col = vec![0; tabs.len()];
+        let shown_cols = vec![None; tabs.len()];
         let mut table = TableState::default();
         table.select(Some(0));
         App {
@@ -229,6 +239,8 @@ impl App {
             marks: c.marks,
             tz: c.tz,
             col,
+            shown_cols,
+            col_draft: Vec::new(),
             graph: GraphVisibility::default(),
             last_height: 0,
             col_picker: ListState::default(),
@@ -348,6 +360,99 @@ impl App {
         let Some(slot) = slot else { return };
         let cur = *slot as isize;
         *slot = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+    }
+
+    /// 全サンプルを通して 1 度でも値が出た列。
+    ///
+    /// **「その世代に無い」「未実装」の列は全行が `—` になる。**
+    /// MEMORY の 19 列のうち何列かがそれだと、読みたい列が画面の外へ出てしまう。
+    /// 隠した列は消したのではなく、`C` で出せることをタイトルに書く。
+    fn measured_columns(&self) -> Vec<&'static str> {
+        let all = self.columns();
+        let (Some(act), Some(want)) = (self.current_activity(), self.selected_item_name()) else {
+            return all;
+        };
+        all.into_iter()
+            .filter(|name| {
+                self.samples.iter().any(|s| {
+                    graph::find_field(s, act, &want, name).is_some_and(|f| {
+                        f.value.is_some() || f.text.is_some() || f.raw.is_some()
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// 表に出す列。
+    fn table_columns(&self) -> Vec<&'static str> {
+        match self.shown_cols.get(self.tab).and_then(|c| c.as_ref()) {
+            Some(chosen) => {
+                // 元の列順を保つ (選んだ順に並べ替えると読みにくい)。
+                let all = self.columns();
+                all.into_iter().filter(|c| chosen.contains(c)).collect()
+            }
+            None => self.measured_columns(),
+        }
+    }
+
+    /// 表から外れている列の数。
+    fn hidden_column_count(&self) -> usize {
+        self.columns().len().saturating_sub(self.table_columns().len())
+    }
+
+    /// 列ピッカーを開く (いまの表示列を下書きに写す)。
+    fn open_column_picker(&mut self) {
+        self.col_draft = self.table_columns();
+        let pos = self.col_picker.selected().unwrap_or(0);
+        self.col_picker
+            .select(Some(pos.min(self.columns().len().saturating_sub(1))));
+        self.mode = Mode::PickColumn;
+    }
+
+    /// 下書きの列を 1 つ出し入れする。
+    fn toggle_draft_column(&mut self) {
+        let all = self.columns();
+        let Some(name) = self.col_picker.selected().and_then(|i| all.get(i)).copied() else {
+            return;
+        };
+        match self.col_draft.iter().position(|c| *c == name) {
+            Some(i) => {
+                self.col_draft.remove(i);
+            }
+            None => self.col_draft.push(name),
+        }
+    }
+
+    /// 下書きを「全部」と「値が出た列だけ」で切り替える。
+    fn toggle_draft_all(&mut self) {
+        let all = self.columns();
+        if self.col_draft.len() == all.len() {
+            self.col_draft = self.measured_columns();
+        } else {
+            self.col_draft = all;
+        }
+    }
+
+    /// 下書きを表へ反映する。
+    ///
+    /// 既定 (値が出た列だけ) と同じ内容なら `None` に戻す。そうしないと、
+    /// item を切り替えて列の顔ぶれが変わったとき、古い選択に縛られる。
+    fn commit_columns(&mut self) {
+        let draft = std::mem::take(&mut self.col_draft);
+        let slot_is_default = draft == self.measured_columns();
+        if let Some(slot) = self.shown_cols.get_mut(self.tab) {
+            *slot = if slot_is_default { None } else { Some(draft) };
+        }
+    }
+
+    fn move_col_picker(&mut self, delta: isize) {
+        let n = self.columns().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.col_picker.selected().unwrap_or(0) as isize;
+        let next = (((cur + delta) % n as isize) + n as isize) % n as isize;
+        self.col_picker.select(Some(next as usize));
     }
 
     /// グラフに描ける列。**数値でない列は除く** (デバイス名などは線にならない)。

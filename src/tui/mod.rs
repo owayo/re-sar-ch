@@ -204,7 +204,11 @@ struct App {
     /// タブごとの選択 item。タブを切り替えても選択を保つ。
     item: Vec<usize>,
     /// タブごとのグラフ対象列。タブを切り替えても選択を保つ。
-    col: Vec<usize>,
+    ///
+    /// **添字ではなく名前で持つ。** item を切り替えると列の顔ぶれが変わるので、
+    /// 添字では「別の列に化ける」。`None` は「まだ選んでいない」で、
+    /// そのときは描ける列の先頭を使う。
+    graph_col: Vec<Option<&'static str>>,
     /// タブごとの「表に出す列」。
     ///
     /// `None` は既定 = **全時刻で 1 度も値が出なかった列を隠す**。
@@ -244,7 +248,7 @@ impl App {
             }
         }
         let item = vec![0; tabs.len()];
-        let col = vec![0; tabs.len()];
+        let graph_col = vec![None; tabs.len()];
         let shown_cols = vec![None; tabs.len()];
         let mut table = TableState::default();
         table.select(Some(0));
@@ -253,7 +257,7 @@ impl App {
             samples: c.samples,
             marks: c.marks,
             tz: c.tz,
-            col,
+            graph_col,
             shown_cols,
             col_draft: Vec::new(),
             graph: GraphVisibility::default(),
@@ -484,6 +488,20 @@ impl App {
         if let Some(slot) = self.shown_cols.get_mut(self.tab) {
             *slot = if slot_is_default { None } else { Some(draft) };
         }
+        // カーソル位置の列をグラフ対象にする。ただし
+        // **描けない列 (識別子など) と、いま表から外した列は対象にしない。**
+        // 外した列をグラフへ回すと、`[` / `]` の巡回からも外れているのに
+        // グラフにだけ出ている、という辻褄の合わない状態になる。
+        let all = self.columns();
+        let Some(name) = self.col_picker.selected().and_then(|i| all.get(i)).copied() else {
+            return;
+        };
+        if self.plottable_columns().contains(&name)
+            && self.table_columns().contains(&name)
+            && let Some(slot) = self.graph_col.get_mut(self.tab)
+        {
+            *slot = Some(name);
+        }
     }
 
     fn move_col_picker(&mut self, delta: isize) {
@@ -521,24 +539,44 @@ impl App {
 
     /// グラフに描く列。描ける列が無ければ `None`。
     fn selected_column(&self) -> Option<&'static str> {
-        let cols = self.plottable_columns();
-        if cols.is_empty() {
-            return None;
+        let plottable = self.plottable_columns();
+        match self.graph_col.get(self.tab).copied().flatten() {
+            // 選んだ列が今の item に無ければ (デバイスを替えた等)、先頭へ戻す。
+            Some(name) if plottable.contains(&name) => Some(name),
+            _ => plottable.first().copied(),
         }
-        let i = self.col.get(self.tab).copied().unwrap_or(0);
-        Some(cols[i.min(cols.len() - 1)])
+    }
+
+    /// `[` / `]` で順に送る列。
+    ///
+    /// **表に出していない列は飛ばす。** 画面に無い列へ移ると、グラフの見出しだけが
+    /// 変わって、どの列を見ているのかを表で確かめられない。
+    fn steppable_columns(&self) -> Vec<&'static str> {
+        let shown = self.table_columns();
+        self.plottable_columns()
+            .into_iter()
+            .filter(|c| shown.contains(c))
+            .collect()
     }
 
     fn move_col(&mut self, delta: isize) {
-        let n = self.plottable_columns().len();
+        let steppable = self.steppable_columns();
+        let n = steppable.len();
         if n == 0 {
             return;
         }
-        let Some(slot) = self.col.get_mut(self.tab) else {
-            return;
+        let cur = self
+            .selected_column()
+            .and_then(|c| steppable.iter().position(|n| *n == c));
+        let next = match cur {
+            Some(i) => (((i as isize + delta) % n as isize + n as isize) % n as isize) as usize,
+            // いま見ている列が巡回の対象外 (表から外した列) なら端から入る。
+            None if delta >= 0 => 0,
+            None => n - 1,
         };
-        let cur = (*slot).min(n - 1) as isize;
-        *slot = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+        if let Some(slot) = self.graph_col.get_mut(self.tab) {
+            *slot = Some(steppable[next]);
+        }
     }
 
     /// いま実際にグラフが出ているか。
@@ -1123,7 +1161,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("i           item を選ぶ"),
         Line::from("/           item を名前で絞り込む"),
         Line::from("c           列を選ぶ (表に出す列とグラフの列)"),
-        Line::from("[  ]        グラフの列を前 / 次へ"),
+        Line::from("[  ]        グラフの列を前 / 次へ (表に出ている列だけ)"),
         Line::from("v           グラフの表示を切り替える"),
         Line::from("?           このヘルプ"),
         Line::from("q  ctrl-c   終了"),
@@ -1652,6 +1690,105 @@ mod tests {
         assert_eq!(app.selected_column(), Some("user"));
         on_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
         assert_eq!(app.selected_column(), Some("c"));
+    }
+
+    /// `[` / `]` は、表に出していない列を飛ばす。
+    #[test]
+    fn stepping_skips_columns_hidden_from_the_table() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for (name, v) in [("b", 2.0), ("c", 3.0)] {
+            for s in &mut app.samples {
+                s.activities[0].items[0].rates.push(FieldOut {
+                    name,
+                    unit: "percent",
+                    kind: "counter",
+                    raw: None,
+                    value: Some(v),
+                    text: None,
+                    quality: Quality::Ok,
+                });
+            }
+        }
+        assert_eq!(app.plottable_columns(), vec!["user", "b", "c"]);
+
+        // 真ん中の `b` を表から外す
+        app.open_column_picker();
+        app.col_picker.select(Some(1));
+        app.toggle_draft_column();
+        app.commit_columns();
+        app.mode = Mode::Normal;
+        assert_eq!(app.table_columns(), vec!["user", "c"]);
+        assert_eq!(app.steppable_columns(), vec!["user", "c"]);
+
+        // `]` は `b` を飛ばして `c` へ
+        assert_eq!(app.selected_column(), Some("user"));
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("c"), "外した列は飛ばす");
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("user"), "端で巻き戻る");
+        on_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("c"));
+    }
+
+    /// グラフ対象が巡回の対象外になっていても `[` / `]` は動く。
+    ///
+    /// 通常の操作ではこの状態にならない (確定時に表から外れた列は選ばない) が、
+    /// item を替えて列の顔ぶれが変わったときに起こり得る。
+    /// **押しても動かない、にはしない。**
+    #[test]
+    fn stepping_from_a_hidden_column_enters_at_the_edge() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.push(FieldOut {
+                name: "b",
+                unit: "percent",
+                kind: "counter",
+                raw: None,
+                value: Some(2.0),
+                text: None,
+                quality: Quality::Ok,
+            });
+        }
+        // `b` をグラフ対象にしたまま、表からは外す
+        app.graph_col[app.tab] = Some("b");
+        app.open_column_picker();
+        app.col_picker.select(Some(1));
+        app.toggle_draft_column();
+        app.commit_columns();
+        app.mode = Mode::Normal;
+        assert_eq!(app.table_columns(), vec!["user"]);
+        assert_eq!(app.selected_column(), Some("b"), "グラフには出たまま");
+
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("user"));
+    }
+
+    /// item を替えて列の顔ぶれが変わっても、別の列に化けない。
+    #[test]
+    fn the_graph_column_is_remembered_by_name() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.push(FieldOut {
+                name: "b",
+                unit: "percent",
+                kind: "counter",
+                raw: None,
+                value: Some(2.0),
+                text: None,
+                quality: Quality::Ok,
+            });
+        }
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("b"));
+        // 列が消えた item に移ったことにする
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.retain(|f| f.name != "b");
+        }
+        assert_eq!(
+            app.selected_column(),
+            Some("user"),
+            "無くなった列は先頭へ戻す (別の列に化けさせない)"
+        );
     }
 
     /// グラフに描いている列は、表の見出しも同じ色にする。

@@ -29,7 +29,7 @@ use super::sadf::access::ActivityPair;
 use super::sadf::spec;
 use crate::error::Result;
 use crate::format::file::{SaFile, ScanControl};
-use crate::model::ActivityId;
+use crate::model::{ActivityId, DisplayTz};
 use crate::output::time_filter::Admit;
 use crate::series::{Selection, WalkItem, walk_items};
 
@@ -301,9 +301,15 @@ fn display_width(s: &str) -> usize {
 }
 
 /// 既定の設定 (`--format table` で activity を絞らない場合)。
+///
+/// **時刻は UTC で出る。CLI の既定 (実行環境のローカル) とは違う。**
+/// `..Default::default()` に任せず明示しているのは、`DisplayTz` の
+/// 構造体既定が変わったときにこの関数の表示が静かに変わらないようにするため。
+/// ローカル時刻で出したい呼び出し側は `tz` を差し替える。
 pub fn default_config() -> CustomConfig {
     CustomConfig {
         selection: Selection::All,
+        tz: DisplayTz::Utc,
         ..Default::default()
     }
 }

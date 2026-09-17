@@ -1077,29 +1077,47 @@ fn draw_table_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
 ///
 /// **描ける列だけを並べる。** デバイス名のような識別子の列を混ぜると、
 /// 選んでも線が出ない選択肢を見せることになる。
+///
+/// 数値の列でも、全時刻で値が出なければ線は引けない。
+/// **選択肢から消さずに灰色と注記で示す** — 消すと「その列が無い」と
+/// 読まれてしまい、観測できなかった事実まで隠れる (表の列ピッカーと同じ扱い)。
 fn draw_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = app.plottable_columns();
     if cols.is_empty() {
         return;
     }
-    let h = (cols.len() as u16 + 2)
+    let measured = app.measured_columns();
+    let rows: Vec<ListItem> = cols
+        .iter()
+        .map(|name| {
+            let has_value = measured.contains(name);
+            let note = if has_value {
+                ""
+            } else {
+                "  (全時刻で値なし)"
+            };
+            let style = if has_value {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(Line::from(Span::styled(format!("{name}{note}"), style)))
+        })
+        .collect();
+    let h = (rows.len() as u16 + 2)
         .min(area.height.saturating_sub(2))
         .max(3);
     let w = cols
         .iter()
-        .map(|s| s.chars().count() as u16)
+        .map(|s| s.chars().count() as u16 + 18)
         .max()
         .unwrap_or(10)
         .clamp(20, area.width.saturating_sub(4));
     let r = centered(area, w + 4, h);
     f.render_widget(Clear, r);
-    let list = List::new(
-        cols.iter()
-            .map(|s| ListItem::new((*s).to_string()))
-            .collect::<Vec<_>>(),
-    )
-    .block(Block::bordered().title(" グラフの列 (Enter 決定 / Esc 取消) "))
-    .highlight_style(Style::default().bg(Color::DarkGray));
+    let list = List::new(rows)
+        .block(Block::bordered().title(" グラフの列 (Enter 決定 / Esc 取消) "))
+        .highlight_style(Style::default().bg(Color::DarkGray));
     app.col_picker.select(Some(
         app.col
             .get(app.tab)
@@ -1489,6 +1507,60 @@ mod tests {
         // **黙って消さない。** 何列外したかと、出し方を書く。
         assert!(shows(&screen, "他 1 列"), "{screen}");
         assert!(shows(&screen, "C で選ぶ"), "{screen}");
+    }
+
+    /// グラフの列ピッカーも、値の出ない列を灰色と注記で示す。
+    #[test]
+    fn the_graph_picker_greys_out_columns_without_values() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        for s in &mut app.samples {
+            s.activities[0].items[0].rates.push(FieldOut {
+                name: "never",
+                unit: "percent",
+                kind: "counter",
+                raw: None,
+                value: None,
+                text: None,
+                quality: Quality::UnsupportedBySource,
+            });
+        }
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::PickColumn);
+
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // **選択肢から消さない。** 灰色と注記で「選んでも線は出ない」と示す。
+        assert!(shows(&dump, "never"), "{dump}");
+        assert!(shows(&dump, "全時刻で値なし"), "{dump}");
+
+        // `never` の行が灰色で、値のある `user` の行はそうでないこと。
+        let fg_of = |needle: &str| -> Option<Color> {
+            for y in 0..buf.area.height {
+                let line: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>();
+                if line.contains(needle) {
+                    let x = line.find(needle).unwrap() as u16;
+                    return buf[(x, y)].style().fg;
+                }
+            }
+            None
+        };
+        assert_eq!(fg_of("never"), Some(Color::DarkGray), "灰色にする");
+        assert_ne!(
+            fg_of("user"),
+            Some(Color::DarkGray),
+            "値のある列は灰色にしない"
+        );
     }
 
     /// `C` で選べば、値の無い列も表に出せる。

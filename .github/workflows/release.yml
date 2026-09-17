@@ -209,6 +209,12 @@ jobs:
 
             sysstat の sar バイナリ (sa ファイル) を sar / sadf に依存せず単体で解析する CLI
 
+            ### 変更点
+
+            バージョンは CalVer で、番号からは破壊的変更かどうかが読み取れない。
+            **互換性を壊す変更は [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ needs.prepare-release.outputs.tag }}/CHANGELOG.md) の各版の先頭に「⚠️ 破壊的変更」として載せている。**
+            更新前に確認すること。
+
             ### Installation
 
             #### Homebrew (macOS/Linux)

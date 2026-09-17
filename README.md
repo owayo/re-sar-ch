@@ -166,6 +166,11 @@ only `all`.
 
 #### Timestamp timezone
 
+> **The default changed in v26.9.102.** Native subcommands used to print UTC; they now
+> print the machine's local timezone. Pass `--utc` to get the previous behaviour back.
+> See [CHANGELOG.md](CHANGELOG.md) for details.
+
+
 The native subcommands (`show`, `summarize`, `detect`, `compare`, `tui`) display
 timestamps in **the machine's local timezone**. `--timezone <TZ>` changes the basis and
 accepts `local` (the default), `utc`, or an IANA name such as `Asia/Tokyo`. `--utc` is an

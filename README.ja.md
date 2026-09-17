@@ -165,6 +165,11 @@ resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 
 #### 時刻のタイムゾーン
 
+> **v26.9.102 で既定が変わりました。** 独自サブコマンドの時刻は UTC 固定から
+> 実行環境のローカルタイムゾーンになりました。従来どおり UTC で出すには `--utc` を
+> 付けてください。詳細は [CHANGELOG.md](CHANGELOG.md) を参照してください。
+
+
 独自サブコマンド (`show` / `summarize` / `detect` / `compare` / `tui`) は、時刻を
 **実行環境のローカルタイムゾーン**で表示します。`--timezone <TZ>` で基準を変えられ、
 `local` (既定) / `utc` / `Asia/Tokyo` のような IANA 名を受け付けます。`--utc` は

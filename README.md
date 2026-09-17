@@ -200,7 +200,8 @@ resarch tui sa01
 resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
 ```
 
-Recorded activities become tabs; pick an item and read its time series as a table.
+Recorded activities become tabs; pick an item and read its time series as a table with a
+graph above it.
 
 | Key | Action |
 |---|---|
@@ -209,8 +210,17 @@ Recorded activities become tabs; pick an item and read its time series as a tabl
 | `g` / `G` | first / last |
 | `i` | pick an item (device, interface, CPU) |
 | `/` | filter items by name |
+| `c` | pick the metric to graph |
+| `[` / `]` | previous / next metric |
+| `v` | show or hide the graph |
 | `?` | key reference |
 | `q`, `Ctrl-C` | quit |
+
+The graph plots one series — the selected activity, item and metric. A vertical cursor
+marks the timestamp selected in the table, so both halves of the screen point at the same
+moment. On short terminals (24 rows or fewer) it stays hidden by default: a table reduced
+to a couple of rows can no longer be navigated. `v` forces it down to 18 rows; below that
+it cannot be shown at all.
 
 It follows the same rules as every other output:
 
@@ -218,6 +228,11 @@ It follows the same rules as every other output:
   missing samples and intervals where no delta can be taken are never filled with 0.
 - **`!` before a timestamp marks a discontinuity**, `R` a restart, `C` a comment.
   What happened between two samples was not observed, so points are not joined.
+- **The graph line breaks for the same reason.** Gaps and discontinuities split it into
+  separate segments that are never bridged, and a missing sample is never plotted as 0.
+  When the line is split, the count is stated in words rather than left to colour alone.
+  When nothing can be plotted at all, the reason is printed
+  (`unsupported_by_source: 120`) instead of an empty pair of axes.
 - Timestamps use the `--timezone` basis (local by default), and the screen says so.
 
 The TUI needs an interactive terminal. Piped or redirected, it tells you to use

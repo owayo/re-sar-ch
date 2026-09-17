@@ -21,15 +21,21 @@
 //! - **点を線で結ばない。** 不連続 (再起動・欠測・item の入れ替え) をまたぐ区間は
 //!   表で印を付ける。採取と採取の間に何が起きたかは観測されていない。
 //! - **時刻の基準を画面に明記する** (`--timezone`、既定はローカル)。独自出力の既定と揃える。
+//! - **グラフも同じ規律で描く。** 折れ線は不連続と欠測のところで切り、
+//!   飛び越えて結ばない。欠測を 0 に写さない (`graph` モジュールを参照)。
+
+pub mod graph;
 
 use std::path::Path;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs,
+    Axis, Block, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph, Row,
+    Table, TableState, Tabs,
 };
 use ratatui::{Frame, Terminal, prelude::Backend};
 
@@ -121,10 +127,46 @@ enum Mode {
     Normal,
     /// item 選択のポップアップ。
     PickItem,
+    /// グラフに描く列を選ぶポップアップ。
+    PickColumn,
     /// 絞り込み入力中。**ここでは `q` は文字であって終了ではない**。
     Filter,
     /// ヘルプ。
     Help,
+}
+
+/// グラフを出すかどうか。
+///
+/// 単なる `bool` にしないのは、「まだ何も指定していない」と
+/// 「利用者が明示的に隠した」を区別するため。前者は端末の高さに任せ、
+/// 後者は広い端末でも隠したままにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GraphVisibility {
+    /// 端末の高さに任せる (既定)。
+    #[default]
+    Auto,
+    /// 明示的に出す。
+    Shown,
+    /// 明示的に隠す。
+    Hidden,
+}
+
+/// グラフに割く行数。0 なら出さない。
+///
+/// **表よりグラフを優先しない。** グラフを出したせいで表が 2〜3 行しか
+/// 見えなくなると、時刻を追う操作ができなくなって閲覧の用をなさない。
+/// 低い端末では既定で出さず、明示されたときだけ最小限の高さを渡す。
+fn graph_height(vis: GraphVisibility, total: u16) -> u16 {
+    // ヘッダ 2 + タブ 1 + ヒント 1 + 表の枠と 3 行 = 9 行は譲れない。
+    match vis {
+        GraphVisibility::Hidden => 0,
+        // 明示されても、表が潰れる高さでは出さない。
+        GraphVisibility::Shown if total < 18 => 0,
+        GraphVisibility::Shown if total < 25 => 6,
+        GraphVisibility::Auto if total < 25 => 0,
+        _ if total < 32 => 7,
+        _ => (total / 3).clamp(9, 14),
+    }
 }
 
 /// タブ 1 つ = activity 1 種。
@@ -146,8 +188,16 @@ struct App {
     tab: usize,
     /// タブごとの選択 item。タブを切り替えても選択を保つ。
     item: Vec<usize>,
+    /// タブごとのグラフ対象列。タブを切り替えても選択を保つ。
+    col: Vec<usize>,
+    /// グラフを出すか。
+    graph: GraphVisibility,
+    /// 直近の描画で使った端末の高さ。`v` の判定に使う。
+    last_height: u16,
     table: TableState,
     picker: ListState,
+    /// 列ピッカーの選択位置。
+    col_picker: ListState,
     mode: Mode,
     filter: String,
     /// 終了要求。
@@ -170,6 +220,7 @@ impl App {
             }
         }
         let item = vec![0; tabs.len()];
+        let col = vec![0; tabs.len()];
         let mut table = TableState::default();
         table.select(Some(0));
         App {
@@ -177,6 +228,10 @@ impl App {
             samples: c.samples,
             marks: c.marks,
             tz: c.tz,
+            col,
+            graph: GraphVisibility::default(),
+            last_height: 0,
+            col_picker: ListState::default(),
             tabs,
             tab: 0,
             item,
@@ -294,6 +349,68 @@ impl App {
         let cur = *slot as isize;
         *slot = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
     }
+
+    /// グラフに描ける列。**数値でない列は除く** (デバイス名などは線にならない)。
+    fn plottable_columns(&self) -> Vec<&'static str> {
+        let Some(act) = self.current_activity() else {
+            return Vec::new();
+        };
+        let Some(want) = self.selected_item_name() else {
+            return Vec::new();
+        };
+        for s in &self.samples {
+            for a in s.activities.iter().filter(|a| a.activity == act) {
+                for it in &a.items {
+                    if display_item(&it.item, it.cpu.as_deref()) == want {
+                        return visible_fields(it)
+                            .filter(|f| graph::is_plottable(f))
+                            .map(|f| f.name)
+                            .collect();
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// グラフに描く列。描ける列が無ければ `None`。
+    fn selected_column(&self) -> Option<&'static str> {
+        let cols = self.plottable_columns();
+        if cols.is_empty() {
+            return None;
+        }
+        let i = self.col.get(self.tab).copied().unwrap_or(0);
+        Some(cols[i.min(cols.len() - 1)])
+    }
+
+    fn move_col(&mut self, delta: isize) {
+        let n = self.plottable_columns().len();
+        if n == 0 {
+            return;
+        }
+        let Some(slot) = self.col.get_mut(self.tab) else {
+            return;
+        };
+        let cur = (*slot).min(n - 1) as isize;
+        *slot = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+    }
+
+    /// いま実際にグラフが出ているか。
+    fn graph_visible(&self) -> bool {
+        graph_height(self.graph, self.last_height) > 0
+    }
+
+    /// グラフの表示を切り替える。
+    ///
+    /// 「いま見えているか」を基準に反転する。`Auto` で出ていない低い端末では
+    /// `Shown` にして (出せる高さなら) 出す。
+    fn toggle_graph(&mut self) {
+        self.graph = if self.graph_visible() {
+            GraphVisibility::Hidden
+        } else {
+            GraphVisibility::Shown
+        };
+    }
 }
 
 /// IRQ のように CPU 次元を持つ item は、名前に次元を足して区別する。
@@ -369,24 +486,136 @@ fn hhmmss(tz: DisplayTz, epoch: u64) -> String {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    // `v` の判定に使うので、描画のたびに実際の高さを控える。
+    app.last_height = area.height;
+    let gh = graph_height(app.graph, area.height);
     let chunks = Layout::vertical([
-        Constraint::Length(2), // ヘッダ
-        Constraint::Length(1), // タブ
-        Constraint::Min(3),    // 表
-        Constraint::Length(1), // キーヒント
+        Constraint::Length(2),  // ヘッダ
+        Constraint::Length(1),  // タブ
+        Constraint::Length(gh), // グラフ (0 なら出ない)
+        Constraint::Min(3),     // 表
+        Constraint::Length(1),  // キーヒント
     ])
     .split(area);
 
     draw_header(f, chunks[0], app);
     draw_tabs(f, chunks[1], app);
-    draw_table(f, chunks[2], app);
-    draw_hint(f, chunks[3], app);
+    if gh > 0 {
+        draw_graph(f, chunks[2], app);
+    }
+    draw_table(f, chunks[3], app);
+    draw_hint(f, chunks[4], app);
 
     match app.mode {
         Mode::PickItem => draw_picker(f, area, app),
+        Mode::PickColumn => draw_column_picker(f, area, app),
         Mode::Help => draw_help(f, area),
         _ => {}
     }
+}
+
+/// 選択中の 1 系列を折れ線で描く。
+///
+/// **不連続と欠測ごとに `Dataset` を分ける。** 1 本の点列に混ぜて
+/// 飛び越えた線を引くと、観測していない区間をあたかも観測したかのように見せる。
+fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
+    let (Some(act), Some(item)) = (app.current_activity(), app.selected_item_name()) else {
+        return;
+    };
+    let Some(col) = app.selected_column() else {
+        f.render_widget(
+            Paragraph::new("グラフに描ける数値の列がありません")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::bordered().title(" グラフ ")),
+            area,
+        );
+        return;
+    };
+    let view = graph::GraphView::build(&app.samples, act, &item, col);
+
+    let unit = if view.unit.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", view.unit)
+    };
+    let title = format!(" {act} / {item} / {col}{unit} ");
+
+    if view.is_empty() {
+        // **空の軸を出さない。** 「描けなかった」ことと「なぜか」を書く。
+        let mut lines = vec![Line::from("この範囲に描画できる観測がありません")];
+        if !view.absent.is_empty() {
+            lines.push(Line::from(Span::styled(
+                view.absent_summary(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .centered()
+                .block(Block::bordered().title(title)),
+            area,
+        );
+        return;
+    }
+
+    // 表で選んでいる時刻に縦線を立てる。表とグラフが同じ時刻を指していることを
+    // 見せるため。**値が欠測の時刻でも線は立つ** (1 点の散布では消えてしまう)。
+    let cursor: Option<[(f64, f64); 2]> = app
+        .table
+        .selected()
+        .and_then(|i| app.samples.get(i))
+        .map(|s| {
+            let x = (s.end_epoch as f64) - (view.x_origin as f64);
+            [(x, view.y_bounds[0]), (x, view.y_bounds[1])]
+        });
+
+    let mut datasets: Vec<Dataset> = Vec::with_capacity(view.segments.len() + 1);
+    if let Some(c) = cursor.as_ref() {
+        datasets.push(
+            Dataset::default()
+                .graph_type(GraphType::Line)
+                .marker(symbols::Marker::Bar)
+                .style(Style::default().fg(Color::DarkGray))
+                .data(c),
+        );
+    }
+    for seg in &view.segments {
+        datasets.push(
+            Dataset::default()
+                .graph_type(GraphType::Line)
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::Cyan))
+                .data(seg),
+        );
+    }
+
+    let gap = view.segments.len().saturating_sub(1);
+    // 線の切れ目は表の `!` / `R` と同じ意味。**色だけに頼らず語で書く。**
+    // 軸の title には出さない (Y 軸ラベルと重なって読めなくなる)。
+    let note = if gap > 0 {
+        format!(" 切れ目 {gap} (不連続・欠測) ")
+    } else {
+        String::new()
+    };
+    let chart = Chart::new(datasets)
+        .block(
+            Block::bordered()
+                .title(title)
+                .title_bottom(Line::from(note).right_aligned()),
+        )
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds(view.x_bounds)
+                .labels(view.x_labels(app.tz)),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds(view.y_bounds)
+                .labels(view.y_labels()),
+        );
+    f.render_widget(chart, area);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -544,9 +773,25 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 format!("{}  {}", hhmmss(app.tz, note.epoch), note.text)
             } else {
                 let n = app.filtered_items().len();
-                format!(
-                    "←→ activity   ↑↓ 時刻   i item ({n})   / 絞り込み   g/G 先頭末尾   ? help   q 終了"
-                )
+                // **押しても効かないキーを案内しない。** 端末が低くてグラフを
+                // 出せないときは、限られた 1 行をグラフの説明で埋めない。
+                let graph = if app.graph_visible() {
+                    "c/[] 列  v 図  "
+                } else if graph_height(GraphVisibility::Shown, app.last_height) > 0 {
+                    "v 図  "
+                } else {
+                    ""
+                };
+                let full = format!(
+                    "←→ activity  ↑↓ 時刻  i item ({n})  / 絞り込み  g/G 先頭末尾  {graph}? help  q 終了"
+                );
+                // 幅に入らないときは短い方を出す。途中で切れて語の途中で
+                // 終わるより、短くても最後まで読める方が案内になる。
+                if text_width(&full) <= area.width as usize {
+                    full
+                } else {
+                    format!("←→ act  ↑↓ 時刻  i item  {graph}? help  q")
+                }
             }
         }
     };
@@ -554,6 +799,13 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+/// 端末での表示幅 (全角を 2 桁で数える)。
+///
+/// `chars().count()` だと日本語のヒントが実際の倍の幅を占めて溢れる。
+fn text_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -593,6 +845,43 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, r, &mut app.picker);
 }
 
+/// グラフに描く列を選ぶポップアップ。
+///
+/// **描ける列だけを並べる。** デバイス名のような識別子の列を混ぜると、
+/// 選んでも線が出ない選択肢を見せることになる。
+fn draw_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
+    let cols = app.plottable_columns();
+    if cols.is_empty() {
+        return;
+    }
+    let h = (cols.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let w = cols
+        .iter()
+        .map(|s| s.chars().count() as u16)
+        .max()
+        .unwrap_or(10)
+        .clamp(20, area.width.saturating_sub(4));
+    let r = centered(area, w + 4, h);
+    f.render_widget(Clear, r);
+    let list = List::new(
+        cols.iter()
+            .map(|s| ListItem::new((*s).to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .block(Block::bordered().title(" グラフの列 (Enter 決定 / Esc 取消) "))
+    .highlight_style(Style::default().bg(Color::DarkGray));
+    app.col_picker.select(Some(
+        app.col
+            .get(app.tab)
+            .copied()
+            .unwrap_or(0)
+            .min(cols.len() - 1),
+    ));
+    f.render_stateful_widget(list, r, &mut app.col_picker);
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("←/→        activity を切り替える"),
@@ -601,13 +890,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("g / G      先頭 / 末尾"),
         Line::from("i          item を選ぶ"),
         Line::from("/          item を名前で絞り込む"),
+        Line::from("c          グラフに描く列を選ぶ"),
+        Line::from("[ / ]      グラフの列を前 / 次へ"),
+        Line::from("v          グラフの表示を切り替える"),
         Line::from("?          このヘルプ"),
         Line::from("q / Ctrl-C 終了"),
         Line::from(""),
         Line::from(format!("{ABSENT} は値が無いこと。0 ではない。")),
         Line::from("時刻の前の ! は、直前との間に不連続があること。"),
+        Line::from("グラフの線は、不連続と欠測のところで切れる。"),
+        Line::from("切れ目を飛び越えて結ばないのは、その間を観測していないため。"),
     ];
-    let r = centered(area, 56, lines.len() as u16 + 2);
+    let r = centered(area, 60, lines.len() as u16 + 2);
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" キー操作 ")),
@@ -649,6 +943,12 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             _ => {}
         },
+        Mode::PickColumn => match code {
+            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Enter => app.mode = Mode::Normal,
+            KeyCode::Up => app.move_col(-1),
+            KeyCode::Down => app.move_col(1),
+            _ => {}
+        },
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match code {
             KeyCode::Char('q') => app.quit = true,
@@ -664,6 +964,11 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.table.select(Some(last));
             }
             KeyCode::Char('i') => app.mode = Mode::PickItem,
+            KeyCode::Char('c') => app.mode = Mode::PickColumn,
+            // グラフの列送り。`←` / `→` は activity に使っているので別のキーにする。
+            KeyCode::Char('[') => app.move_col(-1),
+            KeyCode::Char(']') => app.move_col(1),
+            KeyCode::Char('v') => app.toggle_graph(),
             KeyCode::Char('/') => {
                 app.filter.clear();
                 app.mode = Mode::Filter;
@@ -730,6 +1035,204 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::json::{ActivityOut, ItemOut, Quality};
+    use ratatui::backend::TestBackend;
+
+    const T0: u64 = 1_767_225_600;
+
+    fn host() -> HostOut {
+        HostOut {
+            hostname: "testhost".into(),
+            sysname: "Linux".into(),
+            release: "0.0.0".into(),
+            machine: "x86_64".into(),
+            cpu_count: 2,
+            file_date: "2026-01-01".into(),
+            timezone: String::new(),
+            source: "sa01".into(),
+        }
+    }
+
+    /// `values` の `None` は欠測。`continuous` が false の添字で線が切れる。
+    fn app_with(values: &[Option<f64>], broken: &[usize]) -> App {
+        let samples = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| SampleOut {
+                boot: 1,
+                start_epoch: T0 + i as u64 * 600,
+                end_epoch: T0 + (i as u64 + 1) * 600,
+                elapsed_cs: 60_000,
+                continuous: !broken.contains(&i),
+                activities: vec![ActivityOut {
+                    activity: "A_CPU",
+                    label: "CPU 使用率",
+                    items: vec![ItemOut {
+                        item: "all".into(),
+                        index: 0,
+                        cpu: None,
+                        raw: Vec::new(),
+                        rates: vec![FieldOut {
+                            name: "user",
+                            unit: "percent",
+                            kind: "counter",
+                            raw: None,
+                            value: *v,
+                            text: None,
+                            quality: if v.is_some() {
+                                Quality::Ok
+                            } else {
+                                Quality::MissingInSample
+                            },
+                        }],
+                    }],
+                }],
+            })
+            .collect();
+        App::new(Collected {
+            host: host(),
+            samples,
+            marks: Vec::new(),
+            tz: DisplayTz::Utc,
+        })
+    }
+
+    fn render(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 画面に文字列が出ているか。
+    ///
+    /// 全角文字は 2 セルを占め、2 セル目が空白になる。バッファをそのまま
+    /// 連結すると「時 刻」のように隙間が入るので、**両辺から空白を落として**
+    /// 比べる。列の間隔ではなく「その語が出ているか」を見たいテストなので、
+    /// この丸めで失うものはない。
+    fn shows(screen: &str, needle: &str) -> bool {
+        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        strip(screen).contains(&strip(needle))
+    }
+
+    /// 広い端末では既定でグラフが出て、選択中の系列を名指しする。
+    #[test]
+    fn a_tall_terminal_shows_the_graph_by_default() {
+        let mut app = app_with(&[Some(1.0), Some(2.0), Some(3.0)], &[]);
+        let screen = render(&mut app, 80, 40);
+        assert!(shows(&screen, "A_CPU / all / user"), "{screen}");
+        assert!(shows(&screen, "percent"), "単位を出す: {screen}");
+    }
+
+    /// 低い端末では既定で出さない。表が潰れる方が困る。
+    #[test]
+    fn a_short_terminal_keeps_the_table_and_hides_the_graph() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        let screen = render(&mut app, 80, 20);
+        assert!(!shows(&screen, "A_CPU / all / user"), "{screen}");
+        // 表は出ている
+        assert!(shows(&screen, "CPU 使用率"), "{screen}");
+    }
+
+    /// `v` で出し入れできる。
+    #[test]
+    fn the_v_key_toggles_the_graph() {
+        let mut app = app_with(&[Some(1.0), Some(2.0), Some(3.0)], &[]);
+        let shown = render(&mut app, 80, 40);
+        assert!(shows(&shown, "A_CPU / all / user"));
+
+        on_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        let hidden = render(&mut app, 80, 40);
+        assert!(!shows(&hidden, "A_CPU / all / user"), "{hidden}");
+
+        on_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        let again = render(&mut app, 80, 40);
+        assert!(shows(&again, "A_CPU / all / user"), "{again}");
+    }
+
+    /// 全部欠測なら、空の軸ではなく理由を出す。
+    #[test]
+    fn an_all_missing_series_says_why_it_is_empty() {
+        let mut app = app_with(&[None, None, None], &[]);
+        let screen = render(&mut app, 80, 40);
+        assert!(shows(&screen, "描画できる観測がありません"), "{screen}");
+        assert!(shows(&screen, "missing_in_sample"), "理由も出す: {screen}");
+    }
+
+    /// 線の切れ目があることを語で書く (色だけに頼らない)。
+    #[test]
+    fn a_broken_line_is_stated_in_words() {
+        let mut app = app_with(&[Some(1.0), Some(2.0), None, Some(3.0)], &[]);
+        let screen = render(&mut app, 80, 40);
+        assert!(shows(&screen, "切れ目"), "{screen}");
+    }
+
+    /// 端末が低くてグラフを出せないときは、効かないキーを案内しない。
+    #[test]
+    fn the_hint_omits_graph_keys_when_the_graph_cannot_fit() {
+        let mut app = app_with(&[Some(1.0)], &[]);
+        let screen = render(&mut app, 80, 16);
+        assert!(!shows(&screen, "v 図"), "{screen}");
+        // 使えるキーの案内は残る
+        assert!(shows(&screen, "i item"), "{screen}");
+    }
+
+    /// ヒントは端末幅に収まる (語の途中で切れない)。
+    ///
+    /// 収まったかどうかは**右端に余白が残っているか**で見る。
+    /// バッファのダンプは全角の 2 セル目が空白になるため、
+    /// ダンプ文字列の長さからは実際の表示幅を数えられない。
+    #[test]
+    fn the_hint_fits_the_terminal_width() {
+        let mut app = app_with(&[Some(1.0), Some(2.0), Some(3.0)], &[]);
+        for w in [80u16, 100, 120] {
+            let screen = render(&mut app, w, 40);
+            let hint = screen.lines().last().unwrap();
+            assert!(shows(hint, "q"), "幅 {w} で末尾まで出る: {hint}");
+            assert_eq!(
+                hint.chars().last(),
+                Some(' '),
+                "幅 {w} で右端に余白が残る (切れていない): {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_height_never_starves_the_table() {
+        // 低い端末では既定で出さない
+        assert_eq!(graph_height(GraphVisibility::Auto, 20), 0);
+        // 明示されても、表が潰れる高さでは出さない
+        assert_eq!(graph_height(GraphVisibility::Shown, 17), 0);
+        assert_eq!(graph_height(GraphVisibility::Shown, 20), 6);
+        // 隠す指定は常に優先
+        assert_eq!(graph_height(GraphVisibility::Hidden, 100), 0);
+        // 高い端末でも上限を超えて広げない
+        assert_eq!(graph_height(GraphVisibility::Auto, 200), 14);
+        assert_eq!(graph_height(GraphVisibility::Auto, 30), 7);
+    }
+
+    /// 実ファイルの描画を目で見るための一時確認。
+    #[test]
+    #[ignore = "目視確認用"]
+    fn preview_real_file() {
+        let path = std::path::Path::new("target/fixtures/upstream/data-ppc-11.7.2");
+        if !path.exists() {
+            eprintln!("fixture なし");
+            return;
+        }
+        let file = crate::format::SaFile::open_with(path, Default::default()).unwrap();
+        let cfg = crate::output::table::default_config();
+        let collected = collect(&file, &cfg).unwrap();
+        let mut app = App::new(collected);
+        println!("{}", render(&mut app, 100, 36));
+    }
 
     #[test]
     fn absent_is_not_zero() {

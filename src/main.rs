@@ -1076,6 +1076,14 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
             Err(e) => return Err(e.into()),
         }
     }
+    // **黙って無視しない。** `json` / `ndjson` は `--verbose` によらず
+    // 全フィールドを出すので、指定しても出力は変わらない。
+    if args.verbose && args.format != DetectFormat::Text {
+        eprintln!(
+            "resarch: --verbose は --format text にだけ効きます \
+             (json / ndjson は指定によらず全フィールドを出します)"
+        );
+    }
     let tz = display_tz(&args.timezone)?;
     let opts = detect_options(&args, tz)?;
     let mopts = detect_multi_options(&args)?;
@@ -1124,11 +1132,17 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
         DetectFormat::Json => detect_report::write_json(&mut out, &assessments, tz)?,
         DetectFormat::Ndjson => detect_report::write_ndjson(&mut out, &assessments, tz)?,
         DetectFormat::Text => {
+            // 省くのは text だけ。json / ndjson は `--verbose` によらず全フィールドを出す。
+            let detail = if args.verbose {
+                detect_report::Detail::Full
+            } else {
+                detect_report::Detail::Summary
+            };
             for (i, a) in assessments.iter().enumerate() {
                 if i > 0 {
                     writeln!(out)?;
                 }
-                detect_report::write_text(&mut out, a, tz)?;
+                detect_report::write_text(&mut out, a, tz, detail)?;
             }
         }
     }

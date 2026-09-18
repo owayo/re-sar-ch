@@ -148,6 +148,7 @@ resarch info sa01                        # generation, ABI, activity table
 resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
 resarch detect sa01                      # where and what looks off
+resarch detect sa01 --verbose            # every detection's breakdown and interpretations
 resarch summarize sa01 sa02 --format json
 resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 09:00-18:00 local time each day
 resarch show sa01 --activity irq --irq-cpus --format ndjson  # per-CPU interrupt detail
@@ -290,6 +291,18 @@ What it will not do is dress up a guess as a measurement:
   samples was not observed.
 - **"Not evaluated" is not "nothing found".** Every series it could not assess is listed
   with the reason.
+
+The default text report summarises: each episode gets its headline, priority, evidence
+sufficiency, the series involved and one line per detection. What the report drops is
+repetition — the per-detection breakdown (observed values, basis figures, window sizes)
+and the interpretation list, which is fixed per detection pattern and would otherwise
+repeat once per episode. `--verbose` restores all of it verbatim.
+
+Nothing the report owes you is dropped. Where the basis came from, the evaluation
+coverage, and the caveats specific to a series stay in the summary; what a finding does
+**not** establish moves to the end of the report, listed once per metric instead of once
+per episode. `--format json` and `--format ndjson` are unaffected and always carry every
+field.
 
 ### Charting detected anomalies as SVG
 

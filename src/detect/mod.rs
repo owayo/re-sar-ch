@@ -619,8 +619,36 @@ pub struct BaselineEvidence {
     /// 1.0 に近いほど「異常が入力の大半を占めている」ことを示す。
     pub flagged_share: f64,
     /// 読み手に伝える留保。
+    ///
+    /// **先頭は必ず [`BASELINE_CAVEAT_SELF_SOURCED`]** で、これは比較基準の
+    /// 出所そのものを言い直したものである。2 件目以降がその系列に固有の留保
+    /// (中央値が固定条件の内側、`MAD = 0`、要求当たりの平均) になる。
     pub caveats: Vec<&'static str>,
 }
+
+/// すべての比較基準に付く一般的な留保。
+///
+/// **この 1 件だけは系列を選ばない。** 比較基準は常に入力自身から作るので、
+/// 検出ごとに繰り返しても読み手が得る情報は増えない。`text` の要約では
+/// 出力層がこれを外し、報告の冒頭と末尾で 1 度ずつ言う
+/// (規律 3 は「出所を必ず明示する」であって「毎検出で繰り返す」ではない)。
+pub const BASELINE_CAVEAT_SELF_SOURCED: &str =
+    "この基準は入力自身から作ったものであり、外部の正常値ではない";
+
+/// 散らばりが測れないときの留保 ([`Dispersion::NotMeasurable`])。
+///
+/// **検出の説明文が同じことを言う** ので、`text` の要約では出力層が外す。
+/// 「散らばりが測れないため絶対差で判断した」と書いたうえで同じ留保を並べても、
+/// 読み手が得る情報は増えない。
+pub const BASELINE_CAVEAT_MAD_ZERO: &str = "MAD が 0 なので正規化した逸脱評価はできない。\
+     宣言された最小有意変化量を超える差は絶対差として別に報告する";
+
+/// 中央値と同じ値が大半を占めるときの留保 ([`Dispersion::TooSparse`])。
+///
+/// [`BASELINE_CAVEAT_MAD_ZERO`] と同じ理由で、要約では外す。
+pub const BASELINE_CAVEAT_TOO_SPARSE: &str = "中央値と同じ値が大半を占める。\
+     散らばりの推定材料にならないので正規化した逸脱評価はできない。\
+     絶対差による観測は別に報告する";
 
 impl BaselineEvidence {
     /// 基準が異常側へ寄っている疑いがあるか。
@@ -1444,8 +1472,7 @@ pub fn build_baseline(
     let flagged = threshold::flagged_share(entry, &values);
     let median_flagged = med.is_some_and(|c| threshold::satisfies_any_fixed(entry, c));
 
-    let mut caveats: Vec<&'static str> =
-        vec!["この基準は入力自身から作ったものであり、外部の正常値ではない"];
+    let mut caveats: Vec<&'static str> = vec![BASELINE_CAVEAT_SELF_SOURCED];
     if median_flagged {
         caveats.push(
             "中央値そのものが固定条件を満たしている。基準が異常側へ寄っているため、\
@@ -1456,18 +1483,8 @@ pub fn build_baseline(
             .push("材料の半分以上が固定条件を満たしている。基準が異常側へ寄っている可能性がある");
     }
     match dispersion {
-        Dispersion::NotMeasurable => {
-            caveats.push(
-                "MAD が 0 なので正規化した逸脱評価はできない。\
-                 宣言された最小有意変化量を超える差は絶対差として別に報告する",
-            );
-        }
-        Dispersion::TooSparse { .. } => {
-            caveats.push(
-                "中央値と同じ値が大半を占める。散らばりの推定材料にならないので\
-                 正規化した逸脱評価はできない。絶対差による観測は別に報告する",
-            );
-        }
+        Dispersion::NotMeasurable => caveats.push(BASELINE_CAVEAT_MAD_ZERO),
+        Dispersion::TooSparse { .. } => caveats.push(BASELINE_CAVEAT_TOO_SPARSE),
         _ => {}
     }
     // **要求当たりの平均は、要求数の重みが無いと期間全体へ合算できない。**

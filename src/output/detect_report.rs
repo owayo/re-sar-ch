@@ -26,8 +26,11 @@ use crate::analyze::assessment::{
     describe_detection,
 };
 use crate::detect::episodes::Episode;
+use crate::detect::{
+    BASELINE_CAVEAT_MAD_ZERO, BASELINE_CAVEAT_SELF_SOURCED, BASELINE_CAVEAT_TOO_SPARSE,
+    DecisionBasis, DetectRoute, Detection, Observation,
+};
 use crate::detect::{DETECT_SCHEMA_VERSION, DETECTOR_VERSION};
-use crate::detect::{DecisionBasis, DetectRoute, Detection, Observation};
 use crate::model::DisplayTz;
 
 /// タイムゾーン名を決めるときの基準時刻。
@@ -49,8 +52,38 @@ fn json_err(e: serde_json::Error) -> io::Error {
 // text
 // ===========================================================================
 
+/// `text` の詳しさ。
+///
+/// **省くのは `text` だけ。** `json` / `ndjson` は指定によらず全フィールドを出すので、
+/// 要約で落とした根拠は機械可読形式から取れる。
+///
+/// 要約でも落とさないものがある。**その所見に固有の留保**
+/// (比較基準が異変側へ寄っている疑い) と、**評価の網羅度**、**注意**である。
+/// 前者は規律 3、後者 2 つは規律 7 と「観測と解釈の境界」がかかっている
+/// (`docs/design.md` §11.2)。落としてよいのは、検出パターンが決まれば
+/// 内容も決まる固定文と、機械可読形式に同じものがある内訳だけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Detail {
+    /// 既定。エピソードの見出し・優先度・関わった系列・検出の要約まで。
+    #[default]
+    Summary,
+    /// 検出 1 件ごとの内訳と、検出パターンごとの解釈・留保まで出す。
+    Full,
+}
+
+impl Detail {
+    fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// 人が読む形式。
-pub fn write_text<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
+pub fn write_text<W: Write>(
+    out: &mut W,
+    a: &Assessment,
+    tz: DisplayTz,
+    detail: Detail,
+) -> io::Result<()> {
     write_header(out, a, tz)?;
 
     if a.episodes.is_empty() {
@@ -62,11 +95,27 @@ pub fn write_text<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::R
     }
     for e in &a.episodes {
         writeln!(out)?;
-        write_episode(out, e, tz)?;
+        write_episode(out, e, tz, detail)?;
+    }
+    // **省いたことを黙らない。** 出ていない情報があると分からなければ、
+    // 読み手は「この所見にはこれしか根拠が無い」と読む。
+    if !detail.is_full() && !a.episodes.is_empty() {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "検出ごとの内訳 (観測値・比較基準・窓) と考えられる解釈は省いた \
+             (--verbose で出る。全フィールドは --format json / --format ndjson)"
+        )?;
     }
 
     writeln!(out)?;
-    write_background(out, a, tz)?;
+    write_background(out, a, tz, detail)?;
+
+    // 要約ではエピソード本文から外した分をここで 1 度だけ出す。
+    // **落とさずに位置を変えているだけ**である (規律 21 / 22)。
+    if !detail.is_full() {
+        write_not_established(out, a)?;
+    }
 
     writeln!(out)?;
     write_coverage(out, &a.coverage)?;
@@ -159,7 +208,12 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Res
     writeln!(out, "所見: {}", crate::analyze::describe_assessment(a))
 }
 
-fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode, tz: DisplayTz) -> io::Result<()> {
+fn write_episode<W: Write>(
+    out: &mut W,
+    e: &AssessedEpisode,
+    tz: DisplayTz,
+    detail: Detail,
+) -> io::Result<()> {
     let ep = &e.episode;
     // **2 つの範囲を区別して出す。** 根拠が及ぶ範囲だけを出すと
     // 「その期間まるごとが 1 つの事象で、内側のエピソードはその一部」と
@@ -180,14 +234,22 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode, tz: DisplayTz) -> i
     writeln!(out, "  {} {}", e.priority.mark(), e.headline)?;
     // **優先度は検出単位。** 見出しの検出について書いていることを明示する
     // (別の検出の持続性で上がったのではない)。
-    writeln!(
-        out,
-        "     優先度: {} (下地 {}) — この見出しの検出について",
-        e.priority.label(),
-        e.base_priority.label()
-    )?;
-    for r in &e.priority_reasons {
-        writeln!(out, "       - {r}")?;
+    //
+    // 要約では**昇降があったときだけ**下地と理由を出す。下地のままなら
+    // 「注視 (下地 注視) — 昇降なし」は同じことを 3 回言っている。
+    let moved = e.priority != e.base_priority;
+    if detail.is_full() || moved {
+        writeln!(
+            out,
+            "     優先度: {} (下地 {}) — この見出しの検出について",
+            e.priority.label(),
+            e.base_priority.label()
+        )?;
+        for r in &e.priority_reasons {
+            writeln!(out, "       - {r}")?;
+        }
+    } else {
+        writeln!(out, "     優先度: {}", e.priority.label())?;
     }
     if let Some(longest) = &e.longest_running_headline {
         writeln!(out, "     最も長く続いた検出: {longest}")?;
@@ -205,6 +267,8 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode, tz: DisplayTz) -> i
         s.missing_samples,
         s.discontinuities
     )?;
+    // **この留保は要約でも落とさない。** その系列の逸脱判定が当てにならない
+    // という話で、注意書きの一般論では代用できない (規律 3)。
     if s.basis_may_reflect_the_anomaly {
         writeln!(
             out,
@@ -213,34 +277,42 @@ fn write_episode<W: Write>(out: &mut W, e: &AssessedEpisode, tz: DisplayTz) -> i
     }
     // **「独立な裏付けが N 個」と書かない。** 観点として並べるだけ。
     writeln!(out, "     観点: {}", e.viewpoints.join(", "))?;
-    if ep.max_viewpoints_on_one_series > 1 {
-        writeln!(
-            out,
-            "       (同じ系列に {} つの観点が当たった。3 経路は相関するので独立な裏付けの数ではない)",
-            ep.max_viewpoints_on_one_series
-        )?;
-    }
-    if !e.corroborating_series.is_empty() {
-        writeln!(
-            out,
-            "       水準変化と別の観点が同じ時刻で当たった系列: {} (優先度は上げていない)",
-            e.corroborating_series.join(", ")
-        )?;
+    // 相関することは末尾の注意が言うので、要約では繰り返さない。
+    if detail.is_full() {
+        if ep.max_viewpoints_on_one_series > 1 {
+            writeln!(
+                out,
+                "       (同じ系列に {} つの観点が当たった。3 経路は相関するので独立な裏付けの数ではない)",
+                ep.max_viewpoints_on_one_series
+            )?;
+        }
+        if !e.corroborating_series.is_empty() {
+            writeln!(
+                out,
+                "       水準変化と別の観点が同じ時刻で当たった系列: {} (優先度は上げていない)",
+                e.corroborating_series.join(", ")
+            )?;
+        }
     }
 
     write_series_rollup(out, ep)?;
-    write_detections(out, ep, tz)?;
+    write_detections(out, ep, tz, detail)?;
 
-    if !e.possible_interpretations.is_empty() {
-        writeln!(out, "     考えられる解釈 (どれとも断定しない)")?;
-        for i in &e.possible_interpretations {
-            writeln!(out, "       - {i}")?;
+    // 解釈と留保は**検出パターンが決まれば中身も決まる**。エピソードごとに
+    // 並べるとエピソード数に比例して同じ文が増えるので、要約では指標ごとに
+    // 1 度だけレポート末尾へ集約する (`write_not_established`)。
+    if detail.is_full() {
+        if !e.possible_interpretations.is_empty() {
+            writeln!(out, "     考えられる解釈 (どれとも断定しない)")?;
+            for i in &e.possible_interpretations {
+                writeln!(out, "       - {i}")?;
+            }
         }
-    }
-    if !e.not_established.is_empty() {
-        writeln!(out, "     この所見では確かめていないこと")?;
-        for n in &e.not_established {
-            writeln!(out, "       - {n}")?;
+        if !e.not_established.is_empty() {
+            writeln!(out, "     この所見では確かめていないこと")?;
+            for n in &e.not_established {
+                writeln!(out, "       - {n}")?;
+            }
         }
     }
     Ok(())
@@ -254,6 +326,11 @@ const MAX_LISTED_SERIES_IN_EPISODE: usize = 12;
 /// 負荷の高いホストでは 1 日で 100 件を超えることがあり、全件の根拠を
 /// 並べると読めない。**件数は必ず出し**、詳細だけを打ち切る。
 const MAX_DETAILED_DETECTIONS: usize = 6;
+
+/// 要約で 1 行ずつ並べる検出数の上限。
+///
+/// 1 件が 1 行なので詳細より多く並べられる。ここも**件数は必ず出す**。
+const MAX_SUMMARIZED_DETECTIONS: usize = 12;
 
 /// 関わった系列の一覧 (件数と観点)。
 ///
@@ -299,13 +376,25 @@ fn write_series_rollup<W: Write>(out: &mut W, ep: &Episode) -> io::Result<()> {
 /// 件数が多い場合は**系列ごとに 1 件**へ絞る。同じ系列の区間を
 /// 優先度順に並べると `pgscand` の 18 件が全枠を埋めてしまい、
 /// 他に何が起きていたか分からなくなる。
-fn write_detections<W: Write>(out: &mut W, ep: &Episode, tz: DisplayTz) -> io::Result<()> {
+fn write_detections<W: Write>(
+    out: &mut W,
+    ep: &Episode,
+    tz: DisplayTz,
+    detail: Detail,
+) -> io::Result<()> {
     let total = ep.detections.len();
-    if total <= MAX_DETAILED_DETECTIONS {
+    // 要約は 1 検出 1 行なので、詳細を書くときより多くを並べられる。
+    // **絞る規則は同じ** (系列ごとの代表) で、上限だけが違う。
+    let cap = if detail.is_full() {
+        MAX_DETAILED_DETECTIONS
+    } else {
+        MAX_SUMMARIZED_DETECTIONS
+    };
+    if total <= cap {
         writeln!(out, "     検出の根拠 (全 {total} 件)")?;
         // 時刻順のまま出す (エピソードの並びと一致させる)
         for d in &ep.detections {
-            write_detection(out, d, tz)?;
+            write_detection(out, d, tz, detail)?;
         }
         return Ok(());
     }
@@ -331,25 +420,36 @@ fn write_detections<W: Write>(out: &mut W, ep: &Episode, tz: DisplayTz) -> io::R
             .then_with(|| a.series.cmp(&b.series))
             .then_with(|| a.route().cmp(&b.route()))
     });
-    let shown = best.len().min(MAX_DETAILED_DETECTIONS);
+    let shown = best.len().min(cap);
     writeln!(
         out,
         "     検出の根拠 (全 {total} 件。系列ごとの代表を {shown} 件だけ示す。\
          全件は --format json / --format ndjson で出る)"
     )?;
-    for d in best.into_iter().take(MAX_DETAILED_DETECTIONS) {
-        write_detection(out, d, tz)?;
+    for d in best.into_iter().take(cap) {
+        write_detection(out, d, tz, detail)?;
     }
     Ok(())
 }
 
-fn write_detection<W: Write>(out: &mut W, d: &Detection, tz: DisplayTz) -> io::Result<()> {
+fn write_detection<W: Write>(
+    out: &mut W,
+    d: &Detection,
+    tz: DisplayTz,
+    detail: Detail,
+) -> io::Result<()> {
     writeln!(
         out,
         "     ・[{}] {}",
         d.route().label(),
         describe_detection(d)
     )?;
+    // 要約はここで打ち切る。**判定に使った数値は 1 行目に入っている**
+    // (分析層が作った文がそう書いている) ので、落ちるのは検算の材料だけ。
+    // 系列に固有の留保だけはここでも出す。
+    if !detail.is_full() {
+        return write_series_specific_caveats(out, d);
+    }
     writeln!(
         out,
         "         系列 {} / {} / 形 {}",
@@ -483,12 +583,98 @@ fn write_baseline<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
     Ok(())
 }
 
+/// 報告の別の場所が同じことを言っている留保。
+///
+/// **要約で外してよいのはここに挙げたものだけ。** 落とすのではなく、
+/// 既に出ている文と重複しているから繰り返さないという判断である。
+const CAVEATS_STATED_ELSEWHERE: &[&str] = &[
+    // ヘッダの「比較基準: …(この入力自身が材料)」と末尾の「注意」が言う
+    BASELINE_CAVEAT_SELF_SOURCED,
+    // 検出の説明文が「散らばりが測れないため絶対差で判断した」と言う
+    BASELINE_CAVEAT_MAD_ZERO,
+    BASELINE_CAVEAT_TOO_SPARSE,
+];
+
+/// 系列に固有の留保だけを書き出す (要約用)。
+///
+/// 残るのは**報告の他のどこにも出ていない留保**で、実際には
+/// 「中央値そのものが固定条件を満たしている」「材料の半分以上が固定条件を
+/// 満たしている」「区間の 1 要求あたりの値なので基準は要求当たりの平均ではない」の
+/// 3 つになる。規律 3 が求めているのは出所と当てにならなさを伝えることで、
+/// 検出ごとに同じ一文を並べることではない。
+///
+/// 固定条件の検出には出さない。**その経路は比較基準を判定に使っていない**ので、
+/// 基準の留保を添えると使っていない根拠で所見を割り引くことになる (規律 17)。
+fn write_series_specific_caveats<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
+    if matches!(d.decision.basis, DecisionBasis::FixedCondition { .. }) {
+        return Ok(());
+    }
+    for c in d
+        .baseline
+        .caveats
+        .iter()
+        .filter(|c| !CAVEATS_STATED_ELSEWHERE.contains(c))
+    {
+        writeln!(out, "         ! {c}")?;
+    }
+    Ok(())
+}
+
+/// 確かめていないことを**指標ごとに 1 度だけ**書き出す (要約用)。
+///
+/// # なぜエピソード本文から出すのか
+///
+/// 中身は指標が決まれば決まる。同じ `%idle` の所見が 4 回立てば、
+/// 同じ 6 行が 4 回並ぶ。エピソード数に比例して増えるのは繰り返しであって
+/// 情報ではない。ここへ集めると**指標の数**にしか比例しない。
+///
+/// # 落としてはいけない
+///
+/// 「観測と解釈の境界」はこの出力の必須要素で (モジュール doc の「必ず出すもの」、
+/// 規律 21 / 22)、`--verbose` や JSON への案内では代用にならない。
+/// 位置を変えているだけで、要約でも必ず出す。
+fn write_not_established<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
+    // 指標ごとに最初の 1 件。並びは検出の出現順 (決定的)。
+    let mut rows: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+    let detections = a
+        .episodes
+        .iter()
+        .flat_map(|e| e.episode.detections.iter())
+        .chain(a.background.iter().map(|b| &b.detection));
+    for d in detections {
+        if d.not_established.is_empty() || rows.iter().any(|(label, _)| *label == d.metric_label) {
+            continue;
+        }
+        rows.push((d.metric_label, d.not_established));
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "確かめていないこと (指標ごとに 1 度。観測と解釈の境界)"
+    )?;
+    for (label, items) in rows {
+        writeln!(out, "  {label}")?;
+        for n in items {
+            writeln!(out, "    - {n}")?;
+        }
+    }
+    Ok(())
+}
+
 /// 背景の所見を書き出す。
 ///
 /// **エピソードと同じ画面に出す。** 「一日中スワップが使われている」を
 /// 別枠にした理由 (いつの手がかりを持たない) と、そのぶん
 /// エピソードから外れていることを読み手へ伝えるため。
-fn write_background<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
+fn write_background<W: Write>(
+    out: &mut W,
+    a: &Assessment,
+    tz: DisplayTz,
+    detail: Detail,
+) -> io::Result<()> {
     let excluded = a.report_scope.background_excluded_by_priority;
     if a.background.is_empty() {
         writeln!(
@@ -523,14 +709,19 @@ fn write_background<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io:
             b.share_of_input_percent
                 .map_or(String::new(), |p| format!(" — 入力の {p}% を占める"))
         )?;
-        writeln!(
-            out,
-            "     優先度: {} (下地 {}) — この検出について",
-            f.priority.label(),
-            f.base_priority.label()
-        )?;
-        for r in &f.priority_reasons {
-            writeln!(out, "       - {r}")?;
+        // エピソードと同じ扱い。昇降がなければ下地と理由を繰り返さない。
+        if detail.is_full() || f.priority != f.base_priority {
+            writeln!(
+                out,
+                "     優先度: {} (下地 {}) — この検出について",
+                f.priority.label(),
+                f.base_priority.label()
+            )?;
+            for r in &f.priority_reasons {
+                writeln!(out, "       - {r}")?;
+            }
+        } else {
+            writeln!(out, "     優先度: {}", f.priority.label())?;
         }
         writeln!(
             out,
@@ -540,7 +731,7 @@ fn write_background<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io:
             f.sufficiency.material_samples,
             f.sufficiency.required_samples
         )?;
-        write_detection(out, &b.detection, tz)?;
+        write_detection(out, &b.detection, tz, detail)?;
     }
     if excluded > 0 {
         writeln!(out, "  (優先度の下限で {excluded} 件を除外した)")?;
@@ -829,9 +1020,19 @@ mod tests {
     /// テストの T0 は UTC 基準に置いた値なので、表記も UTC で確かめる。
     const TZ: DisplayTz = DisplayTz::Utc;
 
+    /// 既定 (要約) の text。
     fn render(a: &Assessment) -> String {
+        render_with(a, Detail::Summary)
+    }
+
+    /// `--verbose` の text。
+    fn render_full(a: &Assessment) -> String {
+        render_with(a, Detail::Full)
+    }
+
+    fn render_with(a: &Assessment, detail: Detail) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        write_text(&mut buf, a, TZ).expect("書き出し");
+        write_text(&mut buf, a, TZ, detail).expect("書き出し");
         String::from_utf8(buf).expect("UTF-8")
     }
 
@@ -1060,5 +1261,107 @@ mod tests {
             .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("パース"))
             .expect("ヘッダ行");
         assert_eq!(first["report_scope"]["min_priority"], "investigate");
+    }
+
+    /// 検出が立つ入力。`%idle` が 80 から 1 へ落ちて戻る。
+    fn assessment_with_an_episode() -> Assessment {
+        let mut v = vec![80.0; 40];
+        for x in v.iter_mut().take(25).skip(20) {
+            *x = 1.0;
+        }
+        let a = assessment(&v);
+        assert!(!a.episodes.is_empty(), "この入力では検出が立つ");
+        a
+    }
+
+    /// 要約でも落とさないもの。
+    ///
+    /// **規律 3 / 7 と「観測と解釈の境界」は `--verbose` を付けなくても満たす。**
+    /// 冗長さの解消のために出力の契約を削ってはいけない。
+    #[test]
+    fn the_summary_still_states_the_basis_the_coverage_and_the_boundary() {
+        let text = render(&assessment_with_an_episode());
+        // 規律 3: 比較基準の出所
+        assert!(text.contains("この入力自身が材料"), "{text}");
+        assert!(text.contains("外部の正常値ではない"), "{text}");
+        // 規律 7: 評価の網羅度
+        assert!(text.contains("評価の網羅度"), "{text}");
+        // 規律 21 / 22: 観測と解釈の境界 (指標ごとに 1 度)
+        assert!(text.contains("確かめていないこと"), "{text}");
+        assert!(text.contains("CPU 能力の不足"), "{text}");
+        // 優先度と充足度は別のフィールドのまま
+        assert!(text.contains("優先度:"), "{text}");
+        assert!(text.contains("根拠の充足度:"), "{text}");
+        assert!(!text.contains("確信度:"), "{text}");
+    }
+
+    /// 要約で省くもの。
+    #[test]
+    fn the_summary_drops_the_per_detection_breakdown_and_the_interpretations() {
+        let text = render(&assessment_with_an_episode());
+        assert!(!text.contains("観測: "), "検算用の値列挙は省く\n{text}");
+        // 見出しで判定する (何を省いたかの案内には「考えられる解釈」の語が入る)
+        assert!(
+            !text.contains("考えられる解釈 (どれとも断定しない)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("この所見では確かめていないこと"),
+            "エピソード本文ではなく末尾へ集約する\n{text}"
+        );
+        // **省いたことを黙らない。**
+        assert!(text.contains("--verbose"), "{text}");
+    }
+
+    /// 同じ留保を 2 か所で言わない。
+    ///
+    /// 「散らばりが測れない」は検出の説明文に入っているので、
+    /// 比較基準の留保として繰り返さない。
+    #[test]
+    fn the_summary_does_not_repeat_a_caveat_the_description_already_carries() {
+        let text = render(&assessment_with_an_episode());
+        assert!(
+            text.contains("散らばりが測れないため絶対差で判断した") || text.contains("MAD の"),
+            "判定の根拠は説明文に残る\n{text}"
+        );
+        assert!(
+            !text.contains(BASELINE_CAVEAT_MAD_ZERO),
+            "説明文と同じ内容を留保として並べない\n{text}"
+        );
+    }
+
+    /// `--verbose` は従来の全文に戻す。
+    #[test]
+    fn verbose_restores_the_full_report() {
+        let a = assessment_with_an_episode();
+        let text = render_full(&a);
+        assert!(text.contains("考えられる解釈"), "{text}");
+        assert!(text.contains("この所見では確かめていないこと"), "{text}");
+        assert!(text.contains("観測: "), "{text}");
+        assert!(text.contains("比較基準: 中央値"), "{text}");
+        // 要約への案内は出さない (省いていないため)
+        assert!(!text.contains("--verbose で出る"), "{text}");
+        // 要約より必ず長い
+        assert!(
+            text.lines().count() > render(&a).lines().count(),
+            "全文が要約より短いことはない"
+        );
+    }
+
+    /// 基準が異変側へ寄っている疑いは要約でも出す (規律 3)。
+    #[test]
+    fn the_summary_keeps_a_warning_that_the_basis_leans_toward_the_anomaly() {
+        // 大半が固定条件を満たす → 中央値そのものが条件の内側
+        let mut v = vec![2.0; 30];
+        for x in v.iter_mut().take(6) {
+            *x = 80.0;
+        }
+        let a = assessment_with_period(&v, period_of(&v));
+        let text = render(&a);
+        assert!(
+            text.contains("比較基準が異変側へ寄っている疑いがある")
+                || text.contains("中央値そのものが固定条件を満たしている"),
+            "{text}"
+        );
     }
 }

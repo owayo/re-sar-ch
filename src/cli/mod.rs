@@ -280,7 +280,7 @@ pub struct SummarizeArgs {
 /// 出せない形式を `--help` に並べると読み手を惑わせる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum DetectFormat {
-    /// 人が読む形式 (既定)。
+    /// 人が読む形式 (既定)。要約で、全文は `--verbose`。
     #[default]
     Text,
     /// 独自 JSON (エージェント向け。型のフィールドをそのまま出す)。
@@ -327,6 +327,19 @@ pub struct DetectArgs {
     /// 出力形式。
     #[arg(long, value_enum, default_value_t = DetectFormat::Text)]
     pub format: DetectFormat,
+
+    /// 検出ごとの内訳と考えられる解釈まで出す。
+    ///
+    /// 既定の `text` は**エピソードの見出しと検出の要約まで**で、
+    /// 検出 1 件ごとの系列・条件・観測値・比較基準と、
+    /// 検出パターンごとに固定の「考えられる解釈」を省く。
+    ///
+    /// **比較基準の出所・評価の網羅度・確かめていないことは要約でも出る**
+    /// (確かめていないことは指標ごとに 1 度、報告の末尾にまとまる)。
+    ///
+    /// **省くのは text だけ**で、`json` / `ndjson` は指定によらず全フィールドを出す。
+    #[arg(long, verbatim_doc_comment)]
+    pub verbose: bool,
 
     #[command(flatten)]
     pub timezone: TimeZoneArgs,
@@ -910,10 +923,11 @@ mod tests {
             panic!("detect が選ばれるべき");
         };
         assert_eq!(args.files.len(), 2);
-        // 既定は text / 入力全体 / 下限なし
+        // 既定は text / 入力全体 / 下限なし / 要約
         assert_eq!(args.format, DetectFormat::Text);
         assert_eq!(args.baseline_scope, BaselineScopeArg::Input);
         assert_eq!(args.min_priority, PriorityArg::Informational);
+        assert!(!args.verbose);
     }
 
     #[test]
@@ -933,6 +947,7 @@ mod tests {
             "18:00",
             "--activity",
             "cpu,disk",
+            "--verbose",
         ]))
         .unwrap() else {
             panic!();
@@ -941,6 +956,7 @@ mod tests {
             panic!()
         };
         assert_eq!(args.format, DetectFormat::Json);
+        assert!(args.verbose);
         assert_eq!(args.baseline_scope, BaselineScopeArg::Window);
         assert_eq!(args.min_priority, PriorityArg::Investigate);
         assert_eq!(args.from.as_deref(), Some("09:00"));

@@ -18,6 +18,7 @@
 
 use crate::analyze::assessment::{NotEvaluated, RouteStatus};
 use crate::analyze::metric_catalog::{CatalogEntry, FixedCondition};
+use crate::model::Lang;
 
 use super::{
     Baseline, DETECTOR_VERSION, DecisionBasis, DecisionEvidence, DetectOptions, Detection,
@@ -56,7 +57,7 @@ pub fn detect(
     series: &PreparedSeries,
     entry: &'static CatalogEntry,
     baseline: &Baseline,
-    _opts: &DetectOptions,
+    opts: &DetectOptions,
 ) -> (Vec<Detection>, RouteStatus) {
     if entry.fixed.is_empty() {
         return (
@@ -86,7 +87,7 @@ pub fn detect(
                 if (hit.len() as u32) < condition.min_samples {
                     continue;
                 }
-                out.push(build(series, entry, condition, baseline, hit));
+                out.push(build(series, entry, condition, baseline, hit, opts.lang));
             }
         }
     }
@@ -108,18 +109,19 @@ fn build(
     condition: &FixedCondition,
     baseline: &Baseline,
     hit: &[Observation],
+    lang: Lang,
 ) -> Detection {
     let basis = DecisionBasis::FixedCondition {
         condition_id: condition.id,
         comparison: condition.comparison,
         threshold: condition.value,
         min_samples: condition.min_samples,
-        rationale: condition.rationale,
+        rationale: condition.rationale.get(lang),
     };
     Detection {
         detector_version: DETECTOR_VERSION,
         series: SeriesKey::from_metric(&series.key),
-        metric_label: entry.label,
+        metric_label: entry.label.get(lang),
         unit: series.unit,
         kind: series.kind,
         origin: series.origin,
@@ -128,8 +130,8 @@ fn build(
         baseline: baseline.evidence.clone(),
         decision: DecisionEvidence::new(basis, hit),
         base_priority: condition.priority,
-        possible_interpretations: entry.interpretations,
-        not_established: entry.not_established,
+        possible_interpretations: entry.interpretations.iter().map(|t| t.get(lang)).collect(),
+        not_established: entry.not_established.iter().map(|t| t.get(lang)).collect(),
     }
 }
 
@@ -142,7 +144,10 @@ mod tests {
     fn run(t: crate::analyze::timeline::MetricTimeline) -> (Vec<Detection>, RouteStatus) {
         let entry = entry_for(&t);
         let series = PreparedSeries::from_timeline(&t);
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let material = series.observations.clone();
         let baseline = build_baseline(&series, entry, material, &opts);
         super::detect(&series, entry, &baseline, &opts)

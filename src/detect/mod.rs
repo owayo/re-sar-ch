@@ -92,7 +92,8 @@ use serde::Serialize;
 use crate::analyze::assessment::SeriesEvaluation;
 use crate::analyze::metric_catalog::{self, CatalogEntry, ShiftMagnitude};
 use crate::analyze::timeline::{MetricKey, MetricTimeline, Timelines};
-use crate::model::{ActivityId, DisplayTz, Unit, ValueKind};
+use crate::model::{ActivityId, DisplayTz, Lang, Text, Unit, ValueKind};
+use crate::text;
 
 /// 検出出力のスキーマ版。出力契約として固定する (`docs/design.md` §11)。
 pub const DETECT_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
@@ -206,16 +207,20 @@ impl TemporalSupport {
     ///
     /// **「20 分間」とは書かない。** `sar` のデータは離散的な採取なので、
     /// 採取と採取の間に何が起きていたかは観測されていない。
-    pub fn describe_span(&self) -> String {
+    pub fn describe_span(&self, lang: Lang) -> String {
         let secs = self.span_secs();
+        let n = self.samples;
         if secs == 0 {
-            return format!("1 時点の {} 回の採取", self.samples);
+            return match lang {
+                Lang::Ja => format!("1 時点の {n} 回の採取"),
+                Lang::En => format!("{n} samples at a single point in time"),
+            };
         }
-        format!(
-            "{}にわたる {} 回の採取",
-            describe_duration(secs),
-            self.samples
-        )
+        let duration = describe_duration(secs, lang);
+        match lang {
+            Lang::Ja => format!("{duration}にわたる {n} 回の採取"),
+            Lang::En => format!("{n} samples spanning {duration}"),
+        }
     }
 
     /// 2 つの裏付けを合併する。
@@ -246,17 +251,18 @@ impl TemporalSupport {
 ///
 /// 書式化だが、文の意味 (採取回数との併記) を壊されないよう
 /// [`TemporalSupport::describe_span`] と同じ場所に置く。
-pub fn describe_duration(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs} 秒");
+pub fn describe_duration(secs: u64, lang: Lang) -> String {
+    let (m, h) = (secs / 60, secs / 3600);
+    match (secs, lang) {
+        (s, Lang::Ja) if s < 60 => format!("{s} 秒"),
+        (s, Lang::En) if s < 60 => format!("{s} seconds"),
+        (s, Lang::Ja) if s < 3600 => format!("{m} 分"),
+        (s, Lang::En) if s < 3600 => format!("{m} minutes"),
+        (s, Lang::Ja) if s.is_multiple_of(3600) => format!("{h} 時間"),
+        (s, Lang::En) if s.is_multiple_of(3600) => format!("{h} hours"),
+        (_, Lang::Ja) => format!("{h} 時間 {} 分", (secs % 3600) / 60),
+        (_, Lang::En) => format!("{h} hours {} minutes", (secs % 3600) / 60),
     }
-    if secs < 3600 {
-        return format!("{} 分", secs / 60);
-    }
-    if secs.is_multiple_of(3600) {
-        return format!("{} 時間", secs / 3600);
-    }
-    format!("{} 時間 {} 分", secs / 3600, (secs % 3600) / 60)
 }
 
 // ===========================================================================
@@ -330,11 +336,17 @@ impl ObservationOrigin {
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            ObservationOrigin::IntervalRate => "区間を代表する値 (差分から計算)",
-            ObservationOrigin::InstantGauge => "採取時点の値 (Gauge)",
-            ObservationOrigin::PerRequestAverage => "区間の 1 要求あたりの平均 (差分から計算)",
+            ObservationOrigin::IntervalRate => {
+                text!(ja: "区間を代表する値 (差分から計算)", en: "a value representing the interval (computed from deltas)")
+            }
+            ObservationOrigin::InstantGauge => {
+                text!(ja: "採取時点の値 (Gauge)", en: "the value at the moment of sampling (gauge)")
+            }
+            ObservationOrigin::PerRequestAverage => {
+                text!(ja: "区間の 1 要求あたりの平均 (差分から計算)", en: "a per-request average over the interval (computed from deltas)")
+            }
         }
     }
 }
@@ -381,11 +393,17 @@ pub enum MeanBasis {
 }
 
 impl MeanBasis {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            MeanBasis::TimeWeighted => "区間長で重み付けした平均",
-            MeanBasis::PerSample => "採取ごとの単純平均",
-            MeanBasis::UnweightedPerRequest => "単純平均 (本来必要な要求数の重みが無い)",
+            MeanBasis::TimeWeighted => {
+                text!(ja: "区間長で重み付けした平均", en: "mean weighted by interval length")
+            }
+            MeanBasis::PerSample => {
+                text!(ja: "採取ごとの単純平均", en: "plain mean over the samples")
+            }
+            MeanBasis::UnweightedPerRequest => {
+                text!(ja: "単純平均 (本来必要な要求数の重みが無い)", en: "plain mean (without the request-count weighting it needs)")
+            }
         }
     }
 }
@@ -439,10 +457,11 @@ pub enum ShiftDirection {
 }
 
 impl ShiftDirection {
-    pub const fn as_str(self) -> &'static str {
+    /// 向きを表す語。**文脈は呼び手が付ける** (「上昇側へ」「moved upward」)。
+    pub const fn as_str(self, lang: Lang) -> &'static str {
         match self {
-            ShiftDirection::Rise => "上昇",
-            ShiftDirection::Fall => "低下",
+            ShiftDirection::Rise => text!(ja: "上昇", en: "upward").get(lang),
+            ShiftDirection::Fall => text!(ja: "低下", en: "downward").get(lang),
         }
     }
 
@@ -481,20 +500,22 @@ pub enum Pattern {
 }
 
 impl Pattern {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            Pattern::Spike => "上方への逸脱",
-            Pattern::Dip => "下方への逸脱",
+            Pattern::Spike => text!(ja: "上方への逸脱", en: "deviation upward"),
+            Pattern::Dip => text!(ja: "下方への逸脱", en: "deviation downward"),
             Pattern::LevelShift {
                 direction: ShiftDirection::Rise,
-            } => "水準の上昇",
+            } => text!(ja: "水準の上昇", en: "a rise in level"),
             Pattern::LevelShift {
                 direction: ShiftDirection::Fall,
-            } => "水準の低下",
-            Pattern::Saturation => "飽和",
-            Pattern::Emergence => "事象の発生",
-            Pattern::Depletion => "余裕の減少",
-            Pattern::Sustained => "継続した閾値超過",
+            } => text!(ja: "水準の低下", en: "a fall in level"),
+            Pattern::Saturation => text!(ja: "飽和", en: "saturation"),
+            Pattern::Emergence => text!(ja: "事象の発生", en: "an event occurring"),
+            Pattern::Depletion => text!(ja: "余裕の減少", en: "headroom shrinking"),
+            Pattern::Sustained => {
+                text!(ja: "継続した閾値超過", en: "a sustained breach of the threshold")
+            }
         }
     }
 }
@@ -515,11 +536,13 @@ pub enum DetectRoute {
 
 impl DetectRoute {
     /// 観点の名前。**「独立」「直交」と書かない。**
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            DetectRoute::FixedCondition => "絶対水準",
-            DetectRoute::RobustDeviation => "参照分布からの逸脱",
-            DetectRoute::LevelShift => "時間的変化",
+            DetectRoute::FixedCondition => text!(ja: "絶対水準", en: "absolute level"),
+            DetectRoute::RobustDeviation => {
+                text!(ja: "参照分布からの逸脱", en: "deviation from the reference distribution")
+            }
+            DetectRoute::LevelShift => text!(ja: "時間的変化", en: "change over time"),
         }
     }
 }
@@ -539,10 +562,14 @@ pub enum BasisOrigin {
 }
 
 impl BasisOrigin {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            BasisOrigin::InputItself => "入力全体 (この入力自身が材料)",
-            BasisOrigin::ReportWindowOnly => "報告範囲のみ (この入力自身が材料)",
+            BasisOrigin::InputItself => {
+                text!(ja: "入力全体 (この入力自身が材料)", en: "the whole input (this input itself is the material)")
+            }
+            BasisOrigin::ReportWindowOnly => {
+                text!(ja: "報告範囲のみ (この入力自身が材料)", en: "the report window only (this input itself is the material)")
+            }
         }
     }
 }
@@ -582,12 +609,18 @@ impl Dispersion {
         matches!(self, Dispersion::Measured)
     }
 
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            Dispersion::Measured => "測定できた",
-            Dispersion::NotMeasurable => "MAD が 0 (値がほぼ一定) のため測れない",
-            Dispersion::TooSparse { .. } => "中央値から離れた値が少なすぎて測れない",
-            Dispersion::InsufficientSamples { .. } => "サンプル数が足りない",
+            Dispersion::Measured => text!(ja: "測定できた", en: "measured"),
+            Dispersion::NotMeasurable => {
+                text!(ja: "MAD が 0 (値がほぼ一定) のため測れない", en: "MAD is 0 (the value barely moves), so it cannot be measured")
+            }
+            Dispersion::TooSparse { .. } => {
+                text!(ja: "中央値から離れた値が少なすぎて測れない", en: "too few values sit away from the median to measure it")
+            }
+            Dispersion::InsufficientSamples { .. } => {
+                text!(ja: "サンプル数が足りない", en: "too few samples")
+            }
         }
     }
 }
@@ -618,7 +651,7 @@ pub struct BaselineEvidence {
     ///
     /// 1.0 に近いほど「異常が入力の大半を占めている」ことを示す。
     pub flagged_share: f64,
-    /// 読み手に伝える留保。
+    /// 読み手に伝える留保。**[`DetectOptions::lang`] で解決済み。**
     ///
     /// **先頭は必ず [`BASELINE_CAVEAT_SELF_SOURCED`]** で、これは比較基準の
     /// 出所そのものを言い直したものである。2 件目以降がその系列に固有の留保
@@ -632,23 +665,34 @@ pub struct BaselineEvidence {
 /// 検出ごとに繰り返しても読み手が得る情報は増えない。`text` の要約では
 /// 出力層がこれを外し、報告の冒頭と末尾で 1 度ずつ言う
 /// (規律 3 は「出所を必ず明示する」であって「毎検出で繰り返す」ではない)。
-pub const BASELINE_CAVEAT_SELF_SOURCED: &str =
-    "この基準は入力自身から作ったものであり、外部の正常値ではない";
+pub const BASELINE_CAVEAT_SELF_SOURCED: Text = text!(
+    ja: "この基準は入力自身から作ったものであり、外部の正常値ではない",
+    en: "this basis is built from the input itself; it is not an external notion of normal",
+);
 
 /// 散らばりが測れないときの留保 ([`Dispersion::NotMeasurable`])。
 ///
 /// **検出の説明文が同じことを言う** ので、`text` の要約では出力層が外す。
 /// 「散らばりが測れないため絶対差で判断した」と書いたうえで同じ留保を並べても、
 /// 読み手が得る情報は増えない。
-pub const BASELINE_CAVEAT_MAD_ZERO: &str = "MAD が 0 なので正規化した逸脱評価はできない。\
-     宣言された最小有意変化量を超える差は絶対差として別に報告する";
+pub const BASELINE_CAVEAT_MAD_ZERO: Text = text!(
+    ja: "MAD が 0 なので正規化した逸脱評価はできない。\
+         宣言された最小有意変化量を超える差は絶対差として別に報告する",
+    en: "MAD is 0, so no normalised deviation can be assessed. A difference beyond the declared \
+         minimum significant change is reported separately, as an absolute difference",
+);
 
 /// 中央値と同じ値が大半を占めるときの留保 ([`Dispersion::TooSparse`])。
 ///
 /// [`BASELINE_CAVEAT_MAD_ZERO`] と同じ理由で、要約では外す。
-pub const BASELINE_CAVEAT_TOO_SPARSE: &str = "中央値と同じ値が大半を占める。\
-     散らばりの推定材料にならないので正規化した逸脱評価はできない。\
-     絶対差による観測は別に報告する";
+pub const BASELINE_CAVEAT_TOO_SPARSE: Text = text!(
+    ja: "中央値と同じ値が大半を占める。\
+         散らばりの推定材料にならないので正規化した逸脱評価はできない。\
+         絶対差による観測は別に報告する",
+    en: "most values equal the median, which leaves nothing to estimate spread from, so no \
+         normalised deviation can be assessed. Observations by absolute difference are \
+         reported separately",
+);
 
 impl BaselineEvidence {
     /// 基準が異常側へ寄っている疑いがあるか。
@@ -692,12 +736,12 @@ impl FixedComparison {
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            FixedComparison::AtLeast => "以上",
-            FixedComparison::AtMost => "以下",
-            FixedComparison::Above => "超",
-            FixedComparison::Below => "未満",
+            FixedComparison::AtLeast => text!(ja: "以上", en: "at or above"),
+            FixedComparison::AtMost => text!(ja: "以下", en: "at or below"),
+            FixedComparison::Above => text!(ja: "超", en: "above"),
+            FixedComparison::Below => text!(ja: "未満", en: "below"),
         }
     }
 }
@@ -904,6 +948,7 @@ pub struct Detection {
     pub detector_version: &'static str,
     pub series: SeriesKey,
     /// 人間向けの指標名 (`CPU の空き時間` など)。
+    /// 人間向けの指標名 (**[`DetectOptions::lang`] で解決済み**)。
     pub metric_label: &'static str,
     pub unit: Unit,
     pub kind: ValueKind,
@@ -920,9 +965,9 @@ pub struct Detection {
     /// [`crate::analyze::assessment`] が持続性と充足度を見て決める。
     pub base_priority: crate::analyze::assessment::Priority,
     /// 考えられる解釈 (複数。どれとも断定しない)。
-    pub possible_interpretations: &'static [&'static str],
+    pub possible_interpretations: Vec<&'static str>,
     /// この検出では確かめていないこと。
-    pub not_established: &'static [&'static str],
+    pub not_established: Vec<&'static str>,
 }
 
 impl Detection {
@@ -1148,6 +1193,12 @@ pub struct DetectOptions {
     ///
     /// レポート出力に使うものと同じ値を入れる (CLI は `--timezone` で 1 つに決める)。
     pub tz: DisplayTz,
+    /// 所見の文を組み立てる言語。
+    ///
+    /// **分析層が文を作る**ので、言語はここまで届く必要がある
+    /// (`docs/design.md` §2: 出力層で文を作ると text と JSON で食い違う)。
+    /// 出力層は [`crate::analyze::assessment::Assessment::lang`] を見る。
+    pub lang: Lang,
     pub thresholds: DetectThresholds,
 }
 
@@ -1472,15 +1523,20 @@ pub fn build_baseline(
     let flagged = threshold::flagged_share(entry, &values);
     let median_flagged = med.is_some_and(|c| threshold::satisfies_any_fixed(entry, c));
 
-    let mut caveats: Vec<&'static str> = vec![BASELINE_CAVEAT_SELF_SOURCED];
+    let mut caveats: Vec<Text> = vec![BASELINE_CAVEAT_SELF_SOURCED];
     if median_flagged {
-        caveats.push(
-            "中央値そのものが固定条件を満たしている。基準が異常側へ寄っているため、\
-             この系列の逸脱検出は当てにならない",
-        );
+        caveats.push(text!(
+            ja: "中央値そのものが固定条件を満たしている。基準が異常側へ寄っているため、\
+                 この系列の逸脱検出は当てにならない",
+            en: "the median itself meets a fixed condition. The basis leans toward the anomalous \
+                 side, so deviation detection for this series cannot be trusted",
+        ));
     } else if flagged >= 0.5 {
-        caveats
-            .push("材料の半分以上が固定条件を満たしている。基準が異常側へ寄っている可能性がある");
+        caveats.push(text!(
+            ja: "材料の半分以上が固定条件を満たしている。基準が異常側へ寄っている可能性がある",
+            en: "more than half the material meets a fixed condition, so the basis may lean \
+                 toward the anomalous side",
+        ));
     }
     match dispersion {
         Dispersion::NotMeasurable => caveats.push(BASELINE_CAVEAT_MAD_ZERO),
@@ -1491,10 +1547,13 @@ pub fn build_baseline(
     // `await` の正しい合算は Σ(Δticks) / Σ(Δ要求数) であり、中央値も
     // 「要求当たり」ではなく「区間ごとの値の中央値」である
     if series.origin == ObservationOrigin::PerRequestAverage {
-        caveats.push(
-            "区間の 1 要求あたりの値なので、この基準は「要求当たりの平均」ではなく\
-             「区間ごとの値の分布」である。要求数の重みが検出層へ渡っていない",
-        );
+        caveats.push(text!(
+            ja: "区間の 1 要求あたりの値なので、この基準は「要求当たりの平均」ではなく\
+                 「区間ごとの値の分布」である。要求数の重みが検出層へ渡っていない",
+            en: "the value is a per-request average over the interval, so this basis is the \
+                 distribution of per-interval values, not a per-request mean. The request-count \
+                 weighting does not reach the detection layer",
+        ));
     }
 
     Baseline {
@@ -1507,7 +1566,7 @@ pub fn build_baseline(
             dispersion,
             median_within_fixed_condition: median_flagged,
             flagged_share: flagged,
-            caveats,
+            caveats: caveats.into_iter().map(|c| c.get(opts.lang)).collect(),
         },
         material,
     }
@@ -1576,7 +1635,7 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
         let material = baseline_material(&series, opts, window);
         let baseline = build_baseline(&series, entry, material, opts);
 
-        let mut eval = SeriesEvaluation::observed(&series, entry, &baseline.evidence);
+        let mut eval = SeriesEvaluation::observed(&series, entry, &baseline.evidence, opts.lang);
 
         // --- 3 経路。互いを実行条件にしない ---
         let (fixed, fixed_status) = threshold::detect(&series, entry, &baseline, opts);
@@ -1601,9 +1660,9 @@ pub fn detect(timelines: &Timelines, opts: &DetectOptions) -> DetectOutcome {
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(&entry.activity));
             out.evaluations.push(if excluded {
-                SeriesEvaluation::excluded(entry)
+                SeriesEvaluation::excluded(entry, opts.lang)
             } else {
-                SeriesEvaluation::absent(entry)
+                SeriesEvaluation::absent(entry, opts.lang)
             });
         }
     }
@@ -1795,7 +1854,7 @@ mod tests {
             samples: 3,
             ..Default::default()
         };
-        let text = s.describe_span();
+        let text = s.describe_span(Lang::Ja);
         assert!(text.contains("20 分"), "{text}");
         assert!(text.contains("3 回の採取"), "{text}");
         // 「20 分間」と書いてはいけない (採取の間は観測していない)
@@ -1804,10 +1863,10 @@ mod tests {
 
     #[test]
     fn duration_is_rendered_in_readable_units() {
-        assert_eq!(describe_duration(45), "45 秒");
-        assert_eq!(describe_duration(600), "10 分");
-        assert_eq!(describe_duration(7200), "2 時間");
-        assert_eq!(describe_duration(5400), "1 時間 30 分");
+        assert_eq!(describe_duration(45, Lang::Ja), "45 秒");
+        assert_eq!(describe_duration(600, Lang::Ja), "10 分");
+        assert_eq!(describe_duration(7200, Lang::Ja), "2 時間");
+        assert_eq!(describe_duration(5400, Lang::Ja), "1 時間 30 分");
     }
 
     /// 不連続 (RESTART) を挟んだ区間は観測に数えず、連続区間を切る。
@@ -1960,8 +2019,8 @@ mod tests {
         );
         assert_eq!(support.end_ust, T0 + 5 * STEP_SECS);
         assert_eq!(support.span_secs(), 2 * STEP_SECS, "3 回の採取の広がり");
-        assert!(support.describe_span().contains("20 分"));
-        assert!(support.describe_span().contains("3 回の採取"));
+        assert!(support.describe_span(Lang::Ja).contains("20 分"));
+        assert!(support.describe_span(Lang::Ja).contains("3 回の採取"));
         assert!(
             support.span_secs() < DetectThresholds::default().persistence_secs,
             "3 回の採取で昇格条件 (1800 秒) へ到達してはいけない"
@@ -2272,6 +2331,7 @@ mod tests {
         let ts = single(t);
 
         let opts = DetectOptions {
+            lang: Lang::Ja,
             report_from: ReportBound::Epoch(T0 + 34 * STEP_SECS),
             ..Default::default()
         };
@@ -2294,6 +2354,7 @@ mod tests {
         let t = cpu_idle(&vals(&[10.0; 40]));
         let ts = single(t);
         let opts = DetectOptions {
+            lang: Lang::Ja,
             baseline_scope: BaselineScope::Window,
             report_from: ReportBound::Epoch(T0 + 30 * STEP_SECS),
             ..Default::default()
@@ -2313,6 +2374,7 @@ mod tests {
     fn activity_selection_is_not_reported_as_source_absence() {
         use crate::analyze::assessment::{NotEvaluated, RouteStatus};
         let opts = DetectOptions {
+            lang: Lang::Ja,
             selected_activities: Some(vec![ActivityId::CPU]),
             ..Default::default()
         };
@@ -2335,7 +2397,13 @@ mod tests {
     #[test]
     fn absent_series_are_reported_as_not_evaluated() {
         let ts = single(cpu_idle(&vals(&[50.0; 20])));
-        let out = detect(&ts, &DetectOptions::default());
+        let out = detect(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let absent = out.evaluations.iter().filter(|e| !e.present).count();
         assert!(absent > 0, "入力に無い系列を黙って落としてはいけない");
         let disk = out

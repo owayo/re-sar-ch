@@ -44,7 +44,7 @@ use re_sar_ch::cli::{
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
-use re_sar_ch::model::{ActivityId, DisplayTz, KNOWN_ACTIVITIES};
+use re_sar_ch::model::{ActivityId, DisplayTz, KNOWN_ACTIVITIES, Lang};
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
@@ -1085,7 +1085,8 @@ fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
         );
     }
     let tz = display_tz(&args.timezone)?;
-    let opts = detect_options(&args, tz)?;
+    let lang = args.language.resolve().map_err(anyhow::Error::msg)?;
+    let opts = detect_options(&args, tz, lang)?;
     let mopts = detect_multi_options(&args)?;
     let analysis = multi::analyze_files(&args.files, &mopts)?;
     report_incomplete_files(&analysis);
@@ -1244,7 +1245,7 @@ fn save_detect_graphs(
     Ok(())
 }
 
-fn detect_options(args: &DetectArgs, tz: DisplayTz) -> anyhow::Result<DetectOptions> {
+fn detect_options(args: &DetectArgs, tz: DisplayTz, lang: Lang) -> anyhow::Result<DetectOptions> {
     let report_from = report_bound("--from", args.from.as_deref())?;
     let report_to = report_bound("--to", args.to.as_deref())?;
     if matches!((report_from, report_to), (ReportBound::Epoch(s), ReportBound::Epoch(e)) if e < s) {
@@ -1258,6 +1259,7 @@ fn detect_options(args: &DetectArgs, tz: DisplayTz) -> anyhow::Result<DetectOpti
         report_from,
         report_to,
         tz,
+        lang,
         selected_activities: match selection_from(&args.activity)? {
             Selection::All => None,
             Selection::Only(ids) => Some(ids),

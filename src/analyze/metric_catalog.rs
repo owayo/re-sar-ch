@@ -56,7 +56,8 @@
 use crate::analyze::assessment::Priority;
 use crate::analyze::timeline::{MetricKey, SINGLE_ITEM};
 use crate::detect::{FixedComparison, Pattern, ShiftDirection};
-use crate::model::{ActivityId, Unit, ValueKind};
+use crate::model::{ActivityId, Lang, Text, Unit, ValueKind};
+use crate::text;
 
 /// カタログの版。項目・閾値を変えたら上げる。
 ///
@@ -132,7 +133,7 @@ pub struct FixedCondition {
     /// [`boundary_phrase`] が作る境界の文言を必ず含めること
     /// (テストで機械的に照合している)。解釈はここに書かず
     /// [`CatalogEntry::interpretations`] へ回す。
-    pub rationale: &'static str,
+    pub rationale: Text,
 }
 
 /// 固定条件の境界を、実装している比較演算子から文言に起こす。
@@ -144,7 +145,7 @@ pub struct FixedCondition {
 ///
 /// 単位は [`Unit::suffix`] から採る。`%` は数値に続けて書き
 /// (`5% 以下`)、それ以外の記号は 1 つ空ける (`100 ms 以上`)。
-pub fn boundary_phrase(unit: Unit, condition: &FixedCondition) -> String {
+pub fn boundary_phrase(unit: Unit, condition: &FixedCondition, lang: Lang) -> String {
     let suffix = unit.suffix();
     let sep = if suffix.is_empty() || suffix == "%" {
         ""
@@ -157,10 +158,13 @@ pub fn boundary_phrase(unit: Unit, condition: &FixedCondition) -> String {
     } else {
         format!("{:.1}", condition.value)
     };
-    format!(
-        "{value}{sep}{suffix} {}",
-        condition.comparison.label().trim()
-    )
+    // **比較の語は言語で位置が変わる。** 日本語は後置 (`5% 以下`)、
+    // 英語は前置 (`at most 5%`) で、語順まで含めてここで決める。
+    let comparison = condition.comparison.label().get(lang).trim();
+    match lang {
+        Lang::Ja => format!("{value}{sep}{suffix} {comparison}"),
+        Lang::En => format!("{comparison} {value}{sep}{suffix}"),
+    }
 }
 
 // ===========================================================================
@@ -240,7 +244,7 @@ pub struct CatalogEntry {
     /// 単位。**`layout` の宣言と一致すること** (テストで固定)。
     pub unit: Unit,
     /// 人間向けの指標名。
-    pub label: &'static str,
+    pub label: Text,
     /// 固定条件 (0 件でもよい)。
     pub fixed: &'static [FixedCondition],
     pub deviation: DeviationInterest,
@@ -250,9 +254,9 @@ pub struct CatalogEntry {
     /// 判断の基準は [`CatalogEntry::shift_interest`] の doc にある。
     pub shift_direction: DeviationInterest,
     /// 考えられる解釈 (複数。どれとも断定しない)。
-    pub interpretations: &'static [&'static str],
+    pub interpretations: &'static [Text],
     /// この系列からは確かめられないこと。
-    pub not_established: &'static [&'static str],
+    pub not_established: &'static [Text],
 }
 
 impl CatalogEntry {
@@ -347,82 +351,198 @@ pub fn activities() -> Vec<ActivityId> {
 // **あった**時間の割合」。**どちらも CPU は idle** である。
 // したがって `%idle` が 0 でも、その時間が `%iowait` に寄っているだけで
 // CPU は何も実行していない、という状態があり得る。
-const I_CPU_IDLE: &[&str] = &[
-    "実行時間 (%user + %nice + %system) が増え、CPU 能力が要求に対して不足している",
-    "単一のプロセスが CPU を占有している",
-    "意図的に CPU を使い切るバッチ処理が動いていた",
-    "idle 時間が I/O 完了待ち (%iowait) に寄っており、CPU は実行していない",
-    "仮想化環境で実行を待たされている (%steal に寄っている)",
-    "水準が上がった場合は負荷源が消えた (処理の完了とサービスの停止を区別できない)",
+const I_CPU_IDLE: &[Text] = &[
+    text!(
+        ja: "実行時間 (%user + %nice + %system) が増え、CPU 能力が要求に対して不足している",
+        en: "Running time (%user + %nice + %system) rose and the CPU cannot keep up with demand",
+    ),
+    text!(
+        ja: "単一のプロセスが CPU を占有している",
+        en: "A single process is monopolising the CPU",
+    ),
+    text!(
+        ja: "意図的に CPU を使い切るバッチ処理が動いていた",
+        en: "A batch job designed to use the whole CPU was running",
+    ),
+    text!(
+        ja: "idle 時間が I/O 完了待ち (%iowait) に寄っており、CPU は実行していない",
+        en: "The idle time shifted into waiting for I/O (%iowait); the CPU is not executing",
+    ),
+    text!(
+        ja: "仮想化環境で実行を待たされている (%steal に寄っている)",
+        en: "The guest is waiting to run under virtualisation (the time shifted into %steal)",
+    ),
+    text!(
+        ja: "水準が上がった場合は負荷源が消えた (処理の完了とサービスの停止を区別できない)",
+        en: "If the level rose, the source of load disappeared (work finishing and a service stopping cannot be told apart)",
+    ),
 ];
-const NE_CPU_IDLE: &[&str] = &[
-    "CPU 能力の不足。sar(1) の %idle は「未完了ディスク I/O が無い idle 時間」、\
+const NE_CPU_IDLE: &[Text] = &[
+    text!(
+        ja: "CPU 能力の不足。sar(1) の %idle は「未完了ディスク I/O が無い idle 時間」、\
      %iowait は「未完了ディスク I/O がある idle 時間」で**どちらも CPU は idle** なので、\
      %idle が低いことからは進めない。%idle=0 かつ %iowait=99 もこの条件を満たす",
-    "実行時間の割合 (%user + %nice + %system)。複数列の和を条件にする仕組みが無く、\
+        en: "That the CPU is short of capacity. In sar(1), %idle is idle time with no outstanding disk I/O \
+     and %iowait is idle time with outstanding disk I/O — **the CPU is idle in both** — so a low \
+     %idle leads nowhere on its own. %idle=0 with %iowait=99 also meets this condition",
+    ),
+    text!(
+        ja: "実行時間の割合 (%user + %nice + %system)。複数列の和を条件にする仕組みが無く、\
      このカタログは合成列を持たない",
-    "どのプロセスが CPU を使っていたか (sa ファイルにプロセス別の内訳は無い)",
-    "処理が遅延したかどうか (応答時間は観測していない)",
+        en: "The share of running time (%user + %nice + %system). There is no mechanism for conditions on a \
+     sum of columns, and this catalog has no derived columns",
+    ),
+    text!(
+        ja: "どのプロセスが CPU を使っていたか (sa ファイルにプロセス別の内訳は無い)",
+        en: "Which processes used the CPU (the sa file has no per-process breakdown)",
+    ),
+    text!(
+        ja: "処理が遅延したかどうか (応答時間は観測していない)",
+        en: "Whether anything was actually delayed (response time is not observed)",
+    ),
 ];
 
 // `%iowait` は「CPU が idle で、未完了のディスク I/O 要求があった時間」の割合
 // (`sar(1)`)。**CPU が I/O のために働いている時間ではない。**
 // 分母は tick 合計なので、CPU が空いていれば同じ I/O 量でも割合は大きく見える。
-const I_IOWAIT: &[&str] = &[
-    "ストレージの応答が遅い",
-    "I/O 要求が多い (正常な負荷でも上がる)",
-    "CPU が空いているため待ち時間が相対的に大きく見えている",
+const I_IOWAIT: &[Text] = &[
+    text!(
+        ja: "ストレージの応答が遅い",
+        en: "Storage is responding slowly",
+    ),
+    text!(
+        ja: "I/O 要求が多い (正常な負荷でも上がる)",
+        en: "There are many I/O requests (a healthy load raises this too)",
+    ),
+    text!(
+        ja: "CPU が空いているため待ち時間が相対的に大きく見えている",
+        en: "The CPU is idle, which makes the waiting time look large in relative terms",
+    ),
 ];
-const NE_IOWAIT: &[&str] = &[
-    "ストレージ障害の有無 (%iowait だけでは判定できない。デバイス別の await / %util と併せて見る)",
-    "CPU の忙しさ。%iowait の時間は CPU が idle だった時間であり、\
+const NE_IOWAIT: &[Text] = &[
+    text!(
+        ja: "ストレージ障害の有無 (%iowait だけでは判定できない。デバイス別の await / %util と併せて見る)",
+        en: "Whether storage is faulty (%iowait alone cannot tell; read it with per-device await / %util)",
+    ),
+    text!(
+        ja: "CPU の忙しさ。%iowait の時間は CPU が idle だった時間であり、\
      %idle と足して「空いていた割合」になる",
-    "どのデバイスが待たされていたか",
+        en: "How busy the CPU was. Time in %iowait is time the CPU was idle; added to %idle it gives the \
+     share of time it was free",
+    ),
+    text!(
+        ja: "どのデバイスが待たされていたか",
+        en: "Which device was being waited on",
+    ),
 ];
 
-const I_STEAL: &[&str] = &[
-    "同一ハイパーバイザ上の他ゲストと CPU を競合している",
-    "CPU クォータによる制限を受けている",
+const I_STEAL: &[Text] = &[
+    text!(
+        ja: "同一ハイパーバイザ上の他ゲストと CPU を競合している",
+        en: "The guest is contending for CPU with other guests on the same hypervisor",
+    ),
+    text!(
+        ja: "CPU クォータによる制限を受けている",
+        en: "A CPU quota is capping it",
+    ),
 ];
-const NE_STEAL: &[&str] = &["ホスト側の構成・他ゲストの負荷 (ゲスト内の統計からは見えない)"];
+const NE_STEAL: &[Text] = &[text!(
+    ja: "ホスト側の構成・他ゲストの負荷 (ゲスト内の統計からは見えない)",
+    en: "The host's configuration and the load from other guests (invisible from statistics inside the guest)",
+)];
 
-const I_SYS: &[&str] = &[
-    "システムコールや割り込み処理が増えた",
-    "ファイルシステム・ネットワークスタックでの処理が増えた",
+const I_SYS: &[Text] = &[
+    text!(
+        ja: "システムコールや割り込み処理が増えた",
+        en: "System calls or interrupt handling increased",
+    ),
+    text!(
+        ja: "ファイルシステム・ネットワークスタックでの処理が増えた",
+        en: "Work in the filesystem or the network stack increased",
+    ),
 ];
-const NE_SYS: &[&str] = &["どのカーネル処理が増えたか (内訳は記録されていない)"];
+const NE_SYS: &[Text] = &[text!(
+    ja: "どのカーネル処理が増えたか (内訳は記録されていない)",
+    en: "Which kernel work increased (no breakdown is recorded)",
+)];
 
-const I_RUNQ: &[&str] = &[
-    "CPU 数に対して実行可能タスクが多い",
-    "短時間に大量のタスクが投入された",
+const I_RUNQ: &[Text] = &[
+    text!(
+        ja: "CPU 数に対して実行可能タスクが多い",
+        en: "There are many runnable tasks for the number of CPUs",
+    ),
+    text!(
+        ja: "短時間に大量のタスクが投入された",
+        en: "A burst of tasks was submitted in a short time",
+    ),
 ];
-const NE_RUNQ: &[&str] = &[
-    "待ち時間の長さ (キュー長からは算出できない)",
-    "絶対値の妥当性は CPU 数に依存する。固定条件は置いていない",
-];
-
-const I_BLOCKED: &[&str] = &[
-    "I/O の完了待ちが常に存在する",
-    "ネットワークストレージの応答待ちが続いている",
-];
-const NE_BLOCKED: &[&str] = &["待たされていたデバイス (blocked にデバイスの内訳は無い)"];
-
-const I_LOADAVG: &[&str] = &[
-    "実行可能・I/O 待ちのタスクが増えた",
-    "CPU 数に対して負荷が大きい",
-];
-const NE_LOADAVG: &[&str] = &[
-    "load average は I/O 待ちを含む。CPU 不足とは限らない",
-    "適正値は CPU 数に依存する。固定条件は置いていない",
+const NE_RUNQ: &[Text] = &[
+    text!(
+        ja: "待ち時間の長さ (キュー長からは算出できない)",
+        en: "How long anything waited (queue length does not give this)",
+    ),
+    text!(
+        ja: "絶対値の妥当性は CPU 数に依存する。固定条件は置いていない",
+        en: "Whether the absolute value is reasonable depends on the CPU count, so no fixed condition is declared",
+    ),
 ];
 
-const I_MEM_AVAIL: &[&str] = &[
-    "メモリ要求が増えた",
-    "回収できないページ (tmpfs・カーネルスラブ) が増えた",
+const I_BLOCKED: &[Text] = &[
+    text!(
+        ja: "I/O の完了待ちが常に存在する",
+        en: "There is always something waiting for I/O to complete",
+    ),
+    text!(
+        ja: "ネットワークストレージの応答待ちが続いている",
+        en: "Waits on network storage are continuing",
+    ),
 ];
-const NE_MEM_AVAIL: &[&str] = &[
-    "OOM Killer が動いたか (sa ファイルに記録は無い)",
-    "絶対値の妥当性は搭載量に依存する。固定条件は置いていない",
+const NE_BLOCKED: &[Text] = &[text!(
+    ja: "待たされていたデバイス (blocked にデバイスの内訳は無い)",
+    en: "Which device was being waited on (blocked carries no per-device breakdown)",
+)];
+
+const I_LOADAVG: &[Text] = &[
+    text!(
+        ja: "実行可能・I/O 待ちのタスクが増えた",
+        en: "Runnable and I/O-waiting tasks increased",
+    ),
+    text!(
+        ja: "CPU 数に対して負荷が大きい",
+        en: "The load is large for the number of CPUs",
+    ),
+];
+const NE_LOADAVG: &[Text] = &[
+    text!(
+        ja: "load average は I/O 待ちを含む。CPU 不足とは限らない",
+        en: "Load average includes tasks waiting on I/O, so it does not have to mean a CPU shortage",
+    ),
+    text!(
+        ja: "適正値は CPU 数に依存する。固定条件は置いていない",
+        en: "What counts as reasonable depends on the CPU count, so no fixed condition is declared",
+    ),
+];
+
+const I_MEM_AVAIL: &[Text] = &[
+    text!(
+        ja: "メモリ要求が増えた",
+        en: "Demand for memory increased",
+    ),
+    text!(
+        ja: "回収できないページ (tmpfs・カーネルスラブ) が増えた",
+        en: "Unreclaimable pages (tmpfs, kernel slab) increased",
+    ),
+];
+const NE_MEM_AVAIL: &[Text] = &[
+    text!(
+        ja: "OOM Killer が動いたか (sa ファイルに記録は無い)",
+        en: "Whether the OOM killer ran (the sa file records nothing about it)",
+    ),
+    text!(
+        ja: "絶対値の妥当性は搭載量に依存する。固定条件は置いていない",
+        en: "Whether the absolute value is reasonable depends on how much memory is installed, so no fixed \
+     condition is declared",
+    ),
 ];
 
 // この実装の `%memused` は `100 × (tlmkb − availablekb) / tlmkb`
@@ -432,147 +552,334 @@ const NE_MEM_AVAIL: &[&str] = &[
 // MemFree・SReclaimable・file LRU の大きさと各 zone の low watermark から計算する」
 // と定義されている。**回収可能なページキャッシュは既に差し引かれている**ので、
 // 「ページキャッシュを含むから高くても問題ない」は**この列には当てはまらない**。
-const I_MEMUSED: &[&str] = &[
-    "割り当て済み (回収できない) メモリが増えた",
-    "回収できないページ (tmpfs・カーネルスラブ・mlock) が増えた",
-    "ページキャッシュのうち回収できると見積もられない分が増えた",
+const I_MEMUSED: &[Text] = &[
+    text!(
+        ja: "割り当て済み (回収できない) メモリが増えた",
+        en: "Allocated, unreclaimable memory increased",
+    ),
+    text!(
+        ja: "回収できないページ (tmpfs・カーネルスラブ・mlock) が増えた",
+        en: "Unreclaimable pages (tmpfs, kernel slab, mlock) increased",
+    ),
+    text!(
+        ja: "ページキャッシュのうち回収できると見積もられない分が増えた",
+        en: "The part of the page cache not estimated as reclaimable increased",
+    ),
 ];
-const NE_MEMUSED: &[&str] = &[
-    "OOM Killer が動いたか (sa ファイルに記録は無い)",
-    "割り当てが実際に待たされたか。待ちの有無は PSI memory (some / full) と \
+const NE_MEMUSED: &[Text] = &[
+    text!(
+        ja: "OOM Killer が動いたか (sa ファイルに記録は無い)",
+        en: "Whether the OOM killer ran (the sa file records nothing about it)",
+    ),
+    text!(
+        ja: "割り当てが実際に待たされたか。待ちの有無は PSI memory (some / full) と \
      pgscand/s が示すが、どちらも採取されていない世代がある",
-    "97% という境界は運用上の設定値であり、カーネルがこの比率で挙動を変えるわけではない。\
+        en: "Whether an allocation actually had to wait. PSI memory (some / full) and pgscand/s would show \
+     that, but there are generations where neither is collected",
+    ),
+    text!(
+        ja: "97% という境界は運用上の設定値であり、カーネルがこの比率で挙動を変えるわけではない。\
      搭載量が大きいホストでは残り 3% が絶対量としては十分な場合がある",
-    "旧世代 (availablekb 非搭載) の値。本家互換出力は kbmemfree で代用するが、\
+        en: "The 97% boundary is an operational setting, not a ratio at which the kernel changes behaviour. \
+     On a host with a lot of memory the remaining 3% can still be plenty in absolute terms",
+    ),
+    text!(
+        ja: "旧世代 (availablekb 非搭載) の値。本家互換出力は kbmemfree で代用するが、\
      その値は回収可能なページキャッシュを含み意味が変わる。検出経路は厳密モードで\
      読むため代用せず、評価不能として報告する",
+        en: "The value on older generations that carry no availablekb. The compatibility output substitutes \
+     kbmemfree, but that value includes reclaimable page cache and means something different. The \
+     detection path reads strictly and does not substitute; it reports the series as not evaluated",
+    ),
 ];
 
-const I_COMMIT: &[&str] = &["割り当てを約束したメモリ量が増えた"];
-const NE_COMMIT: &[&str] =
-    &["%commit が 100 を超えること自体は異常ではない (overcommit は既定で許可される)"];
+const I_COMMIT: &[Text] = &[text!(
+    ja: "割り当てを約束したメモリ量が増えた",
+    en: "The amount of memory promised to allocations increased",
+)];
+const NE_COMMIT: &[Text] = &[text!(
+    ja: "%commit が 100 を超えること自体は異常ではない (overcommit は既定で許可される)",
+    en: "%commit going above 100 is not itself a fault (overcommit is permitted by default)",
+)];
 
 // Linux は不足時にだけ退避するのではない。`vm.swappiness` (既定 60、
 // カーネル文書 `admin-guide/sysctl/vm.rst`) は「swap とファイルページングの
 // 相対 I/O コスト」の設定で、0 でない既定構成では**不足が無くても**
 // 使われないページが退避される。したがって「使用中」は背景情報であり、
 // それ自体が調査の理由にはならない。
-const I_SWAP_SPACE: &[&str] = &[
-    "swappiness の設定に従って使われないページが退避された (通常動作)",
-    "過去にメモリ不足があり、退避したページが残っている",
-    "現在もメモリが不足している",
+const I_SWAP_SPACE: &[Text] = &[
+    text!(
+        ja: "swappiness の設定に従って使われないページが退避された (通常動作)",
+        en: "Unused pages were evicted in line with the swappiness setting (ordinary behaviour)",
+    ),
+    text!(
+        ja: "過去にメモリ不足があり、退避したページが残っている",
+        en: "Memory ran short in the past and the evicted pages are still there",
+    ),
+    text!(
+        ja: "現在もメモリが不足している",
+        en: "Memory is short right now",
+    ),
 ];
-const NE_SWAP_SPACE: &[&str] = &[
-    "現在のメモリ不足。退避済みページは読み戻されるまで残るので、\
+const NE_SWAP_SPACE: &[Text] = &[
+    text!(
+        ja: "現在のメモリ不足。退避済みページは読み戻されるまで残るので、\
      使用率からは過去の痕跡と現在の不足を区別できない",
-    "この 1% は運用上の設定値であり、普遍的な意味を持つ境界ではない。\
+        en: "Whether memory is short now. Evicted pages stay until they are read back, so usage cannot \
+     separate a trace of the past from a shortage in the present",
+    ),
+    text!(
+        ja: "この 1% は運用上の設定値であり、普遍的な意味を持つ境界ではない。\
      swappiness とワークロードによって通常運用の水準が変わる",
-    "スワップ未構成のホストでの扱い。総量が 0 のとき使用率は 0% として計算されるため\
+        en: "This 1% is an operational setting, not a boundary with universal meaning. What is normal moves \
+     with swappiness and with the workload",
+    ),
+    text!(
+        ja: "スワップ未構成のホストでの扱い。総量が 0 のとき使用率は 0% として計算されるため\
      (`series::compute` の `swpused_pct`)、この条件は成立しないが\
      「未構成なので適用対象外」とは報告されない",
+        en: "What it means on a host with no swap configured. With a total of 0 the usage is computed as 0% \
+     (`swpused_pct` in `series::compute`), so the condition never holds — but the report does not \
+     say 'not applicable because swap is not configured' either",
+    ),
 ];
 
-const I_SWAP_IO: &[&str] = &[
-    "長時間使われないページを退避しているだけ (swappiness による通常動作)",
-    "メモリ不足でページの追い出し・読み戻しが起きている",
+const I_SWAP_IO: &[Text] = &[
+    text!(
+        ja: "長時間使われないページを退避しているだけ (swappiness による通常動作)",
+        en: "Long-unused pages are simply being evicted (ordinary behaviour under swappiness)",
+    ),
+    text!(
+        ja: "メモリ不足でページの追い出し・読み戻しが起きている",
+        en: "Memory is short, so pages are being pushed out and read back",
+    ),
 ];
-const NE_SWAP_IO: &[&str] = &[
-    "スワップ発生が性能低下を招いたか (遅延は観測していない)",
-    "メモリ不足かどうか。swappiness が 0 でない既定構成では不足が無くても発生する",
-    "どのプロセスのページが退避されたか",
+const NE_SWAP_IO: &[Text] = &[
+    text!(
+        ja: "スワップ発生が性能低下を招いたか (遅延は観測していない)",
+        en: "Whether the swapping hurt performance (latency is not observed)",
+    ),
+    text!(
+        ja: "メモリ不足かどうか。swappiness が 0 でない既定構成では不足が無くても発生する",
+        en: "Whether memory is short. With the default non-zero swappiness this happens without any shortage",
+    ),
+    text!(
+        ja: "どのプロセスのページが退避されたか",
+        en: "Whose pages were evicted",
+    ),
 ];
 
-const I_RECLAIM_K: &[&str] = &[
-    "空きメモリが回収閾値を下回り kswapd が回収を始めた",
-    "ページキャッシュの入れ替えが活発 (大量の逐次 I/O でも起きる)",
+const I_RECLAIM_K: &[Text] = &[
+    text!(
+        ja: "空きメモリが回収閾値を下回り kswapd が回収を始めた",
+        en: "Free memory fell below the watermark and kswapd started reclaiming",
+    ),
+    text!(
+        ja: "ページキャッシュの入れ替えが活発 (大量の逐次 I/O でも起きる)",
+        en: "The page cache is turning over quickly (heavy sequential I/O does this too)",
+    ),
 ];
-const NE_RECLAIM_K: &[&str] = &["回収が割り当て待ちを起こしたか (待ち時間は観測していない)"];
+const NE_RECLAIM_K: &[Text] = &[text!(
+    ja: "回収が割り当て待ちを起こしたか (待ち時間は観測していない)",
+    en: "Whether the reclaim made any allocation wait (waiting time is not observed)",
+)];
 
-const I_RECLAIM_D: &[&str] = &[
-    "kswapd の回収が追いつかず、プロセス自身が回収している",
-    "特定の zone / NUMA ノードのメモリが枯渇している",
+const I_RECLAIM_D: &[Text] = &[
+    text!(
+        ja: "kswapd の回収が追いつかず、プロセス自身が回収している",
+        en: "kswapd cannot keep up, so processes are reclaiming for themselves",
+    ),
+    text!(
+        ja: "特定の zone / NUMA ノードのメモリが枯渇している",
+        en: "Memory in a particular zone or NUMA node is exhausted",
+    ),
 ];
-const NE_RECLAIM_D: &[&str] = &["どのプロセスが待たされたか"];
+const NE_RECLAIM_D: &[Text] = &[text!(
+    ja: "どのプロセスが待たされたか",
+    en: "Which processes were made to wait",
+)];
 
-const I_MAJFLT: &[&str] = &[
-    "実行イメージやマップしたファイルの読み込みが発生した",
-    "スワップインが発生した",
+const I_MAJFLT: &[Text] = &[
+    text!(
+        ja: "実行イメージやマップしたファイルの読み込みが発生した",
+        en: "Executable images or mapped files were read in",
+    ),
+    text!(
+        ja: "スワップインが発生した",
+        en: "Pages were swapped in",
+    ),
 ];
-const NE_MAJFLT: &[&str] = &["起動直後やバッチ開始時には通常発生する。単独では異常を意味しない"];
+const NE_MAJFLT: &[Text] = &[text!(
+    ja: "起動直後やバッチ開始時には通常発生する。単独では異常を意味しない",
+    en: "This is normal just after start-up or at the beginning of a batch job; on its own it means nothing is wrong",
+)];
 
 // `sar(1)`: `%util` = 「デバイスへ I/O 要求が発行されていた経過時間の割合
 // (デバイスの帯域利用率)」。**要求を何本同時に処理していたかは入っていない**ので、
 // 並列に処理するデバイス (NVMe・RAID・SSD) では 100% でも余力があり得る。
 // 本家の man も「such as RAID arrays and modern SSDs, this number does not
 // reflect their performance limits」と注記している。
-const I_DISK_UTIL: &[&str] = &[
-    "デバイスへの要求が処理能力に達している",
-    "逐次 I/O でデバイスを使い切っている (正常な高スループット)",
-    "要求を並列に処理するデバイスで、稼働時間が長くても余力が残っている",
-    "水準が下がった場合は I/O を出していた処理が止まった (完了か停止かは区別できない)",
+const I_DISK_UTIL: &[Text] = &[
+    text!(
+        ja: "デバイスへの要求が処理能力に達している",
+        en: "Requests to the device have reached what it can process",
+    ),
+    text!(
+        ja: "逐次 I/O でデバイスを使い切っている (正常な高スループット)",
+        en: "Sequential I/O is using the device fully (healthy high throughput)",
+    ),
+    text!(
+        ja: "要求を並列に処理するデバイスで、稼働時間が長くても余力が残っている",
+        en: "On a device that processes requests in parallel, a long busy time can still leave headroom",
+    ),
+    text!(
+        ja: "水準が下がった場合は I/O を出していた処理が止まった (完了か停止かは区別できない)",
+        en: "If the level fell, whatever was issuing I/O stopped (finishing and halting cannot be told apart)",
+    ),
 ];
-const NE_DISK_UTIL: &[&str] = &[
-    "処理能力の飽和。%util は「要求が 1 つ以上あった時間の割合」で同時実行数を含まないため、\
+const NE_DISK_UTIL: &[Text] = &[
+    text!(
+        ja: "処理能力の飽和。%util は「要求が 1 つ以上あった時間の割合」で同時実行数を含まないため、\
      複数キューのデバイス (NVMe・RAID) では 100% でも飽和を意味しない",
-    "残っている余力の量 (キュー深度・並列度はこの列からは分からない)",
-    "デバイス名は major/minor から組んだ表記であり、OS 上の名前とは異なる場合がある",
+        en: "That the device is saturated. %util is the share of time at least one request was outstanding \
+     and carries no notion of concurrency, so on multi-queue devices (NVMe, RAID) even 100% does \
+     not mean saturation",
+    ),
+    text!(
+        ja: "残っている余力の量 (キュー深度・並列度はこの列からは分からない)",
+        en: "How much headroom is left (queue depth and parallelism are not in this column)",
+    ),
+    text!(
+        ja: "デバイス名は major/minor から組んだ表記であり、OS 上の名前とは異なる場合がある",
+        en: "The device name is built from major/minor and can differ from the name the OS uses",
+    ),
 ];
 
 // `sar(1)`: `await` = 「デバイスへ発行された I/O 要求が処理されるまでの平均時間
 // (ミリ秒)。**キューで待った時間とサービスに要した時間の両方を含む**」。
 // 大きいことは「遅かった」までしか示さず、滞留 (キュー待ち) と
 // サービス時間の長さ (大きな要求・低速デバイス) を分けられない。
-const I_DISK_AWAIT: &[&str] = &[
-    "デバイスの応答が遅い",
-    "キューに要求が滞留している",
-    "要求サイズが大きく 1 要求あたりの時間が伸びている",
+const I_DISK_AWAIT: &[Text] = &[
+    text!(
+        ja: "デバイスの応答が遅い",
+        en: "The device is responding slowly",
+    ),
+    text!(
+        ja: "キューに要求が滞留している",
+        en: "Requests are queueing up",
+    ),
+    text!(
+        ja: "要求サイズが大きく 1 要求あたりの時間が伸びている",
+        en: "Requests are large, which stretches the time each one takes",
+    ),
 ];
-const NE_DISK_AWAIT: &[&str] = &[
-    "滞留かサービス時間か。await はキュー待ち時間とサービス時間の合計なので、\
+const NE_DISK_AWAIT: &[Text] = &[
+    text!(
+        ja: "滞留かサービス時間か。await はキュー待ち時間とサービス時間の合計なので、\
      値の大きさだけでは切り分けられない (aqu-sz / areq-sz と併せる)",
-    "デバイス障害と輻輳の区別",
-    "アプリケーションから見た遅延 (await はブロック層の値)",
+        en: "Whether this is queueing or service time. await is the sum of both, so its size alone does not \
+     separate them (read it with aqu-sz / areq-sz)",
+    ),
+    text!(
+        ja: "デバイス障害と輻輳の区別",
+        en: "Telling a failing device from a congested one",
+    ),
+    text!(
+        ja: "アプリケーションから見た遅延 (await はブロック層の値)",
+        en: "The latency an application sees (await is a block-layer figure)",
+    ),
 ];
 
-const I_DISK_LOAD: &[&str] = &[
-    "I/O 要求が増えた",
-    "書き込みフラッシュが集中した",
-    "水準が下がった場合は I/O を出していた処理が止まった (完了か停止かは区別できない)",
+const I_DISK_LOAD: &[Text] = &[
+    text!(
+        ja: "I/O 要求が増えた",
+        en: "I/O requests increased",
+    ),
+    text!(
+        ja: "書き込みフラッシュが集中した",
+        en: "Write flushes bunched up",
+    ),
+    text!(
+        ja: "水準が下がった場合は I/O を出していた処理が止まった (完了か停止かは区別できない)",
+        en: "If the level fell, whatever was issuing I/O stopped (finishing and halting cannot be told apart)",
+    ),
 ];
-const NE_DISK_LOAD: &[&str] = &[
-    "どのプロセスの I/O か (内訳は記録されていない)",
-    "転送数が減った理由 (処理の完了・停止・上流の詰まりを区別できない)",
+const NE_DISK_LOAD: &[Text] = &[
+    text!(
+        ja: "どのプロセスの I/O か (内訳は記録されていない)",
+        en: "Whose I/O this is (no breakdown is recorded)",
+    ),
+    text!(
+        ja: "転送数が減った理由 (処理の完了・停止・上流の詰まりを区別できない)",
+        en: "Why the transfer count fell (work finishing, halting, and a blockage upstream cannot be told apart)",
+    ),
 ];
 
-const I_NET_TP: &[&str] = &[
-    "転送量が増えた",
-    "バックアップ・レプリケーションが動いた",
-    "水準が下がった場合は通信が止まった (処理の完了・上流の停止・経路障害を区別できない)",
+const I_NET_TP: &[Text] = &[
+    text!(
+        ja: "転送量が増えた",
+        en: "The volume transferred increased",
+    ),
+    text!(
+        ja: "バックアップ・レプリケーションが動いた",
+        en: "A backup or replication job ran",
+    ),
+    text!(
+        ja: "水準が下がった場合は通信が止まった (処理の完了・上流の停止・経路障害を区別できない)",
+        en: "If the level fell, traffic stopped (work finishing, an upstream halt, and a broken path cannot \
+     be told apart)",
+    ),
 ];
-const NE_NET_TP: &[&str] = &[
-    "相手先・プロトコルの内訳 (記録されていない)",
-    "転送量が減った理由 (このインターフェースの統計だけでは断定できない)",
+const NE_NET_TP: &[Text] = &[
+    text!(
+        ja: "相手先・プロトコルの内訳 (記録されていない)",
+        en: "Which peers and protocols (not recorded)",
+    ),
+    text!(
+        ja: "転送量が減った理由 (このインターフェースの統計だけでは断定できない)",
+        en: "Why the volume fell (this interface's statistics alone cannot settle it)",
+    ),
 ];
 
-const I_NET_UTIL: &[&str] = &["リンク帯域を使い切っている"];
-const NE_NET_UTIL: &[&str] = &[
-    "%ifutil はインターフェースの申告速度 (`speed`、Mbit/s) を分母にする。\
+const I_NET_UTIL: &[Text] = &[text!(
+    ja: "リンク帯域を使い切っている",
+    en: "The link's bandwidth is fully used",
+)];
+const NE_NET_UTIL: &[Text] = &[
+    text!(
+        ja: "%ifutil はインターフェースの申告速度 (`speed`、Mbit/s) を分母にする。\
      速度が 0 = 不明のインターフェース (仮想デバイス・ethtool が返さない NIC) では\
      分母が無いので**値を作らず評価不能として報告する**",
-    "全二重では受信・送信の**大きい方**だけを見る (sar(1))。逆方向の余裕は分からない",
+        en: "%ifutil divides by the speed the interface declares (`speed`, Mbit/s). Where that is 0, meaning \
+     unknown (virtual devices, NICs ethtool will not answer for), there is no denominator, so \
+     **no value is produced and the series is reported as not evaluated**",
+    ),
+    text!(
+        ja: "全二重では受信・送信の**大きい方**だけを見る (sar(1))。逆方向の余裕は分からない",
+        en: "On full duplex only the **larger** of receive and transmit is considered (sar(1)), so headroom \
+     in the other direction is unknown",
+    ),
 ];
 
 // `rx_errors` / `tx_errors` (カーネル文書 `networking/statistics.rst`) は
 // 「受信した不良パケットの総数」「送信時の問題の総数」で、下位カウンタ
 // (crc / frame / carrier / fifo など) を束ねた値である。内訳は sa ファイルに無い。
-const I_NET_ERR: &[&str] = &[
-    "リンク品質・ケーブル・対向機器に問題がある",
-    "デバイスの FIFO が溢れている (負荷起因)",
+const I_NET_ERR: &[Text] = &[
+    text!(
+        ja: "リンク品質・ケーブル・対向機器に問題がある",
+        en: "There is a problem with link quality, the cable, or the device at the other end",
+    ),
+    text!(
+        ja: "デバイスの FIFO が溢れている (負荷起因)",
+        en: "The device's FIFO is overflowing (load-induced)",
+    ),
 ];
-const NE_NET_ERR: &[&str] = &[
-    "どのエラーがどの層で起きたか。rx_errors / tx_errors は下位カウンタを束ねた総数で、\
-     内訳 (crc / frame / carrier / fifo) は記録されていない",
-];
+const NE_NET_ERR: &[Text] = &[text!(
+    ja: "どのエラーがどの層で起きたか。rx_errors / tx_errors は下位カウンタを束ねた総数で、\
+ 内訳 (crc / frame / carrier / fifo) は記録されていない",
+    en: "Which error happened at which layer. rx_errors / tx_errors are totals bundling lower counters, \
+ and the breakdown (crc / frame / carrier / fifo) is not recorded",
+)];
 
 // `/proc/net/dev` の drop 列は**キュー溢れ専用のカウンタではない**。
 // カーネル文書 (`networking/statistics.rst`) の `rx_dropped` は
@@ -580,99 +887,235 @@ const NE_NET_ERR: &[&str] = &[
 // ハードウェアインターフェースではこのカウンタは **L2 アドレスフィルタで破棄された
 // パケットを含み得る**」。さらに `rx_missed_errors` (「ホストが取りこぼしたパケット」) は
 // 「procfs では drop カウンタに畳み込まれる」ので、この列は 2 つの合算である。
-const I_NET_RX_DROP: &[&str] = &[
-    "未対応のプロトコル・VLAN タグのパケットを受け取った (処理されないのが正常)",
-    "受信キュー・ソケットバッファが溢れた",
-    "L2 アドレスフィルタで破棄された",
-    "ホストが取りこぼした (rx_missed_errors 分。procfs が drop に畳み込む)",
+const I_NET_RX_DROP: &[Text] = &[
+    text!(
+        ja: "未対応のプロトコル・VLAN タグのパケットを受け取った (処理されないのが正常)",
+        en: "Packets arrived for an unsupported protocol or VLAN tag (not processing them is correct)",
+    ),
+    text!(
+        ja: "受信キュー・ソケットバッファが溢れた",
+        en: "A receive queue or socket buffer overflowed",
+    ),
+    text!(
+        ja: "L2 アドレスフィルタで破棄された",
+        en: "They were discarded by the L2 address filter",
+    ),
+    text!(
+        ja: "ホストが取りこぼした (rx_missed_errors 分。procfs が drop に畳み込む)",
+        en: "The host missed them (the rx_missed_errors part, which procfs folds into drop)",
+    ),
 ];
-const NE_NET_RX_DROP: &[&str] = &[
-    "破棄の原因。procfs の drop 列は資源不足・未対応プロトコル・L2 フィルタ・\
+const NE_NET_RX_DROP: &[Text] = &[
+    text!(
+        ja: "破棄の原因。procfs の drop 列は資源不足・未対応プロトコル・L2 フィルタ・\
      rx_missed_errors を合算した値で、内訳は sa ファイルからは分けられない",
-    "運用上許容できる件数・割合。受信パケット数に対する比率と、\
+        en: "Why they were dropped. The drop column in procfs sums resource shortages, unsupported \
+     protocols, the L2 filter and rx_missed_errors, and the sa file cannot separate them",
+    ),
+    text!(
+        ja: "運用上許容できる件数・割合。受信パケット数に対する比率と、\
      そのホストで通常どれだけ計上されるかを別に決める必要がある",
-    "通信品質への影響 (破棄されたパケットが再送されたかは観測していない)",
+        en: "How many, or what share, is acceptable in practice. The ratio against received packets and what \
+     this host normally records both have to be decided separately",
+    ),
+    text!(
+        ja: "通信品質への影響 (破棄されたパケットが再送されたかは観測していない)",
+        en: "The effect on quality of service (whether the dropped packets were retransmitted is not observed)",
+    ),
 ];
 
 // `tx_dropped` = 「送信に向かう途中で破棄されたパケットの数。例えば資源不足による」
 // (カーネル文書 `networking/statistics.rst`)。
-const I_NET_TX_DROP: &[&str] = &[
-    "送信キューの資源が不足した",
-    "デバイスが停止している間に送信しようとした",
+const I_NET_TX_DROP: &[Text] = &[
+    text!(
+        ja: "送信キューの資源が不足した",
+        en: "The transmit queue ran short of resources",
+    ),
+    text!(
+        ja: "デバイスが停止している間に送信しようとした",
+        en: "Something tried to send while the device was down",
+    ),
 ];
-const NE_NET_TX_DROP: &[&str] = &[
-    "破棄の原因 (tx_dropped は「送信に向かう途中の資源不足等」を束ねた値)",
-    "運用上許容できる件数・割合",
+const NE_NET_TX_DROP: &[Text] = &[
+    text!(
+        ja: "破棄の原因 (tx_dropped は「送信に向かう途中の資源不足等」を束ねた値)",
+        en: "Why they were dropped (tx_dropped bundles resource shortages and the like on the way out)",
+    ),
+    text!(
+        ja: "運用上許容できる件数・割合",
+        en: "How many, or what share, is acceptable in practice",
+    ),
 ];
 
-const I_FS_FULL: &[&str] = &[
-    "書き込みが増えて空き容量が減った",
-    "ログ・一時ファイルが溜まっている",
+const I_FS_FULL: &[Text] = &[
+    text!(
+        ja: "書き込みが増えて空き容量が減った",
+        en: "Writing increased and free space shrank",
+    ),
+    text!(
+        ja: "ログ・一時ファイルが溜まっている",
+        en: "Logs or temporary files are piling up",
+    ),
 ];
-const NE_FS_FULL: &[&str] = &[
-    "どのディレクトリが使っているか (sa ファイルに内訳は無い)",
-    "%fsused は特権ユーザ視点。非特権プロセスから見た空きは %ufsused",
+const NE_FS_FULL: &[Text] = &[
+    text!(
+        ja: "どのディレクトリが使っているか (sa ファイルに内訳は無い)",
+        en: "Which directories are using it (the sa file has no breakdown)",
+    ),
+    text!(
+        ja: "%fsused は特権ユーザ視点。非特権プロセスから見た空きは %ufsused",
+        en: "%fsused is the privileged view; what an unprivileged process sees free is %ufsused",
+    ),
 ];
 
-const I_FS_INODE: &[&str] = &["小さなファイルが大量に作られている"];
-const NE_FS_INODE: &[&str] = &["どのディレクトリのファイルか"];
+const I_FS_INODE: &[Text] = &[text!(
+    ja: "小さなファイルが大量に作られている",
+    en: "Large numbers of small files are being created",
+)];
+const NE_FS_INODE: &[Text] = &[text!(
+    ja: "どのディレクトリのファイルか",
+    en: "Which directory the files are in",
+)];
 
-const I_FILE_NR: &[&str] = &[
-    "開いているファイル記述子が増えた",
-    "記述子を閉じ忘れているプロセスがある",
+const I_FILE_NR: &[Text] = &[
+    text!(
+        ja: "開いているファイル記述子が増えた",
+        en: "The number of open file descriptors increased",
+    ),
+    text!(
+        ja: "記述子を閉じ忘れているプロセスがある",
+        en: "Some process is failing to close descriptors",
+    ),
 ];
-const NE_FILE_NR: &[&str] = &[
-    "上限に達したか (file-max はこのファイルに記録されていない)",
-    "どのプロセスが開いているか",
+const NE_FILE_NR: &[Text] = &[
+    text!(
+        ja: "上限に達したか (file-max はこのファイルに記録されていない)",
+        en: "Whether the limit was reached (file-max is not recorded in this file)",
+    ),
+    text!(
+        ja: "どのプロセスが開いているか",
+        en: "Which process has them open",
+    ),
 ];
 
 // PSI (カーネル文書 `accounting/psi.rst`): some = 「少なくとも一部のタスクが
 // 待たされていた時間の割合」、full = 「**全 non-idle タスク**が同時に
 // 待たされていた時間の割合」。full は「全タスク」ではない
 // (待つべき仕事を持たないタスクは数に入らない)。
-const I_PSI_CPU: &[&str] = &["実行可能タスクが CPU を待っている"];
-const NE_PSI_CPU: &[&str] = &[
-    "PSI は待ち時間の割合であり、待ったタスクの内訳は持たない",
-    "待ちが応答時間に響いたか (遅延は観測していない)",
+const I_PSI_CPU: &[Text] = &[text!(
+    ja: "実行可能タスクが CPU を待っている",
+    en: "Runnable tasks are waiting for CPU",
+)];
+const NE_PSI_CPU: &[Text] = &[
+    text!(
+        ja: "PSI は待ち時間の割合であり、待ったタスクの内訳は持たない",
+        en: "PSI is a share of stalled time and carries no breakdown of which tasks stalled",
+    ),
+    text!(
+        ja: "待ちが応答時間に響いたか (遅延は観測していない)",
+        en: "Whether the waiting showed up in response time (latency is not observed)",
+    ),
 ];
 
-const I_PSI_IO: &[&str] = &["I/O 完了待ちで処理が止まっている"];
-const NE_PSI_IO: &[&str] = &[
-    "どのデバイス・どのプロセスが待ったか",
-    "full が示すのは「全 non-idle タスクが同時に待った」ことであり、\
+const I_PSI_IO: &[Text] = &[text!(
+    ja: "I/O 完了待ちで処理が止まっている",
+    en: "Work is stalled waiting for I/O to complete",
+)];
+const NE_PSI_IO: &[Text] = &[
+    text!(
+        ja: "どのデバイス・どのプロセスが待ったか",
+        en: "Which device, and which process, was waiting",
+    ),
+    text!(
+        ja: "full が示すのは「全 non-idle タスクが同時に待った」ことであり、\
      待つ仕事を持たないタスクまで止まっていたことではない",
+        en: "full means every **non-idle** task stalled at the same time; it does not mean tasks with no work \
+     to wait on were stopped too",
+    ),
 ];
 
-const I_PSI_MEM: &[&str] = &["メモリ回収待ちで処理が止まっている"];
-const NE_PSI_MEM: &[&str] = &[
-    "どのプロセスが待ったか",
-    "full が示すのは「全 non-idle タスクが同時に待った」ことであり、\
+const I_PSI_MEM: &[Text] = &[text!(
+    ja: "メモリ回収待ちで処理が止まっている",
+    en: "Work is stalled waiting for memory reclaim",
+)];
+const NE_PSI_MEM: &[Text] = &[
+    text!(
+        ja: "どのプロセスが待ったか",
+        en: "Which process was waiting",
+    ),
+    text!(
+        ja: "full が示すのは「全 non-idle タスクが同時に待った」ことであり、\
      待つ仕事を持たないタスクまで止まっていたことではない",
+        en: "full means every **non-idle** task stalled at the same time; it does not mean tasks with no work \
+     to wait on were stopped too",
+    ),
 ];
 
-const I_CSWCH: &[&str] = &[
-    "実行するタスクが増えた",
-    "ロック競合や短い待ちが頻発している",
-    "割り込みが増えた",
-    "水準が下がった場合は動いていたタスクが減った (処理の完了と停止を区別できない)",
+const I_CSWCH: &[Text] = &[
+    text!(
+        ja: "実行するタスクが増えた",
+        en: "There are more tasks to run",
+    ),
+    text!(
+        ja: "ロック競合や短い待ちが頻発している",
+        en: "Lock contention or short waits are happening often",
+    ),
+    text!(
+        ja: "割り込みが増えた",
+        en: "Interrupts increased",
+    ),
+    text!(
+        ja: "水準が下がった場合は動いていたタスクが減った (処理の完了と停止を区別できない)",
+        en: "If the level fell, fewer tasks are running (work finishing and halting cannot be told apart)",
+    ),
 ];
-const NE_CSWCH: &[&str] = &["適正値はワークロードに依存する。固定条件は置いていない"];
+const NE_CSWCH: &[Text] = &[text!(
+    ja: "適正値はワークロードに依存する。固定条件は置いていない",
+    en: "What counts as reasonable depends on the workload, so no fixed condition is declared",
+)];
 
-const I_PROC: &[&str] = &[
-    "プロセス・スレッドの生成が増えた",
-    "fork を多用する処理が動いた",
-    "水準が下がった場合は生成していた処理が止まった (完了と停止を区別できない)",
+const I_PROC: &[Text] = &[
+    text!(
+        ja: "プロセス・スレッドの生成が増えた",
+        en: "Process and thread creation increased",
+    ),
+    text!(
+        ja: "fork を多用する処理が動いた",
+        en: "Something that forks heavily was running",
+    ),
+    text!(
+        ja: "水準が下がった場合は生成していた処理が止まった (完了と停止を区別できない)",
+        en: "If the level fell, whatever was creating them stopped (finishing and halting cannot be told apart)",
+    ),
 ];
-const NE_PROC: &[&str] = &["生成されたプロセスの内容 (記録されていない)"];
+const NE_PROC: &[Text] = &[text!(
+    ja: "生成されたプロセスの内容 (記録されていない)",
+    en: "What the created processes were (not recorded)",
+)];
 
-const I_SOCK: &[&str] = &[
-    "接続数が増えた",
-    "短命な接続が大量に作られている (TIME_WAIT の滞留)",
-    "水準が下がった場合は接続が切れた・受け付けが止まった",
+const I_SOCK: &[Text] = &[
+    text!(
+        ja: "接続数が増えた",
+        en: "The number of connections increased",
+    ),
+    text!(
+        ja: "短命な接続が大量に作られている (TIME_WAIT の滞留)",
+        en: "Large numbers of short-lived connections are being made (TIME_WAIT piling up)",
+    ),
+    text!(
+        ja: "水準が下がった場合は接続が切れた・受け付けが止まった",
+        en: "If the level fell, connections were lost or the host stopped accepting them",
+    ),
 ];
-const NE_SOCK: &[&str] = &[
-    "接続先・ポートの内訳 (記録されていない)",
-    "接続数が減った理由 (正常な終了と受け付け停止を区別できない)",
+const NE_SOCK: &[Text] = &[
+    text!(
+        ja: "接続先・ポートの内訳 (記録されていない)",
+        en: "Which peers and ports (not recorded)",
+    ),
+    text!(
+        ja: "接続数が減った理由 (正常な終了と受け付け停止を区別できない)",
+        en: "Why the count fell (a clean shutdown and a halt in accepting cannot be told apart)",
+    ),
 ];
 
 // ===========================================================================
@@ -688,7 +1131,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Aggregate,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "CPU の空き時間",
+        label: text!(ja: "CPU の空き時間", en: "CPU idle time"),
         fixed: &[FixedCondition {
             id: "cpu-idle-exhausted",
             comparison: FixedComparison::AtMost,
@@ -696,10 +1139,16 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "非 I/O 待ちの idle が 5% 以下で続いた。sar(1) の %idle は\
-                        「CPU が idle で未完了のディスク I/O 要求が無かった時間」の割合で、\
-                        搭載量やワークロードに依存せず意味が定まるのは**この観測まで**である。\
-                        %iowait も idle 時間なので、ここから CPU 能力の不足には進めない",
+            rationale: text!(
+                ja: "非 I/O 待ちの idle が 5% 以下で続いた。sar(1) の %idle は\
+                            「CPU が idle で未完了のディスク I/O 要求が無かった時間」の割合で、\
+                            搭載量やワークロードに依存せず意味が定まるのは**この観測まで**である。\
+                            %iowait も idle 時間なので、ここから CPU 能力の不足には進めない",
+                en: "Non-I/O-waiting idle stayed at or below 5%. In sar(1), %idle is the share of time the CPU was \
+                 idle with no outstanding disk I/O request; its meaning is fixed, independent of \
+                 capacity or workload, **only as far as that observation**. %iowait is idle time too, \
+                 so this does not lead on to a shortage of CPU capacity",
+            ),
         }],
         deviation: DeviationInterest::Lower,
         shift: ShiftMagnitude::Absolute(20.0),
@@ -715,7 +1164,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Aggregate,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "I/O 待ちの CPU 時間",
+        label: text!(ja: "I/O 待ちの CPU 時間", en: "CPU time idle with I/O outstanding"),
         fixed: &[FixedCondition {
             id: "cpu-iowait-high",
             comparison: FixedComparison::AtLeast,
@@ -723,8 +1172,12 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "未完了のディスク I/O があった idle 時間の割合が 30% 以上で続いた。\
-                        正常な大量 I/O でも上がるため、原因の特定には至らない",
+            rationale: text!(
+                ja: "未完了のディスク I/O があった idle 時間の割合が 30% 以上で続いた。\
+                            正常な大量 I/O でも上がるため、原因の特定には至らない",
+                en: "The share of idle time with disk I/O outstanding stayed at or above 30%. A healthy, heavy I/O \
+                 load raises this too, so it does not identify a cause",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(10.0),
@@ -739,7 +1192,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Aggregate,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "奪われた CPU 時間",
+        label: text!(ja: "奪われた CPU 時間", en: "Stolen CPU time"),
         fixed: &[FixedCondition {
             id: "cpu-steal-present",
             comparison: FixedComparison::Above,
@@ -747,8 +1200,12 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "仮想化環境で実行を待たされた CPU 時間の割合が 2% 超で続いた。\
-                        ゲスト内の対策では解消しないため、この水準でも報告する価値がある",
+            rationale: text!(
+                ja: "仮想化環境で実行を待たされた CPU 時間の割合が 2% 超で続いた。\
+                            ゲスト内の対策では解消しないため、この水準でも報告する価値がある",
+                en: "The share of CPU time the guest spent waiting to run under virtualisation stayed above 2%. \
+                 Nothing inside the guest resolves it, which is why even this level is worth reporting",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(5.0),
@@ -763,7 +1220,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Aggregate,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "カーネルモードの CPU 時間",
+        label: text!(ja: "カーネルモードの CPU 時間", en: "CPU time in kernel mode"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(15.0),
@@ -779,7 +1236,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::None,
-        label: "実行待ちタスク数",
+        label: text!(ja: "実行待ちタスク数", en: "Runnable tasks"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(4.0),
@@ -794,7 +1251,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::None,
-        label: "ブロックされたタスク数",
+        label: text!(ja: "ブロックされたタスク数", en: "Blocked tasks"),
         fixed: &[FixedCondition {
             id: "queue-blocked-present",
             comparison: FixedComparison::Above,
@@ -802,9 +1259,14 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 3,
             priority: Priority::Watch,
-            rationale: "I/O 完了待ちで走れないタスクの数が 0 超で続いた。\
-                        瞬間値としては珍しくないが、採取をまたいで続けて観測されるのは\
-                        待ちが常態化していることを示す",
+            rationale: text!(
+                ja: "I/O 完了待ちで走れないタスクの数が 0 超で続いた。\
+                            瞬間値としては珍しくないが、採取をまたいで続けて観測されるのは\
+                            待ちが常態化していることを示す",
+                en: "The number of tasks unable to run while waiting for I/O stayed above 0. A single sample is \
+                 unremarkable, but seeing it across consecutive samples means the waiting has become \
+                 the normal state",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(2.0),
@@ -819,7 +1281,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::None,
-        label: "1 分平均負荷",
+        label: text!(ja: "1 分平均負荷", en: "1-minute load average"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(2.0),
@@ -834,7 +1296,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::None,
-        label: "15 分平均負荷",
+        label: text!(ja: "15 分平均負荷", en: "15-minute load average"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(2.0),
@@ -850,7 +1312,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::Kilobytes,
-        label: "利用可能メモリ",
+        label: text!(ja: "利用可能メモリ", en: "Available memory"),
         // kB の絶対量なので搭載量に依存する。割合による固定条件は
         // 同じ入力から作る `%memused` (= 100 − 利用可能比率) の側に置いた。
         fixed: &[],
@@ -870,7 +1332,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::Percent,
-        label: "メモリ使用率",
+        label: text!(ja: "メモリ使用率", en: "Memory used"),
         // この列は `100 × (総量 − 利用可能) / 総量` なので、条件は
         // 「利用可能メモリが総量の 3% 以下」という**割合**の観測である。
         // 搭載量に依存しない形で書けるのはここまでで、3% という線は
@@ -886,12 +1348,18 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Depletion,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "利用可能メモリが総量の 3% 以下 (%memused が 97% 以上) で続いた。\
-                        この列の分子は総量 − MemAvailable で、MemAvailable は\
-                        「swapping なしで新しいアプリケーションを起動するのに使える量の推定値」\
-                        (カーネル文書 filesystems/proc.rst) なので、回収可能なページキャッシュは\
-                        既に差し引かれている。**97% は運用上の設定値**であり、\
-                        カーネルがこの比率で挙動を変えるわけではない",
+            rationale: text!(
+                ja: "利用可能メモリが総量の 3% 以下 (%memused が 97% 以上) で続いた。\
+                            この列の分子は総量 − MemAvailable で、MemAvailable は\
+                            「swapping なしで新しいアプリケーションを起動するのに使える量の推定値」\
+                            (カーネル文書 filesystems/proc.rst) なので、回収可能なページキャッシュは\
+                            既に差し引かれている。**97% は運用上の設定値**であり、\
+                            カーネルがこの比率で挙動を変えるわけではない",
+                en: "Available memory stayed at or below 3% of the total (%memused at or above 97%). The numerator \
+                 of this column is total minus MemAvailable, and MemAvailable is the kernel's estimate \
+                 of how much is available to start new applications without swapping \
+                 (filesystems/proc.rst), so reclaimable page cache is already excluded",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(10.0),
@@ -906,7 +1374,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::Percent,
-        label: "約束済みメモリの比率",
+        label: text!(ja: "約束済みメモリの比率", en: "Committed memory ratio"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(25.0),
@@ -921,7 +1389,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::Percent,
-        label: "スワップ使用率",
+        label: text!(ja: "スワップ使用率", en: "Swap used"),
         // 「使われている」ことは**背景情報**である。swappiness が 0 でない
         // 既定構成では不足が無くても退避されるので、使用の事実から
         // メモリ不足へは進めない。1% は運用上の設定値として扱い、
@@ -933,10 +1401,15 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Informational,
-            rationale: "スワップ領域の使用率が 1% 超で続いた。**この 1% は運用上の設定値**で、\
-                        普遍的な境界ではない。Linux は vm.swappiness (既定 60) に従って\
-                        使われないページを退避するため、使用中であること自体は\
-                        メモリ不足の証拠にならない。退避済みページは読み戻されるまで残る",
+            rationale: text!(
+                ja: "スワップ領域の使用率が 1% 超で続いた。**この 1% は運用上の設定値**で、\
+                            普遍的な境界ではない。Linux は vm.swappiness (既定 60) に従って\
+                            使われないページを退避するため、使用中であること自体は\
+                            メモリ不足の証拠にならない。退避済みページは読み戻されるまで残る",
+                en: "Swap usage stayed above 1%. **This 1% is an operational setting**, not a universal boundary. \
+                 Linux evicts unused pages in line with vm.swappiness (default 60), so swap being in \
+                 use is not itself evidence that memory is short. Evicted pages stay until read back",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(10.0),
@@ -952,7 +1425,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "スワップイン",
+        label: text!(ja: "スワップイン", en: "Swap-in"),
         fixed: &[FixedCondition {
             id: "swap-in-occurred",
             comparison: FixedComparison::Above,
@@ -960,10 +1433,16 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Watch,
-            rationale: "退避したページの読み戻しが 0 超で観測された。読み戻しは\
-                        ページフォールトの待ちを伴うので、発生したこと自体に意味がある。\
-                        ただし**スワップを構成したホストで 0 が常態とは限らない**ため、\
-                        どれだけ続いたか・どれだけの量かを別に見る必要がある",
+            rationale: text!(
+                ja: "退避したページの読み戻しが 0 超で観測された。読み戻しは\
+                            ページフォールトの待ちを伴うので、発生したこと自体に意味がある。\
+                            ただし**スワップを構成したホストで 0 が常態とは限らない**ため、\
+                            どれだけ続いたか・どれだけの量かを別に見る必要がある",
+                en: "Reading evicted pages back was observed above 0. A read-back carries a page-fault wait, so the \
+                 fact it happened means something. But **0 is not necessarily the normal state on a \
+                 host with swap configured**, so how long it continued and how much moved have to be \
+                 read separately",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -978,7 +1457,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "スワップアウト",
+        label: text!(ja: "スワップアウト", en: "Swap-out"),
         fixed: &[FixedCondition {
             id: "swap-out-occurred",
             comparison: FixedComparison::Above,
@@ -986,9 +1465,14 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Informational,
-            rationale: "ページの退避が 0 超で観測された。退避が起きた事実を示すが、\
-                        vm.swappiness が 0 でない既定構成では**不足が無くても起きる**ため、\
-                        単独では調査の理由にならない",
+            rationale: text!(
+                ja: "ページの退避が 0 超で観測された。退避が起きた事実を示すが、\
+                            vm.swappiness が 0 でない既定構成では**不足が無くても起きる**ため、\
+                            単独では調査の理由にならない",
+                en: "Page eviction was observed above 0. It shows eviction happened, but with the default non-zero \
+                 vm.swappiness it **happens without any shortage**, so on its own it is not a reason \
+                 to investigate",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1004,7 +1488,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "kswapd のページスキャン",
+        label: text!(ja: "kswapd のページスキャン", en: "Pages scanned by kswapd"),
         fixed: &[FixedCondition {
             id: "page-reclaim-kswapd",
             comparison: FixedComparison::Above,
@@ -1012,9 +1496,14 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Informational,
-            rationale: "kswapd のページスキャンが 0 超で観測された。空きメモリが\
-                        回収閾値を下回ったことを示すが、大量の逐次 I/O でも起きるため\
-                        単独では負荷の証拠にならない",
+            rationale: text!(
+                ja: "kswapd のページスキャンが 0 超で観測された。空きメモリが\
+                            回収閾値を下回ったことを示すが、大量の逐次 I/O でも起きるため\
+                            単独では負荷の証拠にならない",
+                en: "Page scanning by kswapd was observed above 0. It means free memory fell below the reclaim \
+                 watermark, but heavy sequential I/O does this too, so on its own it is not evidence \
+                 of load",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1029,7 +1518,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "direct reclaim のページスキャン",
+        label: text!(ja: "direct reclaim のページスキャン", en: "Pages scanned in direct reclaim"),
         fixed: &[FixedCondition {
             id: "page-reclaim-direct",
             comparison: FixedComparison::Above,
@@ -1037,9 +1526,14 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Investigate,
-            rationale: "direct reclaim のページスキャンが 0 超で観測された。\
-                        kswapd が追いつかずプロセス自身が回収していることを示し、\
-                        割り当てを求めたプロセスはその場で待たされる",
+            rationale: text!(
+                ja: "direct reclaim のページスキャンが 0 超で観測された。\
+                            kswapd が追いつかずプロセス自身が回収していることを示し、\
+                            割り当てを求めたプロセスはその場で待たされる",
+                en: "Page scanning in direct reclaim was observed above 0. It means kswapd could not keep up and \
+                 processes are reclaiming for themselves; a process asking for an allocation waits \
+                 there and then",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1054,7 +1548,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "メジャーフォールト",
+        label: text!(ja: "メジャーフォールト", en: "Major faults"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1073,7 +1567,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "ブロック I/O 転送数",
+        label: text!(ja: "ブロック I/O 転送数", en: "Block I/O transfers"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1092,7 +1586,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "デバイス使用率",
+        label: text!(ja: "デバイス使用率", en: "Device utilisation"),
         // 汎用の条件は「**高い稼働時間割合**」までである。処理能力の飽和という
         // 解釈はデバイス種別 (単一キューか、並列に処理するか) が分からないと
         // 成立せず、この系列からはそれが分からない。したがって pattern に
@@ -1104,10 +1598,16 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "I/O 要求が発行されていた経過時間の割合が 95% 以上で続いた。\
-                        sar(1) の %util は「要求が 1 つ以上あった時間の割合」で\
-                        **同時に何本処理していたかを含まない**ため、単一キューの\
-                        デバイスでなければ処理能力の上限を示さない",
+            rationale: text!(
+                ja: "I/O 要求が発行されていた経過時間の割合が 95% 以上で続いた。\
+                            sar(1) の %util は「要求が 1 つ以上あった時間の割合」で\
+                            **同時に何本処理していたかを含まない**ため、単一キューの\
+                            デバイスでなければ処理能力の上限を示さない",
+                en: "The share of elapsed time with I/O requests outstanding stayed at or above 95%. In sar(1), \
+                 %util is the share of time at least one request was outstanding and **carries no \
+                 notion of how many were in flight**, so on anything but a single-queue device it does \
+                 not indicate a limit on throughput",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(25.0),
@@ -1122,7 +1622,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Gauge,
         unit: Unit::Milliseconds,
-        label: "デバイス応答時間",
+        label: text!(ja: "デバイス応答時間", en: "Device response time"),
         fixed: &[FixedCondition {
             id: "disk-latency-high",
             comparison: FixedComparison::AtLeast,
@@ -1130,10 +1630,16 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "1 要求あたりの平均時間が 100 ms 以上で続いた。回転ディスクの\
-                        シーク時間と比べても大きい。ただし sar(1) の await は\
-                        **キュー待ち時間とサービス時間の合計**なので、値の大きさだけでは\
-                        要求の滞留とサービス時間の長さを区別できない",
+            rationale: text!(
+                ja: "1 要求あたりの平均時間が 100 ms 以上で続いた。回転ディスクの\
+                            シーク時間と比べても大きい。ただし sar(1) の await は\
+                            **キュー待ち時間とサービス時間の合計**なので、値の大きさだけでは\
+                            要求の滞留とサービス時間の長さを区別できない",
+                en: "The average time per request stayed at or above 100 ms, which is large even next to the seek \
+                 time of a rotating disk. But await in sar(1) is **the sum of queueing time and service \
+                 time**, so its size alone does not separate requests piling up from each one taking \
+                 long",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1151,7 +1657,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::None,
-        label: "デバイスキュー長",
+        label: text!(ja: "デバイスキュー長", en: "Device queue length"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1169,7 +1675,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "デバイス転送数",
+        label: text!(ja: "デバイス転送数", en: "Device transfers"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1188,7 +1694,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Gauge,
         unit: Unit::Percent,
-        label: "インターフェース使用率",
+        label: text!(ja: "インターフェース使用率", en: "Interface utilisation"),
         // 分母 (申告速度) が取れないインターフェースでは、この列は値を持たない。
         // 以前は `speed == 0` でも 0.0 を返していたため、固定条件経路が
         // 「評価済み・検出なし」になっていた (規律 7 の抜け)。
@@ -1201,9 +1707,15 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "インターフェース使用率が 90% 以上で続いた。分母は申告速度\
-                        (`speed`、Mbit/s) で、全二重では受信・送信の大きい方だけを見る。\
-                        速度が 0 = 不明のインターフェースでは値を作らず評価不能として報告する",
+            rationale: text!(
+                ja: "インターフェース使用率が 90% 以上で続いた。分母は申告速度\
+                            (`speed`、Mbit/s) で、全二重では受信・送信の大きい方だけを見る。\
+                            速度が 0 = 不明のインターフェースでは値を作らず評価不能として報告する",
+                en: "Interface utilisation stayed at or above 90%. The denominator is the declared speed (`speed`, \
+                 Mbit/s), and on full duplex only the larger of receive and transmit is considered. \
+                 Where the speed is 0, meaning unknown, no value is produced and the series is \
+                 reported as not evaluated",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(25.0),
@@ -1219,7 +1731,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::BytesPerSec,
-        label: "受信スループット",
+        label: text!(ja: "受信スループット", en: "Receive throughput"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1238,7 +1750,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::BytesPerSec,
-        label: "送信スループット",
+        label: text!(ja: "送信スループット", en: "Transmit throughput"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1256,7 +1768,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "受信エラー",
+        label: text!(ja: "受信エラー", en: "Receive errors"),
         fixed: &[FixedCondition {
             id: "net-rx-error-occurred",
             comparison: FixedComparison::Above,
@@ -1264,9 +1776,14 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Watch,
-            rationale: "受信エラーが 0 超で観測された。rx_errors は「受信した不良パケットの総数」\
-                        (カーネル文書 networking/statistics.rst) で、正常なリンクでは増えない。\
-                        0 でないこと自体が事象として意味を持つ",
+            rationale: text!(
+                ja: "受信エラーが 0 超で観測された。rx_errors は「受信した不良パケットの総数」\
+                            (カーネル文書 networking/statistics.rst) で、正常なリンクでは増えない。\
+                            0 でないこと自体が事象として意味を持つ",
+                en: "Receive errors were observed above 0. rx_errors is the total number of bad packets received \
+                 (networking/statistics.rst) and does not grow on a healthy link, so being non-zero is \
+                 itself the event",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1281,7 +1798,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "送信エラー",
+        label: text!(ja: "送信エラー", en: "Transmit errors"),
         fixed: &[FixedCondition {
             id: "net-tx-error-occurred",
             comparison: FixedComparison::Above,
@@ -1289,9 +1806,14 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Watch,
-            rationale: "送信エラーが 0 超で観測された。tx_errors は「送信時の問題の総数」\
-                        (カーネル文書 networking/statistics.rst) で、正常なリンクでは増えない。\
-                        0 でないこと自体が事象として意味を持つ",
+            rationale: text!(
+                ja: "送信エラーが 0 超で観測された。tx_errors は「送信時の問題の総数」\
+                            (カーネル文書 networking/statistics.rst) で、正常なリンクでは増えない。\
+                            0 でないこと自体が事象として意味を持つ",
+                en: "Transmit errors were observed above 0. tx_errors is the total number of problems on transmit \
+                 (networking/statistics.rst) and does not grow on a healthy link, so being non-zero is \
+                 itself the event",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1306,7 +1828,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "受信パケットの破棄",
+        label: text!(ja: "受信パケットの破棄", en: "Received packets dropped"),
         // **キュー溢れ専用のカウンタではない。** 原因を特定できないので、
         // 発生の事実だけを参考情報として出す (調査優先度は上げない)。
         // 未対応プロトコルのパケットを受け取るだけで計上されるホストは珍しくない。
@@ -1317,12 +1839,19 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Informational,
-            rationale: "受信したが処理されなかったパケットの計上が 0 超で観測された。\
-                        カーネル文書 (networking/statistics.rst) の rx_dropped は\
-                        「資源不足や**未対応プロトコル**等で処理されなかったパケットの数」で、\
-                        L2 アドレスフィルタによる破棄を含み得る。さらに procfs はホストの\
-                        取りこぼし (rx_missed_errors) をこの列に畳み込む。\
-                        **原因は特定できない**",
+            rationale: text!(
+                ja: "受信したが処理されなかったパケットの計上が 0 超で観測された。\
+                            カーネル文書 (networking/statistics.rst) の rx_dropped は\
+                            「資源不足や**未対応プロトコル**等で処理されなかったパケットの数」で、\
+                            L2 アドレスフィルタによる破棄を含み得る。さらに procfs はホストの\
+                            取りこぼし (rx_missed_errors) をこの列に畳み込む。\
+                            **原因は特定できない**",
+                en: "Packets received but not processed were counted above 0. In the kernel documentation \
+                 (networking/statistics.rst), rx_dropped is the number of packets not processed, for \
+                 example through a shortage of resources or an **unsupported protocol**, and it can \
+                 include packets discarded by the L2 address filter. procfs also folds the host's own \
+                 rx_missed_errors into this column",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1337,7 +1866,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "送信パケットの破棄",
+        label: text!(ja: "送信パケットの破棄", en: "Transmitted packets dropped"),
         fixed: &[FixedCondition {
             id: "net-tx-drop-occurred",
             comparison: FixedComparison::Above,
@@ -1345,10 +1874,16 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Emergence,
             min_samples: 1,
             priority: Priority::Watch,
-            rationale: "送信に向かう途中で破棄されたパケットの計上が 0 超で観測された。\
-                        カーネル文書 (networking/statistics.rst) の tx_dropped は\
-                        「送信に向かう途中で破棄されたパケットの数。例えば資源不足による」で、\
-                        送信側の資源不足を示すが**内訳は特定できない**",
+            rationale: text!(
+                ja: "送信に向かう途中で破棄されたパケットの計上が 0 超で観測された。\
+                            カーネル文書 (networking/statistics.rst) の tx_dropped は\
+                            「送信に向かう途中で破棄されたパケットの数。例えば資源不足による」で、\
+                            送信側の資源不足を示すが**内訳は特定できない**",
+                en: "Packets discarded on the way out were counted above 0. In the kernel documentation \
+                 (networking/statistics.rst), tx_dropped is the number of packets dropped on the way \
+                 to transmission, for example through a shortage of resources. It points at resources \
+                 on the sending side but **the breakdown cannot be identified**",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::NotEvaluated,
@@ -1363,7 +1898,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::Count,
-        label: "使用中ソケット数",
+        label: text!(ja: "使用中ソケット数", en: "Sockets in use"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1381,7 +1916,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::Count,
-        label: "TIME_WAIT のソケット数",
+        label: text!(ja: "TIME_WAIT のソケット数", en: "Sockets in TIME_WAIT"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1400,7 +1935,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Gauge,
         unit: Unit::Percent,
-        label: "ファイルシステム使用率",
+        label: text!(ja: "ファイルシステム使用率", en: "Filesystem used"),
         fixed: &[FixedCondition {
             id: "filesystem-nearly-full",
             comparison: FixedComparison::AtLeast,
@@ -1408,8 +1943,12 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Depletion,
             min_samples: 1,
             priority: Priority::Investigate,
-            rationale: "使用率が 95% 以上になった (空き容量が 5% 以下)。予約ブロックと\
-                        断片化により、この水準からは書き込み失敗が現実的になる",
+            rationale: text!(
+                ja: "使用率が 95% 以上になった (空き容量が 5% 以下)。予約ブロックと\
+                            断片化により、この水準からは書き込み失敗が現実的になる",
+                en: "Usage stayed at or above 95% (5% or less free). With reserved blocks and \
+                     fragmentation, a write failing becomes a realistic prospect from this level",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(5.0),
@@ -1425,7 +1964,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Each,
         kind: ValueKind::Gauge,
         unit: Unit::Percent,
-        label: "inode 使用率",
+        label: text!(ja: "inode 使用率", en: "Inodes used"),
         fixed: &[FixedCondition {
             id: "filesystem-inodes-nearly-exhausted",
             comparison: FixedComparison::AtLeast,
@@ -1433,8 +1972,12 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Depletion,
             min_samples: 1,
             priority: Priority::Investigate,
-            rationale: "inode 使用率が 95% 以上になった (残りが 5% 以下)。\
-                        容量が空いていてもファイルを作れなくなる",
+            rationale: text!(
+                ja: "inode 使用率が 95% 以上になった (残りが 5% 以下)。\
+                            容量が空いていてもファイルを作れなくなる",
+                en: "Inode usage stayed at or above 95% (5% or less left). Files can stop being \
+                     creatable even with space to spare",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(5.0),
@@ -1450,7 +1993,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Gauge,
         unit: Unit::None,
-        label: "使用中ファイル記述子数",
+        label: text!(ja: "使用中ファイル記述子数", en: "File descriptors in use"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1469,7 +2012,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "コンテキストスイッチ",
+        label: text!(ja: "コンテキストスイッチ", en: "Context switches"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1489,7 +2032,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: "プロセス生成",
+        label: text!(ja: "プロセス生成", en: "Process creation"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Relative {
@@ -1508,7 +2051,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "CPU の待ち圧力 (some)",
+        label: text!(ja: "CPU の待ち圧力 (some)", en: "CPU pressure (some)"),
         fixed: &[FixedCondition {
             id: "psi-cpu-some-stalled",
             comparison: FixedComparison::AtLeast,
@@ -1516,10 +2059,15 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Watch,
-            rationale: "一部のタスクが CPU を待っていた時間の割合が 20% 以上で続いた。\
-                        PSI の some は「少なくとも一部のタスクが待たされていた時間の割合」\
-                        (カーネル文書 accounting/psi.rst) で、この水準が続くのは\
-                        待ちが常態化していることを示す",
+            rationale: text!(
+                ja: "一部のタスクが CPU を待っていた時間の割合が 20% 以上で続いた。\
+                            PSI の some は「少なくとも一部のタスクが待たされていた時間の割合」\
+                            (カーネル文書 accounting/psi.rst) で、この水準が続くのは\
+                            待ちが常態化していることを示す",
+                en: "The share of time some tasks were waiting for CPU stayed at or above 20%. PSI's some is the \
+                 share of time at least some tasks were stalled (accounting/psi.rst), and staying at \
+                 this level means the waiting has become the normal state",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(10.0),
@@ -1534,7 +2082,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "I/O の待ち圧力 (some)",
+        label: text!(ja: "I/O の待ち圧力 (some)", en: "I/O pressure (some)"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(10.0),
@@ -1549,7 +2097,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "I/O の待ち圧力 (full)",
+        label: text!(ja: "I/O の待ち圧力 (full)", en: "I/O pressure (full)"),
         fixed: &[FixedCondition {
             id: "psi-io-full-stalled",
             comparison: FixedComparison::Above,
@@ -1557,10 +2105,15 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Investigate,
-            rationale: "全 non-idle タスクが同時に I/O 待ちで進めなかった時間の割合が\
-                        1% 超で続いた。PSI の full は「全 non-idle タスクが同時に\
-                        待たされていた時間の割合」(カーネル文書 accounting/psi.rst) で、\
-                        待っていない実行可能タスクが 1 つも無かった状態を指す",
+            rationale: text!(
+                ja: "全 non-idle タスクが同時に I/O 待ちで進めなかった時間の割合が\
+                            1% 超で続いた。PSI の full は「全 non-idle タスクが同時に\
+                            待たされていた時間の割合」(カーネル文書 accounting/psi.rst) で、\
+                            待っていない実行可能タスクが 1 つも無かった状態を指す",
+                en: "The share of time every non-idle task was stalled on I/O at once stayed above 1%. PSI's full \
+                 is the share of time **all non-idle tasks** were stalled simultaneously \
+                 (accounting/psi.rst), meaning not one runnable task was making progress",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(5.0),
@@ -1575,7 +2128,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "メモリの待ち圧力 (some)",
+        label: text!(ja: "メモリの待ち圧力 (some)", en: "Memory pressure (some)"),
         fixed: &[],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(10.0),
@@ -1590,7 +2143,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::Percent,
-        label: "メモリの待ち圧力 (full)",
+        label: text!(ja: "メモリの待ち圧力 (full)", en: "Memory pressure (full)"),
         fixed: &[FixedCondition {
             id: "psi-mem-full-stalled",
             comparison: FixedComparison::Above,
@@ -1598,10 +2151,15 @@ pub static CATALOG: &[CatalogEntry] = &[
             pattern: Pattern::Sustained,
             min_samples: 2,
             priority: Priority::Investigate,
-            rationale: "全 non-idle タスクが同時にメモリ回収待ちで進めなかった時間の割合が\
-                        1% 超で続いた。PSI の full は「全 non-idle タスクが同時に\
-                        待たされていた時間の割合」(カーネル文書 accounting/psi.rst) で、\
-                        カーネル文書はこの状態を thrashing として扱っている",
+            rationale: text!(
+                ja: "全 non-idle タスクが同時にメモリ回収待ちで進めなかった時間の割合が\
+                            1% 超で続いた。PSI の full は「全 non-idle タスクが同時に\
+                            待たされていた時間の割合」(カーネル文書 accounting/psi.rst) で、\
+                            カーネル文書はこの状態を thrashing として扱っている",
+                en: "The share of time every non-idle task was stalled on memory reclaim at once stayed above 1%. \
+                 PSI's full is the share of time **all non-idle tasks** were stalled simultaneously \
+                 (accounting/psi.rst), and the kernel documentation treats this state as thrashing",
+            ),
         }],
         deviation: DeviationInterest::Upper,
         shift: ShiftMagnitude::Absolute(5.0),
@@ -1649,18 +2207,23 @@ mod tests {
     /// 演算子から組んだ文言 ([`boundary_phrase`]) を rationale に必ず含める。
     #[test]
     fn rationales_state_the_boundary_that_the_comparison_implements() {
-        for e in CATALOG {
-            for f in e.fixed {
-                let phrase = boundary_phrase(e.unit, f);
-                assert!(
-                    f.rationale.contains(&phrase),
-                    "{} ({}): rationale に境界の文言 `{}` が無い。\
-                     比較演算子と文言が食い違うと境界上の値の扱いが読み手に伝わらない\n{}",
-                    e.display(),
-                    f.id,
-                    phrase,
-                    f.rationale
-                );
+        // **両方の言語で確かめる。** 片方だけ守っても、もう片方を読む人には
+        // 境界上の値の扱いが伝わらない。
+        for lang in [Lang::Ja, Lang::En] {
+            for e in CATALOG {
+                for f in e.fixed {
+                    let phrase = boundary_phrase(e.unit, f, lang);
+                    assert!(
+                        f.rationale.get(lang).contains(&phrase),
+                        "{} ({}, {:?}): rationale に境界の文言 `{}` が無い。\
+                         比較演算子と文言が食い違うと境界上の値の扱いが読み手に伝わらない\n{}",
+                        e.display(),
+                        f.id,
+                        lang,
+                        phrase,
+                        f.rationale.get(lang)
+                    );
+                }
             }
         }
     }
@@ -1679,8 +2242,18 @@ mod tests {
                 .unwrap();
             assert!(condition.comparison.holds(condition.value, condition.value));
             assert_eq!(100.0 - condition.value, free);
-            assert!(condition.rationale.contains(&format!("{free}% 以下")));
-            assert!(!condition.rationale.contains(&format!("{free}% 未満")));
+            assert!(
+                condition
+                    .rationale
+                    .get(Lang::Ja)
+                    .contains(&format!("{free}% 以下"))
+            );
+            assert!(
+                !condition
+                    .rationale
+                    .get(Lang::Ja)
+                    .contains(&format!("{free}% 未満"))
+            );
         }
     }
 
@@ -1693,16 +2266,19 @@ mod tests {
             pattern: Pattern::Sustained,
             min_samples: 1,
             priority: Priority::Watch,
-            rationale: "",
+            rationale: text!(ja: "", en: ""),
         };
-        assert_eq!(boundary_phrase(Unit::Percent, &at_most), "5% 以下");
+        assert_eq!(
+            boundary_phrase(Unit::Percent, &at_most, Lang::Ja),
+            "5% 以下"
+        );
         let above = FixedCondition {
             comparison: FixedComparison::Above,
             value: 0.0,
             ..at_most
         };
         // 単位表記を持たない系列では数値だけを書く
-        assert_eq!(boundary_phrase(Unit::CountPerSec, &above), "0 超");
+        assert_eq!(boundary_phrase(Unit::CountPerSec, &above, Lang::Ja), "0 超");
         let at_least = FixedCondition {
             comparison: FixedComparison::AtLeast,
             value: 100.0,
@@ -1710,7 +2286,7 @@ mod tests {
         };
         // 記号でない単位は 1 つ空ける
         assert_eq!(
-            boundary_phrase(Unit::Milliseconds, &at_least),
+            boundary_phrase(Unit::Milliseconds, &at_least, Lang::Ja),
             "100 ms 以上"
         );
     }

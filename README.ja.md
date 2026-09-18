@@ -148,6 +148,7 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # エージェントやパイプラインへ流すとき
 resarch detect sa01                      # いつ・何に異変があったか
 resarch detect sa01 --verbose            # 検出ごとの内訳と考えられる解釈まで出す
+resarch detect sa01 --lang en            # 英語で出す (下記「出力の言語」)
 resarch summarize sa01 sa02 --format json
 resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 各日のローカル 9〜18 時を集計
 resarch show sa01 --activity irq --irq-cpus --format ndjson  # 割り込みの CPU 別内訳も表示
@@ -322,6 +323,26 @@ TUI は対話端末でのみ動きます。パイプやファイルへ出す場�
 検出パターンが決まれば中身も決まる「考えられる解釈」がそれにあたります。
 `--verbose` を付けるとエピソードが 1 件ずつ、以前と同じ全文で出ます。
 `--format json` / `--format ndjson` は指定によらず全フィールドを出すので影響ありません。
+
+### 出力の言語
+
+`detect` は日本語と英語で出せます。言語は次の順で決まります。
+
+1. `--lang ja|en`
+2. `RESARCH_LANG`
+3. `LC_ALL` → `LC_MESSAGES` → `LANG` (`C` / `POSIX` / `C.UTF-8` は英語で確定)
+4. `LANGUAGE` (GNU の候補リスト。対応している先頭を採る)
+5. ローカルタイムゾーン (`Asia/Tokyo` なら日本語)
+6. 英語
+
+**ロケールはタイムゾーンより強く見ます。** ロケールは「どの言語で読みたいか」の宣言
+そのもので、タイムゾーンは「どこにいるか」でしかありません。日本で
+`LANG=en_US.UTF-8` を設定している人は既に希望を伝えているので、位置で上書きしません。
+同じ理由で `LC_ALL=C` は `LANGUAGE` より先に英語で確定します
+(スクリプトがこのロケールで決定的な出力を得る慣行があるため)。
+
+JSON / NDJSON のキーと列挙値は言語によらず英語のままです。言語で変わるのは
+人が読む文だけです。
 
 ### 検知した箇所を SVG で確認する
 

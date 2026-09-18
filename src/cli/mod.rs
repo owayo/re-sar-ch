@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
-use crate::model::DisplayTz;
+use crate::model::{DisplayTz, Lang};
 
 pub use sadf_args::{
     SadfArgError, SadfFormat, SadfImmediate, SadfOptions, SadfOutputOptions, SadfTimeBase,
@@ -167,6 +167,35 @@ impl TimeZoneArgs {
     }
 }
 
+/// 独自出力の表示言語。
+///
+/// 互換入口 (`resarch sar` / `resarch sadf` / `resarch sa2sar`) はこの引数を
+/// 持たない。本家の書式をそのまま出すので、言語の選択肢が無い。
+#[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
+pub struct LangArgs {
+    /// 表示言語 (`ja` / `en`)。
+    ///
+    /// 未指定なら実行環境から決める。優先順は
+    /// `RESARCH_LANG` → `LC_ALL` / `LC_MESSAGES` / `LANG` → `LANGUAGE` →
+    /// ローカルタイムゾーン (日本なら `ja`) → 英語。
+    ///
+    /// **ロケール環境変数はタイムゾーンより強い。** ロケールは
+    /// 「どの言語で読みたいか」の宣言そのもので、タイムゾーンは
+    /// 「どこにいるか」でしかない。
+    #[arg(long, value_name = "LANG", verbatim_doc_comment)]
+    pub lang: Option<String>,
+}
+
+impl LangArgs {
+    /// 表示言語を決める。
+    pub fn resolve(&self) -> Result<Lang, String> {
+        match self.lang.as_deref() {
+            Some(v) => Lang::parse_option(v),
+            None => Ok(Lang::from_env()),
+        }
+    }
+}
+
 /// 複数のサブコマンドで共通の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct CommonArgs {
@@ -176,6 +205,9 @@ pub struct CommonArgs {
 
     #[command(flatten)]
     pub timezone: TimeZoneArgs,
+
+    #[command(flatten)]
+    pub language: LangArgs,
 
     /// 対象 activity をカンマ区切りで絞る (例: `cpu,disk`)。
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
@@ -343,6 +375,9 @@ pub struct DetectArgs {
 
     #[command(flatten)]
     pub timezone: TimeZoneArgs,
+
+    #[command(flatten)]
+    pub language: LangArgs,
 
     /// 検知したリソース・指標ごとの SVG と一覧を保存する新規ディレクトリ。
     /// 通常の検知レポートも標準出力へ出す。既存ディレクトリは上書きしない。
@@ -518,6 +553,9 @@ pub struct TuiArgs {
 
     #[command(flatten)]
     pub timezone: TimeZoneArgs,
+
+    #[command(flatten)]
+    pub language: LangArgs,
 
     /// 回復可能な破損を診断付きで読み飛ばす。
     #[arg(long)]

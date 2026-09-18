@@ -54,6 +54,7 @@
 
 use crate::analyze::assessment::{NotEvaluated, RouteStatus};
 use crate::analyze::metric_catalog::CatalogEntry;
+use crate::model::Lang;
 
 use super::{
     Baseline, DETECTOR_VERSION, DecisionBasis, DecisionEvidence, DetectOptions, Detection,
@@ -88,7 +89,7 @@ pub fn detect(
     // **散らばりが測れないときは逸脱スコアを出さない。** ε で割らない。
     // 代わりに絶対差で判断できるかを見る (何も言わないで済ませない)。
     let Some((center, mad)) = baseline.usable_mad() else {
-        return absolute_departures(series, entry, baseline);
+        return absolute_departures(series, entry, baseline, opts.lang);
     };
 
     let ratio_threshold = opts.thresholds.deviation_ratio;
@@ -118,7 +119,9 @@ pub fn detect(
                 peak_absolute_deviation: diff.abs(),
                 direction,
             };
-            out.push(build(series, entry, baseline, basis, direction, hit));
+            out.push(build(
+                series, entry, baseline, basis, direction, hit, opts.lang,
+            ));
         }
     }
 
@@ -145,6 +148,7 @@ fn absolute_departures(
     series: &PreparedSeries,
     entry: &'static CatalogEntry,
     baseline: &Baseline,
+    lang: Lang,
 ) -> (Vec<Detection>, RouteStatus) {
     let dispersion = baseline.evidence.dispersion;
     let reason = match dispersion {
@@ -189,7 +193,7 @@ fn absolute_departures(
                 peak_absolute_deviation: diff.abs(),
                 direction,
             };
-            out.push(build(series, entry, baseline, basis, direction, hit));
+            out.push(build(series, entry, baseline, basis, direction, hit, lang));
         }
     }
 
@@ -230,11 +234,12 @@ fn build(
     basis: DecisionBasis,
     direction: ShiftDirection,
     hit: &[Observation],
+    lang: Lang,
 ) -> Detection {
     Detection {
         detector_version: DETECTOR_VERSION,
         series: SeriesKey::from_metric(&series.key),
-        metric_label: entry.label,
+        metric_label: entry.label.get(lang),
         unit: series.unit,
         kind: series.kind,
         origin: series.origin,
@@ -248,8 +253,8 @@ fn build(
         // 逸脱だけでは「このホストでは珍しい」までしか言えない。
         // 絶対水準の裏付けが無いので単独では Watch を超えない。
         base_priority: crate::analyze::assessment::Priority::Watch,
-        possible_interpretations: entry.interpretations,
-        not_established: entry.not_established,
+        possible_interpretations: entry.interpretations.iter().map(|t| t.get(lang)).collect(),
+        not_established: entry.not_established.iter().map(|t| t.get(lang)).collect(),
     }
 }
 
@@ -272,7 +277,13 @@ mod tests {
     }
 
     fn run(t: crate::analyze::timeline::MetricTimeline) -> (Vec<Detection>, RouteStatus, Baseline) {
-        run_with(t, &DetectOptions::default())
+        run_with(
+            t,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        )
     }
 
     /// **`MAD == 0` の系列で巨大スコアが出ない。**

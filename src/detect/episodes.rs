@@ -557,8 +557,8 @@ mod tests {
             },
             decision: DecisionEvidence::new(basis, &[]),
             base_priority: Priority::Watch,
-            possible_interpretations: &[],
-            not_established: &[],
+            possible_interpretations: Vec::new(),
+            not_established: Vec::new(),
         }
     }
 

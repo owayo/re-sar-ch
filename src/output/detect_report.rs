@@ -32,6 +32,8 @@ use crate::detect::{
 };
 use crate::detect::{DETECT_SCHEMA_VERSION, DETECTOR_VERSION};
 use crate::model::DisplayTz;
+use crate::model::{Lang, Text, count_en};
+use crate::text;
 
 /// タイムゾーン名を決めるときの基準時刻。
 ///
@@ -84,19 +86,26 @@ pub fn write_text<W: Write>(
     tz: DisplayTz,
     detail: Detail,
 ) -> io::Result<()> {
+    let lang = a.lang;
     write_header(out, a, tz)?;
 
     if a.episodes.is_empty() {
         writeln!(out)?;
         writeln!(
             out,
-            "エピソードなし (報告範囲・優先度の下限で絞った結果を含む)"
+            "{}",
+            text!(
+                ja: "エピソードなし (報告範囲・優先度の下限で絞った結果を含む)",
+                en: "No episodes (this includes what the report window and the priority \
+                     floor filtered out)",
+            )
+            .get(lang)
         )?;
     }
     if detail.is_full() {
         for e in &a.episodes {
             writeln!(out)?;
-            write_episode(out, e, tz, detail)?;
+            write_episode(out, e, tz, detail, lang)?;
         }
     } else {
         write_episode_groups(out, a, tz)?;
@@ -107,8 +116,15 @@ pub fn write_text<W: Write>(
         writeln!(out)?;
         writeln!(
             out,
-            "エピソード 1 件ずつの根拠 (観測値・比較基準・窓) と考えられる解釈は省いた \
-             (--verbose で出る。全フィールドは --format json / --format ndjson)"
+            "{}",
+            text!(
+                ja: "エピソード 1 件ずつの根拠 (観測値・比較基準・窓) と考えられる解釈は省いた \
+                     (--verbose で出る。全フィールドは --format json / --format ndjson)",
+                en: "Per-episode evidence (observed values, comparison basis, windows) and the \
+                     interpretations are omitted (--verbose shows them; --format json / \
+                     --format ndjson carry every field)",
+            )
+            .get(lang)
         )?;
     }
 
@@ -122,50 +138,84 @@ pub fn write_text<W: Write>(
     }
 
     writeln!(out)?;
-    write_coverage(out, &a.coverage)?;
+    write_coverage(out, &a.coverage, lang)?;
 
     writeln!(out)?;
-    writeln!(out, "注意")?;
-    for n in a.notes {
+    writeln!(out, "{}", text!(ja: "注意", en: "Notes").get(lang))?;
+    for n in &a.notes {
         writeln!(out, "  - {n}")?;
     }
     Ok(())
 }
 
 fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
+    let lang = a.lang;
     let s = &a.source;
-    writeln!(
-        out,
-        "異変検出: {} ({} / {}, {} CPU)",
-        if s.label.is_empty() { "-" } else { &s.label },
+    let host = if s.label.is_empty() { "-" } else { &s.label };
+    let (release, machine) = (
         s.release.as_deref().unwrap_or("-"),
         s.machine.as_deref().unwrap_or("-"),
-        s.cpu_nr.map_or("?".to_string(), |n| n.to_string())
+    );
+    let cpus = s.cpu_nr.map_or("?".to_string(), |n| n.to_string());
+    writeln!(
+        out,
+        "{}: {host} ({release} / {machine}, {cpus} CPU)",
+        text!(ja: "異変検出", en: "Anomaly detection").get(lang)
     )?;
     if !s.files.is_empty() {
         writeln!(out, "files: {}", s.files.join(", "))?;
     }
     let p = &a.period;
-    writeln!(
-        out,
-        "期間: {} → {}  ({} サンプル / 連続 {} 区間 / 不連続 {} 区間)",
+    let (first, last) = (
         p.first_ust.map_or("-".to_string(), |ust| tz.datetime(ust)),
         p.last_ust.map_or("-".to_string(), |ust| tz.datetime(ust)),
-        p.samples,
-        p.continuous_intervals,
-        p.broken_intervals
-    )?;
+    );
+    let (samples, cont, broken) = (p.samples, p.continuous_intervals, p.broken_intervals);
     writeln!(
         out,
-        "比較基準: {}  採取間隔の代表値: {}  エピソード結合: 始まりが {} 秒以内 (広がりの上限 {})",
-        a.baseline_basis.label(),
-        a.interval_p90_secs
-            .map_or("不明".to_string(), |i| format!("{i} 秒")),
-        a.episode_gap_secs,
-        if a.episode_onset_span_cap_secs == u64::MAX {
-            "なし".to_string()
-        } else {
-            format!("{} 秒", a.episode_onset_span_cap_secs)
+        "{}",
+        match lang {
+            Lang::Ja => format!(
+                "期間: {first} → {last}  \
+                 ({samples} サンプル / 連続 {cont} 区間 / 不連続 {broken} 区間)"
+            ),
+            Lang::En => format!(
+                "Period: {first} → {last}  ({} / {} / {})",
+                count_en(samples, "sample", "samples"),
+                count_en(cont, "continuous stretch", "continuous stretches"),
+                count_en(broken, "break", "breaks"),
+            ),
+        }
+    )?;
+    let basis = a.baseline_basis.label().get(lang);
+    let interval = a.interval_p90_secs.map_or_else(
+        || text!(ja: "不明", en: "unknown").get(lang).to_string(),
+        |i| match lang {
+            Lang::Ja => format!("{i} 秒"),
+            Lang::En => format!("{i}s"),
+        },
+    );
+    let gap = a.episode_gap_secs;
+    let cap = if a.episode_onset_span_cap_secs == u64::MAX {
+        text!(ja: "なし", en: "none").get(lang).to_string()
+    } else {
+        match lang {
+            Lang::Ja => format!("{} 秒", a.episode_onset_span_cap_secs),
+            Lang::En => format!("{}s", a.episode_onset_span_cap_secs),
+        }
+    };
+    writeln!(
+        out,
+        "{}",
+        match lang {
+            Lang::Ja => format!(
+                "比較基準: {basis}  採取間隔の代表値: {interval}  \
+                 エピソード結合: 始まりが {gap} 秒以内 (広がりの上限 {cap})"
+            ),
+            Lang::En => format!(
+                "Comparison basis: {basis}  Typical sampling interval: {interval}  \
+                 Episode grouping: onsets within {gap}s (spread capped at {cap})"
+            ),
         }
     )?;
     let s = &a.report_scope;
@@ -177,39 +227,80 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Res
     } else {
         String::new()
     };
+    let (from, to) = (s.from.label(lang), s.to.label(lang));
+    let min = s.min_priority.label().get(lang);
+    let standing = a.standing_span_percent;
     writeln!(
         out,
-        "報告範囲: {} → {}{scope_tz}  最低優先度: {}  背景の所見に回す割合: 入力の {}% 以上",
-        s.from.label(),
-        s.to.label(),
-        s.min_priority.label(),
-        a.standing_span_percent
+        "{}",
+        match lang {
+            Lang::Ja => format!(
+                "報告範囲: {from} → {to}{scope_tz}  最低優先度: {min}  \
+                 背景の所見に回す割合: 入力の {standing}% 以上"
+            ),
+            Lang::En => format!(
+                "Report window: {from} → {to}{scope_tz}  Minimum priority: {min}  \
+                 Moved to standing findings at: {standing}% or more of the input"
+            ),
+        }
     )?;
-    writeln!(
-        out,
-        "件数: 入力全体の検出 {} 件 / 報告範囲の検出 {} 件 / 背景の所見 {} 件 / \
-         エピソード {} 件 (優先度で除外 {} 件)",
+    let (d_in, d_win, bg, eps, dropped) = (
         s.detections_in_input,
         s.detections_in_report_window,
         s.background_findings,
         s.episodes_before_priority_filter,
-        s.episodes_excluded_by_priority
+        s.episodes_excluded_by_priority,
+    );
+    writeln!(
+        out,
+        "{}",
+        match lang {
+            Lang::Ja => format!(
+                "件数: 入力全体の検出 {d_in} 件 / 報告範囲の検出 {d_win} 件 / \
+                 背景の所見 {bg} 件 / エピソード {eps} 件 (優先度で除外 {dropped} 件)"
+            ),
+            Lang::En => format!(
+                "Counts: {} across the input / {d_win} within the report window / \
+                 {} / {} ({dropped} dropped by priority)",
+                count_en(d_in as u64, "detection", "detections"),
+                count_en(bg as u64, "standing finding", "standing findings"),
+                count_en(eps as u64, "episode", "episodes"),
+            ),
+        }
     )?;
     // **窓幅は「要求した幅」であって実効幅ではない。** 実効幅は
     // 採取間隔と点数の下限で決まるので、検出ごとに根拠へ出す
     // (600 秒採取では要求 1800 秒に対して実効 3000 秒になる)。
+    let (detector, catalog) = (a.detector_version, a.coverage.catalog_version);
+    let t = &a.thresholds;
+    let (ratio, window, normalized, persistence) = (
+        t.deviation_ratio,
+        t.shift_window_secs,
+        t.shift_normalized,
+        t.shift_persistence_share * 100.0,
+    );
     writeln!(
         out,
-        "検出器: {}  カタログ: {}  逸脱閾値: MAD の {} 倍  \
-         水準変化: 要求窓 {} 秒 (実効幅は検出ごと) / 正規化 {} 倍 / 持続 {:.0}%",
-        a.detector_version,
-        a.coverage.catalog_version,
-        a.thresholds.deviation_ratio,
-        a.thresholds.shift_window_secs,
-        a.thresholds.shift_normalized,
-        a.thresholds.shift_persistence_share * 100.0
+        "{}",
+        match lang {
+            Lang::Ja => format!(
+                "検出器: {detector}  カタログ: {catalog}  逸脱閾値: MAD の {ratio} 倍  \
+                 水準変化: 要求窓 {window} 秒 (実効幅は検出ごと) / 正規化 {normalized} 倍 / \
+                 持続 {persistence:.0}%"
+            ),
+            Lang::En => format!(
+                "Detector: {detector}  Catalog: {catalog}  Deviation threshold: {ratio}x MAD  \
+                 Level change: {window}s requested (effective width is per detection) / \
+                 {normalized}x normalised / {persistence:.0}% persistence"
+            ),
+        }
     )?;
-    writeln!(out, "所見: {}", crate::analyze::describe_assessment(a))
+    writeln!(
+        out,
+        "{}: {}",
+        text!(ja: "所見", en: "Assessment").get(lang),
+        crate::analyze::describe_assessment(a)
+    )
 }
 
 /// 1 つの系列にまとめたエピソード群。
@@ -279,6 +370,7 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
         ONSETS_PER_LINE_WITH_DATE
     };
 
+    let lang = a.lang;
     for g in &groups {
         writeln!(out)?;
         let top = g
@@ -286,14 +378,23 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
             .iter()
             .max_by_key(|e| e.priority)
             .expect("グループは空でない");
-        writeln!(
-            out,
-            "{} {} [{}] — {} 件 (最高: {})",
+        let (mark, metric, series, n, priority) = (
             top.priority.mark(),
             g.metric_label,
             g.series.display(),
             g.episodes.len(),
-            top.priority.label()
+            top.priority.label().get(lang),
+        );
+        writeln!(
+            out,
+            "{}",
+            match lang {
+                Lang::Ja => format!("{mark} {metric} [{series}] — {n} 件 (最高: {priority})"),
+                Lang::En => format!(
+                    "{mark} {metric} [{series}] — {} (highest: {priority})",
+                    count_en(n as u64, "episode", "episodes")
+                ),
+            }
         )?;
         // 観点は系列単位の和集合。**「N 個の裏付け」とは書かない** (規律 2′)。
         let mut viewpoints: Vec<&'static str> = Vec::new();
@@ -302,7 +403,12 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
                 viewpoints.push(v);
             }
         }
-        writeln!(out, "     観点: {}", viewpoints.join(", "))?;
+        writeln!(
+            out,
+            "     {}: {}",
+            text!(ja: "観点", en: "Views").get(lang),
+            viewpoints.join(", ")
+        )?;
 
         for chunk in g
             .episodes
@@ -323,22 +429,26 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
                         .map(|d| &d.series)
                         .collect::<std::collections::BTreeSet<_>>()
                         .len();
-                    format!(
-                        "{}→{} ({}, {} 採取{})",
-                        if same_day {
-                            tz.time(ep.support.start_ust)
-                        } else {
-                            tz.datetime(ep.support.start_ust)
-                        },
-                        tz.time(ep.support.end_ust),
-                        e.priority.label(),
-                        ep.support.samples,
-                        if others > 0 {
-                            format!(", +{others} 系列")
-                        } else {
-                            String::new()
-                        }
-                    )
+                    let start = if same_day {
+                        tz.time(ep.support.start_ust)
+                    } else {
+                        tz.datetime(ep.support.start_ust)
+                    };
+                    let end = tz.time(ep.support.end_ust);
+                    let priority = e.priority.label().get(lang);
+                    let n = ep.support.samples;
+                    let extra = match (others, lang) {
+                        (0, _) => String::new(),
+                        (n, Lang::Ja) => format!(", +{n} 系列"),
+                        (n, Lang::En) => format!(", +{n} series"),
+                    };
+                    match lang {
+                        Lang::Ja => format!("{start}→{end} ({priority}, {n} 採取{extra})"),
+                        Lang::En => format!(
+                            "{start}→{end} ({priority}, {}{extra})",
+                            count_en(n, "sample", "samples")
+                        ),
+                    }
                 })
                 .collect();
             writeln!(out, "       {}", cells.join("  "))?;
@@ -347,22 +457,30 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
         if rest > 0 {
             writeln!(
                 out,
-                "       … 他 {rest} 件 (全件は --verbose / --format json)"
+                "       {}",
+                match lang {
+                    Lang::Ja => format!("… 他 {rest} 件 (全件は --verbose / --format json)"),
+                    Lang::En =>
+                        format!("… and {rest} more (--verbose / --format json show all of them)"),
+                }
             )?;
         }
 
         // 充足度は**エピソードごとに違う**。系列でまとめても最低と最高を出す。
         let levels: Vec<_> = g.episodes.iter().map(|e| e.sufficiency.level).collect();
-        let lo = levels.iter().min().expect("空でない");
-        let hi = levels.iter().max().expect("空でない");
+        let lo = levels.iter().min().expect("空でない").label().get(lang);
+        let hi = levels.iter().max().expect("空でない").label().get(lang);
+        let sufficiency = text!(ja: "根拠の充足度", en: "Evidence sufficiency").get(lang);
         if lo == hi {
-            writeln!(out, "     根拠の充足度: {}", hi.label())?;
+            writeln!(out, "     {sufficiency}: {hi}")?;
         } else {
             writeln!(
                 out,
-                "     根拠の充足度: {}〜{} (件により違う)",
-                lo.label(),
-                hi.label()
+                "     {sufficiency}: {}",
+                match lang {
+                    Lang::Ja => format!("{lo}〜{hi} (件により違う)"),
+                    Lang::En => format!("{lo} to {hi} (varies by episode)"),
+                }
             )?;
         }
         // **系列に固有の留保は要約でも出す** (規律 3)。
@@ -370,37 +488,56 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
             .iter()
             .any(|e| e.sufficiency.basis_may_reflect_the_anomaly)
         {
-            writeln!(
-                out,
-                "       ! 比較基準が異変側へ寄っている疑いがある (入力自身が材料のため)"
-            )?;
+            writeln!(out, "       ! {}", BASIS_MAY_LEAN.get(lang))?;
         }
     }
     Ok(())
 }
+
+/// 比較基準がその系列の異変側へ寄っている疑い (規律 3)。
+///
+/// **要約でも落とさない。** その系列の逸脱判定が当てにならないという話で、
+/// 注意書きの一般論では代用できない。
+const BASIS_MAY_LEAN: Text = text!(
+    ja: "比較基準が異変側へ寄っている疑いがある (入力自身が材料のため)",
+    en: "the comparison basis may lean toward the anomaly (the input itself is its material)",
+);
 
 fn write_episode<W: Write>(
     out: &mut W,
     e: &AssessedEpisode,
     tz: DisplayTz,
     detail: Detail,
+    lang: Lang,
 ) -> io::Result<()> {
     let ep = &e.episode;
     // **2 つの範囲を区別して出す。** 根拠が及ぶ範囲だけを出すと
     // 「その期間まるごとが 1 つの事象で、内側のエピソードはその一部」と
     // 読まれてしまう。エピソードは検出の**始まり**のまとまりである。
+    let index = ep.index + 1;
+    let (start, last_onset, end) = (
+        tz.datetime(ep.support.start_ust),
+        tz.datetime(ep.last_onset_ust),
+        tz.datetime(ep.support.end_ust),
+    );
     writeln!(
         out,
-        "エピソード {}  検出の始まり {} 〜 {}",
-        ep.index + 1,
-        tz.datetime(ep.support.start_ust),
-        tz.datetime(ep.last_onset_ust)
+        "{}",
+        match lang {
+            Lang::Ja => format!("エピソード {index}  検出の始まり {start} 〜 {last_onset}"),
+            Lang::En => format!("Episode {index}  Detections began {start} – {last_onset}"),
+        }
     )?;
     writeln!(
         out,
-        "              根拠が及ぶ範囲 {} → {} (他のエピソードと重なることがある)",
-        tz.datetime(ep.support.start_ust),
-        tz.datetime(ep.support.end_ust)
+        "{}",
+        match lang {
+            Lang::Ja => format!(
+                "              根拠が及ぶ範囲 {start} → {end} (他のエピソードと重なることがある)"
+            ),
+            Lang::En =>
+                format!("          Evidence covers {start} → {end} (may overlap other episodes)"),
+        }
     )?;
     writeln!(out, "  {} {}", e.priority.mark(), e.headline)?;
     // **優先度は検出単位。** 見出しの検出について書いていることを明示する
@@ -408,79 +545,148 @@ fn write_episode<W: Write>(
     //
     // 要約では**昇降があったときだけ**下地と理由を出す。下地のままなら
     // 「注視 (下地 注視) — 昇降なし」は同じことを 3 回言っている。
+    let priority_label = text!(ja: "優先度", en: "Priority").get(lang);
     let moved = e.priority != e.base_priority;
     if detail.is_full() || moved {
+        let (p, base) = (
+            e.priority.label().get(lang),
+            e.base_priority.label().get(lang),
+        );
         writeln!(
             out,
-            "     優先度: {} (下地 {}) — この見出しの検出について",
-            e.priority.label(),
-            e.base_priority.label()
+            "     {priority_label}: {}",
+            match lang {
+                Lang::Ja => format!("{p} (下地 {base}) — この見出しの検出について"),
+                Lang::En => format!("{p} (baseline {base}) — for the headline detection"),
+            }
         )?;
         for r in &e.priority_reasons {
             writeln!(out, "       - {r}")?;
         }
     } else {
-        writeln!(out, "     優先度: {}", e.priority.label())?;
+        writeln!(
+            out,
+            "     {priority_label}: {}",
+            e.priority.label().get(lang)
+        )?;
     }
     if let Some(longest) = &e.longest_running_headline {
-        writeln!(out, "     最も長く続いた検出: {longest}")?;
+        writeln!(
+            out,
+            "     {}: {longest}",
+            text!(ja: "最も長く続いた検出", en: "Longest-running detection").get(lang)
+        )?;
     }
     let s = &e.sufficiency;
-    writeln!(out, "     根拠の充足度: {}", e.sufficiency_spread.label())?;
     writeln!(
         out,
-        "       内訳 ({}): {} 採取 / 要 {} 採取 — 基準 {} 採取 / 検出 {} 採取 / 欠測 {} / 不連続 {}",
-        s.basis.label(),
+        "     {}: {}",
+        text!(ja: "根拠の充足度", en: "Evidence sufficiency").get(lang),
+        e.sufficiency_spread.label(lang)
+    )?;
+    let basis = s.basis.label().get(lang);
+    let (material, required, baseline, detected, missing, breaks) = (
         s.material_samples,
         s.required_samples,
         s.baseline_samples,
         s.detected_samples,
         s.missing_samples,
-        s.discontinuities
+        s.discontinuities,
+    );
+    writeln!(
+        out,
+        "       {}",
+        match lang {
+            Lang::Ja => format!(
+                "内訳 ({basis}): {material} 採取 / 要 {required} 採取 — 基準 {baseline} 採取 / \
+                 検出 {detected} 採取 / 欠測 {missing} / 不連続 {breaks}"
+            ),
+            Lang::En => format!(
+                "Breakdown ({basis}): {material} samples / {required} required — \
+                 {baseline} in the basis / {detected} detected / {missing} missing / \
+                 {breaks} discontinuities"
+            ),
+        }
     )?;
     // **この留保は要約でも落とさない。** その系列の逸脱判定が当てにならない
     // という話で、注意書きの一般論では代用できない (規律 3)。
     if s.basis_may_reflect_the_anomaly {
-        writeln!(
-            out,
-            "       ! 比較基準が異変側へ寄っている疑いがある (入力自身が材料のため)"
-        )?;
+        writeln!(out, "       ! {}", BASIS_MAY_LEAN.get(lang))?;
     }
     // **「独立な裏付けが N 個」と書かない。** 観点として並べるだけ。
-    writeln!(out, "     観点: {}", e.viewpoints.join(", "))?;
+    writeln!(
+        out,
+        "     {}: {}",
+        text!(ja: "観点", en: "Views").get(lang),
+        e.viewpoints.join(", ")
+    )?;
     // 相関することは末尾の注意が言うので、要約では繰り返さない。
     if detail.is_full() {
         if ep.max_viewpoints_on_one_series > 1 {
+            let n = ep.max_viewpoints_on_one_series;
             writeln!(
                 out,
-                "       (同じ系列に {} つの観点が当たった。3 経路は相関するので独立な裏付けの数ではない)",
-                ep.max_viewpoints_on_one_series
+                "       {}",
+                match lang {
+                    Lang::Ja => format!(
+                        "(同じ系列に {n} つの観点が当たった。3 経路は相関するので独立な裏付けの数ではない)"
+                    ),
+                    Lang::En => format!(
+                        "({n} views fired on the same series. The three routes correlate, so this \
+                         is not that many independent corroborations)"
+                    ),
+                }
             )?;
         }
         if !e.corroborating_series.is_empty() {
+            let series = e.corroborating_series.join(", ");
             writeln!(
                 out,
-                "       水準変化と別の観点が同じ時刻で当たった系列: {} (優先度は上げていない)",
-                e.corroborating_series.join(", ")
+                "       {}",
+                match lang {
+                    Lang::Ja => format!(
+                        "水準変化と別の観点が同じ時刻で当たった系列: {series} (優先度は上げていない)"
+                    ),
+                    Lang::En => format!(
+                        "Series where a level change and another view fired at the same time: \
+                         {series} (priority was not raised for it)"
+                    ),
+                }
             )?;
         }
     }
 
-    write_series_rollup(out, ep)?;
-    write_detections(out, ep, tz, detail)?;
+    write_series_rollup(out, ep, lang)?;
+    write_detections(out, ep, tz, detail, lang)?;
 
     // 解釈と留保は**検出パターンが決まれば中身も決まる**。エピソードごとに
     // 並べるとエピソード数に比例して同じ文が増えるので、要約では指標ごとに
     // 1 度だけレポート末尾へ集約する (`write_not_established`)。
     if detail.is_full() {
         if !e.possible_interpretations.is_empty() {
-            writeln!(out, "     考えられる解釈 (どれとも断定しない)")?;
+            writeln!(
+                out,
+                "     {}",
+                text!(
+                    ja: "考えられる解釈 (どれとも断定しない)",
+                    en: "Possible interpretations (none of them asserted)",
+                )
+                .get(lang)
+            )?;
             for i in &e.possible_interpretations {
                 writeln!(out, "       - {i}")?;
             }
         }
         if !e.not_established.is_empty() {
-            writeln!(out, "     この所見では確かめていないこと")?;
+            writeln!(
+                out,
+                "     {}",
+                text!(
+                    ja: "この所見では確かめていないこと",
+                    en: "What this finding does not establish",
+                )
+                .get(lang)
+            )?;
             for n in &e.not_established {
                 writeln!(out, "       - {n}")?;
             }
@@ -506,38 +712,52 @@ const MAX_SUMMARIZED_DETECTIONS: usize = 12;
 /// 関わった系列の一覧 (件数と観点)。
 ///
 /// 検出を全件並べる前に「何が動いたか」を 1 望できるようにする。
-fn write_series_rollup<W: Write>(out: &mut W, ep: &Episode) -> io::Result<()> {
+fn write_series_rollup<W: Write>(out: &mut W, ep: &Episode, lang: Lang) -> io::Result<()> {
     // (系列, 指標名) → (件数, 観点)
     let mut rows: Vec<(String, &'static str, usize, Vec<&'static str>)> = Vec::new();
     for d in &ep.detections {
         let key = d.series.display();
+        let route = d.route().label().get(lang);
         match rows.iter_mut().find(|(k, _, _, _)| *k == key) {
             Some((_, _, n, routes)) => {
                 *n += 1;
-                let label = d.route().label();
-                if !routes.contains(&label) {
-                    routes.push(label);
+                if !routes.contains(&route) {
+                    routes.push(route);
                 }
             }
-            None => rows.push((key, d.metric_label, 1, vec![d.route().label()])),
+            None => rows.push((key, d.metric_label, 1, vec![route])),
         }
     }
     // 件数の多い順 → 系列名順 (決定的にする)
     rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-    writeln!(out, "     関わった系列 ({})", rows.len())?;
+    writeln!(
+        out,
+        "     {} ({})",
+        text!(ja: "関わった系列", en: "Series involved").get(lang),
+        rows.len()
+    )?;
     for (series, label, count, routes) in rows.iter().take(MAX_LISTED_SERIES_IN_EPISODE) {
+        let routes = routes.join(", ");
         writeln!(
             out,
-            "       {:<30} {:<22} {count} 件 [{}]",
-            series,
-            label,
-            routes.join(", ")
+            "       {series:<30} {label:<22} {}",
+            match lang {
+                Lang::Ja => format!("{count} 件 [{routes}]"),
+                Lang::En => format!("{count} detections [{routes}]"),
+            }
         )?;
     }
     let rest = rows.len().saturating_sub(MAX_LISTED_SERIES_IN_EPISODE);
     if rest > 0 {
-        writeln!(out, "       … 他 {rest} 系列")?;
+        writeln!(
+            out,
+            "       {}",
+            match lang {
+                Lang::Ja => format!("… 他 {rest} 系列"),
+                Lang::En => format!("… and {rest} more series"),
+            }
+        )?;
     }
     Ok(())
 }
@@ -552,6 +772,7 @@ fn write_detections<W: Write>(
     ep: &Episode,
     tz: DisplayTz,
     detail: Detail,
+    lang: Lang,
 ) -> io::Result<()> {
     let total = ep.detections.len();
     // 要約は 1 検出 1 行なので、詳細を書くときより多くを並べられる。
@@ -562,10 +783,20 @@ fn write_detections<W: Write>(
         MAX_SUMMARIZED_DETECTIONS
     };
     if total <= cap {
-        writeln!(out, "     検出の根拠 (全 {total} 件)")?;
+        writeln!(
+            out,
+            "     {}",
+            match lang {
+                Lang::Ja => format!("検出の根拠 (全 {total} 件)"),
+                Lang::En => format!(
+                    "Evidence ({})",
+                    count_en(total as u64, "detection", "detections")
+                ),
+            }
+        )?;
         // 時刻順のまま出す (エピソードの並びと一致させる)
         for d in &ep.detections {
-            write_detection(out, d, tz, detail)?;
+            write_detection(out, d, tz, detail, lang)?;
         }
         return Ok(());
     }
@@ -594,11 +825,20 @@ fn write_detections<W: Write>(
     let shown = best.len().min(cap);
     writeln!(
         out,
-        "     検出の根拠 (全 {total} 件。系列ごとの代表を {shown} 件だけ示す。\
-         全件は --format json / --format ndjson で出る)"
+        "     {}",
+        match lang {
+            Lang::Ja => format!(
+                "検出の根拠 (全 {total} 件。系列ごとの代表を {shown} 件だけ示す。\
+                 全件は --format json / --format ndjson で出る)"
+            ),
+            Lang::En => format!(
+                "Evidence ({total} detections; showing {shown} as one representative per series. \
+                 --format json / --format ndjson carry all of them)"
+            ),
+        }
     )?;
     for d in best.into_iter().take(cap) {
-        write_detection(out, d, tz, detail)?;
+        write_detection(out, d, tz, detail, lang)?;
     }
     Ok(())
 }
@@ -608,33 +848,43 @@ fn write_detection<W: Write>(
     d: &Detection,
     tz: DisplayTz,
     detail: Detail,
+    lang: Lang,
 ) -> io::Result<()> {
     writeln!(
         out,
         "     ・[{}] {}",
-        d.route().label(),
-        describe_detection(d)
+        d.route().label().get(lang),
+        describe_detection(d, lang)
     )?;
     // 要約はここで打ち切る。**判定に使った数値は 1 行目に入っている**
     // (分析層が作った文がそう書いている) ので、落ちるのは検算の材料だけ。
     // 系列に固有の留保だけはここでも出す。
     if !detail.is_full() {
-        return write_series_specific_caveats(out, d);
+        return write_series_specific_caveats(out, d, lang);
     }
+    let (series, origin, pattern) = (
+        d.series.display(),
+        d.origin.label().get(lang),
+        d.pattern.label().get(lang),
+    );
     writeln!(
         out,
-        "         系列 {} / {} / 形 {}",
-        d.series.display(),
-        d.origin.label(),
-        d.pattern.label()
+        "         {}",
+        match lang {
+            Lang::Ja => format!("系列 {series} / {origin} / 形 {pattern}"),
+            Lang::En => format!("Series {series} / {origin} / shape {pattern}"),
+        }
     )?;
     // **平均の取り方を必ず添える。** 瞬時値を区間長で重み付けした平均と
     // 同じ数字として読まれないようにするため。
+    let (mean, mean_basis) = (d.decision.mean, d.decision.mean_basis.label().get(lang));
     writeln!(
         out,
-        "         平均 {:.2} ({})",
-        d.decision.mean,
-        d.decision.mean_basis.label()
+        "         {}",
+        match lang {
+            Lang::Ja => format!("平均 {mean:.2} ({mean_basis})"),
+            Lang::En => format!("Mean {mean:.2} ({mean_basis})"),
+        }
     )?;
     match &d.decision.basis {
         DecisionBasis::FixedCondition {
@@ -645,7 +895,14 @@ fn write_detection<W: Write>(
         } => {
             writeln!(
                 out,
-                "         条件 {condition_id} (連続 {min_samples} 回以上): {rationale}"
+                "         {}",
+                match lang {
+                    Lang::Ja =>
+                        format!("条件 {condition_id} (連続 {min_samples} 回以上): {rationale}"),
+                    Lang::En => format!(
+                        "Condition {condition_id} ({min_samples}+ consecutive samples): {rationale}"
+                    ),
+                }
             )?;
         }
         DecisionBasis::RobustDeviation {
@@ -656,7 +913,17 @@ fn write_detection<W: Write>(
         } => {
             writeln!(
                 out,
-                "         閾値 MAD の {ratio_threshold} 倍以上、かつ絶対差 {min_absolute_deviation:.2} 以上 (実測 {peak_absolute_deviation:.2})"
+                "         {}",
+                match lang {
+                    Lang::Ja => format!(
+                        "閾値 MAD の {ratio_threshold} 倍以上、かつ絶対差 \
+                         {min_absolute_deviation:.2} 以上 (実測 {peak_absolute_deviation:.2})"
+                    ),
+                    Lang::En => format!(
+                        "Threshold: at least {ratio_threshold}x MAD and an absolute difference of \
+                         at least {min_absolute_deviation:.2} (measured {peak_absolute_deviation:.2})"
+                    ),
+                }
             )?;
         }
         // **倍数を書かない。** 散らばりが測れないので基準になる倍数が無い。
@@ -666,11 +933,21 @@ fn write_detection<W: Write>(
             peak_absolute_deviation,
             ..
         } => {
+            let dispersion = dispersion.label().get(lang);
             writeln!(
                 out,
-                "         絶対差 {min_absolute_deviation:.2} 以上 (実測 {peak_absolute_deviation:.2})。\
-                 倍数では判断していない ({})",
-                dispersion.label()
+                "         {}",
+                match lang {
+                    Lang::Ja => format!(
+                        "絶対差 {min_absolute_deviation:.2} 以上 (実測 {peak_absolute_deviation:.2})。\
+                         倍数では判断していない ({dispersion})"
+                    ),
+                    Lang::En => format!(
+                        "Absolute difference of at least {min_absolute_deviation:.2} \
+                         (measured {peak_absolute_deviation:.2}). No multiple of the spread was \
+                         used ({dispersion})"
+                    ),
+                }
             )?;
         }
         DecisionBasis::LevelShift {
@@ -684,21 +961,49 @@ fn write_detection<W: Write>(
             window_secs,
             ..
         } => {
+            let spread = pooled_mad.map_or_else(
+                || {
+                    text!(ja: "測れない", en: "not measurable")
+                        .get(lang)
+                        .to_string()
+                },
+                |m| format!("{m:.2}"),
+            );
+            let (share, required) = (persistence_share * 100.0, persistence_threshold * 100.0);
             writeln!(
                 out,
-                "         最小変化量 {min_shift:.2} / 窓内の散らばり {} / 正規化閾値 {normalized_threshold} 倍 / 持続 {:.0}% (要 {:.0}%)",
-                pooled_mad.map_or("測れない".to_string(), |m| format!("{m:.2}")),
-                persistence_share * 100.0,
-                persistence_threshold * 100.0
+                "         {}",
+                match lang {
+                    Lang::Ja => format!(
+                        "最小変化量 {min_shift:.2} / 窓内の散らばり {spread} / \
+                         正規化閾値 {normalized_threshold} 倍 / 持続 {share:.0}% (要 {required:.0}%)"
+                    ),
+                    Lang::En => format!(
+                        "Minimum shift {min_shift:.2} / spread within the windows {spread} / \
+                         normalised threshold {normalized_threshold}x / \
+                         persistence {share:.0}% ({required:.0}% required)"
+                    ),
+                }
             )?;
             // **要求した窓幅と実効の窓幅を書き分ける。**
             // 点数は採取間隔と下限で決まるので、要求幅をそのまま
             // 「この幅で判定した」と出すと嘘になる。
+            let (effective, requested) = (
+                crate::detect::describe_duration(*window_secs, lang),
+                crate::detect::describe_duration(*window_requested_secs, lang),
+            );
             writeln!(
                 out,
-                "         窓: 前後 {window_samples} 点ずつ / 実効幅 {} (要求 {})",
-                crate::detect::describe_duration(*window_secs),
-                crate::detect::describe_duration(*window_requested_secs)
+                "         {}",
+                match lang {
+                    Lang::Ja => format!(
+                        "窓: 前後 {window_samples} 点ずつ / 実効幅 {effective} (要求 {requested})"
+                    ),
+                    Lang::En => format!(
+                        "Windows: {window_samples} points either side / \
+                         effective width {effective} ({requested} requested)"
+                    ),
+                }
             )?;
         }
     }
@@ -707,8 +1012,9 @@ fn write_detection<W: Write>(
         &d.decision.observations,
         d.decision.observations_truncated,
         tz,
+        lang,
     )?;
-    write_baseline(out, d)
+    write_baseline(out, d, lang)
 }
 
 fn write_observations<W: Write>(
@@ -716,36 +1022,55 @@ fn write_observations<W: Write>(
     observations: &[Observation],
     truncated: bool,
     tz: DisplayTz,
+    lang: Lang,
 ) -> io::Result<()> {
     if observations.is_empty() {
         return Ok(());
     }
-    let mut line = String::from("         観測:");
+    let mut line = format!("         {}:", text!(ja: "観測", en: "Observed").get(lang));
     for o in observations {
         line.push_str(&format!(" {}={:.2}", tz.time(o.end_ust), o.value));
     }
     if truncated {
-        line.push_str(" … (以降は省略)");
+        line.push_str(text!(ja: " … (以降は省略)", en: " … (rest omitted)").get(lang));
     }
     writeln!(out, "{line}")
 }
 
-fn write_baseline<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
+fn write_baseline<W: Write>(out: &mut W, d: &Detection, lang: Lang) -> io::Result<()> {
     let b = &d.baseline;
-    writeln!(
-        out,
-        "         比較基準: 中央値 {} / MAD {} / 材料 {} 採取 / 散らばり {} — {}",
+    let (median, mad) = (
         b.median.map_or("-".to_string(), |v| format!("{v:.2}")),
         b.mad.map_or("-".to_string(), |v| format!("{v:.2}")),
+    );
+    let (samples, dispersion, basis) = (
         b.samples,
-        b.dispersion.label(),
-        b.basis.label()
+        b.dispersion.label().get(lang),
+        b.basis.label().get(lang),
+    );
+    writeln!(
+        out,
+        "         {}",
+        match lang {
+            Lang::Ja => format!(
+                "比較基準: 中央値 {median} / MAD {mad} / 材料 {samples} 採取 / \
+                 散らばり {dispersion} — {basis}"
+            ),
+            Lang::En => format!(
+                "Comparison basis: median {median} / MAD {mad} / {samples} samples of material / \
+                 spread {dispersion} — {basis}"
+            ),
+        }
     )?;
     if b.flagged_share > 0.0 {
+        let share = b.flagged_share * 100.0;
         writeln!(
             out,
-            "           材料のうち固定条件を満たした割合: {:.0}%",
-            b.flagged_share * 100.0
+            "           {}",
+            match lang {
+                Lang::Ja => format!("材料のうち固定条件を満たした割合: {share:.0}%"),
+                Lang::En => format!("Share of the material meeting a fixed condition: {share:.0}%"),
+            }
         )?;
     }
     for c in &b.caveats {
@@ -758,13 +1083,23 @@ fn write_baseline<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
 ///
 /// **要約で外してよいのはここに挙げたものだけ。** 落とすのではなく、
 /// 既に出ている文と重複しているから繰り返さないという判断である。
-const CAVEATS_STATED_ELSEWHERE: &[&str] = &[
+const CAVEATS_STATED_ELSEWHERE: &[Text] = &[
     // ヘッダの「比較基準: …(この入力自身が材料)」と末尾の「注意」が言う
     BASELINE_CAVEAT_SELF_SOURCED,
     // 検出の説明文が「散らばりが測れないため絶対差で判断した」と言う
     BASELINE_CAVEAT_MAD_ZERO,
     BASELINE_CAVEAT_TOO_SPARSE,
 ];
+
+/// 留保が「別の場所で言っている」ものかどうか。
+///
+/// 比較は**解決済みの文字列**で行う。[`Detection`] が持つ留保は
+/// 分析層が言語を解決したあとの値なので、ここで `Text` に戻さない。
+fn is_stated_elsewhere(caveat: &str, lang: Lang) -> bool {
+    CAVEATS_STATED_ELSEWHERE
+        .iter()
+        .any(|t| t.get(lang) == caveat)
+}
 
 /// 系列に固有の留保だけを書き出す (要約用)。
 ///
@@ -776,7 +1111,11 @@ const CAVEATS_STATED_ELSEWHERE: &[&str] = &[
 ///
 /// 固定条件の検出には出さない。**その経路は比較基準を判定に使っていない**ので、
 /// 基準の留保を添えると使っていない根拠で所見を割り引くことになる (規律 17)。
-fn write_series_specific_caveats<W: Write>(out: &mut W, d: &Detection) -> io::Result<()> {
+fn write_series_specific_caveats<W: Write>(
+    out: &mut W,
+    d: &Detection,
+    lang: Lang,
+) -> io::Result<()> {
     if matches!(d.decision.basis, DecisionBasis::FixedCondition { .. }) {
         return Ok(());
     }
@@ -784,7 +1123,7 @@ fn write_series_specific_caveats<W: Write>(out: &mut W, d: &Detection) -> io::Re
         .baseline
         .caveats
         .iter()
-        .filter(|c| !CAVEATS_STATED_ELSEWHERE.contains(c))
+        .filter(|c| !is_stated_elsewhere(c, lang))
     {
         writeln!(out, "         ! {c}")?;
     }
@@ -806,7 +1145,7 @@ fn write_series_specific_caveats<W: Write>(out: &mut W, d: &Detection) -> io::Re
 /// 位置を変えているだけで、要約でも必ず出す。
 fn write_not_established<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()> {
     // 指標ごとに最初の 1 件。並びは検出の出現順 (決定的)。
-    let mut rows: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+    let mut rows: Vec<(&'static str, &[&'static str])> = Vec::new();
     let detections = a
         .episodes
         .iter()
@@ -816,7 +1155,7 @@ fn write_not_established<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()
         if d.not_established.is_empty() || rows.iter().any(|(label, _)| *label == d.metric_label) {
             continue;
         }
-        rows.push((d.metric_label, d.not_established));
+        rows.push((d.metric_label, d.not_established.as_slice()));
     }
     if rows.is_empty() {
         return Ok(());
@@ -824,7 +1163,13 @@ fn write_not_established<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()
     writeln!(out)?;
     writeln!(
         out,
-        "確かめていないこと (指標ごとに 1 度。観測と解釈の境界)"
+        "{}",
+        text!(
+            ja: "確かめていないこと (指標ごとに 1 度。観測と解釈の境界)",
+            en: "What these findings do not establish (once per metric — the line between \
+                 observation and interpretation)",
+        )
+        .get(a.lang)
     )?;
     for (label, items) in rows {
         writeln!(out, "  {label}")?;
@@ -846,87 +1191,152 @@ fn write_background<W: Write>(
     tz: DisplayTz,
     detail: Detail,
 ) -> io::Result<()> {
+    let lang = a.lang;
     let excluded = a.report_scope.background_excluded_by_priority;
     if a.background.is_empty() {
+        let dropped = match (excluded, lang) {
+            (0, _) => String::new(),
+            (n, Lang::Ja) => format!("。優先度の下限で {n} 件を除外"),
+            (n, Lang::En) => format!("; {n} dropped by the priority floor"),
+        };
         writeln!(
             out,
-            "背景の所見なし (入力のほぼ全体を占める検出は無かった{})",
-            if excluded > 0 {
-                format!("。優先度の下限で {excluded} 件を除外")
-            } else {
-                String::new()
+            "{}",
+            match lang {
+                Lang::Ja =>
+                    format!("背景の所見なし (入力のほぼ全体を占める検出は無かった{dropped})"),
+                Lang::En => format!(
+                    "No standing findings (nothing spanned almost the whole input{dropped})"
+                ),
             }
         )?;
         return Ok(());
     }
     writeln!(
         out,
-        "背景の所見 (入力のほぼ全体を占め、いつ起きたかの手がかりを持たない)"
+        "{}",
+        text!(
+            ja: "背景の所見 (入力のほぼ全体を占め、いつ起きたかの手がかりを持たない)",
+            en: "Standing findings (they span almost the whole input and carry no clue about when)",
+        )
+        .get(lang)
     )?;
     // **「重要でない」と読まれないようにする。** 時刻を絞る材料にならない
     // ことだけを言っている。優先度はエピソードと同じ規則で付けてある。
     writeln!(
         out,
-        "  (重要でないという意味ではない。入力のどこを切っても成立するので、\
-         いつ何が起きたかを絞る材料にならないという意味である)"
+        "  {}",
+        text!(
+            ja: "(重要でないという意味ではない。入力のどこを切っても成立するので、\
+                 いつ何が起きたかを絞る材料にならないという意味である)",
+            en: "(This does not make them unimportant. They hold wherever you cut the input, \
+                 which is why they narrow down nothing about when something happened)",
+        )
+        .get(lang)
     )?;
     for b in &a.background {
         let f = &b.finding;
-        writeln!(
-            out,
-            "  {} {}{}",
-            f.priority.mark(),
-            f.headline,
-            b.share_of_input_percent
-                .map_or(String::new(), |p| format!(" — 入力の {p}% を占める"))
-        )?;
+        let share = b
+            .share_of_input_percent
+            .map_or(String::new(), |p| match lang {
+                Lang::Ja => format!(" — 入力の {p}% を占める"),
+                Lang::En => format!(" — spans {p}% of the input"),
+            });
+        writeln!(out, "  {} {}{share}", f.priority.mark(), f.headline)?;
         // エピソードと同じ扱い。昇降がなければ下地と理由を繰り返さない。
         if detail.is_full() || f.priority != f.base_priority {
+            let (p, base) = (
+                f.priority.label().get(lang),
+                f.base_priority.label().get(lang),
+            );
             writeln!(
                 out,
-                "     優先度: {} (下地 {}) — この検出について",
-                f.priority.label(),
-                f.base_priority.label()
+                "     {}: {}",
+                text!(ja: "優先度", en: "Priority").get(lang),
+                match lang {
+                    Lang::Ja => format!("{p} (下地 {base}) — この検出について"),
+                    Lang::En => format!("{p} (baseline {base}) — for this detection"),
+                }
             )?;
             for r in &f.priority_reasons {
                 writeln!(out, "       - {r}")?;
             }
         } else {
-            writeln!(out, "     優先度: {}", f.priority.label())?;
+            writeln!(
+                out,
+                "     {}: {}",
+                text!(ja: "優先度", en: "Priority").get(lang),
+                f.priority.label().get(lang)
+            )?;
         }
+        let (level, basis) = (
+            f.sufficiency.level.label().get(lang),
+            f.sufficiency.basis.label().get(lang),
+        );
+        let (material, required) = (
+            f.sufficiency.material_samples,
+            f.sufficiency.required_samples,
+        );
         writeln!(
             out,
-            "     根拠の充足度: {} ({}: {} 採取 / 要 {} 採取)",
-            f.sufficiency.level.label(),
-            f.sufficiency.basis.label(),
-            f.sufficiency.material_samples,
-            f.sufficiency.required_samples
+            "     {}: {}",
+            text!(ja: "根拠の充足度", en: "Evidence sufficiency").get(lang),
+            match lang {
+                Lang::Ja => format!("{level} ({basis}: {material} 採取 / 要 {required} 採取)"),
+                Lang::En => format!("{level} ({basis}: {material} samples / {required} required)"),
+            }
         )?;
-        write_detection(out, &b.detection, tz, detail)?;
+        write_detection(out, &b.detection, tz, detail, lang)?;
     }
     if excluded > 0 {
-        writeln!(out, "  (優先度の下限で {excluded} 件を除外した)")?;
+        writeln!(
+            out,
+            "  {}",
+            match lang {
+                Lang::Ja => format!("(優先度の下限で {excluded} 件を除外した)"),
+                Lang::En => format!("({excluded} were dropped by the priority floor)"),
+            }
+        )?;
     }
     Ok(())
 }
 
-fn write_coverage<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()> {
-    writeln!(out, "評価の網羅度")?;
+fn write_coverage<W: Write>(out: &mut W, c: &EvaluationCoverage, lang: Lang) -> io::Result<()> {
     writeln!(
         out,
-        "  カタログ {} パターン / 入力にあった系列 {} / 評価できた系列 {} / 評価できなかった系列 {}",
-        c.patterns_in_catalog, c.series_present, c.series_evaluated, c.series_not_evaluated
+        "{}",
+        text!(ja: "評価の網羅度", en: "Evaluation coverage").get(lang)
+    )?;
+    let (patterns, present, evaluated, not_evaluated) = (
+        c.patterns_in_catalog,
+        c.series_present,
+        c.series_evaluated,
+        c.series_not_evaluated,
+    );
+    writeln!(
+        out,
+        "  {}",
+        match lang {
+            Lang::Ja => format!(
+                "カタログ {patterns} パターン / 入力にあった系列 {present} / \
+                 評価できた系列 {evaluated} / 評価できなかった系列 {not_evaluated}"
+            ),
+            Lang::En => format!(
+                "{patterns} patterns in the catalog / {present} series present in the input / \
+                 {evaluated} evaluated / {not_evaluated} not evaluated"
+            ),
+        }
     )?;
     for (route, tally) in [
         (DetectRoute::FixedCondition, &c.fixed_condition),
         (DetectRoute::RobustDeviation, &c.robust_deviation),
         (DetectRoute::LevelShift, &c.level_shift),
     ] {
-        write_tally(out, route, tally)?;
+        write_tally(out, route, tally, lang)?;
     }
 
-    write_blocked(out, c)?;
-    write_basis_leaning(out, c)
+    write_blocked(out, c, lang)?;
+    write_basis_leaning(out, c, lang)
 }
 
 /// 比較基準が異変側へ寄っている系列を列挙する。
@@ -936,15 +1346,28 @@ fn write_coverage<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<(
 /// `%idle` が 4 と 6 を交互に取る系列では中央値 5 が固定条件の内側だが、
 /// 連続 2 回を満たさないので固定条件の検出は無く、逸脱も水準変化も
 /// 絶対差の下限に届かない。それでも「この系列の基準は当てにならない」は伝える。
-fn write_basis_leaning<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()> {
+fn write_basis_leaning<W: Write>(
+    out: &mut W,
+    c: &EvaluationCoverage,
+    lang: Lang,
+) -> io::Result<()> {
     let series: Vec<String> = c.basis_leaning().map(|e| e.series.display()).collect();
     if series.is_empty() {
         return Ok(());
     }
+    let n = series.len();
     writeln!(
         out,
-        "  比較基準が異変側へ寄っている疑いがある系列: {} 系列 (検出の有無とは無関係)",
-        series.len()
+        "  {}",
+        match lang {
+            Lang::Ja => format!(
+                "比較基準が異変側へ寄っている疑いがある系列: {n} 系列 (検出の有無とは無関係)"
+            ),
+            Lang::En => format!(
+                "Series whose comparison basis may lean toward the anomaly: {n} \
+                 (independent of whether anything was detected)"
+            ),
+        }
     )?;
     let shown: Vec<&str> = series
         .iter()
@@ -952,16 +1375,22 @@ fn write_basis_leaning<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Res
         .map(String::as_str)
         .collect();
     let rest = series.len().saturating_sub(shown.len());
-    let tail = if rest > 0 {
-        format!(", 他 {rest} 系列")
-    } else {
-        String::new()
+    let tail = match (rest, lang) {
+        (0, _) => String::new(),
+        (n, Lang::Ja) => format!(", 他 {n} 系列"),
+        (n, Lang::En) => format!(", and {n} more"),
     };
     writeln!(out, "    {}{tail}", shown.join(", "))?;
     writeln!(
         out,
-        "    (中央値そのものが固定条件の内側にある、または材料の半分以上が条件を満たしている。\
-         この系列の逸脱検出は当てにならない)"
+        "    {}",
+        text!(
+            ja: "(中央値そのものが固定条件の内側にある、または材料の半分以上が条件を満たしている。\
+                 この系列の逸脱検出は当てにならない)",
+            en: "(Either the median itself sits inside a fixed condition, or more than half the \
+                 material meets one. Deviation detection for these series cannot be trusted)",
+        )
+        .get(lang)
     )
 }
 
@@ -975,7 +1404,7 @@ const MAX_LISTED_SERIES: usize = 3;
 ///
 /// **「評価できなかった」は「検出なし」ではない。** 理由と件数を必ず出す。
 /// 系列を 1 行ずつ並べると数百行になるので、理由でまとめて代表名だけ挙げる。
-fn write_blocked<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()> {
+fn write_blocked<W: Write>(out: &mut W, c: &EvaluationCoverage, lang: Lang) -> io::Result<()> {
     // (観点, 理由) → 該当系列
     let mut groups: Vec<((&'static str, &'static str), Vec<String>)> = Vec::new();
     for e in c.blocked() {
@@ -990,7 +1419,7 @@ fn write_blocked<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()
             if reason.is_by_design() {
                 continue;
             }
-            let key = (route.label(), reason.label());
+            let key = (route.label().get(lang), reason.label().get(lang));
             match groups.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, v)) => v.push(e.series.display()),
                 None => groups.push((key, vec![e.series.display()])),
@@ -1002,7 +1431,12 @@ fn write_blocked<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()
     }
     writeln!(
         out,
-        "  評価できなかったもの (データの制約による。これは「検出なし」ではない)"
+        "  {}",
+        text!(
+            ja: "評価できなかったもの (データの制約による。これは「検出なし」ではない)",
+            en: "What could not be evaluated (limits in the data — this is not 'nothing found')",
+        )
+        .get(lang)
     )?;
     for ((route, reason), series) in &groups {
         let shown: Vec<&str> = series
@@ -1011,39 +1445,69 @@ fn write_blocked<W: Write>(out: &mut W, c: &EvaluationCoverage) -> io::Result<()
             .map(String::as_str)
             .collect();
         let rest = series.len().saturating_sub(shown.len());
-        let tail = if rest > 0 {
-            format!(", 他 {rest} 系列")
-        } else {
-            String::new()
+        let tail = match (rest, lang) {
+            (0, _) => String::new(),
+            (n, Lang::Ja) => format!(", 他 {n} 系列"),
+            (n, Lang::En) => format!(", and {n} more"),
         };
+        let (n, names) = (series.len(), shown.join(", "));
         writeln!(
             out,
-            "    [{route}] {reason}: {} 系列 ({}{tail})",
-            series.len(),
-            shown.join(", ")
+            "    {}",
+            match lang {
+                Lang::Ja => format!("[{route}] {reason}: {n} 系列 ({names}{tail})"),
+                Lang::En => format!("[{route}] {reason}: {n} series ({names}{tail})"),
+            }
         )?;
     }
     Ok(())
 }
 
-fn write_tally<W: Write>(out: &mut W, route: DetectRoute, t: &RouteTally) -> io::Result<()> {
-    writeln!(
-        out,
-        "  {:<20} 検出 {} 系列 ({} 件) / 評価済み {} 系列 / 対象外 {} 系列 / 評価不能 {} 系列",
-        route.label(),
+fn write_tally<W: Write>(
+    out: &mut W,
+    route: DetectRoute,
+    t: &RouteTally,
+    lang: Lang,
+) -> io::Result<()> {
+    let label = route.label().get(lang);
+    let (detected, detections, evaluated, not_applicable, blocked) = (
         t.detected_series,
         t.detections,
         t.evaluated_series,
         t.not_applicable_series,
-        t.blocked_series
+        t.blocked_series,
+    );
+    writeln!(
+        out,
+        "  {label:<20} {}",
+        match lang {
+            Lang::Ja => format!(
+                "検出 {detected} 系列 ({detections} 件) / 評価済み {evaluated} 系列 / \
+                 対象外 {not_applicable} 系列 / 評価不能 {blocked} 系列"
+            ),
+            Lang::En => format!(
+                "{detected} series with detections ({detections} of them) / \
+                 {evaluated} evaluated / {not_applicable} not applicable / {blocked} blocked"
+            ),
+        }
     )?;
     // 構造的に見ていない端は「検出なし」に数えているので、別行で必ず出す。
     // 出さないと「ファイル端で起きた変化が無かった」と読まれる (規律 7)。
     if t.series_with_blind_edges > 0 {
+        let (n, samples) = (t.series_with_blind_edges, t.blind_edge_samples);
         writeln!(
             out,
-            "  {:<20}   うち {} 系列は前後窓を取れない端があり、計 {} 採取を見ていない",
-            "", t.series_with_blind_edges, t.blind_edge_samples
+            "  {:<20}   {}",
+            "",
+            match lang {
+                Lang::Ja => format!(
+                    "うち {n} 系列は前後窓を取れない端があり、計 {samples} 採取を見ていない"
+                ),
+                Lang::En => format!(
+                    "{n} of them have edges where no window fits; {samples} samples in total \
+                     were not looked at"
+                ),
+            }
         )?;
     }
     Ok(())
@@ -1165,7 +1629,10 @@ mod tests {
     /// 試すテストでは期間を渡す。
     fn assessment_with_period(values: &[f64], period: PeriodBounds) -> Assessment {
         let ts = single(cpu_idle(&vals(values)));
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let outcome = detect(&ts, &opts);
         assess(
             outcome,
@@ -1500,7 +1967,7 @@ mod tests {
             "比較基準の出所はヘッダと注意が言う。検出ごとに繰り返さない\n{text}"
         );
         assert!(
-            !text.contains(BASELINE_CAVEAT_MAD_ZERO),
+            !text.contains(BASELINE_CAVEAT_MAD_ZERO.get(Lang::Ja)),
             "説明文と同じ内容を留保として並べない\n{text}"
         );
         // ヘッダと注意では言っている (落としたのではなく繰り返さないだけ)

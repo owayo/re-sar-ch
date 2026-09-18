@@ -149,6 +149,7 @@ resarch show sa01 --activity cpu,disk --format table
 resarch show sa01 --format ndjson        # for feeding an agent or a pipeline
 resarch detect sa01                      # where and what looks off
 resarch detect sa01 --verbose            # every detection's breakdown and interpretations
+resarch detect sa01 --lang ja            # report in Japanese (see "Output language")
 resarch summarize sa01 sa02 --format json
 resarch summarize sa01 sa02 sa03 --from 09:00 --to 18:00  # 09:00-18:00 local time each day
 resarch show sa01 --activity irq --irq-cpus --format ndjson  # per-CPU interrupt detail
@@ -309,6 +310,26 @@ What the summary drops is repetition: the per-detection breakdown (observed valu
 figures, window sizes) and the interpretation list, which is fixed per detection pattern.
 `--verbose` restores every episode individually, verbatim as before. `--format json` and
 `--format ndjson` are unaffected and always carry every field.
+
+### Output language
+
+`detect` reports in English or Japanese. The language is resolved in this order:
+
+1. `--lang ja|en`
+2. `RESARCH_LANG`
+3. `LC_ALL` → `LC_MESSAGES` → `LANG` (`C` / `POSIX` / `C.UTF-8` settle on English)
+4. `LANGUAGE` (the GNU list, first supported entry wins)
+5. The local time zone — Japanese if it is `Asia/Tokyo`
+6. English
+
+**Locale beats the time zone.** A locale is a statement about which language you want to
+read; a time zone only says where you are. Someone working in Japan with `LANG=en_US.UTF-8`
+has told the machine which they prefer, and the time zone does not override that. For the
+same reason `LC_ALL=C` settles on English before `LANGUAGE` is consulted — scripts rely on
+that locale for deterministic output.
+
+JSON and NDJSON keep English keys and stable enum values whatever the language; only the
+human-readable sentences follow it.
 
 ### Charting detected anomalies as SVG
 

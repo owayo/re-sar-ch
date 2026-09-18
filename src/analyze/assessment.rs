@@ -72,6 +72,8 @@ use crate::detect::{
     DetectOptions, DetectOutcome, DetectRoute, DetectThresholds, Detection, Dispersion,
     PreparedSeries, ReportBound, SeriesKey, TemporalSupport,
 };
+use crate::model::{Lang, Text, count_en};
+use crate::text;
 
 /// 所見の種別。`summarize` の出力と混同されないよう明示する。
 pub const ASSESSMENT_KIND: &str = "resarch_detect_assessment";
@@ -93,11 +95,11 @@ pub enum Priority {
 }
 
 impl Priority {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            Priority::Informational => "参考",
-            Priority::Watch => "注視",
-            Priority::Investigate => "調査",
+            Priority::Informational => text!(ja: "参考", en: "Informational"),
+            Priority::Watch => text!(ja: "注視", en: "Watch"),
+            Priority::Investigate => text!(ja: "調査", en: "Investigate"),
         }
     }
 
@@ -147,11 +149,11 @@ pub enum SufficiencyLevel {
 }
 
 impl SufficiencyLevel {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            SufficiencyLevel::Thin => "乏しい",
-            SufficiencyLevel::Moderate => "最低限",
-            SufficiencyLevel::Adequate => "十分",
+            SufficiencyLevel::Thin => text!(ja: "乏しい", en: "Thin"),
+            SufficiencyLevel::Moderate => text!(ja: "最低限", en: "Moderate"),
+            SufficiencyLevel::Adequate => text!(ja: "十分", en: "Adequate"),
         }
     }
 }
@@ -181,11 +183,17 @@ impl SufficiencyBasis {
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            SufficiencyBasis::ObservedSamplesOnly => "条件を満たした採取",
-            SufficiencyBasis::ComparisonBasis => "比較基準の材料",
-            SufficiencyBasis::LocalWindows => "水準変化の前後窓",
+            SufficiencyBasis::ObservedSamplesOnly => {
+                text!(ja: "条件を満たした採取", en: "samples meeting the condition")
+            }
+            SufficiencyBasis::ComparisonBasis => {
+                text!(ja: "比較基準の材料", en: "material behind the comparison basis")
+            }
+            SufficiencyBasis::LocalWindows => {
+                text!(ja: "水準変化の前後窓", en: "windows either side of the level change")
+            }
         }
     }
 
@@ -303,16 +311,22 @@ impl SufficiencySpread {
     }
 
     /// 1 行の表記。混在しているときは範囲も示す。
-    pub fn label(&self) -> String {
-        if self.mixed {
-            format!(
-                "{} (優先度を決めた検出) / エピソード内は {}〜{} の混在",
-                self.representative.label(),
-                self.lowest.label(),
-                self.highest.label()
-            )
-        } else {
-            self.representative.label().to_string()
+    pub fn label(&self, lang: Lang) -> String {
+        if !self.mixed {
+            return self.representative.label().get(lang).to_string();
+        }
+        let (rep, lo, hi) = (
+            self.representative.label().get(lang),
+            self.lowest.label().get(lang),
+            self.highest.label().get(lang),
+        );
+        match lang {
+            Lang::Ja => format!("{rep} (優先度を決めた検出) / エピソード内は {lo}〜{hi} の混在"),
+            Lang::En => {
+                format!(
+                    "{rep} for the detection that set the priority; {lo} to {hi} across the episode"
+                )
+            }
         }
     }
 }
@@ -359,19 +373,41 @@ pub enum NotEvaluated {
 }
 
 impl NotEvaluated {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> Text {
         match self {
-            NotEvaluated::SeriesAbsentFromSource => "この入力に系列が無い",
-            NotEvaluated::ExcludedBySelection => "activity 選択で除外された",
-            NotEvaluated::NoUsableObservation => "有効な観測が無い",
-            NotEvaluated::NoFixedConditionDeclared => "固定条件を宣言していない",
-            NotEvaluated::NoDeviationInterestDeclared => "逸脱の向きを宣言していない",
-            NotEvaluated::LevelShiftNotDeclared => "水準変化を見ない指標",
-            NotEvaluated::DispersionNotMeasurable => "MAD が 0 で散らばりが測れない",
-            NotEvaluated::DispersionTooSparse => "同値が大半で散らばりが測れない",
-            NotEvaluated::TooFewBaselineSamples => "基準を作るサンプルが足りない",
-            NotEvaluated::NoWindowLongEnough => "前後窓を取れる長さの連続区間が無い",
-            NotEvaluated::WindowSpansMissingSamples => "前後窓が欠測を挟むので連続した窓が取れない",
+            NotEvaluated::SeriesAbsentFromSource => {
+                text!(ja: "この入力に系列が無い", en: "the series is absent from this input")
+            }
+            NotEvaluated::ExcludedBySelection => {
+                text!(ja: "activity 選択で除外された", en: "excluded by the activity selection")
+            }
+            NotEvaluated::NoUsableObservation => {
+                text!(ja: "有効な観測が無い", en: "no usable observation")
+            }
+            NotEvaluated::NoFixedConditionDeclared => {
+                text!(ja: "固定条件を宣言していない", en: "no fixed condition is declared")
+            }
+            NotEvaluated::NoDeviationInterestDeclared => {
+                text!(ja: "逸脱の向きを宣言していない", en: "no direction of interest is declared")
+            }
+            NotEvaluated::LevelShiftNotDeclared => {
+                text!(ja: "水準変化を見ない指標", en: "level changes are not assessed for this metric")
+            }
+            NotEvaluated::DispersionNotMeasurable => {
+                text!(ja: "MAD が 0 で散らばりが測れない", en: "MAD is 0, so spread cannot be measured")
+            }
+            NotEvaluated::DispersionTooSparse => {
+                text!(ja: "同値が大半で散らばりが測れない", en: "one value dominates, so spread cannot be measured")
+            }
+            NotEvaluated::TooFewBaselineSamples => {
+                text!(ja: "基準を作るサンプルが足りない", en: "too few samples to build a basis")
+            }
+            NotEvaluated::NoWindowLongEnough => {
+                text!(ja: "前後窓を取れる長さの連続区間が無い", en: "no continuous stretch long enough for windows either side")
+            }
+            NotEvaluated::WindowSpansMissingSamples => {
+                text!(ja: "前後窓が欠測を挟むので連続した窓が取れない", en: "the windows would span a gap, so no continuous window exists")
+            }
         }
     }
 
@@ -433,23 +469,54 @@ impl RouteStatus {
         )
     }
 
-    pub fn label(self) -> String {
-        match self {
-            RouteStatus::Detected {
-                count,
-                blind_edge_points,
-            } => {
-                if blind_edge_points == 0 {
-                    format!("検出 {count} 件")
-                } else {
-                    format!("検出 {count} 件 (窓を取れない端 {blind_edge_points} 採取は見ていない)")
-                }
-            }
-            RouteStatus::Evaluated => "検出なし".to_string(),
-            RouteStatus::EvaluatedWithBlindEdges { edge_points } => {
+    pub fn label(self, lang: Lang) -> String {
+        match (self, lang) {
+            (
+                RouteStatus::Detected {
+                    count,
+                    blind_edge_points: 0,
+                },
+                Lang::Ja,
+            ) => format!("検出 {count} 件"),
+            (
+                RouteStatus::Detected {
+                    count,
+                    blind_edge_points: 0,
+                },
+                Lang::En,
+            ) => format!("{count} detected"),
+            (
+                RouteStatus::Detected {
+                    count,
+                    blind_edge_points,
+                },
+                Lang::Ja,
+            ) => format!("検出 {count} 件 (窓を取れない端 {blind_edge_points} 採取は見ていない)"),
+            (
+                RouteStatus::Detected {
+                    count,
+                    blind_edge_points,
+                },
+                Lang::En,
+            ) => format!(
+                "{count} detected ({blind_edge_points} samples at the edges were not looked at, \
+                 no window fits there)"
+            ),
+            (RouteStatus::Evaluated, Lang::Ja) => "検出なし".to_string(),
+            (RouteStatus::Evaluated, Lang::En) => "nothing detected".to_string(),
+            (RouteStatus::EvaluatedWithBlindEdges { edge_points }, Lang::Ja) => {
                 format!("検出なし (窓を取れない端 {edge_points} 採取は見ていない)")
             }
-            RouteStatus::NotEvaluated { reason } => format!("評価不能 ({})", reason.label()),
+            (RouteStatus::EvaluatedWithBlindEdges { edge_points }, Lang::En) => format!(
+                "nothing detected ({edge_points} samples at the edges were not looked at, \
+                 no window fits there)"
+            ),
+            (RouteStatus::NotEvaluated { reason }, Lang::Ja) => {
+                format!("評価不能 ({})", reason.label().get(lang))
+            }
+            (RouteStatus::NotEvaluated { reason }, Lang::En) => {
+                format!("not evaluated ({})", reason.label().get(lang))
+            }
         }
     }
 }
@@ -486,10 +553,11 @@ impl SeriesEvaluation {
         series: &PreparedSeries,
         entry: &'static CatalogEntry,
         baseline: &BaselineEvidence,
+        lang: Lang,
     ) -> Self {
         Self {
             series: SeriesKey::from_metric(&series.key),
-            metric_label: entry.label,
+            metric_label: entry.label.get(lang),
             present: true,
             observed_samples: series.observations.len() as u64,
             missing_samples: series.missing,
@@ -505,8 +573,8 @@ impl SeriesEvaluation {
     }
 
     /// activity 選択から除外された系列。入力の欠落とは区別する。
-    pub fn excluded(entry: &'static CatalogEntry) -> Self {
-        let mut evaluation = Self::absent(entry);
+    pub fn excluded(entry: &'static CatalogEntry, lang: Lang) -> Self {
+        let mut evaluation = Self::absent(entry, lang);
         let status = RouteStatus::NotEvaluated {
             reason: NotEvaluated::ExcludedBySelection,
         };
@@ -517,13 +585,13 @@ impl SeriesEvaluation {
     }
 
     /// 入力に無かった系列の評価。**黙って落とさない。**
-    pub fn absent(entry: &'static CatalogEntry) -> Self {
+    pub fn absent(entry: &'static CatalogEntry, lang: Lang) -> Self {
         let absent = RouteStatus::NotEvaluated {
             reason: NotEvaluated::SeriesAbsentFromSource,
         };
         Self {
             series: SeriesKey::from_metric(&entry.placeholder_key()),
-            metric_label: entry.label,
+            metric_label: entry.label.get(lang),
             present: false,
             observed_samples: 0,
             missing_samples: 0,
@@ -732,7 +800,7 @@ pub struct AssessedDetection {
 
 impl AssessedDetection {
     /// 検出 1 件に優先度と充足度を付ける。
-    fn of(d: &Detection, th: &DetectThresholds) -> Self {
+    fn of(d: &Detection, th: &DetectThresholds, lang: Lang) -> Self {
         let sufficiency = EvidenceSufficiency::of(d, th);
         let mut reasons: Vec<&'static str> = Vec::new();
         let mut priority = d.base_priority;
@@ -770,19 +838,19 @@ impl AssessedDetection {
             base_priority: d.base_priority,
             priority_reasons: reasons,
             sufficiency,
-            headline: headline_of(d),
+            headline: headline_of(d, lang),
         }
     }
 }
 
 /// 検出 1 件の見出し。
-fn headline_of(d: &Detection) -> String {
+fn headline_of(d: &Detection, lang: Lang) -> String {
     format!(
         "{} [{}] {} — {}",
         d.metric_label,
         d.series.display(),
-        d.pattern.label(),
-        d.support.describe_span()
+        d.pattern.label().get(lang),
+        d.support.describe_span(lang)
     )
 }
 
@@ -831,11 +899,11 @@ pub struct AssessedEpisode {
 }
 
 impl AssessedEpisode {
-    fn of(episode: Episode, th: &DetectThresholds) -> Self {
+    fn of(episode: Episode, th: &DetectThresholds, lang: Lang) -> Self {
         let assessed: Vec<AssessedDetection> = episode
             .detections
             .iter()
-            .map(|d| AssessedDetection::of(d, th))
+            .map(|d| AssessedDetection::of(d, th, lang))
             .collect();
 
         // 優先度はエピソード内の最大。**見出しもその検出に揃える**
@@ -862,7 +930,7 @@ impl AssessedEpisode {
         let longest_running_headline = (longest.series != lead.series
             || longest.route() != lead.route
             || longest.support != lead.support)
-            .then(|| headline_of(longest));
+            .then(|| headline_of(longest, lang));
 
         let priority = lead.priority;
         let base_priority = lead.base_priority;
@@ -875,7 +943,7 @@ impl AssessedEpisode {
         let viewpoints = episode
             .viewpoints
             .iter()
-            .map(|r| r.label())
+            .map(|r| r.label().get(lang))
             .collect::<Vec<_>>();
         let corroborating_series = episode
             .series_with_corroborating_viewpoints()
@@ -885,12 +953,12 @@ impl AssessedEpisode {
         let mut interpretations: Vec<&'static str> = Vec::new();
         let mut not_established: Vec<&'static str> = Vec::new();
         for d in &episode.detections {
-            for i in d.possible_interpretations {
+            for i in &d.possible_interpretations {
                 if !interpretations.contains(i) {
                     interpretations.push(i);
                 }
             }
-            for n in d.not_established {
+            for n in &d.not_established {
                 if !not_established.contains(n) {
                     not_established.push(n);
                 }
@@ -935,9 +1003,9 @@ pub struct BackgroundFinding {
 }
 
 impl BackgroundFinding {
-    fn of(d: Detection, th: &DetectThresholds, input_span_secs: Option<u64>) -> Self {
+    fn of(d: Detection, th: &DetectThresholds, input_span_secs: Option<u64>, lang: Lang) -> Self {
         Self {
-            finding: AssessedDetection::of(&d, th),
+            finding: AssessedDetection::of(&d, th, lang),
             share_of_input_percent: episodes::share_of_input_percent(&d.support, input_span_secs),
             detection: d,
         }
@@ -949,21 +1017,52 @@ impl BackgroundFinding {
 // ===========================================================================
 
 /// 読み手に必ず伝える前提。
-const STANDING_NOTES: &[&str] = &[
-    "比較基準はこの入力自身から作ったものであり、外部の正常値ではない。\
-     異変が入力の大半を占めていれば基準もその状態に寄る",
-    "確率や確信度は出さない。優先度は順序尺度で、根拠の充足度は別のフィールドである",
-    "3 つの観点 (絶対水準 / 参照分布からの逸脱 / 時間的変化) は統計的に独立ではない。\
-     複数の観点が当たったことを独立な裏付けの数として数えていない",
-    "sar のデータは離散的な採取である。採取と採取の間に何が起きていたかは観測されていない",
-    "エピソードは検出が**始まった時刻**でまとめている。長く続く検出は始まった時刻の\
-     エピソードに 1 度だけ現れるので、後の時刻のエピソードを読むときは\
-     それ以前から続いている所見も併せて見る必要がある",
-    "エピソードの「根拠が及ぶ範囲」は互いに重なることがある。\
-     範囲の包含は同一事象を意味しない",
-    "入力のほぼ全体を占める検出は「いつ」の手がかりを持たないので、\
-     エピソードではなく背景の所見として分けている。\
-     **重要でないという意味ではない**",
+const STANDING_NOTES: &[Text] = &[
+    text!(
+        ja: "比較基準はこの入力自身から作ったものであり、外部の正常値ではない。\
+             異変が入力の大半を占めていれば基準もその状態に寄る",
+        en: "The comparison basis is built from this input itself; it is not an external \
+             notion of normal. If the anomaly dominates the input, the basis moves with it",
+    ),
+    text!(
+        ja: "確率や確信度は出さない。優先度は順序尺度で、根拠の充足度は別のフィールドである",
+        en: "No probabilities or confidence values are produced. Priority is an ordinal scale, \
+             and how much evidence backed it is a separate field",
+    ),
+    text!(
+        ja: "3 つの観点 (絶対水準 / 参照分布からの逸脱 / 時間的変化) は統計的に独立ではない。\
+             複数の観点が当たったことを独立な裏付けの数として数えていない",
+        en: "The three views (absolute level / deviation from the reference distribution / \
+             change over time) are not statistically independent. Several of them firing is \
+             not counted as that many independent corroborations",
+    ),
+    text!(
+        ja: "sar のデータは離散的な採取である。採取と採取の間に何が起きていたかは観測されていない",
+        en: "sar data is a series of discrete samples. What happened between two samples was \
+             not observed",
+    ),
+    text!(
+        ja: "エピソードは検出が**始まった時刻**でまとめている。長く続く検出は始まった時刻の\
+             エピソードに 1 度だけ現れるので、後の時刻のエピソードを読むときは\
+             それ以前から続いている所見も併せて見る必要がある",
+        en: "Episodes are grouped by the time a detection **started**. A long-running detection \
+             appears once, in the episode for the time it began, so when reading a later episode \
+             you also need the findings still running from before it",
+    ),
+    text!(
+        ja: "エピソードの「根拠が及ぶ範囲」は互いに重なることがある。\
+             範囲の包含は同一事象を意味しない",
+        en: "The range an episode's evidence covers can overlap another's. One range containing \
+             another does not make them the same event",
+    ),
+    text!(
+        ja: "入力のほぼ全体を占める検出は「いつ」の手がかりを持たないので、\
+             エピソードではなく背景の所見として分けている。\
+             **重要でないという意味ではない**",
+        en: "A detection that spans almost the whole input carries no clue about *when*, so it \
+             is separated out as a standing finding rather than an episode. \
+             **That does not make it unimportant**",
+    ),
 ];
 
 /// 報告範囲の境界 (出力用の表記)。
@@ -1001,9 +1100,11 @@ impl ReportBoundary {
     }
 
     /// 1 行の表記。
-    pub fn label(self) -> String {
+    pub fn label(self, lang: Lang) -> String {
         match self {
-            ReportBoundary::Unbounded => "指定なし".to_string(),
+            ReportBoundary::Unbounded => {
+                text!(ja: "指定なし", en: "unbounded").get(lang).to_string()
+            }
             ReportBoundary::Epoch { ust } => format!("epoch {ust}"),
             ReportBoundary::TimeOfDay { hour, min, sec } => {
                 format!("{hour:02}:{min:02}:{sec:02}")
@@ -1068,7 +1169,15 @@ pub struct Assessment {
     pub background: Vec<BackgroundFinding>,
     /// 何を評価でき、何を評価できなかったか。
     pub coverage: EvaluationCoverage,
-    pub notes: &'static [&'static str],
+    /// 読み手に必ず伝える前提。**[`Assessment::lang`] で解決済み。**
+    pub notes: Vec<&'static str>,
+    /// この所見の文を組み立てた言語。
+    ///
+    /// **所見に付随させる。** 見出しや根拠の文は分析層で作り終えているので、
+    /// 出力層が別の言語で見出しを書くと 1 つのレポートに 2 言語が混ざる。
+    /// どの形式もここを見れば、本文と同じ言語で自分の見出しを出せる。
+    #[serde(skip)]
+    pub lang: Lang,
 }
 
 impl Assessment {
@@ -1136,12 +1245,12 @@ pub fn assess(
     );
     let background: Vec<BackgroundFinding> = standing
         .into_iter()
-        .map(|d| BackgroundFinding::of(d, &th, input_span))
+        .map(|d| BackgroundFinding::of(d, &th, input_span, opts.lang))
         .collect();
     let grouped = episodes::group(local, rules, &outcome.discontinuity_marks);
     let episodes: Vec<AssessedEpisode> = grouped
         .into_iter()
-        .map(|e| AssessedEpisode::of(e, &th))
+        .map(|e| AssessedEpisode::of(e, &th, opts.lang))
         .collect();
 
     let report_scope = ReportScope {
@@ -1175,7 +1284,8 @@ pub fn assess(
         episodes,
         background,
         coverage,
-        notes: STANDING_NOTES,
+        notes: STANDING_NOTES.iter().map(|t| t.get(opts.lang)).collect(),
+        lang: opts.lang,
     }
 }
 
@@ -1196,92 +1306,140 @@ fn basis_of(opts: &DetectOptions) -> BasisOrigin {
 ///
 /// **採取回数と時間範囲を必ず併記する** (`crate::detect::TemporalSupport` の方針)。
 /// 時刻そのものは出力層が付ける (エポック秒の書式はこの層の責務ではない)。
-pub fn describe_detection(d: &Detection) -> String {
+pub fn describe_detection(d: &Detection, lang: Lang) -> String {
     let unit = d.unit.suffix();
-    match &d.decision.basis {
-        DecisionBasis::FixedCondition {
-            comparison,
-            threshold,
-            ..
-        } => format!(
-            "{} が {}{unit} {}の状態で {} (最小 {:.2} / 最大 {:.2})",
-            d.metric_label,
-            threshold,
-            comparison.label(),
-            d.support.describe_span(),
-            d.decision.min,
-            d.decision.max
+    let metric = d.metric_label;
+    let span = d.support.describe_span(lang);
+    let (min, max) = (d.decision.min, d.decision.max);
+    match (&d.decision.basis, lang) {
+        (
+            DecisionBasis::FixedCondition {
+                comparison,
+                threshold,
+                ..
+            },
+            Lang::Ja,
+        ) => format!(
+            "{metric} が {threshold}{unit} {}の状態で {span} (最小 {min:.2} / 最大 {max:.2})",
+            comparison.label().get(lang)
         ),
-        DecisionBasis::RobustDeviation {
-            median,
-            mad,
-            peak_mad_ratio,
-            direction,
-            ..
-        } => format!(
-            "{} が比較基準 (中央値 {:.2}{unit}、MAD {:.2}) から{}側へ MAD の {:.1} 倍離れた \
-             ({}、最小 {:.2} / 最大 {:.2})",
-            d.metric_label,
-            median,
-            mad,
-            direction.as_str(),
-            peak_mad_ratio,
-            d.support.describe_span(),
-            d.decision.min,
-            d.decision.max
+        (
+            DecisionBasis::FixedCondition {
+                comparison,
+                threshold,
+                ..
+            },
+            Lang::En,
+        ) => format!(
+            "{metric} stayed {} {threshold}{unit} across {span} (minimum {min:.2} / maximum {max:.2})",
+            comparison.label().get(lang)
+        ),
+        (
+            DecisionBasis::RobustDeviation {
+                median,
+                mad,
+                peak_mad_ratio,
+                direction,
+                ..
+            },
+            Lang::Ja,
+        ) => format!(
+            "{metric} が比較基準 (中央値 {median:.2}{unit}、MAD {mad:.2}) から{}側へ \
+             MAD の {peak_mad_ratio:.1} 倍離れた ({span}、最小 {min:.2} / 最大 {max:.2})",
+            direction.as_str(lang)
+        ),
+        (
+            DecisionBasis::RobustDeviation {
+                median,
+                mad,
+                peak_mad_ratio,
+                direction,
+                ..
+            },
+            Lang::En,
+        ) => format!(
+            "{metric} moved {peak_mad_ratio:.1}x MAD {} from the comparison basis \
+             (median {median:.2}{unit}, MAD {mad:.2}) across {span} \
+             (minimum {min:.2} / maximum {max:.2})",
+            direction.as_str(lang)
         ),
         // **「MAD の N 倍」と書かない。** 散らばりが測れなかったので
         // 倍数は存在しない (`DecisionBasis::AbsoluteDeparture` の方針)。
-        DecisionBasis::AbsoluteDeparture {
-            reference,
-            dispersion,
-            min_absolute_deviation,
-            peak_absolute_deviation,
-            direction,
-            ..
-        } => format!(
-            "{} が比較基準 (中央値 {:.2}{unit}) から{}側へ {:.2}{unit} 離れた \
-             (散らばりが測れないため絶対差で判断した: {}、要 {:.2}{unit} 以上。{}、\
-             最小 {:.2} / 最大 {:.2})",
-            d.metric_label,
-            reference,
-            direction.as_str(),
-            peak_absolute_deviation,
-            dispersion.label(),
-            min_absolute_deviation,
-            d.support.describe_span(),
-            d.decision.min,
-            d.decision.max
+        (
+            DecisionBasis::AbsoluteDeparture {
+                reference,
+                dispersion,
+                min_absolute_deviation,
+                peak_absolute_deviation,
+                direction,
+                ..
+            },
+            Lang::Ja,
+        ) => format!(
+            "{metric} が比較基準 (中央値 {reference:.2}{unit}) から{}側へ \
+             {peak_absolute_deviation:.2}{unit} 離れた \
+             (散らばりが測れないため絶対差で判断した: {}、要 {min_absolute_deviation:.2}{unit} 以上。\
+             {span}、最小 {min:.2} / 最大 {max:.2})",
+            direction.as_str(lang),
+            dispersion.label().get(lang)
         ),
-        DecisionBasis::LevelShift {
-            before_median,
-            after_median,
-            shift,
-            trend_explained_shift,
-            step_shift,
-            normalized_shift,
-            before,
-            after,
-            ..
-        } => {
-            // **正規化しているのは段差 (`step_shift`) であって観測差ではない。**
-            let norm = match normalized_shift {
-                Some(n) => format!("段差は散らばりの {n:.1} 倍"),
-                None => "散らばりが測れないため正規化なし".to_string(),
-            };
-            format!(
-                "{} の水準が前後の窓で {:.2}{unit} から {:.2}{unit} へ {:+.2}{unit} 違う \
-                 (うち窓内の傾向で説明できる差 {:+.2}{unit} / 残る段差 {:+.2}{unit}、{norm}。\
-                 前: {} / 後: {})",
-                d.metric_label,
+        (
+            DecisionBasis::AbsoluteDeparture {
+                reference,
+                dispersion,
+                min_absolute_deviation,
+                peak_absolute_deviation,
+                direction,
+                ..
+            },
+            Lang::En,
+        ) => format!(
+            "{metric} moved {peak_absolute_deviation:.2}{unit} {} from the comparison basis \
+             (median {reference:.2}{unit}); spread could not be measured, so this was judged on \
+             absolute difference ({}, at least {min_absolute_deviation:.2}{unit} required). \
+             {span}, minimum {min:.2} / maximum {max:.2}",
+            direction.as_str(lang),
+            dispersion.label().get(lang)
+        ),
+        (
+            DecisionBasis::LevelShift {
                 before_median,
                 after_median,
                 shift,
                 trend_explained_shift,
                 step_shift,
-                before.describe_span(),
-                after.describe_span()
-            )
+                normalized_shift,
+                before,
+                after,
+                ..
+            },
+            _,
+        ) => {
+            // **正規化しているのは段差 (`step_shift`) であって観測差ではない。**
+            let norm = match (normalized_shift, lang) {
+                (Some(n), Lang::Ja) => format!("段差は散らばりの {n:.1} 倍"),
+                (Some(n), Lang::En) => format!("the step is {n:.1}x the spread"),
+                (None, Lang::Ja) => "散らばりが測れないため正規化なし".to_string(),
+                (None, Lang::En) => {
+                    "spread could not be measured, so nothing was normalised".to_string()
+                }
+            };
+            let (b, a) = (before.describe_span(lang), after.describe_span(lang));
+            match lang {
+                Lang::Ja => format!(
+                    "{metric} の水準が前後の窓で {before_median:.2}{unit} から \
+                     {after_median:.2}{unit} へ {shift:+.2}{unit} 違う \
+                     (うち窓内の傾向で説明できる差 {trend_explained_shift:+.2}{unit} / \
+                     残る段差 {step_shift:+.2}{unit}、{norm}。前: {b} / 後: {a})"
+                ),
+                Lang::En => format!(
+                    "The level of {metric} differs by {shift:+.2}{unit} between the two windows, \
+                     from {before_median:.2}{unit} to {after_median:.2}{unit} \
+                     (of which {trend_explained_shift:+.2}{unit} is explained by the trend within \
+                     the windows, leaving a step of {step_shift:+.2}{unit}; {norm}. \
+                     Before: {b} / after: {a})"
+                ),
+            }
         }
     }
 }
@@ -1291,34 +1449,68 @@ pub fn describe_detection(d: &Detection) -> String {
 /// **絞り込みで空になったのか、検出が無かったのかを混ぜない。**
 /// 件数は [`Assessment::report_scope`] から採る。
 pub fn describe_assessment(a: &Assessment) -> String {
+    let lang = a.lang;
     let s = &a.report_scope;
-    let mut text = match a.top_priority() {
-        None => format!(
+    let min = s.min_priority.label().get(lang);
+    let mut text = match (a.top_priority(), lang) {
+        (None, Lang::Ja) => format!(
             "エピソードなし (入力全体の検出 {} 件 / 報告範囲の検出 {} 件 / \
-             優先度 {} 未満で除外したエピソード {} 件)",
-            s.detections_in_input,
-            s.detections_in_report_window,
-            s.min_priority.label(),
-            s.episodes_excluded_by_priority
+             優先度 {min} 未満で除外したエピソード {} 件)",
+            s.detections_in_input, s.detections_in_report_window, s.episodes_excluded_by_priority
         ),
-        Some(p) => format!(
+        (None, Lang::En) => format!(
+            "No episodes ({} across the input / {} within the report window / \
+             {} dropped below priority {min})",
+            count_en(s.detections_in_input as u64, "detection", "detections"),
+            count_en(
+                s.detections_in_report_window as u64,
+                "detection",
+                "detections"
+            ),
+            count_en(
+                s.episodes_excluded_by_priority as u64,
+                "episode",
+                "episodes"
+            ),
+        ),
+        (Some(p), Lang::Ja) => format!(
             "エピソード {} 件 (最高優先度: {})、検出 {} 件、背景の所見 {} 件、\
              評価できた系列 {} / 入力にあった系列 {}",
             a.episodes.len(),
-            p.label(),
+            p.label().get(lang),
             a.detection_count(),
             a.background.len(),
             a.coverage.series_evaluated,
             a.coverage.series_present
         ),
+        (Some(p), Lang::En) => format!(
+            "{} (highest priority: {}), {}, {}, {} of {} series present in the input \
+             were evaluated",
+            count_en(a.episodes.len() as u64, "episode", "episodes"),
+            p.label().get(lang),
+            count_en(a.detection_count() as u64, "detection", "detections"),
+            count_en(
+                a.background.len() as u64,
+                "standing finding",
+                "standing findings"
+            ),
+            a.coverage.series_evaluated,
+            a.coverage.series_present
+        ),
     };
     if s.episodes_excluded_by_priority > 0 || s.background_excluded_by_priority > 0 {
-        text.push_str(&format!(
-            "。優先度 {} 未満で除外: エピソード {} 件 / 背景の所見 {} 件",
-            s.min_priority.label(),
+        let (e, b) = (
             s.episodes_excluded_by_priority,
-            s.background_excluded_by_priority
-        ));
+            s.background_excluded_by_priority,
+        );
+        text.push_str(&match lang {
+            Lang::Ja => {
+                format!("。優先度 {min} 未満で除外: エピソード {e} 件 / 背景の所見 {b} 件")
+            }
+            Lang::En => {
+                format!(". Dropped below priority {min}: {e} episodes / {b} standing findings")
+            }
+        });
     }
     text
 }
@@ -1413,8 +1605,8 @@ mod tests {
             },
             decision: DecisionEvidence::new(basis, &[]),
             base_priority,
-            possible_interpretations: &[],
-            not_established: &[],
+            possible_interpretations: Vec::new(),
+            not_established: Vec::new(),
         }
     }
 
@@ -1430,7 +1622,10 @@ mod tests {
             outcome,
             SummarySource::default(),
             period,
-            &DetectOptions::default(),
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
         )
     }
 
@@ -1470,7 +1665,13 @@ mod tests {
         let mut v: Vec<f64> = (0..20).map(|i| 2.0 + f64::from(i % 3)).collect();
         v.extend((0..20).map(|i| 40.0 + f64::from(i % 3)));
         let ts = single(runq(&vals(&v)));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
 
         let ev = a
             .coverage
@@ -1501,7 +1702,13 @@ mod tests {
     fn a_fixed_condition_fires_even_when_dispersion_cannot_be_measured() {
         // %idle が終始 2% (= 一定値なので MAD は 0)
         let ts = single(cpu_idle(&vals(&[2.0; 30])));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let ev = a
             .coverage
             .series
@@ -1526,7 +1733,13 @@ mod tests {
     fn the_output_admits_when_the_basis_reflects_the_anomaly() {
         // 30 点すべて %idle 2%。中央値そのものが固定条件の内側
         let ts = single(cpu_idle(&vals(&[2.0; 30])));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
 
         let ev = a
             .coverage
@@ -1570,7 +1783,13 @@ mod tests {
         v[12] = 2.0;
         v[13] = 2.0;
         let ts = single(cpu_idle(&vals(&v)));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let ep = a.episodes.first().expect("エピソード");
         // 下地の絶対値はカタログの宣言なのでここでは固定しない。
         // **昇格が起きたこと**と、その理由が「この検出自身の持続」であることを見る
@@ -1701,7 +1920,13 @@ mod tests {
     fn a_fixed_condition_is_not_demoted_by_a_thin_comparison_basis() {
         // 6 点だけ。基準を作るサンプル (既定 12) に届かない
         let ts = single(cpu_idle(&vals(&[80.0, 80.0, 2.0, 2.0, 80.0, 80.0])));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let ep = a.episodes.first().expect("エピソード");
         let fixed = ep
             .detections
@@ -1796,7 +2021,7 @@ mod tests {
         assert!(ep.sufficiency_spread.mixed);
         assert_eq!(ep.sufficiency_spread.lowest, SufficiencyLevel::Thin);
         assert_eq!(ep.sufficiency_spread.highest, SufficiencyLevel::Adequate);
-        assert!(ep.sufficiency_spread.label().contains("混在"));
+        assert!(ep.sufficiency_spread.label(Lang::Ja).contains("混在"));
     }
 
     /// 水準変化の充足度は局所窓の点数で測る (Issue #5 ⑫)。
@@ -1806,7 +2031,13 @@ mod tests {
         let mut v: Vec<f64> = vec![2.0; 20];
         v.extend(vec![40.0; 20]);
         let ts = single(runq(&vals(&v)));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let shift = a
             .episodes
             .iter()
@@ -1833,7 +2064,13 @@ mod tests {
                 point.end_ust = T0 + (i as u64 + 1) * interval;
                 point.elapsed_cs = interval * 100;
             }
-            let a = assess_timelines(&single(timeline), &DetectOptions::default());
+            let a = assess_timelines(
+                &single(timeline),
+                &DetectOptions {
+                    lang: Lang::Ja,
+                    ..Default::default()
+                },
+            );
             let shift = a
                 .episodes
                 .iter()
@@ -1853,7 +2090,13 @@ mod tests {
         for point in &mut points[60..66] {
             *point = P::V(1.0);
         }
-        let a = assess_timelines(&single(cpu_idle(&points)), &DetectOptions::default());
+        let a = assess_timelines(
+            &single(cpu_idle(&points)),
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let fixed = a
             .episodes
             .iter()
@@ -1932,7 +2175,13 @@ mod tests {
     #[test]
     fn coverage_separates_not_evaluated_from_no_detection() {
         let ts = single(cpu_idle(&vals(&[50.0; 20])));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         assert!(a.coverage.patterns_in_catalog > 1);
         assert_eq!(a.coverage.series_present, 1);
         assert!(
@@ -1959,7 +2208,13 @@ mod tests {
             crate::model::ValueKind::Counter,
             &vals(&v),
         ));
-        let mut a = assess_timelines(&ts, &DetectOptions::default());
+        let mut a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         assert_eq!(a.episodes.len(), 1);
         // pgscank の発生は Informational 相当 (材料が乏しければ更に下がる)
         assert!(a.episodes[0].priority <= Priority::Watch);
@@ -1982,6 +2237,7 @@ mod tests {
         ));
         // T0 は 00:00:00 UTC。検出を落とさない境界を指定する
         let opts = DetectOptions {
+            lang: Lang::Ja,
             report_from: ReportBound::TimeOfDay {
                 hour: 0,
                 min: 0,
@@ -2033,6 +2289,7 @@ mod tests {
         ));
         // 検出の時刻より後ろだけを報告範囲にする
         let opts = DetectOptions {
+            lang: Lang::Ja,
             report_from: ReportBound::Epoch(T0 + 20 * 600),
             ..Default::default()
         };
@@ -2050,7 +2307,13 @@ mod tests {
     #[test]
     fn standing_notes_state_the_limits() {
         let ts = single(cpu_idle(&vals(&[50.0; 20])));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         assert!(a.notes.iter().any(|n| n.contains("外部の正常値ではない")));
         assert!(a.notes.iter().any(|n| n.contains("確率や確信度は出さない")));
         assert!(a.notes.iter().any(|n| n.contains("独立ではない")));
@@ -2072,10 +2335,17 @@ mod tests {
     #[test]
     fn baseline_scope_is_recorded_in_the_assessment() {
         let ts = single(cpu_idle(&vals(&[50.0; 20])));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         assert_eq!(a.baseline_basis, BasisOrigin::InputItself);
 
         let opts = DetectOptions {
+            lang: Lang::Ja,
             baseline_scope: BaselineScope::Window,
             report_from: ReportBound::Epoch(T0),
             ..Default::default()
@@ -2091,9 +2361,15 @@ mod tests {
         v[10] = 2.0;
         v[11] = 2.0;
         let ts = single(cpu_idle(&vals(&v)));
-        let a = assess_timelines(&ts, &DetectOptions::default());
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::Ja,
+                ..Default::default()
+            },
+        );
         let d = &a.episodes[0].episode.detections[0];
-        let text = describe_detection(d);
+        let text = describe_detection(d, Lang::Ja);
         assert!(text.contains("回の採取"), "{text}");
         assert!(!text.contains("分間"), "{text}");
     }

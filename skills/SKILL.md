@@ -81,12 +81,23 @@ broken.bin             -       -                             -         -       -
 resarch detect /var/log/sa/sa07
 resarch detect sa07 --format json          # エージェント向け (型のフィールドをそのまま出す)
 resarch detect sa07 --verbose              # text に検出ごとの内訳と解釈まで出す
+resarch detect sa07 --lang en              # 英語で出す (既定は実行環境から決まる)
 resarch detect sa07 --min-priority investigate   # 優先度の下限で絞る
 resarch detect sa07 --from 09:00 --to 10:00      # 報告範囲だけを絞る (下記の注意)
 ```
 
 評価できるすべての系列に 3 つの観点を当て、当たったものを時間的に近いものごとに
 **エピソード**としてまとめる。
+
+### 出力の言語
+
+`detect` は日本語と英語で出る。**エージェントが読むなら `--lang en` を明示する**か、
+`--format json` / `--format ndjson` を使う (キーと列挙値は言語によらず英語で固定)。
+
+言語は `--lang` → `RESARCH_LANG` → `LC_ALL` / `LC_MESSAGES` / `LANG` → `LANGUAGE` →
+ローカルタイムゾーン (日本なら日本語) → 英語 の順で決まる。
+**ロケール環境変数はタイムゾーンより強い。** `LC_ALL=C` は `LANGUAGE` より先に
+英語で確定するので、決定的な出力がほしいスクリプトはこれを使える。
 
 ### text は既定で要約 (エージェントは JSON を使う)
 

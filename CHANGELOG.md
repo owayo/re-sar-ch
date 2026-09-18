@@ -22,9 +22,36 @@
   系列に固有の留保 (中央値そのものが固定条件の内側、基準が異変側へ寄っている疑い) も
   要約に残る
 
+### ⚠️ 破壊的変更 (続き)
+
+- **`detect` の出力言語を実行環境から決めるようにした。** これまでは常に日本語だった。
+  **日本語のままにするには `--lang ja`** を付けるか、`LANG=ja_JP.UTF-8` のような
+  ロケールを設定する。判定の順は
+  `--lang` → `RESARCH_LANG` → `LC_ALL` / `LC_MESSAGES` / `LANG` → `LANGUAGE` →
+  ローカルタイムゾーン (日本なら日本語) → 英語。
+  **ロケール環境変数はタイムゾーンより強い** (ロケールは「どの言語で読みたいか」の
+  宣言そのもので、タイムゾーンは「どこにいるか」でしかない)。
+  `LC_ALL=C` は `LANGUAGE` より強く、英語で確定する (スクリプトが決定的な出力を得る慣行)
+- **ライブラリとして使っている場合、表示文字列の API が変わった。** CLI だけを使うなら
+  影響しない。`Priority::label` / `SufficiencyLevel::label` / `SufficiencyBasis::label` /
+  `NotEvaluated::label` / `ObservationOrigin::label` / `MeanBasis::label` /
+  `Pattern::label` / `DetectRoute::label` / `BasisOrigin::label` / `Dispersion::label` /
+  `FixedComparison::label` は **`&'static str` ではなく `Text` (日英の対) を返す**。
+  `.get(lang)` を挟めば従来の文字列が取れる。
+  `SufficiencySpread::label` / `RouteStatus::label` / `ReportBoundary::label` /
+  `ShiftDirection::as_str` / `TemporalSupport::describe_span` / `describe_duration` /
+  `describe_detection` / `boundary_phrase` / `SeriesEvaluation::{observed, excluded, absent}`
+  は **引数に `Lang` が増えた**。`CatalogEntry` の `label` / `interpretations` /
+  `not_established` / `FixedCondition::rationale` も `Text` になった
+- `DetectOptions` に `lang` フィールドが増えた (`..Default::default()` で組んでいれば
+  英語になる)。`Assessment` は組み立てに使った言語を `lang` で持つ
+
 ### 追加
 
 - `detect --verbose` を追加した (上記の全文表示)
+- **`detect` を日本語 / 英語の 2 言語に対応させた。** 指標名・検出の説明文・
+  考えられる解釈・確かめていないこと・評価の網羅度・注意まで、
+  `text` と SVG のすべてを訳してある。`--lang ja` / `--lang en` で明示指定できる
 - `detect --format json` / `--format ndjson` のエピソードに `headline_series` と
   `headline_metric_label` を足した。どの検出が見出しになったかを、
   見出し文字列を解析せずに取れる

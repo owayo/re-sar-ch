@@ -11,7 +11,8 @@ use crate::analyze::assessment::{AssessedDetection, Assessment, describe_detecti
 use crate::analyze::summary::{NativePeriodSummary, SummarySource};
 use crate::analyze::timeline::{ExclusionReason, MetricKey, MetricPoint};
 use crate::detect::{DecisionBasis, Detection, ObservationOrigin, SeriesKey};
-use crate::model::{DisplayTz, Unit};
+use crate::model::{DisplayTz, Lang, Unit};
+use crate::text;
 
 /// 1 枚の図に含まれる所見。優先度・充足度・根拠を元の型で保持する。
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +42,9 @@ pub struct Chart {
     pub findings: Vec<ChartFinding>,
     pub points: Vec<ChartPoint>,
     pub missing_timeline: bool,
+    /// 図の文を組み立てる言語。**所見と同じものを使う** (図だけ別言語にしない)。
+    #[serde(skip)]
+    pub lang: Lang,
 }
 
 /// 報告対象の検知から、同一系列の前後窓を作る。
@@ -129,6 +133,7 @@ pub fn plan(
                     findings: vec![finding],
                     points: Vec::new(),
                     missing_timeline: timeline.is_none(),
+                    lang: assessment.lang,
                 });
             }
         }
@@ -243,6 +248,15 @@ struct Guide {
     label: String,
 }
 
+/// 比較基準の中央値を指す線のキャプション。
+fn median_caption(d: &Detection, lang: Lang) -> String {
+    let basis = d.baseline.basis.label().get(lang);
+    match lang {
+        Lang::Ja => format!("比較基準の中央値 ({basis})"),
+        Lang::En => format!("Median of the comparison basis ({basis})"),
+    }
+}
+
 fn unit_symbol(unit: Unit) -> &'static str {
     match unit {
         Unit::None | Unit::Identifier => "",
@@ -268,6 +282,7 @@ fn axis_number(value: f64) -> String {
 }
 
 fn guides(chart: &Chart) -> Vec<Guide> {
+    let lang = chart.lang;
     let mut out = Vec::new();
     for finding in &chart.findings {
         let d = &finding.detection;
@@ -290,28 +305,24 @@ fn guides(chart: &Chart) -> Vec<Guide> {
                 threshold,
                 comparison,
                 ..
-            } => add(
-                *threshold,
-                chart.window_start_ust,
-                chart.window_end_ust,
-                format!(
-                    "固定条件: {} {}{}",
-                    comparison.label(),
-                    threshold,
-                    unit_symbol(chart.unit)
-                ),
-            ),
+            } => add(*threshold, chart.window_start_ust, chart.window_end_ust, {
+                let (cmp, u) = (comparison.label().get(lang), unit_symbol(chart.unit));
+                match lang {
+                    Lang::Ja => format!("固定条件: {cmp} {threshold}{u}"),
+                    Lang::En => format!("Fixed condition: {cmp} {threshold}{u}"),
+                }
+            }),
             DecisionBasis::RobustDeviation { median, .. } => add(
                 *median,
                 chart.window_start_ust,
                 chart.window_end_ust,
-                format!("比較基準の中央値 ({})", d.baseline.basis.label()),
+                median_caption(d, lang),
             ),
             DecisionBasis::AbsoluteDeparture { reference, .. } => add(
                 *reference,
                 chart.window_start_ust,
                 chart.window_end_ust,
-                format!("比較基準の中央値 ({})", d.baseline.basis.label()),
+                median_caption(d, lang),
             ),
             DecisionBasis::LevelShift {
                 before_median,
@@ -409,6 +420,7 @@ impl Coordinates {
 
 /// 1 系列・1 前後窓を、外部依存のない SVG にする。
 pub fn write_svg<W: Write>(out: &mut W, chart: &Chart, tz: DisplayTz) -> io::Result<()> {
+    let lang = chart.lang;
     if chart.window_start_ust > chart.window_end_ust {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -420,43 +432,80 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart, tz: DisplayTz) -> io::Res
     for (index, finding) in chart.findings.iter().enumerate() {
         let d = &finding.detection;
         let prefix = if finding.background {
-            "背景の所見 (入力の大半で続く状態)"
+            text!(
+                ja: "背景の所見 (入力の大半で続く状態)",
+                en: "Standing finding (a state holding across most of the input)",
+            )
         } else {
-            "局所の所見"
+            text!(ja: "局所の所見", en: "Local finding")
         };
-        detail_lines.push(format!("{}. {} / {}", index + 1, prefix, d.route().label()));
+        let n = index + 1;
         detail_lines.push(format!(
-            "調査優先度: {}　根拠の充足度: {} ({})",
-            finding.assessed.priority.label(),
-            finding.assessed.sufficiency.level.label(),
-            finding.assessed.sufficiency.basis.label()
+            "{n}. {} / {}",
+            prefix.get(lang),
+            d.route().label().get(lang)
         ));
-        detail_lines.push(format!(
-            "検知を裏付けた範囲: {} → {} ({} 回の採取)",
+        let (priority, level, basis) = (
+            finding.assessed.priority.label().get(lang),
+            finding.assessed.sufficiency.level.label().get(lang),
+            finding.assessed.sufficiency.basis.label().get(lang),
+        );
+        detail_lines.push(match lang {
+            Lang::Ja => format!("調査優先度: {priority}　根拠の充足度: {level} ({basis})"),
+            Lang::En => {
+                format!(
+                    "Investigation priority: {priority}   Evidence sufficiency: {level} ({basis})"
+                )
+            }
+        });
+        let (from, to, samples) = (
             epoch(tz, d.support.start_ust),
             epoch(tz, d.support.end_ust),
-            d.support.samples
-        ));
-        detail_lines.push(describe_detection(d));
+            d.support.samples,
+        );
+        detail_lines.push(match lang {
+            Lang::Ja => format!("検知を裏付けた範囲: {from} → {to} ({samples} 回の採取)"),
+            Lang::En => format!("Range the detection rests on: {from} → {to} ({samples} samples)"),
+        });
+        detail_lines.push(describe_detection(d, lang));
         detail_lines.extend(
             finding
                 .assessed
                 .priority_reasons
                 .iter()
-                .map(|s| format!("優先度の理由: {s}")),
+                .map(|s| match lang {
+                    Lang::Ja => format!("優先度の理由: {s}"),
+                    Lang::En => format!("Reason for the priority: {s}"),
+                }),
         );
         if let DecisionBasis::FixedCondition { rationale, .. } = &d.decision.basis {
-            detail_lines.push(format!("条件の説明: {rationale}"));
+            detail_lines.push(match lang {
+                Lang::Ja => format!("条件の説明: {rationale}"),
+                Lang::En => format!("What the condition means: {rationale}"),
+            });
         }
         if let DecisionBasis::LevelShift { before, after, .. } = &d.decision.basis {
-            detail_lines.push(format!(
-                "分割時刻: {} (前窓の末尾: {})。変化の発生時刻を確定したものではない。色帯は後窓。",
-                epoch(tz, after.start_ust),
-                epoch(tz, before.end_ust)
-            ));
+            let (split, prev_end) = (epoch(tz, after.start_ust), epoch(tz, before.end_ust));
+            detail_lines.push(match lang {
+                Lang::Ja => format!(
+                    "分割時刻: {split} (前窓の末尾: {prev_end})。\
+                     変化の発生時刻を確定したものではない。色帯は後窓。"
+                ),
+                Lang::En => format!(
+                    "Split time: {split} (end of the earlier window: {prev_end}). This does not \
+                     fix when the change happened. The shaded band is the later window."
+                ),
+            });
         }
         if d.baseline.may_reflect_the_anomaly() {
-            detail_lines.push("留保: 比較基準そのものが異変側に寄っている疑いがある。".into());
+            detail_lines.push(
+                text!(
+                    ja: "留保: 比較基準そのものが異変側に寄っている疑いがある。",
+                    en: "Caveat: the comparison basis itself may lean toward the anomaly.",
+                )
+                .get(lang)
+                .to_string(),
+            );
         }
     }
     let header_lines = wrapped(&title, 90).len();
@@ -496,26 +545,39 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart, tz: DisplayTz) -> io::Res
     )?;
     text_lines(
         out,
-        &format!(
-            "{} / 単位: {} / 起動区間: {}",
-            chart.origin.label(),
-            if unit_symbol(chart.unit).is_empty() {
-                "無次元"
+        &{
+            let origin = chart.origin.label().get(lang);
+            let unit = if unit_symbol(chart.unit).is_empty() {
+                text!(ja: "無次元", en: "dimensionless").get(lang)
             } else {
                 unit_symbol(chart.unit)
-            },
-            chart
-                .source
-                .boot_segment
-                .map_or_else(|| "単一区間".into(), |n| n.to_string())
-        ),
+            };
+            let boot = chart.source.boot_segment.map_or_else(
+                || {
+                    text!(ja: "単一区間", en: "single segment")
+                        .get(lang)
+                        .to_string()
+                },
+                |n| n.to_string(),
+            );
+            match lang {
+                Lang::Ja => format!("{origin} / 単位: {unit} / 起動区間: {boot}"),
+                Lang::En => format!("{origin} / unit: {unit} / boot segment: {boot}"),
+            }
+        },
         &mut y,
         "meta",
         150,
     )?;
     text_lines(
         out,
-        "橙: 検知を裏付けた採取の範囲　青点: 採取値　緑破線: 固定条件・比較基準 (正常値ではない)",
+        text!(
+            ja: "橙: 検知を裏付けた採取の範囲　青点: 採取値　\
+                 緑破線: 固定条件・比較基準 (正常値ではない)",
+            en: "Orange: the sample range the detection rests on   Blue dots: sampled values   \
+                 Green dashes: fixed conditions and the comparison basis (not a notion of normal)",
+        )
+        .get(lang),
         &mut y,
         "meta",
         150,
@@ -701,7 +763,10 @@ mod tests {
             samples: count as u64,
             ..Default::default()
         };
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let mut outcome = crate::detect::detect(&summary.timelines, &opts);
         // 窓の試験は固定条件の位置を入力どおりに固定し、逸脱/段差の重複に依存させない。
         outcome
@@ -756,6 +821,7 @@ mod tests {
     fn report_bounds_do_not_remove_the_input_context() {
         let (summary, _) = fixture(&[(10, 12), (30, 32)], 50);
         let opts = DetectOptions {
+            lang: Lang::Ja,
             report_from: ReportBound::Epoch(T0 + 10 * STEP_SECS),
             report_to: ReportBound::Epoch(T0 + 12 * STEP_SECS),
             ..Default::default()
@@ -905,7 +971,10 @@ mod tests {
         let mut values = vec![90.0; 30];
         values.extend(vec![60.0; 30]);
         summary.timelines = single(cpu_idle(&vals(&values)));
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let mut outcome = crate::detect::detect(&summary.timelines, &opts);
         outcome
             .detections

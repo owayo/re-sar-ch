@@ -98,6 +98,7 @@
 
 use crate::analyze::assessment::{NotEvaluated, RouteStatus};
 use crate::analyze::metric_catalog::CatalogEntry;
+use crate::model::Lang;
 
 use super::{
     Baseline, DETECTOR_VERSION, DecisionBasis, DecisionEvidence, DetectOptions, Detection,
@@ -246,7 +247,18 @@ pub fn detect(
         for best in collapse(&candidates) {
             let after = &segment[best.at..best.at + w];
             let before = series.support_of(&segment[best.at - w..best.at]);
-            out.push(build(series, entry, baseline, best, plan, before, after));
+            out.push(build(
+                series,
+                entry,
+                baseline,
+                ShiftEvidence {
+                    split: best,
+                    plan,
+                    before,
+                    after,
+                },
+                opts.lang,
+            ));
         }
     }
 
@@ -528,15 +540,34 @@ fn collapse(candidates: &[Split]) -> Vec<Split> {
     out
 }
 
+/// 水準変化 1 件を組み立てる材料。
+///
+/// **前後の窓は対で意味を持つ。** 片方だけ差し替えられる形にすると、
+/// 別々の分割から来た窓で 1 件を組み立てられてしまう。
+struct ShiftEvidence<'a> {
+    /// 採用した分割 (**変化した時刻ではなく分割時刻**。規律 8)。
+    split: Split,
+    /// 要求した窓と実効の窓 (規律 13)。
+    plan: WindowPlan,
+    /// 前窓の裏付け。
+    before: super::TemporalSupport,
+    /// 後窓の観測。
+    after: &'a [Observation],
+}
+
 fn build(
     series: &PreparedSeries,
     entry: &'static CatalogEntry,
     baseline: &Baseline,
-    split: Split,
-    plan: WindowPlan,
-    before: super::TemporalSupport,
-    after: &[Observation],
+    evidence: ShiftEvidence<'_>,
+    lang: Lang,
 ) -> Detection {
+    let ShiftEvidence {
+        split,
+        plan,
+        before,
+        after,
+    } = evidence;
     let after_support = series.support_of(after);
     let direction = ShiftDirection::of(split.shift);
     let basis = DecisionBasis::LevelShift {
@@ -560,7 +591,7 @@ fn build(
     Detection {
         detector_version: DETECTOR_VERSION,
         series: SeriesKey::from_metric(&series.key),
-        metric_label: entry.label,
+        metric_label: entry.label.get(lang),
         unit: series.unit,
         kind: series.kind,
         origin: series.origin,
@@ -570,8 +601,8 @@ fn build(
         decision: DecisionEvidence::new(basis, after),
         // 水準変化は「いつ変わったか」を足すが、絶対水準の裏付けは無い
         base_priority: crate::analyze::assessment::Priority::Watch,
-        possible_interpretations: entry.interpretations,
-        not_established: entry.not_established,
+        possible_interpretations: entry.interpretations.iter().map(|t| t.get(lang)).collect(),
+        not_established: entry.not_established.iter().map(|t| t.get(lang)).collect(),
     }
 }
 
@@ -617,7 +648,7 @@ mod tests {
             scope: ItemScope::Single,
             kind: ValueKind::Gauge,
             unit: Unit::None,
-            label: "テスト用の系列",
+            label: text!(ja: "テスト用の系列", en: "test series"),
             fixed: &[],
             deviation: DeviationInterest::Upper,
             shift: ShiftMagnitude::Absolute(4.0),
@@ -634,7 +665,10 @@ mod tests {
     fn run(t: crate::analyze::timeline::MetricTimeline) -> (Vec<Detection>, RouteStatus) {
         let entry = entry_for(&t);
         let series = PreparedSeries::from_timeline(&t);
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let material = series.observations.clone();
         let baseline = build_baseline(&series, entry, material, &opts);
         super::detect(&series, entry, &baseline, &opts)
@@ -1075,7 +1109,10 @@ mod tests {
             &vals(&v),
         );
         let series = PreparedSeries::from_timeline(&t);
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let baseline = build_baseline(&series, &BOTH_WAYS, series.observations.clone(), &opts);
         let (found, status) = super::detect(&series, &BOTH_WAYS, &baseline, &opts);
 
@@ -1105,7 +1142,10 @@ mod tests {
             &vals(&v),
         );
         let series = PreparedSeries::from_timeline(&t);
-        let opts = DetectOptions::default();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
         let baseline = build_baseline(&series, &UPWARD_ONLY, series.observations.clone(), &opts);
         let (found, _) = super::detect(&series, &UPWARD_ONLY, &baseline, &opts);
         assert!(found.is_empty(), "{found:#?}");

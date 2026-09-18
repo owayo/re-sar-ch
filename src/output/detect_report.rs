@@ -93,9 +93,13 @@ pub fn write_text<W: Write>(
             "エピソードなし (報告範囲・優先度の下限で絞った結果を含む)"
         )?;
     }
-    for e in &a.episodes {
-        writeln!(out)?;
-        write_episode(out, e, tz, detail)?;
+    if detail.is_full() {
+        for e in &a.episodes {
+            writeln!(out)?;
+            write_episode(out, e, tz, detail)?;
+        }
+    } else {
+        write_episode_groups(out, a, tz)?;
     }
     // **省いたことを黙らない。** 出ていない情報があると分からなければ、
     // 読み手は「この所見にはこれしか根拠が無い」と読む。
@@ -103,7 +107,7 @@ pub fn write_text<W: Write>(
         writeln!(out)?;
         writeln!(
             out,
-            "検出ごとの内訳 (観測値・比較基準・窓) と考えられる解釈は省いた \
+            "エピソード 1 件ずつの根拠 (観測値・比較基準・窓) と考えられる解釈は省いた \
              (--verbose で出る。全フィールドは --format json / --format ndjson)"
         )?;
     }
@@ -206,6 +210,173 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Res
         a.thresholds.shift_persistence_share * 100.0
     )?;
     writeln!(out, "所見: {}", crate::analyze::describe_assessment(a))
+}
+
+/// 1 つの系列にまとめたエピソード群。
+struct SeriesGroup<'a> {
+    series: &'a crate::detect::SeriesKey,
+    metric_label: &'static str,
+    episodes: Vec<&'a AssessedEpisode>,
+}
+
+/// 1 系列あたりで時刻を並べるエピソード数の上限。
+///
+/// **件数は必ず出し**、時刻の列挙だけを打ち切る。
+const MAX_LISTED_ONSETS: usize = 8;
+
+/// 1 行に並べる時刻の数 (日付を省けるとき / 省けないとき)。
+const ONSETS_PER_LINE: usize = 3;
+const ONSETS_PER_LINE_WITH_DATE: usize = 2;
+
+/// エピソードを**見出しの系列ごとに**まとめて書き出す (要約用)。
+///
+/// # なぜまとめるのか
+///
+/// エピソードは検出の**始まり**でまとめるので、同じ系列が 1 日を通じて
+/// 散発的に鳴ると、その回数だけエピソードができる (実測で `pgscand` が 18 件、
+/// ディスクの `tps` が 15 件、合計 111 エピソード)。1 件ずつ並べると
+/// 「何が鳴っているか」が 1400 行に薄まる。系列でまとめると
+/// **「何が」が先に見え、「いつ」はその下に時刻として残る**。
+///
+/// # 失わないもの
+///
+/// - **いつ** — エピソードごとの範囲を時刻として並べる (打ち切ったら件数を出す)
+/// - **優先度** — 系列の最高優先度を見出しに、各時刻にもその回の優先度を添える
+/// - **同時に鳴った別の系列** — `+N 系列` として時刻の後ろに出す。
+///   複数系列が重なったエピソードは事象らしさの手がかりなので、埋めてはいけない
+///
+/// 1 件ずつの根拠は `--verbose` で従来どおり出る。
+fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
+    let mut groups: Vec<SeriesGroup<'_>> = Vec::new();
+    for e in &a.episodes {
+        match groups.iter_mut().find(|g| *g.series == e.headline_series) {
+            Some(g) => g.episodes.push(e),
+            None => groups.push(SeriesGroup {
+                series: &e.headline_series,
+                metric_label: e.headline_metric_label,
+                episodes: vec![e],
+            }),
+        }
+    }
+    // 優先度の高い順 → 件数の多い順 → 系列名順 (決定的にする)
+    groups.sort_by(|x, y| {
+        let px = x.episodes.iter().map(|e| e.priority).max();
+        let py = y.episodes.iter().map(|e| e.priority).max();
+        py.cmp(&px)
+            .then_with(|| y.episodes.len().cmp(&x.episodes.len()))
+            .then_with(|| x.series.cmp(y.series))
+    });
+
+    // 報告が 1 日に収まるなら時刻だけにする。**日付はヘッダの「期間」が持っている**ので、
+    // 全行に繰り返すと時刻そのものが読み取りにくくなる。
+    let same_day = match (a.period.first_ust, a.period.last_ust) {
+        (Some(f), Some(l)) => tz.date(f) == tz.date(l),
+        _ => false,
+    };
+    let per_line = if same_day {
+        ONSETS_PER_LINE
+    } else {
+        ONSETS_PER_LINE_WITH_DATE
+    };
+
+    for g in &groups {
+        writeln!(out)?;
+        let top = g
+            .episodes
+            .iter()
+            .max_by_key(|e| e.priority)
+            .expect("グループは空でない");
+        writeln!(
+            out,
+            "{} {} [{}] — {} 件 (最高: {})",
+            top.priority.mark(),
+            g.metric_label,
+            g.series.display(),
+            g.episodes.len(),
+            top.priority.label()
+        )?;
+        // 観点は系列単位の和集合。**「N 個の裏付け」とは書かない** (規律 2′)。
+        let mut viewpoints: Vec<&'static str> = Vec::new();
+        for v in g.episodes.iter().flat_map(|e| e.viewpoints.iter()) {
+            if !viewpoints.contains(v) {
+                viewpoints.push(v);
+            }
+        }
+        writeln!(out, "     観点: {}", viewpoints.join(", "))?;
+
+        for chunk in g
+            .episodes
+            .iter()
+            .take(MAX_LISTED_ONSETS)
+            .collect::<Vec<_>>()
+            .chunks(per_line)
+        {
+            let cells: Vec<String> = chunk
+                .iter()
+                .map(|e| {
+                    let ep = &e.episode;
+                    // **同時に鳴った系列を隠さない。** 見出し以外の系列があれば数を添える。
+                    let others = ep
+                        .detections
+                        .iter()
+                        .filter(|d| d.series != e.headline_series)
+                        .map(|d| &d.series)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len();
+                    format!(
+                        "{}→{} ({}, {} 採取{})",
+                        if same_day {
+                            tz.time(ep.support.start_ust)
+                        } else {
+                            tz.datetime(ep.support.start_ust)
+                        },
+                        tz.time(ep.support.end_ust),
+                        e.priority.label(),
+                        ep.support.samples,
+                        if others > 0 {
+                            format!(", +{others} 系列")
+                        } else {
+                            String::new()
+                        }
+                    )
+                })
+                .collect();
+            writeln!(out, "       {}", cells.join("  "))?;
+        }
+        let rest = g.episodes.len().saturating_sub(MAX_LISTED_ONSETS);
+        if rest > 0 {
+            writeln!(
+                out,
+                "       … 他 {rest} 件 (全件は --verbose / --format json)"
+            )?;
+        }
+
+        // 充足度は**エピソードごとに違う**。系列でまとめても最低と最高を出す。
+        let levels: Vec<_> = g.episodes.iter().map(|e| e.sufficiency.level).collect();
+        let lo = levels.iter().min().expect("空でない");
+        let hi = levels.iter().max().expect("空でない");
+        if lo == hi {
+            writeln!(out, "     根拠の充足度: {}", hi.label())?;
+        } else {
+            writeln!(
+                out,
+                "     根拠の充足度: {}〜{} (件により違う)",
+                lo.label(),
+                hi.label()
+            )?;
+        }
+        // **系列に固有の留保は要約でも出す** (規律 3)。
+        if g.episodes
+            .iter()
+            .any(|e| e.sufficiency.basis_may_reflect_the_anomaly)
+        {
+            writeln!(
+                out,
+                "       ! 比較基準が異変側へ寄っている疑いがある (入力自身が材料のため)"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn write_episode<W: Write>(
@@ -1319,15 +1490,74 @@ mod tests {
     /// 比較基準の留保として繰り返さない。
     #[test]
     fn the_summary_does_not_repeat_a_caveat_the_description_already_carries() {
-        let text = render(&assessment_with_an_episode());
+        // 背景の所見は要約でも検出 1 件の根拠を出すので、そこで確かめる。
+        let v = vec![2.0; 30];
+        let a = assessment_with_period(&v, period_of(&v));
+        assert_eq!(a.background.len(), 1, "背景の所見が立つ入力");
+        let text = render(&a);
         assert!(
-            text.contains("散らばりが測れないため絶対差で判断した") || text.contains("MAD の"),
-            "判定の根拠は説明文に残る\n{text}"
+            !text.contains(BASELINE_CAVEAT_SELF_SOURCED_IN_DETECTION),
+            "比較基準の出所はヘッダと注意が言う。検出ごとに繰り返さない\n{text}"
         );
         assert!(
             !text.contains(BASELINE_CAVEAT_MAD_ZERO),
             "説明文と同じ内容を留保として並べない\n{text}"
         );
+        // ヘッダと注意では言っている (落としたのではなく繰り返さないだけ)
+        assert!(text.contains("この入力自身が材料"), "{text}");
+        assert!(text.contains("外部の正常値ではない"), "{text}");
+    }
+
+    /// 検出行に付く一般留保 (`! ` 付きの形)。
+    const BASELINE_CAVEAT_SELF_SOURCED_IN_DETECTION: &str =
+        "! この基準は入力自身から作ったものであり";
+
+    /// 同じ系列の散発的な検出を 1 ブロックにまとめる。
+    ///
+    /// 実データで 111 エピソード中 111 件が単独系列になり、同じ指標が
+    /// 18 回・15 回と並んだのがこの形式を入れた理由。
+    #[test]
+    fn the_summary_groups_episodes_by_series() {
+        // 80 の中に短い落ち込みを 3 回作る → 同じ系列で 3 エピソード
+        let mut v = vec![80.0; 60];
+        for start in [10usize, 30, 50] {
+            for x in v.iter_mut().skip(start).take(3) {
+                *x = 1.0;
+            }
+        }
+        let a = assessment(&v);
+        assert!(a.episodes.len() >= 2, "複数のエピソードが立つ入力");
+        let text = render(&a);
+        // 系列は 1 ブロックにまとまり、件数が出る
+        assert!(
+            text.contains(&format!("— {} 件 (最高:", a.episodes.len())),
+            "系列ごとに件数を出す\n{text}"
+        );
+        // 「いつ」は時刻として残る
+        assert!(text.contains("採取)"), "{text}");
+        // エピソードごとの見出しは出さない (それが繰り返しの正体)
+        assert!(!text.contains("エピソード 2  検出の始まり"), "{text}");
+        // --verbose では従来どおり 1 件ずつ出る
+        let full = render_full(&a);
+        assert!(full.contains("エピソード 2  検出の始まり"), "{full}");
+    }
+
+    /// 同時に鳴った別の系列を隠さない。
+    #[test]
+    fn the_summary_marks_episodes_where_another_series_fired_too() {
+        let a = assessment_with_an_episode();
+        let multi = a.episodes.iter().any(|e| {
+            e.episode
+                .detections
+                .iter()
+                .any(|d| d.series != e.headline_series)
+        });
+        let text = render(&a);
+        if multi {
+            assert!(text.contains("系列)"), "+N 系列 を出す\n{text}");
+        }
+        // 系列が 1 つだけのエピソードに余計な表記を付けない
+        assert!(!text.contains("+0 系列"), "{text}");
     }
 
     /// `--verbose` は従来の全文に戻す。

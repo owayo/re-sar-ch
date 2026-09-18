@@ -292,17 +292,23 @@ What it will not do is dress up a guess as a measurement:
 - **"Not evaluated" is not "nothing found".** Every series it could not assess is listed
   with the reason.
 
-The default text report summarises: each episode gets its headline, priority, evidence
-sufficiency, the series involved and one line per detection. What the report drops is
-repetition — the per-detection breakdown (observed values, basis figures, window sizes)
-and the interpretation list, which is fixed per detection pattern and would otherwise
-repeat once per episode. `--verbose` restores all of it verbatim.
+The default text report summarises. Episodes are grouped by the series that headlined
+them, because a series that fires intermittently through a day produces one episode per
+burst — a real day's file gave 111 episodes across 23 series, and listing them one by one
+buried *what* is firing under 1400 lines. Each group leads with the metric, how many
+episodes it accounts for and its highest priority, then the times those episodes covered.
 
-Nothing the report owes you is dropped. Where the basis came from, the evaluation
-coverage, and the caveats specific to a series stay in the summary; what a finding does
-**not** establish moves to the end of the report, listed once per metric instead of once
-per episode. `--format json` and `--format ndjson` are unaffected and always carry every
-field.
+Nothing the report owes you is dropped. Each group keeps the times, the priority of each
+occurrence and the sample counts; episodes where **another series fired at the same time**
+are marked `+N 系列`, since that overlap is the clue that something happened rather than
+drifted. Where the basis came from, the evaluation coverage and the caveats specific to a
+series all stay. What a finding does **not** establish moves to the end of the report,
+listed once per metric instead of once per episode.
+
+What the summary drops is repetition: the per-detection breakdown (observed values, basis
+figures, window sizes) and the interpretation list, which is fixed per detection pattern.
+`--verbose` restores every episode individually, verbatim as before. `--format json` and
+`--format ndjson` are unaffected and always carry every field.
 
 ### Charting detected anomalies as SVG
 

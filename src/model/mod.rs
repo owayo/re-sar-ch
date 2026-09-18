@@ -8,10 +8,12 @@
 //! 平均・p95・ボトルネック判定が静かに誤る。
 
 pub mod activity;
+pub mod lang;
 pub mod timezone;
 pub mod value;
 
 pub use activity::{ActivityId, KNOWN_ACTIVITIES, MAX_NR_ACT, NR_ACT};
+pub use lang::Lang;
 pub use timezone::DisplayTz;
 pub use value::{Aggregation, Availability, Counter, CounterBits, Unit, ValueKind};
 

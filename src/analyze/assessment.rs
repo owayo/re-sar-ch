@@ -805,6 +805,14 @@ pub struct AssessedEpisode {
     pub sufficiency_spread: SufficiencySpread,
     /// 1 行の見出し。**優先度を決めた検出**の見出し。
     pub headline: String,
+    /// 見出しの検出の系列。
+    ///
+    /// **同じ規則を出力層で書き直させないために持たせている。**
+    /// 見出しを選ぶのは「優先度 → 下地 → 採取回数 → 範囲 → 系列名」の
+    /// 比較で、これを 2 か所に置くと text と JSON で違う検出を指しうる。
+    pub headline_series: SeriesKey,
+    /// 見出しの検出の指標名。
+    pub headline_metric_label: &'static str,
     /// 最も長く続いた検出の見出し。見出しの検出と違うときだけ入る。
     pub longest_running_headline: Option<String>,
     /// 検出ごとの解釈 (`episode.detections` と同じ順序)。
@@ -861,6 +869,8 @@ impl AssessedEpisode {
         let priority_reasons = lead.priority_reasons.clone();
         let sufficiency = lead.sufficiency;
         let headline = lead.headline.clone();
+        let headline_series = lead.series.clone();
+        let headline_metric_label = lead.metric_label;
 
         let viewpoints = episode
             .viewpoints
@@ -895,6 +905,8 @@ impl AssessedEpisode {
             sufficiency,
             sufficiency_spread: spread,
             headline,
+            headline_series,
+            headline_metric_label,
             longest_running_headline,
             detections: assessed,
             viewpoints,

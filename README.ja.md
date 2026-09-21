@@ -526,6 +526,32 @@ v10 のファイルを v12 の `sar` 書式で出すこともその逆もでき�
 | `sadf -g -O autoscale,packed,customcol` | この 3 つは明示的に拒否。skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday は対応 |
 | `sadf -H` と他形式の併用 | 未対応 (`resarch sadf -H <file>` を使う) |
 
+### `sar` が参照する環境変数
+
+本家 `sar` は書式の一部を環境から決めます。reSARch も互換出力
+(`sar` / `sa2sar` / `show --format sar`) で同じ変数を読みます。
+
+| 変数 | 受け付ける値 | 効果 |
+|---|---|---|
+| `S_TIME_FORMAT` | `ISO` と完全一致 | バナー行の日付が `MM/DD/YY` から `YYYY-MM-DD` になる |
+| `S_REPEAT_HEADER` | 全桁が数字で `> 0` | N 行ごとに列見出しを出し直す — **標準出力が端末でないときだけ** |
+
+一致条件は本家と同じ厳しさです。`S_TIME_FORMAT=iso` は効きませんし、
+符号・空白・数字以外を含む `S_REPEAT_HEADER` はエラーではなく無視されます。
+
+標準出力が**端末のとき**は、再表示の間隔をウィンドウの高さ (`rows - 2`) から取り、
+`S_REPEAT_HEADER` は見ません (本家の `else if` と同じ)。
+どちらも得られなければ間隔は 86400 行です。
+
+この 86400 行は見た目ほど大きくありません。本家は CPU ビットマップを使う activity で
+1 サンプルを `count_bits(cpu_bitmap)` 行として数え、`-A` と `-P ALL` はビットマップ全体を
+埋めるので、**実 CPU 数に関係なく 1 サンプル = 8200 行**になります。
+そのため `sar -A` はパイプ出力でも 11 サンプルごとに CPU の見出しを出し直します。
+reSARch もこれを再現します。
+
+これらは `sadf` には効きません。本家が `sadf` で `S_F_PREFD_TIME_OUTPUT` を立てないため、
+日付は常に `%Y-%m-%d`、時刻は常に `%H:%M:%S` です。
+
 ## 設計上の要点
 
 実装して初めて分かったことを [`docs/design.md`](docs/design.md) に記録しています。

@@ -81,7 +81,7 @@ use std::io::{self, Write};
 use crate::format::SaFile;
 use crate::layout::plan::DecodePlan;
 use crate::layout::registry::{ActivityDef, lookup};
-use crate::model::{ActivityId, Availability, ValueKind};
+use crate::model::{ActivityId, Availability, CompatDateFormat, HeaderRows, ValueKind};
 use crate::output::time_filter::{Admit, TimeFilter};
 use crate::series::compute::{
     self, ComputeContext, ComputeIssue, Computed, ItemAccum, bat_col, bat_status, cpu_col,
@@ -155,7 +155,36 @@ pub enum CpuSelection {
     },
 }
 
+/// 本家の `NR_CPUS` (`common.h`)。`__CPU_SETSIZE > 8192` でなければこの値。
+const NR_CPUS: u32 = 8192;
+
+/// `-P ALL` / `-A` が立てるビット数 = `BITMAP_SIZE(NR_CPUS)` バイト × 8。
+///
+/// 本家の `BITMAP_SIZE(m)` は `(((m) + 1) >> 3) + 1` で、`-P ALL` と `-A` は
+/// **そのバイト数を丸ごと `~0` で埋める** (`parse_values()` / `set_bitmaps()`)。
+/// したがって立つビット数は実 CPU 数ではなく常にこの定数になる。
+const CPU_BITMAP_ALL_BITS: u32 = (((NR_CPUS + 1) >> 3) + 1) * 8;
+
 impl CpuSelection {
+    /// 本家 `count_bits(cpu_bitmap)` と同じ立ちビット数 (03 §9.3 の `inc`)。
+    ///
+    /// **実 CPU 数ではない。** `-P ALL` と `-A` はビットマップ全体を `~0` で
+    /// 埋めるので [`CPU_BITMAP_ALL_BITS`] になり、`lines` は 1 サンプルで
+    /// どんな端末高も越える (= 毎サンプル列見出しが出る)。
+    /// これは本家の実挙動であり、実 CPU 数で代用すると再表示が遅れる。
+    pub fn selected_bits(&self) -> u32 {
+        match self {
+            // 既定は bit 0 だけ (`select_default_activity()`)。
+            CpuSelection::Aggregate => 1,
+            CpuSelection::All => CPU_BITMAP_ALL_BITS,
+            // `-P 0,2-3`: 同じ CPU を重ねて書いてもビットは 1 つ。
+            CpuSelection::Listed { aggregate, cpus } => {
+                let distinct: std::collections::BTreeSet<usize> = cpus.iter().copied().collect();
+                u32::try_from(distinct.len() + usize::from(*aggregate)).unwrap_or(u32::MAX)
+            }
+        }
+    }
+
     /// item 添字 (`0` = 集約行、`n` = CPU `n-1`) が選択されているか。
     pub fn includes(&self, item_index: usize) -> bool {
         match self {
@@ -329,6 +358,15 @@ pub struct SarTextOptions {
     pub dev_sid: bool,
     /// タイムスタンプの基準系。
     pub time: TimeStyle,
+    /// `S_TIME_FORMAT` から決めたバナー行の日付書式 (03 §6.1)。
+    ///
+    /// 環境変数の読み取りは CLI 層で済ませ、ここには**解決済みの値**が来る
+    /// ([`crate::model::sysstat_env`] のモジュール説明)。
+    pub date_format: CompatDateFormat,
+    /// 列見出しを再表示するまでの行数 (`get_win_height()`、03 §9.3)。
+    ///
+    /// 既定 ([`HeaderRows::default`]) はパイプ出力と同じ「繰り返さない」。
+    pub header_rows: HeaderRows,
     /// `-P` の CPU 選択。
     pub cpus: CpuSelection,
     /// `-s` / `-e` の時刻フィルタ。既定は無効 (全レコードを出す)。
@@ -1567,7 +1605,14 @@ pub fn write_banner<W: Write>(out: &mut W, file: &SaFile, opts: &SarTextOptions)
         h.sysname,
         h.release,
         h.nodename,
-        banner_date(h.ust_time, h.year, h.month, h.day, opts.time),
+        banner_date(
+            h.ust_time,
+            h.year,
+            h.month,
+            h.day,
+            opts.time,
+            opts.date_format
+        ),
         h.machine,
         real_cpu_count(h.cpu_nr)
     )
@@ -1591,15 +1636,22 @@ pub fn write_banner<W: Write>(out: &mut W, file: &SaFile, opts: &SarTextOptions)
 /// `sa_year` を使うのは `-t` のときだけである。両者は一致するのが普通だが、
 /// 食い違うファイルがある (本家テストデータ `data-ukwn` は
 /// `sa_ust_time` が 2019-09-15、ヘッダ日付が 2019-10-15)。
-fn banner_date(ust_time: u64, year: i32, month: u8, day: u8, style: TimeStyle) -> String {
+fn banner_date(
+    ust_time: u64,
+    year: i32,
+    month: u8,
+    day: u8,
+    style: TimeStyle,
+    format: CompatDateFormat,
+) -> String {
     use chrono::{Datelike, Local, TimeZone, Utc};
 
-    /// エポック秒から落とした日付を `MM/DD/YY` にする。
-    fn from_epoch<Tz: TimeZone>(dt: &chrono::DateTime<Tz>) -> String {
-        report_date(dt.year(), dt.month() as u8, dt.day() as u8)
+    /// エポック秒から落とした日付を書式に合わせる。
+    fn from_epoch<Tz: TimeZone>(dt: &chrono::DateTime<Tz>, format: CompatDateFormat) -> String {
+        report_date_with(dt.year(), dt.month() as u8, dt.day() as u8, format)
     }
 
-    let fallback = || report_date(year, month, day);
+    let fallback = || report_date_with(year, month, day, format);
     match style {
         // `-t`: ヘッダに焼き込まれた年月日をそのまま使う
         TimeStyle::Recorded => fallback(),
@@ -1607,11 +1659,11 @@ fn banner_date(ust_time: u64, year: i32, month: u8, day: u8, style: TimeStyle) -
         TimeStyle::Utc | TimeStyle::Epoch => Utc
             .timestamp_opt(ust_time as i64, 0)
             .single()
-            .map_or_else(fallback, |dt| from_epoch(&dt)),
+            .map_or_else(fallback, |dt| from_epoch(&dt, format)),
         TimeStyle::Local => Local
             .timestamp_opt(ust_time as i64, 0)
             .single()
-            .map_or_else(fallback, |dt| from_epoch(&dt)),
+            .map_or_else(fallback, |dt| from_epoch(&dt, format)),
     }
 }
 
@@ -1622,6 +1674,18 @@ fn banner_date(ust_time: u64, year: i32, month: u8, day: u8, style: TimeStyle) -
 pub fn report_date(year: i32, month: u8, day: u8) -> String {
     let yy = year.rem_euclid(100);
     format!("{month:02}/{day:02}/{yy:02}")
+}
+
+/// `S_TIME_FORMAT` を反映したバナーの日付 (03 §6.1)。
+///
+/// 本家 `print_gal_header()` は `S_TIME_FORMAT=ISO` のとき `%Y-%m-%d`、
+/// それ以外はロケール依存の `%x` を使う。reSARch はロケールを持たないので
+/// 後者は常に C ロケール相当の `MM/DD/YY` になる。
+pub fn report_date_with(year: i32, month: u8, day: u8, format: CompatDateFormat) -> String {
+    match format {
+        CompatDateFormat::Locale => report_date(year, month, day),
+        CompatDateFormat::Iso => format!("{year:04}-{month:02}-{day:02}"),
+    }
 }
 
 /// `LINUX RESTART` 行 (03 §8.4)。
@@ -1856,8 +1920,18 @@ pub struct SarBlock {
     def: &'static ActivityDef,
     /// デコード計画 (平均行の再計算に必要なので控える)。
     plan: Option<DecodePlan>,
-    /// ヘッダを出したか。
-    header_done: bool,
+    /// 本家の `dish` — 「このレコードで列見出しを出すか」。
+    ///
+    /// 本家はループの**先頭**で `lines` を見て決め、表示の後に `lines` を足す。
+    /// 平均ブロックはこの値を**最後の反復で決まったまま**持ち越すので、
+    /// 判定結果そのものを持っておく必要がある ([`SarBlock::begin_record`])。
+    dish: bool,
+    /// ヘッダを出してから積んだ行数 (本家の `lines`、03 §9.3)。
+    ///
+    /// **本家は「印字した行数」ではなく `inc` (ビットマップの立ちビット数)
+    /// か `nr[curr]` (item 数) を足す。**`-z` で行が消えても減らない。
+    /// [`SarTextOptions::header_rows`] に達すると列見出しを出し直す。
+    lines: u32,
     /// ヘッダ行に載せるタイムスタンプ (= 直前サンプルの時刻)。
     prev_ts: String,
     /// 最初のサンプルの uptime (cs)。方式 A の分母の始点。
@@ -1934,7 +2008,9 @@ impl SarBlock {
                 select,
                 def,
                 plan: None,
-                header_done: false,
+                // 本家の初期値は `lines = 0` なので、最初の判定で必ず真になる。
+                dish: true,
+                lines: 0,
                 prev_ts: String::new(),
                 first_uptime: None,
                 last_uptime: 0,
@@ -1972,14 +2048,23 @@ impl SarBlock {
         let ts = event_timestamp(ev, self.opts.time);
         match ev {
             RecordEvent::Restart { cpu_count, .. } => {
-                // 区間が終わるので平均を先に出す
+                // 区間が終わるので平均を先に出す。本家は RESTART を読んだ反復の
+                // 先頭で `dish` を決め直してから抜ける。
+                self.settle_dish_for_average();
                 self.flush_average(out)?;
                 write_restart(out, &ts, restart_cpu_count(*cpu_count, self.file_cpu_nr))?;
                 self.reset_region();
             }
             RecordEvent::Comment { text, .. } => {
+                // 本家は COMMENT レコードでもループ先頭の判定を通す。
+                self.begin_record();
                 if self.opts.comment {
                     write_comment(out, &ts, text)?;
+                    // 本家は `COM` 行を `lines != 0` のときだけ 1 行と数える
+                    // (ブロック先頭のコメントでヘッダの位置をずらさないため)。
+                    if self.lines != 0 {
+                        self.lines += 1;
+                    }
                 }
             }
         }
@@ -2061,16 +2146,25 @@ impl SarBlock {
             ),
         };
 
+        // 本家のループ先頭に当たる判定。行を 1 本も出さないレコードでも通す。
+        self.begin_record();
+
         let rows = self.build_rows(plan, prev_items, &curr_act.items, nr2, itv_cs);
-        if !rows.is_empty() {
-            self.write_header(out)?;
-            let mut buf = String::new();
-            for row in &rows {
-                buf.clear();
-                self.render_row(&mut buf, &ts, row, RowMode::Instant);
-                out.write_all(buf.as_bytes())?;
-            }
+        // **ヘッダは行の有無に関わらず出す。** 本家の `f_print` は item ループの
+        // 前で見出しを書くので、`-z` や名前フィルタで全 item が落ちても
+        // 見出しだけは残る (`nr[curr] > 0` なら呼ばれるため)。
+        self.write_header(out)?;
+        let mut buf = String::new();
+        for row in &rows {
+            buf.clear();
+            self.render_row(&mut buf, &ts, row, RowMode::Instant);
+            out.write_all(buf.as_bytes())?;
         }
+        // 本家は「表示したレコード」ごとに `lines` を進める (行が 1 本も
+        // 出なかった `-z` のレコードも含む)。
+        self.lines = self
+            .lines
+            .saturating_add(self.header_line_increment(curr_act.items.len()));
         self.commit_record(rows, &curr_act.items, view.curr.uptime_cs, ts);
         Ok(())
     }
@@ -2124,6 +2218,8 @@ impl SarBlock {
 
     /// ブロックを閉じ、`Average:` / `Summary:` / `Last:` 行を出す。
     pub fn finish<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        // 本家は EOF を読んだ反復の先頭で `dish` を決め直してから抜ける。
+        self.settle_dish_for_average();
         self.flush_average(out)
     }
 
@@ -2194,7 +2290,9 @@ impl SarBlock {
         self.cpu_last.clear();
         self.displayed = 0;
         self.first_uptime = None;
-        self.header_done = false;
+        // 本家は `handle_curr_act_stats()` に入るたび `lines = 0` から数え直す。
+        self.lines = 0;
+        self.dish = true;
         // 区間が変わるのでサンプル選別もやり直す (次の `adopt_reference` で
         // 基準点が決まるが、基準レコードが来ないまま終わる場合もあるため
         // ここでも初期値に戻す)。
@@ -2206,14 +2304,81 @@ impl SarBlock {
 
     // ---- ヘッダ ----
 
+    /// レコードを 1 件読んだ時点の `dish` 判定 (本家のループ先頭、03 §9.3)。
+    ///
+    /// ```c
+    /// if ((lines >= rows) || !lines) { lines = 0; dish = TRUE; }
+    /// else                            dish = FALSE;
+    /// ```
+    ///
+    /// `lines == 0` が「ブロックの先頭」、`lines >= rows` が端末 1 画面ぶんの
+    /// 再表示に当たる。パイプ出力では `rows` が [`DEFAULT_ROWS`] なので
+    /// **実質先頭の 1 回だけ**真になる。
+    ///
+    /// [`DEFAULT_ROWS`]: crate::model::DEFAULT_ROWS
+    fn begin_record(&mut self) {
+        if self.lines >= self.opts.header_rows.get() || self.lines == 0 {
+            self.lines = 0;
+            self.dish = true;
+        } else {
+            self.dish = false;
+        }
+    }
+
+    /// 平均ブロックへ渡す `dish` を確定させる。
+    ///
+    /// 本家のループは `do { … } while (*cnt)` で、EOF / `LINUX RESTART` は
+    /// **その反復の先頭で `dish` を決め直してから** `break` する。
+    /// 一方 `count` を使い切った場合は `while (*cnt)` で抜けるため次の反復に
+    /// 入らず、**最後に決めた `dish` のまま**平均へ渡る。
+    fn settle_dish_for_average(&mut self) {
+        if self.remaining != Some(0) {
+            self.begin_record();
+        }
+    }
+
+    /// 列見出しを出す。判定は [`SarBlock::begin_record`] が済ませている。
     fn write_header<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
-        if self.header_done && self.view.header == HeaderPolicy::Once {
+        if self.view.header == HeaderPolicy::Once && !self.dish {
             return Ok(());
         }
         let ts = self.prev_ts.clone();
         out.write_all(self.header_for(&ts).as_bytes())?;
-        self.header_done = true;
         Ok(())
+    }
+
+    /// 1 サンプルぶん `lines` に足す数 (本家の `inc ? inc : act[p]->nr[curr]`)。
+    ///
+    /// ビットマップを持つ activity (`A_CPU` / `A_IRQ` / `A_PWR_CPU` /
+    /// `A_PWR_FREQ` / `A_NET_SOFT`) は**ビットマップの立ちビット数**、
+    /// それ以外は item 数を足す。
+    ///
+    /// **どちらも「印字した行数」ではない。** `-z` で行が消えても、
+    /// 名前フィルタで絞っても減らない。ビットマップ側は本家がループの**前**で
+    /// 1 回だけ数えるので、そのレコードの item 数にも依存しない
+    /// ([`CpuSelection::selected_bits`])。
+    fn header_line_increment(&self, item_count: usize) -> u32 {
+        let inc = if matches!(
+            self.view.id,
+            ActivityId::CPU
+                | ActivityId::IRQ
+                | ActivityId::PWR_CPU
+                | ActivityId::PWR_FREQ
+                | ActivityId::NET_SOFT
+        ) {
+            self.opts.cpus.selected_bits()
+        } else {
+            // ビットマップを持たない activity は本家も `inc = 0` のまま。
+            0
+        };
+        // 本家は `lines += (inc ? inc : act[p]->nr[*curr])`。
+        // **ビットが 1 つも立っていないときも item 数へ落ちる。**
+        // ここで 0 を足すと `lines` が進まず、見出しが二度と出なくなる。
+        if inc != 0 {
+            inc
+        } else {
+            u32::try_from(item_count).unwrap_or(u32::MAX)
+        }
     }
 
     fn header_for(&self, timestamp: &str) -> String {
@@ -3059,8 +3224,13 @@ impl SarBlock {
             return Ok(());
         }
 
-        // `-x` 無しのヘッダ行ラベルは平均行と同じ
-        if self.view.header == HeaderPolicy::EverySample {
+        // `-x` 無しのヘッダ行ラベルは平均行と同じ。
+        //
+        // 本家は `dish` を**最後のループ反復で決まった値のまま**平均ブロックへ
+        // 持ち越す (03 §9.3)。確定は [`SarBlock::settle_dish_for_average`] が済ませる。
+        // パイプ出力 (`rows` = `DEFAULT_ROWS`) では常に偽なので、
+        // 従来どおり平均ブロックにヘッダは出ない。
+        if self.view.header == HeaderPolicy::EverySample || self.dish {
             out.write_all(self.header_for(label).as_bytes())?;
         }
 
@@ -4213,11 +4383,44 @@ mod tests {
     #[test]
     fn banner_date_comes_from_ust_time_unless_true_time() {
         const UST: u64 = 1_568_533_161;
-        assert_eq!(banner_date(UST, 2019, 10, 15, TimeStyle::Utc), "09/15/19");
+        let locale = CompatDateFormat::Locale;
         assert_eq!(
-            banner_date(UST, 2019, 10, 15, TimeStyle::Recorded),
+            banner_date(UST, 2019, 10, 15, TimeStyle::Utc, locale),
+            "09/15/19"
+        );
+        assert_eq!(
+            banner_date(UST, 2019, 10, 15, TimeStyle::Recorded, locale),
             "10/15/19",
             "-t はヘッダの年月日を使う"
+        );
+    }
+
+    /// `S_TIME_FORMAT=ISO` はバナーの日付だけを ISO 8601 にする (03 §6.1)。
+    ///
+    /// 時刻側は本家では `%X` → `%H:%M:%S` に変わるが、reSARch は
+    /// ロケールを持たず常に `%H:%M:%S` なので差が出ない。
+    #[test]
+    fn iso_time_format_changes_only_the_banner_date() {
+        const UST: u64 = 1_568_533_161;
+        let iso = CompatDateFormat::Iso;
+        assert_eq!(
+            banner_date(UST, 2019, 10, 15, TimeStyle::Utc, iso),
+            "2019-09-15"
+        );
+        assert_eq!(
+            banner_date(UST, 2019, 10, 15, TimeStyle::Recorded, iso),
+            "2019-10-15",
+            "-t はヘッダの年月日を使う点は書式に依らない"
+        );
+        assert_eq!(report_date_with(2018, 8, 29, iso), "2018-08-29");
+        assert_eq!(
+            report_date_with(2018, 8, 29, CompatDateFormat::Locale),
+            "08/29/18"
+        );
+        // 時刻は ISO でも既定でも同じ。
+        assert_eq!(
+            time_string(UST, 21, 27, 11, TimeStyle::Recorded),
+            "21:27:11"
         );
     }
 
@@ -4548,6 +4751,75 @@ mod tests {
     }
 
     /// `-P` の選択が item 添字に正しく効く (bit 0 = 集約行)。
+    /// `inc` は実 CPU 数ではなくビットマップの立ちビット数 (03 §9.3)。
+    ///
+    /// `-P ALL` / `-A` は `memset(bitmap, ~0, BITMAP_SIZE(NR_CPUS))` なので、
+    /// CPU が何個でも 8200 になる。ここを CPU 数で代用すると、本家が
+    /// 11 サンプルごとに出す列見出しが 1 度も出なくなる。
+    #[test]
+    fn cpu_bitmap_increment_is_the_bit_count_not_the_cpu_count() {
+        assert_eq!(CpuSelection::All.selected_bits(), 8200);
+        assert_eq!(CpuSelection::Aggregate.selected_bits(), 1);
+        assert_eq!(
+            CpuSelection::Listed {
+                aggregate: true,
+                cpus: vec![0, 2, 3],
+            }
+            .selected_bits(),
+            4
+        );
+        assert_eq!(
+            CpuSelection::Listed {
+                aggregate: false,
+                cpus: vec![0, 2, 3],
+            }
+            .selected_bits(),
+            3
+        );
+        // 同じ CPU を重ねて書いてもビットは 1 つ。
+        assert_eq!(
+            CpuSelection::Listed {
+                aggregate: false,
+                cpus: vec![1, 1, 1],
+            }
+            .selected_bits(),
+            1
+        );
+
+        // ビットマップを持たない activity は item 数。
+        let opts = SarTextOptions {
+            cpus: CpuSelection::All,
+            ..Default::default()
+        };
+        assert_eq!(
+            block(ActivityId::CPU, &opts).header_line_increment(25),
+            8200
+        );
+        assert_eq!(block(ActivityId::PCSW, &opts).header_line_increment(1), 1);
+        assert_eq!(
+            block(ActivityId::NET_DEV, &opts).header_line_increment(3),
+            3
+        );
+
+        // 既定の 86400 行を 11 サンプルで越える (本家と同じ間隔)。
+        let rows = HeaderRows::default().get();
+        assert!(8200 * 10 < rows, "10 サンプルではまだ越えない");
+        assert!(8200 * 11 >= rows, "11 サンプルで越える");
+
+        // ビットが 1 つも立っていなければ item 数へ落ちる
+        // (本家の `lines += (inc ? inc : act[p]->nr[*curr])`)。
+        // ここで 0 を足すと `lines` が進まず見出しが二度と出ない。
+        let empty = SarTextOptions {
+            cpus: CpuSelection::Listed {
+                aggregate: false,
+                cpus: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(empty.cpus.selected_bits(), 0);
+        assert_eq!(block(ActivityId::CPU, &empty).header_line_increment(25), 25);
+    }
+
     #[test]
     fn cpu_selection_maps_bit0_to_aggregate() {
         assert!(CpuSelection::Aggregate.includes(0));
@@ -4892,11 +5164,18 @@ mod tests {
         itv_cs: u64,
         uptime_cs: u64,
     ) -> String {
+        // `SarBlock::record()` と同じ順で状態を進める。`begin_record` と
+        // `lines` の加算を省くと、平均ブロックのヘッダ判定 (`dish`) が
+        // 実際の経路と食い違う。
+        blk.begin_record();
         let rows = blk.build_rows(plan, prev, curr, 0, itv_cs);
         let mut text = String::new();
         for row in &rows {
             blk.render_row(&mut text, "10:00:01", row, RowMode::Instant);
         }
+        blk.lines = blk
+            .lines
+            .saturating_add(blk.header_line_increment(curr.len()));
         blk.commit_record(rows, curr, uptime_cs, "10:00:01".to_string());
         text
     }

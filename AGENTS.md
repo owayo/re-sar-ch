@@ -10,7 +10,7 @@ sysstat の `sa` バイナリを単体で解析する CLI。バイナリ名は `
 ```
 format  … 世代 (format_magic) と生成元 ABI の差を吸収し、レコード境界を確定する
 layout  … 43 activity のフィールド定義と列メタデータ
-model   … 統一ドメインモデル (Availability / Counter / ActivityId)
+model   … 統一ドメインモデル (Availability / Counter / ActivityId)、環境からの表示方針
 series  … 差分・レート・不連続の判定、レコード対の走査
 analyze … 期間集計とルール ID 付きの判定
 detect  … 異変の当たり付け (観測の提示。断定や確率は出さない)
@@ -41,6 +41,12 @@ skill   … AI エージェント向けスキルの埋め込みとインスト�
   別の時刻を指す。日内秒を `epoch % 86_400` で出さない (UTC 固定になる)。
   互換出力 (`sar` / `sadf` / `sa2sar`) はここを使わず本家の規則に従う。
   根拠は `docs/design.md` §9.0.1。
+- **環境変数を読むのは CLI 層だけ。** 本家 `sar` が書式に使う環境変数
+  (`S_TIME_FORMAT` / `S_REPEAT_HEADER`) の判定は `model::sysstat_env` の純粋関数に置き、
+  実際の読み取りは `main` の 1 箇所で済ませて、出力層へは**解決済みの値**を
+  `SarTextOptions` に載せて渡す。出力層が `std::env::var` を直接呼ぶと、
+  同じ入力・同じオプションでも出力が変わる隠れた依存になり、ライブラリとして
+  呼んだときやテストの並行実行で再現しない (`set_var` は edition 2024 で `unsafe`)。
 
 ## 利用者から見える変更をしたとき
 

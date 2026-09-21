@@ -33,6 +33,11 @@ thiserror = "2.0.20"
 tempfile = "3.27.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 
+# 本家と同じ `ioctl(STDOUT_FILENO, TIOCGWINSZ)` を直に発行するためだけに使う
+# (crossterm の terminal::size() は /dev/tty を先に開くので代用できない)。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 criterion = { version = "0.8.2", features = ["html_reports"] }

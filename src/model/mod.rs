@@ -9,12 +9,14 @@
 
 pub mod activity;
 pub mod lang;
+pub mod sysstat_env;
 pub mod text;
 pub mod timezone;
 pub mod value;
 
 pub use activity::{ActivityId, KNOWN_ACTIVITIES, MAX_NR_ACT, NR_ACT};
 pub use lang::{Lang, LangSource, ResolvedLang};
+pub use sysstat_env::{CompatDateFormat, DEFAULT_ROWS, HeaderRows, header_rows_from_env};
 pub use text::{Text, count_en};
 pub use timezone::DisplayTz;
 pub use value::{Aggregation, Availability, Counter, CounterBits, Unit, ValueKind};

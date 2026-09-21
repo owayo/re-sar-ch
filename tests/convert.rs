@@ -51,7 +51,7 @@ use golden::Mask;
 use re_sar_ch::cli::sar_args::{Activity, OptFlags, SarOptions, parse_sar_args};
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport, HzSource};
 use re_sar_ch::format::{SaFile, ScanControl};
-use re_sar_ch::model::{ActivityId, Availability};
+use re_sar_ch::model::{ActivityId, Availability, CompatDateFormat, HeaderRows};
 use re_sar_ch::output::sadf;
 use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::TimeFilter;
@@ -742,6 +742,10 @@ fn sar_text_options(o: &SarOptions) -> SarTextOptions {
         } else {
             TimeStyle::Utc
         },
+        // 本家の期待出力は `LC_ALL=C` かつ標準出力がパイプの前提なので、
+        // `S_TIME_FORMAT` / `S_REPEAT_HEADER` は効いていない状態に固定する。
+        date_format: CompatDateFormat::Locale,
+        header_rows: HeaderRows::default(),
         cpus,
         time_filter: TimeFilter::default(),
         item_names: BTreeMap::new(),

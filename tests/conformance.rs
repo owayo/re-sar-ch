@@ -60,7 +60,7 @@ use re_sar_ch::format::abi::{Endian, LayoutAbi, SourceEncoding};
 use re_sar_ch::format::reader::Cursor;
 use re_sar_ch::format::wire::ResolvedLayout;
 use re_sar_ch::format::{SaFile, ScanControl, layouts, selfdesc};
-use re_sar_ch::model::ActivityId;
+use re_sar_ch::model::{ActivityId, CompatDateFormat, HeaderRows};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
 use re_sar_ch::output::sar_text::{self, CpuSelection, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::TimeFilter;
@@ -645,6 +645,10 @@ fn sar_text_options(o: &SarOptions) -> SarTextOptions {
         } else {
             TimeStyle::Utc
         },
+        // 本家の期待出力は `LC_ALL=C` かつ標準出力がパイプの前提なので、
+        // `S_TIME_FORMAT` / `S_REPEAT_HEADER` は効いていない状態に固定する。
+        date_format: CompatDateFormat::Locale,
+        header_rows: HeaderRows::default(),
         cpus,
         // 上の assert のとおり、対象ケースは時刻範囲も item リストも使わない
         time_filter: TimeFilter::default(),

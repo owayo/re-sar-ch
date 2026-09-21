@@ -1144,6 +1144,7 @@ dependencies = [
  "criterion",
  "csv",
  "iana-time-zone",
+ "libc",
  "memmap2",
  "predicates",
  "ratatui",

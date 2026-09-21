@@ -44,7 +44,9 @@ use re_sar_ch::cli::{
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
-use re_sar_ch::model::{ActivityId, DisplayTz, KNOWN_ACTIVITIES, Lang};
+use re_sar_ch::model::{
+    ActivityId, CompatDateFormat, DisplayTz, KNOWN_ACTIVITIES, Lang, header_rows_from_env,
+};
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
@@ -366,6 +368,41 @@ fn sar_sample_select(opts: &SarOptions) -> SampleSelect {
     }
 }
 
+/// 標準出力の端末行数 (本家 `get_win_height()` の `ioctl(STDOUT_FILENO, TIOCGWINSZ)`)。
+///
+/// **`None` = ioctl が失敗した = 標準出力が端末でない。** 本家はこの成否だけで
+/// 「`S_REPEAT_HEADER` を見てよいか」を決めるので、同じ問い合わせを同じ相手に
+/// 投げる必要がある。
+///
+/// `crossterm::terminal::size()` は使えない。あれは **`/dev/tty` を先に開き**、
+/// 失敗したら `tput` にも落ちるので、標準出力をファイルへリダイレクトしていても
+/// 端末の高さを返してしまう (= 本家なら `S_REPEAT_HEADER` を見る場面で見なくなる)。
+#[cfg(unix)]
+fn stdout_terminal_rows() -> Option<u16> {
+    let mut win: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `win` は `winsize` として有効な書き込み先で、TIOCGWINSZ は
+    // それ以外のメモリに触れない。戻り値で成否を判定する。
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut win) };
+    (rc != -1).then_some(win.ws_row)
+}
+
+/// Windows には `TIOCGWINSZ` が無い (本家 sysstat も Linux 専用)。
+///
+/// 合わせる相手がいないので、標準出力が端末かどうかだけを見て
+/// `crossterm` の寸法を使う。端末でなければ `None` で
+/// `S_REPEAT_HEADER` の経路に入る。
+#[cfg(not(unix))]
+fn stdout_terminal_rows() -> Option<u16> {
+    use std::io::IsTerminal;
+
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    ratatui::crossterm::terminal::size()
+        .ok()
+        .map(|(_, rows)| rows)
+}
+
 /// [`SarOptions`] を `sar` テキスト出力の設定へ写す。
 fn sar_text_options(opts: &SarOptions) -> SarTextOptions {
     let mem = opts.opt_flags(Activity::Memory);
@@ -383,6 +420,8 @@ fn sar_text_options(opts: &SarOptions) -> SarTextOptions {
         mount: opts.opt_flags(Activity::Fs).contains(OptFlags::MOUNT),
         dev_sid: opts.flags.dev_sid,
         time: time_style(&opts.flags),
+        date_format: CompatDateFormat::from_env(),
+        header_rows: header_rows_from_env(stdout_terminal_rows()),
         cpus: cpu_selection(opts),
         time_filter: sar_time_filter(opts, CrossDayRule::Sar),
         item_names: sar_item_names(opts),
@@ -443,7 +482,15 @@ fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
     let mut opts = cli::parse_sar_args(&["-A".into(), "-C".into()])?;
     opts.flags.true_time = !args.utc;
     opts.flags.local_time = false;
-    let text = sar_text_options(&opts);
+    let mut text = sar_text_options(&opts);
+    // `-` と未指定は標準出力、それ以外はファイル。
+    let destination = args.output.as_deref().filter(|p| *p != Path::new("-"));
+    if destination.is_some() {
+        // 宛先がファイルなら端末の高さは関係ない。本家が標準出力を
+        // リダイレクトされたときと同じ扱い (= ioctl 失敗) に揃える。
+        // `S_REPEAT_HEADER` はこの経路でこそ効く。
+        text.header_rows = header_rows_from_env(None);
+    }
     let activities = sar_activities(&opts, &file);
     if activities.is_empty() {
         bail!(
@@ -451,7 +498,7 @@ fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
             args.file.display()
         );
     }
-    if let Some(path) = args.output.as_deref().filter(|p| *p != Path::new("-")) {
+    if let Some(path) = destination {
         // 同一ディレクトリの一時ファイルへストリーミングし、成功後に公開する。
         // persist_noclobber は入力自身・hardlink・symlink も上書きしない。
         let parent = path
@@ -962,8 +1009,12 @@ fn write_show_one<W: Write>(
         }
         OutputFormat::Ndjson => ndjson::write_ndjson(out, file, custom)?,
         OutputFormat::Sar => {
+            // 互換入口 (`sar` / `sa2sar`) と同じ sar テキストを出すので、
+            // `S_TIME_FORMAT` / `S_REPEAT_HEADER` の効き方も揃える。
             let text = SarTextOptions {
                 time_filter: filter,
+                date_format: CompatDateFormat::from_env(),
+                header_rows: header_rows_from_env(stdout_terminal_rows()),
                 ..Default::default()
             };
             let activities: Vec<ActivityId> = sar_text::activities_in_file(file)

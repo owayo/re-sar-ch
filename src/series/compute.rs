@@ -2487,7 +2487,8 @@ impl PreparedItem {
 
 /// CPU の分母・端点、softnet hotplug、デバイス再登録を共通処理する。
 ///
-/// 前サンプルの対応付けは [`matching_prev_item`] で行う。
+/// 前サンプルの対応付けは [`matching_prev_item`]、集約 item の判定は
+/// [`is_aggregate_item`] で行う (呼び出し側が `ctx.aggregate_item` に入れた値は使わない)。
 pub fn prepare_item(
     id: ActivityId,
     plan: &DecodePlan,
@@ -2498,6 +2499,9 @@ pub fn prepare_item(
 ) -> Option<PreparedItem> {
     let curr = curr_items.get(index)?;
     let prev = matching_prev_item(id, plan, prev_items, curr, index);
+    // 集約 item かどうかは呼び出し側の判断 (ラベルの文字列など) に任せず、
+    // 保存位置から決める。
+    ctx.aggregate_item = is_aggregate_item(id, plan, index);
     let replaced = ctx.has_prev
         && (prev.is_none() || prev.is_some_and(|p| item_reregistered(id, plan, p, curr)));
     let mut out = PreparedItem {
@@ -2549,7 +2553,7 @@ pub fn prepare_item(
                 }
             }
         }
-        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
+        ActivityId::IRQ if irq_has_cpu_rows(plan) => {
             let start = index / plan.nr2.max(1) as usize * plan.nr2.max(1) as usize;
             let p = prev_items.get(start);
             let c = curr_items.get(start);
@@ -2558,8 +2562,6 @@ pub fn prepare_item(
             if c.is_some_and(|c| raw_column(plan, c, irq_col::COUNT).unwrap_or(0) == 0) {
                 out.curr = out.prev.clone();
             }
-            ctx.aggregate_item = start == 0;
-            out.ctx = ctx;
         }
         _ => {}
     }
@@ -2630,6 +2632,56 @@ fn disk_prev_item<'a>(
         .chain(0..start)
         .map(|j| &prev_items[j])
         .find(|p| device(p) == wanted)
+}
+
+/// 保存位置 `index` の item が集約 item か ([`ComputeContext::aggregate_item`])。
+///
+/// **ラベルの文字列 (`all` / `sum`) では決めない。** 名前を持つ activity には
+/// `all` や `sum` という名前のデバイスがあり得るし、旧世代の `A_IRQ` は
+/// 名前を持たない。保存上の位置から決める。
+///
+/// | activity | 集約 item | 根拠 |
+/// |---|---|---|
+/// | `A_CPU` / `A_NET_SOFT` | item 0 (CPU "all") | 02 §4.2 |
+/// | `A_IRQ` (2 次元、v12.5.6〜) | 行 0 (CPU "all") の全割り込み = 添字 `< nr2` | 02 §6.1 |
+/// | `A_IRQ` (1 次元、〜v12.5.5) | すべて。CPU 次元が無く、どの item も割り込みごとの全 CPU 合計 | 本家は旧形式を変換するとき CPU "all" 行 1 本にする (`upgrade_stats_irq()`) |
+/// | その他 | なし | |
+///
+/// `A_IRQ` の「合計が減ったら 0」のクランプは、本家 `print_irq_stats()` では
+/// CPU "all" 列 (`!c`) の**すべての割り込み**に効く (総和 `sum` の行だけではない)。
+pub fn is_aggregate_item(id: ActivityId, plan: &DecodePlan, index: usize) -> bool {
+    match id {
+        ActivityId::CPU | ActivityId::NET_SOFT => index == 0,
+        ActivityId::IRQ if irq_has_cpu_rows(plan) => index < plan.nr2.max(1) as usize,
+        ActivityId::IRQ => true,
+        _ => false,
+    }
+}
+
+/// `A_IRQ` が「行 = CPU / 列 = 割り込み」の 2 次元で保存されているか (02 §6.1 / §6.4)。
+///
+/// 1 次元の世代 (〜v12.5.5) は `nr2` が必ず 1 で、`irq_name` を持たない。
+fn irq_has_cpu_rows(plan: &DecodePlan) -> bool {
+    plan.nr2 > 1 || plan.text_index("irq_name").is_some()
+}
+
+/// `A_IRQ` の割り込みの名前 (出力・集計で使う item のラベル)。
+///
+/// `irq_name` を持つ世代 (v12.5.6〜) はその名前を使う。持たない世代では
+/// 割り込みを配列添字でしか識別できず、**添字 0 が総和 (`sum`)、添字 `n` が
+/// 割り込み `n - 1`** になる。本家が旧形式を変換するとき (`upgrade_stats_irq()`) に
+/// 付ける名前と同じで、`sar -I` / `sadf` の表示もこの名前になる。
+///
+/// `index` は割り込みの添字 (2 次元の世代では列、1 次元の世代では item の位置)。
+/// 名前が空文字の場合も添字から作る。
+pub fn irq_item_name(index: usize, key: Option<&str>) -> String {
+    match key {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => match index.checked_sub(1) {
+            None => "sum".to_string(),
+            Some(n) => n.to_string(),
+        },
+    }
 }
 
 /// item 群をフィールド単位で合算する。
@@ -5762,7 +5814,7 @@ mod tests {
         );
     }
 
-    // ---- 前サンプルの対応付け (指摘 9) ----
+    // ---- 前サンプルの対応付けと集約 item (指摘 9 / 指摘 10) ----
 
     /// `A_DISK` の 1 台分 (`major` / `minor` / `nr_ios`)。
     fn disk_item(plan: &DecodePlan, major: u64, minor: u64, ios: u64) -> ItemSnapshot {
@@ -5771,6 +5823,18 @@ mod tests {
         put(plan, &mut it, disk_col::MINOR, minor);
         put(plan, &mut it, disk_col::TPS, ios);
         it
+    }
+
+    /// 1 次元 (〜v12.5.5、magic `0x8b`) の `A_IRQ` のデコード計画。
+    fn irq_plan_1d(nr: u32) -> DecodePlan {
+        let def = lookup(ActivityId::IRQ).unwrap();
+        let rev = def
+            .revisions
+            .iter()
+            .find(|r| r.magic == 0x8b)
+            .expect("0x8b の revision がある");
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        DecodePlan::build(def, rev, rev.size_lp64, nr, 1, &enc).expect("計画を作れる")
     }
 
     /// **回帰テスト (指摘 9)**: `A_DISK` の前サンプルは位置ではなく
@@ -5986,5 +6050,143 @@ mod tests {
                 "位置 {index}"
             );
         }
+    }
+
+    /// **回帰テスト (指摘 10)**: `A_IRQ` の名前は `irq_name` を優先し、持たない世代では
+    /// 添字 0 が `sum`、添字 `n` が割り込み `n - 1` (本家の旧形式変換と同じ)。
+    ///
+    /// 以前は独自出力・集計が添字をそのまま使い、総和の行が `0`、割り込み 0 が
+    /// `1` と 1 つずれていた。
+    #[test]
+    fn irq_item_name_matches_the_upstream_conversion() {
+        assert_eq!(irq_item_name(0, None), "sum");
+        assert_eq!(irq_item_name(1, None), "0");
+        assert_eq!(irq_item_name(17, None), "16");
+        // 名前が空なら添字から作る
+        assert_eq!(irq_item_name(0, Some("")), "sum");
+        assert_eq!(irq_item_name(3, Some("")), "2");
+        // 名前を持つ世代はその名前 (位置とは無関係)
+        assert_eq!(irq_item_name(0, Some("sum")), "sum");
+        assert_eq!(irq_item_name(5, Some("NMI")), "NMI");
+    }
+
+    /// **回帰テスト (指摘 10)**: 集約 item はラベルの文字列 (`all` / `sum`) ではなく
+    /// 保存位置で決まる。
+    #[test]
+    fn aggregate_item_is_decided_by_position() {
+        let cpu = plan_for(ActivityId::CPU);
+        assert!(is_aggregate_item(ActivityId::CPU, &cpu, 0));
+        assert!(!is_aggregate_item(ActivityId::CPU, &cpu, 1));
+        let soft = plan_for(ActivityId::NET_SOFT);
+        assert!(is_aggregate_item(ActivityId::NET_SOFT, &soft, 0));
+        assert!(!is_aggregate_item(ActivityId::NET_SOFT, &soft, 2));
+
+        // 2 次元の `A_IRQ` (CPU 3 行 × 割り込み 4 列): 行 0 = CPU "all" の全割り込み
+        let def = lookup(ActivityId::IRQ).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        let irq_2d = DecodePlan::build(def, rev, rev.size_lp64, 3, 4, &enc).unwrap();
+        assert!((0..4).all(|i| is_aggregate_item(ActivityId::IRQ, &irq_2d, i)));
+        assert!((4..12).all(|i| !is_aggregate_item(ActivityId::IRQ, &irq_2d, i)));
+        // 名前を持つ世代は割り込みが 1 列 (`nr2 == 1`) でも 2 次元: 行 0 だけが CPU "all"
+        let irq_2d_one = DecodePlan::build(def, rev, rev.size_lp64, 3, 1, &enc).unwrap();
+        assert!(is_aggregate_item(ActivityId::IRQ, &irq_2d_one, 0));
+        assert!(!is_aggregate_item(ActivityId::IRQ, &irq_2d_one, 1));
+        assert!(!is_aggregate_item(ActivityId::IRQ, &irq_2d_one, 2));
+
+        // 1 次元の `A_IRQ`: CPU 次元が無く、どの item も割り込みごとの全 CPU 合計
+        let irq_1d = irq_plan_1d(5);
+        assert!((0..5).all(|i| is_aggregate_item(ActivityId::IRQ, &irq_1d, i)));
+
+        // 集約 item を持たない activity
+        for id in [ActivityId::DISK, ActivityId::NET_DEV, ActivityId::FS] {
+            assert!(!is_aggregate_item(id, &plan_for(id), 0), "{id:?}");
+        }
+    }
+
+    /// `prepare_item` は呼び出し側が入れた集約判定を使わず、保存位置から決め直す。
+    ///
+    /// 旧世代 (1 次元) の `A_IRQ` では、総和以外の割り込みにも「合計が減ったら 0」の
+    /// クランプが効く。本家は旧形式を CPU "all" 行 1 本に変換し、その列の
+    /// **全割り込み**をクランプする (`print_irq_stats()` の `!c`)。
+    #[test]
+    fn prepare_item_decides_the_aggregate_itself() {
+        let plan = irq_plan_1d(3);
+        let meta = &lookup(ActivityId::IRQ).unwrap().columns[irq_col::COUNT];
+        let irq = |v: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, irq_col::COUNT, v);
+            it
+        };
+        // 総和と割り込み 1 (添字 2) の合計が減った (CPU のオフラインなど)
+        let prev = vec![irq(100), irq(40), irq(60)];
+        let curr = vec![irq(90), irq(50), irq(40)];
+        // 呼び出し側は集約でないと言っている
+        let caller = ComputeContext::new(100);
+        let at = |index| prepare_item(ActivityId::IRQ, &plan, index, &prev, &curr, caller).unwrap();
+        for policy in [MissingPolicy::Compat, MissingPolicy::Strict] {
+            let value =
+                |index| at(index).computed(ActivityId::IRQ, irq_col::COUNT, meta, &plan, policy);
+            assert_eq!(value(0), Ok(0.0), "総和 ({policy:?})");
+            assert_eq!(value(1), Ok(10.0), "{policy:?}");
+            assert_eq!(value(2), Ok(0.0), "総和以外もクランプ ({policy:?})");
+        }
+        assert!((0..3).all(|i| at(i).ctx.aggregate_item));
+
+        // 集約 item を持たない activity は、呼び出し側が真を渡しても偽になる
+        let net = plan_for(ActivityId::NET_DEV);
+        let mut named = zeros(&net);
+        named.key = Some("all".into());
+        let items = std::slice::from_ref(&named);
+        let mut ctx = ComputeContext::new(100);
+        ctx.aggregate_item = true;
+        let p = prepare_item(ActivityId::NET_DEV, &net, 0, items, items, ctx).unwrap();
+        assert!(
+            !p.ctx.aggregate_item,
+            "all という名前のインターフェースは集約 item ではない"
+        );
+    }
+
+    /// 2 次元の `A_IRQ` で「減ったら 0」にするのは CPU "all" 行の列だけで、
+    /// CPU 別の列は本家と同じく符号なし減算のまま (`print_irq_stats()` の `!c`)。
+    #[test]
+    fn irq_clamp_applies_only_to_the_all_cpu_row() {
+        let def = lookup(ActivityId::IRQ).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        // CPU "all" + cpu0 の 2 行 × 割り込み 2 列
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 2, 2, &enc).unwrap();
+        let meta = &def.columns[irq_col::COUNT];
+        let irq = |v: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, irq_col::COUNT, v);
+            it
+        };
+        // どちらの行も割り込み 1 (列 1) の件数が減った
+        let prev = vec![irq(100), irq(60), irq(80), irq(50)];
+        let curr = vec![irq(110), irq(40), irq(90), irq(30)];
+        let value = |index| {
+            prepare_item(
+                ActivityId::IRQ,
+                &plan,
+                index,
+                &prev,
+                &curr,
+                ComputeContext::new(100),
+            )
+            .unwrap()
+            .computed(
+                ActivityId::IRQ,
+                irq_col::COUNT,
+                meta,
+                &plan,
+                MissingPolicy::Compat,
+            )
+        };
+        assert_eq!(value(1), Ok(0.0), "CPU all 行はクランプする");
+        assert!(
+            value(3).is_ok_and(|v| v > 1e9),
+            "CPU 別の列はクランプしない (unsigned int の符号なし減算)"
+        );
     }
 }

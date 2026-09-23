@@ -40,8 +40,8 @@ use crate::format::file::SaFile;
 use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
 use crate::model::{ActivityId, Aggregation, Availability, Unit, ValueKind};
 use crate::series::compute::{
-    ComputeContext, RateSample, column_value_strict, matching_prev_item, prepare_item,
-    rate_from_totals, rate_sample, raw_column, tick_total,
+    ComputeContext, RateSample, column_value_strict, irq_item_name, matching_prev_item,
+    prepare_item, rate_from_totals, rate_sample, raw_column, tick_total,
 };
 use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
@@ -702,8 +702,11 @@ impl NativeSummaryBuilder {
                 },
                 continuous: view.continuous && prev_item.is_some(),
                 has_prev: view.has_prev && prev_item.is_some(),
-                // CPU の `all` 行 / `A_IRQ` の合計列は集約 item として扱う
-                aggregate_item: label == "all" || label == "sum",
+                // 集約 item (CPU `all` 行 / `A_IRQ` の CPU "all" 列) かどうかは
+                // `prepare_item` が保存位置から決める。ラベルの文字列 (`all` / `sum`) では
+                // 決めない (`all` や `sum` という名前のデバイスがあり得るうえ、`A_IRQ` の
+                // 「合計が減ったら 0」は `sum` の行だけでなく全割り込みの CPU "all" 列に効く)。
+                aggregate_item: false,
             };
 
             let prepared = prepare_item(snap.id, plan, index, prev_items, &snap.items, ctx)
@@ -1040,8 +1043,13 @@ fn normalizes_by_cpu_ticks(id: ActivityId) -> bool {
 /// item のラベルを決める。
 ///
 /// 識別子を持つ activity はそれを使う。持たないものは並び位置から決める。
-/// `A_CPU` だけは位置 0 が全 CPU の合計なので `all` とする。
+/// `A_CPU` / `A_NET_SOFT` は位置 0 が全 CPU の合計なので `all` とする。
+/// `A_IRQ` は `sar -I` / `sadf` と同じ名前にする ([`irq_item_name`]。
+/// 名前を持たない旧世代では位置 0 が `sum`、位置 `n` が割り込み `n - 1`)。
 pub fn item_label(id: ActivityId, shape: ItemShape, index: usize, key: Option<&str>) -> String {
+    if id == ActivityId::IRQ {
+        return irq_item_name(index, key);
+    }
     if let Some(k) = key {
         return k.to_string();
     }
@@ -1055,6 +1063,27 @@ pub fn item_label(id: ActivityId, shape: ItemShape, index: usize, key: Option<&s
             }
         }
         _ => index.to_string(),
+    }
+}
+
+/// item 全体の合計を表す item (集約行) に [`item_label`] が付けるラベル。
+/// 集約行を持たない activity は `None`。
+///
+/// 集約行は保存位置 0 にあり、ラベルはその位置から付く。
+///
+/// | activity | 集約行 | ラベル |
+/// |---|---|---|
+/// | `A_CPU` / `A_NET_SOFT` | item 0 = 全 CPU の合計 | `all` |
+/// | `A_IRQ` | 添字 0 = 全割り込みの総和スロット | `sum` ([`irq_item_name`]) |
+///
+/// **それ以外の activity に集約行は無い。** `A_DISK` / `A_NET_DEV` / `A_FS` などに
+/// `all` や `sum` という名前の item があっても、それは実在のデバイスである。
+/// ラベルの文字列だけで集約行を判定すると、それを黙って対象から外してしまう。
+pub const fn total_item_label(id: ActivityId) -> Option<&'static str> {
+    match id {
+        ActivityId::CPU | ActivityId::NET_SOFT => Some("all"),
+        ActivityId::IRQ => Some("sum"),
+        _ => None,
     }
 }
 
@@ -1965,6 +1994,40 @@ mod tests {
             item_label(ActivityId::NET_DEV, ItemShape::List, 1, Some("if-a")),
             "if-a"
         );
+        // 名前を持たない旧世代の `A_IRQ` は `sar -I` と同じ `sum` / 割り込み番号 (指摘 10)
+        assert_eq!(
+            item_label(ActivityId::IRQ, ItemShape::Matrix, 0, None),
+            "sum"
+        );
+        assert_eq!(item_label(ActivityId::IRQ, ItemShape::Matrix, 1, None), "0");
+        assert_eq!(
+            item_label(ActivityId::IRQ, ItemShape::Matrix, 1, Some("timer")),
+            "timer"
+        );
+    }
+
+    /// 集約行のラベルは [`item_label`] が位置 0 に付けるものと一致する。
+    #[test]
+    fn total_item_label_is_the_label_of_position_zero() {
+        for (id, shape) in [
+            (ActivityId::CPU, ItemShape::List),
+            (ActivityId::NET_SOFT, ItemShape::List),
+            (ActivityId::IRQ, ItemShape::Matrix),
+        ] {
+            assert_eq!(
+                total_item_label(id),
+                Some(item_label(id, shape, 0, None).as_str()),
+                "{id:?}"
+            );
+        }
+        for id in [
+            ActivityId::DISK,
+            ActivityId::NET_DEV,
+            ActivityId::FS,
+            ActivityId::MEMORY,
+        ] {
+            assert_eq!(total_item_label(id), None, "{id:?} に集約行は無い");
+        }
     }
 
     /// 集計の出力順は決定的 (activity ID 昇順・item は all → 番号順)。
@@ -2061,5 +2124,59 @@ mod tests {
                 .iter()
                 .any(|e| e.reason == ExclusionReason::ItemReplaced)
         );
+    }
+
+    /// **回帰テスト (指摘 10)**: 名前を持たない旧世代 (magic `0x8b`) の `A_IRQ` は
+    /// `sar -I` と同じ `sum` / 割り込み番号で集計し、「合計が減ったら 0」の
+    /// クランプは総和以外の割り込みにも効く。
+    ///
+    /// 以前は添字をそのままラベルにしており、総和の行が `0`、割り込み 0 が `1` と
+    /// 1 つずれていた。集約判定もラベルの文字列 (`sum`) で行っていたため、
+    /// 旧世代の総和の行はクランプされず除外になっていた。
+    #[test]
+    fn old_generation_irq_is_labelled_and_clamped_like_sar() {
+        let id = ActivityId::IRQ;
+        let def = lookup(id).unwrap();
+        let rev = def
+            .revisions
+            .iter()
+            .find(|r| r.magic == 0x8b)
+            .expect("0x8b の revision");
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 4, 1, &enc).unwrap();
+        let mut f = Feed::new(id, opts_all());
+        f.plans[0].plan = plan.clone();
+        let sample = |counts: [u64; 4]| {
+            counts
+                .iter()
+                .map(|c| item_of(&plan, &[("irq_nr", *c)]))
+                .collect::<Vec<_>>()
+        };
+        // 添字 0 が総和、添字 n が割り込み n - 1
+        f.push(snapshot(id, 1000, 100_000, sample([60, 10, 20, 30])), true);
+        f.push(
+            snapshot(id, 1001, 100_100, sample([150, 15, 20, 115])),
+            true,
+        );
+        // 総和と割り込み 2 が減った (CPU のオフラインなど) → その区間は 0
+        f.push(snapshot(id, 1002, 100_200, sample([140, 25, 20, 95])), true);
+        let s = f.finish();
+
+        let mut labels: Vec<&str> = s
+            .activity(id)
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.item.as_str())
+            .collect();
+        labels.sort_unstable();
+        assert_eq!(labels, vec!["0", "1", "2", "sum"]);
+
+        assert_eq!(observed(&s, id, "sum", "intr"), vec![90.0, 0.0]);
+        assert_eq!(observed(&s, id, "0", "intr"), vec![5.0, 10.0]);
+        assert_eq!(observed(&s, id, "1", "intr"), vec![0.0, 0.0]);
+        assert_eq!(observed(&s, id, "2", "intr"), vec![85.0, 0.0]);
+        assert_eq!(s.column(id, "sum", "intr").unwrap().mean, Some(45.0));
+        assert_eq!(s.column(id, "2", "intr").unwrap().mean, Some(42.5));
     }
 }

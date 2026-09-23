@@ -31,7 +31,7 @@ use crate::format::file::{SaFile, ScanControl};
 use crate::layout::registry::{ActivityDef, ColumnMeta};
 use crate::model::{ActivityId, Availability, DisplayTz, ValueKind};
 use crate::output::time_filter::{Admit, TimeFilter};
-use crate::series::compute::ComputeIssue;
+use crate::series::compute::{ComputeIssue, irq_item_name};
 use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
 
 /// 公開スキーマの版。
@@ -335,21 +335,33 @@ pub fn item_out(
         }
     }
 
-    // item の識別子は `sadf` と同じ組み立て (`render::item_label`) を共有する。
-    // 行列型 (`A_IRQ`) の行も割り込み名で識別されるので、ここに独自出力専用の
-    // 分岐は要らない (`irq_rows_are_identified_by_interrupt_name` が固定)。
-    let label = item_label(sp, item);
     ItemOut {
-        item: if label.jx.is_empty() {
-            // アイテムを持たない activity (`A_MEMORY` など)
-            "-".to_string()
-        } else {
-            label.jx
-        },
+        item: item_name(sp, item),
         index: item.index,
         cpu: (sp.id == ActivityId::IRQ).then(|| "all".to_string()),
         raw,
         rates,
+    }
+}
+
+/// item の識別子 (`all` / `cpu0` / `sda` / `-` など)。
+///
+/// `sadf` と同じ組み立て (`render::item_label`) を共有する。
+///
+/// `A_IRQ` の行 (1 行 = 1 割り込み) だけは割り込みの名前を
+/// [`irq_item_name`] で付ける。`render::item_label` は名前を持たない旧世代
+/// (〜v12.5.5) の行を添字の数字で表すため、総和の行が `0`、割り込み 0 が `1` と
+/// 1 つずれ、`sar -I` / `sadf` / `summarize` の `sum` / `0` と食い違う。
+fn item_name(sp: &spec::ActivitySpec, item: &ItemPair<'_>) -> String {
+    if sp.id == ActivityId::IRQ {
+        return irq_item_name(item.index, item.key());
+    }
+    let label = item_label(sp, item);
+    if label.jx.is_empty() {
+        // アイテムを持たない activity (`A_MEMORY` など)
+        "-".to_string()
+    } else {
+        label.jx
     }
 }
 
@@ -838,5 +850,59 @@ mod tests {
         assert_eq!(expanded[3].item, "eth0-tx");
         assert_eq!(expanded[3].cpu.as_deref(), Some("0"));
         assert_eq!(count_of(&expanded[3]).value, Some(40.0));
+    }
+
+    /// **回帰テスト (指摘 10)**: 名前を持たない旧世代 (〜v12.5.5) の `A_IRQ` の行は
+    /// `sar -I` / `sadf` と同じく総和が `sum`、添字 n が割り込み `n - 1`。
+    ///
+    /// 以前は `render::item_label` が添字をそのまま使い、総和の行が `0`、
+    /// 割り込み 0 が `1` と 1 つずれていた。
+    #[test]
+    fn unnamed_irq_rows_are_sum_and_interrupt_numbers() {
+        use crate::layout::plan::DecodePlan;
+        use crate::model::Availability;
+        use crate::series::{ActivitySnapshot, ItemSnapshot};
+
+        let def = crate::layout::registry::lookup(ActivityId::IRQ).unwrap();
+        // 1 次元 (magic 0x8b): 総和 + 割り込み 2 本、`irq_name` は無い
+        let rev = def.revisions.iter().find(|r| r.magic == 0x8b).unwrap();
+        let enc = crate::format::abi::SourceEncoding::new(
+            crate::format::abi::Endian::Little,
+            crate::format::abi::LayoutAbi::LP64,
+        );
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 3, 1, &enc).unwrap();
+        let snapshot = |counts: [u64; 3]| ActivitySnapshot {
+            id: ActivityId::IRQ,
+            index: 0,
+            nr: 3,
+            nr2: 1,
+            items: counts
+                .iter()
+                .map(|c| ItemSnapshot {
+                    key: None,
+                    texts: Vec::new(),
+                    values: vec![Availability::Present(*c)],
+                })
+                .collect(),
+        };
+        let (prev, curr) = (snapshot([30, 10, 20]), snapshot([60, 25, 35]));
+        let pair = ActivityPair {
+            id: ActivityId::IRQ,
+            def,
+            plan: &plan,
+            curr: &curr,
+            prev: Some(&prev),
+            itv_cs: 100,
+            has_prev: true,
+            continuous: true,
+        };
+        let rows = custom_items(&pair, &CustomConfig::default());
+        let labels: Vec<&str> = rows.iter().map(|r| r.item.as_str()).collect();
+        assert_eq!(labels, ["sum", "0", "1"]);
+        let intr: Vec<Option<f64>> = rows
+            .iter()
+            .map(|r| r.rates.iter().find(|f| f.name == "intr").unwrap().value)
+            .collect();
+        assert_eq!(intr, [Some(30.0), Some(15.0), Some(15.0)]);
     }
 }

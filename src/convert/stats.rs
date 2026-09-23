@@ -34,6 +34,7 @@ use crate::format::writer::{WriteCursor, value_fits};
 use crate::layout::plan::{DeclaredShape, select_revision};
 use crate::layout::registry::{self, WireRevision};
 use crate::model::ActivityId;
+use crate::series::compute;
 
 /// `A_IRQ` が名前指定になった revision の magic (`ACTIVITY_MAGIC_BASE + 2`)。
 ///
@@ -437,12 +438,12 @@ impl ActivityPlan {
 /// 旧形式の割り込み添字から `irq_name` を作る (本家 `upgrade_stats_irq()`)。
 ///
 /// 添字 0 は総和スロットで名前は `"sum"`、添字 `i` は割り込み番号 `i - 1`。
+/// 名前の規則は出力・集計が旧世代のファイルを直接読むときのラベルと共有する
+/// ([`compute::irq_item_name`])。変換後のファイルと変換前のファイルで
+/// 同じ割り込みが同じ名前になる。
 /// `MAX_SA_IRQ_LEN` に収まらない桁数は切り詰める (本家の `snprintf` と同じ)。
 fn irq_name(item_index: u32) -> String {
-    if item_index == 0 {
-        return "sum".to_string();
-    }
-    let mut s = (item_index - 1).to_string();
+    let mut s = compute::irq_item_name(item_index as usize, None);
     s.truncate(MAX_SA_IRQ_LEN - 1);
     s
 }

@@ -54,6 +54,7 @@
 //! 全件を機械的に照合する。
 
 use crate::analyze::assessment::Priority;
+use crate::analyze::summary::total_item_label;
 use crate::analyze::timeline::{MetricKey, SINGLE_ITEM};
 use crate::detect::{FixedComparison, Pattern, ShiftDirection};
 use crate::model::{ActivityId, Lang, Text, Unit, ValueKind};
@@ -88,13 +89,19 @@ pub enum ItemScope {
 }
 
 impl ItemScope {
-    /// item ラベルがこの範囲に入るか。
-    pub fn matches(self, item: &str) -> bool {
+    /// `activity` の item ラベルがこの範囲に入るか。
+    ///
+    /// 集約行かどうかは activity ごとに決まっている ([`total_item_label`])。
+    /// ラベルの文字列 (`all` / `sum`) だけで決めると、集約行を持たない activity
+    /// (`A_DISK` / `A_NET_DEV` / `A_FS` など) で `all` や `sum` という名前の
+    /// デバイスを黙って対象から外し、「評価しなかった」を「検出なし」にしてしまう。
+    pub fn matches(self, activity: ActivityId, item: &str) -> bool {
+        let total = total_item_label(activity);
         match self {
             ItemScope::Single => item == SINGLE_ITEM,
-            ItemScope::Aggregate => item == "all",
+            ItemScope::Aggregate => total == Some(item),
             // 集約行は個別 item として数えない (二重計上になる)
-            ItemScope::Each => item != "all" && item != "sum" && item != SINGLE_ITEM,
+            ItemScope::Each => item != SINGLE_ITEM && total != Some(item),
         }
     }
 
@@ -302,7 +309,9 @@ impl CatalogEntry {
 
     /// この項目が指す系列か。
     pub fn matches(&self, key: &MetricKey) -> bool {
-        self.activity == key.activity && self.column == key.column && self.scope.matches(&key.item)
+        self.activity == key.activity
+            && self.column == key.column
+            && self.scope.matches(key.activity, &key.item)
     }
 
     /// 入力に現れなかった場合の表示用の鍵。
@@ -2344,12 +2353,98 @@ mod tests {
 
     #[test]
     fn item_scope_separates_aggregate_from_each() {
-        assert!(ItemScope::Aggregate.matches("all"));
-        assert!(!ItemScope::Aggregate.matches("cpu0"));
-        assert!(ItemScope::Each.matches("dev8-0"));
-        assert!(!ItemScope::Each.matches("all"), "集約行を二重に数えない");
-        assert!(ItemScope::Single.matches(SINGLE_ITEM));
-        assert!(!ItemScope::Single.matches("dev8-0"));
+        assert!(ItemScope::Aggregate.matches(ActivityId::CPU, "all"));
+        assert!(!ItemScope::Aggregate.matches(ActivityId::CPU, "cpu0"));
+        assert!(ItemScope::Each.matches(ActivityId::DISK, "dev8-0"));
+        assert!(
+            !ItemScope::Each.matches(ActivityId::CPU, "all"),
+            "集約行を二重に数えない"
+        );
+        assert!(
+            !ItemScope::Each.matches(ActivityId::IRQ, "sum"),
+            "割り込みの総和も集約行"
+        );
+        assert!(ItemScope::Single.matches(ActivityId::MEMORY, SINGLE_ITEM));
+        assert!(!ItemScope::Single.matches(ActivityId::DISK, "dev8-0"));
+    }
+
+    /// **回帰テスト**: 集約行を持たない activity では、`all` / `sum` という名前の
+    /// item も個別 item として数える。
+    ///
+    /// 以前はラベルの文字列だけで集約行を判定しており、`all` という名前の
+    /// インターフェースや `sum` という名前のファイルシステムが異変検出の対象から
+    /// 黙って外れていた (評価していないのに「検出なし」になる)。
+    #[test]
+    fn items_named_like_an_aggregate_are_individual_items_without_one() {
+        for activity in [
+            ActivityId::DISK,
+            ActivityId::NET_DEV,
+            ActivityId::NET_EDEV,
+            ActivityId::FS,
+        ] {
+            for name in ["all", "sum"] {
+                assert!(
+                    ItemScope::Each.matches(activity, name),
+                    "{activity:?} の {name}"
+                );
+                assert!(
+                    !ItemScope::Aggregate.matches(activity, name),
+                    "{activity:?} に集約行は無い"
+                );
+            }
+        }
+        let key = MetricKey::new(ActivityId::NET_DEV, "all", "rx_bytes_per_sec");
+        assert!(
+            lookup(&key).is_some(),
+            "all という名前のインターフェースも検出の対象"
+        );
+    }
+
+    /// `all` という名前のインターフェースは、カタログ検索だけでなく
+    /// `detect` の評価にも入力に存在した系列として残る。
+    #[test]
+    fn detect_evaluates_an_interface_named_all() {
+        use crate::analyze::timeline::{MetricPoint, Timelines};
+
+        let key = MetricKey::new(ActivityId::NET_DEV, "all", "rx_bytes_per_sec");
+        let entry = lookup(&key).expect("カタログ項目");
+        let mut timelines = Timelines::new();
+        let t = timelines.entry(key, entry.unit, entry.kind);
+        for i in 0..10u64 {
+            t.push(MetricPoint::observed(
+                1_000 + i * 10,
+                1_010 + i * 10,
+                1_000,
+                100.0,
+            ));
+        }
+        let out = crate::detect::detect(&timelines, &crate::detect::DetectOptions::default());
+        let eval = out
+            .evaluations
+            .iter()
+            .find(|e| {
+                e.series.activity == ActivityId::NET_DEV
+                    && e.series.item == "all"
+                    && e.series.column == "rx_bytes_per_sec"
+            })
+            .expect("評価の記録がある");
+        assert!(eval.present, "入力にある系列として評価する");
+        assert_eq!(eval.observed_samples, 10);
+    }
+
+    /// 集約行だけを見る宣言は、集約行を持つ activity にしか置けない。
+    ///
+    /// 入力に現れなかったときの表示 (`placeholder`) も集約行のラベルと一致させる。
+    #[test]
+    fn aggregate_scope_is_declared_only_where_an_aggregate_row_exists() {
+        for e in CATALOG.iter().filter(|e| e.scope == ItemScope::Aggregate) {
+            assert_eq!(
+                total_item_label(e.activity),
+                Some(e.scope.placeholder()),
+                "{}",
+                e.display()
+            );
+        }
     }
 
     #[test]

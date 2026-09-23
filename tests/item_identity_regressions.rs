@@ -1,9 +1,12 @@
-//! item の同一性 (前サンプルとの対応付け) の結合テスト。
+//! item の同一性 (前サンプルとの対応付け・item のラベル) の結合テスト。
 //!
 //! | # | テスト | 何を固定するか |
 //! |---|---|---|
 //! | 1 | [`disk_values_follow_major_minor_in_every_output`] | `A_DISK` の前サンプルを位置ではなく `major` / `minor` で引くこと。ディスクが消えても増えても、互換出力 (`sar` / `sadf -d` / `sadf -j`)・独自出力 (`show` の json / csv / table / ndjson)・集計 (`summarize`) が同じ区間値を出す (指摘 9) |
 //! | 1' | [`irq_columns_are_paired_by_position_in_every_output`] | 集計も `A_IRQ` の前サンプルを `show` と同じ規則 (位置) で引くこと |
+//! | 2 | [`old_generation_irq_rows_are_sum_and_interrupt_numbers`] | 名前を持たない旧世代 (`0x2171`) の `A_IRQ` を、全出力が `sum` / 割り込み番号で表し、「合計が減ったら 0」を総和以外の割り込みにも効かせること (指摘 10) |
+//! | 3 | [`converted_irq_names_match_the_labels_of_direct_reading`] | 旧形式を変換したファイルの `irq_name` と、変換前のファイルを直接読んだときのラベル・値が一致すること |
+//! | 4 | [`unnamed_irq_of_the_self_describing_generation_is_labelled_the_same`] | 名前を持たない自己記述世代 (`A_IRQ` magic `0x8b`) も独自出力と集計が同じラベルで表すこと |
 //!
 //! fixture はすべて自作。統計のバイト列は `docs/format/02-activities.md` §5 / §6 の
 //! オフセット表から独立に書き起こしたもので、本体のレイアウト定義は使わない。
@@ -16,10 +19,11 @@ use std::collections::BTreeMap;
 use fixtures::{ActivitySpec, FixtureAbi, FixtureSpec, Generation, RecordSpec, build};
 use re_sar_ch::analyze::summary::{NativePeriodSummary, RetainTimelines};
 use re_sar_ch::analyze::timeline::MetricKey;
+use re_sar_ch::convert::{self, ConvertOptions};
 use re_sar_ch::format::file::SaFile;
 use re_sar_ch::model::{ActivityId, DisplayTz};
 use re_sar_ch::multi::{MultiOptions, analyze_files};
-use re_sar_ch::output::json::CustomConfig;
+use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig};
 use re_sar_ch::output::sar_text::{CpuSelection, SarTextOptions, TimeStyle, write_report};
 use re_sar_ch::series::Selection;
@@ -89,6 +93,26 @@ fn disk(major: u32, minor: u32, ios: u64, rd_sect: u64, wr_sect: u64, tot_ticks:
     out[64..68].copy_from_slice(&major.to_le_bytes());
     out[68..72].copy_from_slice(&minor.to_le_bytes());
     out
+}
+
+/// 名前を持たない旧世代の `A_IRQ` (id 3、magic `0x8b`、v11.7.2〜v12.5.5)。
+///
+/// 1 次元で `nr` = 割り込み数 + 1 (添字 0 が総和)、`nr2` = 1。
+/// `stats_irq` は `unsigned long long irq_nr` の 1 フィールド (8 バイト、02 §6.4)。
+fn a_irq_unnamed(nr: i32) -> ActivitySpec {
+    ActivitySpec {
+        id: 3,
+        magic: 0x8b,
+        nr,
+        nr2: 1,
+        has_nr: true,
+        size: 8,
+        types_nr: [1, 0, 0],
+    }
+}
+
+fn irq(count: u64) -> Vec<u8> {
+    count.to_le_bytes().to_vec()
 }
 
 // ===========================================================================
@@ -463,5 +487,304 @@ fn irq_columns_are_paired_by_position_in_every_output() {
             "{label}"
         );
         assert_eq!(observed(&s, id, label, "intr"), vec![v], "{label}");
+    }
+}
+
+// ===========================================================================
+// 2. 名前を持たない旧世代の A_IRQ (指摘 10)
+// ===========================================================================
+
+/// `A_IRQ` の件数。添字 0 が総和、添字 n が割り込み n - 1。
+///
+/// | 時刻 | sum | 0 | 1 | 2 |
+/// |---|---|---|---|---|
+/// | 12:26:40 | 60 | 10 | 20 | 30 |
+/// | 12:26:41 | 150 (+90) | 15 (+5) | 20 (+0) | 115 (+85) |
+/// | 12:26:42 | 140 (減) | 25 (+10) | 20 (+0) | 95 (減) |
+///
+/// 減った区間 (CPU のオフラインなど) は 0 になる。本家は旧形式を CPU "all" 行
+/// 1 本に変換し、その列の**全割り込み**をクランプする (`print_irq_stats()` の `!c`)。
+const IRQ_COUNTS: [[u64; 4]; 3] = [[60, 10, 20, 30], [150, 15, 20, 115], [140, 25, 20, 95]];
+
+/// 区間ごとの期待値 (1 秒間隔なので件数の差がそのまま毎秒の値になる)。
+const IRQ_EXPECTED: [(&str, [f64; 2]); 4] = [
+    ("sum", [90.0, 0.0]),
+    ("0", [5.0, 10.0]),
+    ("1", [0.0, 0.0]),
+    ("2", [85.0, 0.0]),
+];
+
+/// 旧形式 `0x2171` (sysstat 9.1.6〜10.2.1) のファイル。`A_IRQ` の件数だけ手で書く。
+///
+/// `A_IRQ` は時代 A (magic `0x8a`): 1 次元で、`stats_irq` は
+/// `unsigned long long irq_nr` 1 本が `aligned(16)` で 16 バイト (02 §6.4)。
+/// 旧世代の統計はレコードごとの件数を持たず、record_header の直後に
+/// activity の並び順 (`A_CPU` → `A_IRQ`) で `nr` 個ずつ並ぶ。
+/// `A_CPU` の値は fixture 生成器の決定的な値のまま。
+fn old_irq_file(counts: &[[u64; 4]]) -> SaFile {
+    let a_cpu = ActivitySpec {
+        id: 1,
+        magic: 0x8a,
+        nr: 3,
+        nr2: 1,
+        has_nr: false,
+        size: 160,
+        types_nr: [10, 0, 0],
+    };
+    let a_irq = ActivitySpec {
+        id: 3,
+        magic: 0x8a,
+        nr: 4,
+        nr2: 1,
+        has_nr: false,
+        size: 16,
+        types_nr: [1, 0, 0],
+    };
+    let mut spec = FixtureSpec::skeleton(Generation::G2171, FixtureAbi::Le64);
+    // `0x2171` を書いた版 (9.1.6〜10.2.1) にしておく
+    spec.version = (9, 1, 6, 0);
+    let cpu_nr = spec.cpu_nr as i32;
+    spec.activities = vec![a_cpu.clone(), a_irq.clone()];
+    // RESTART の `uptime0` は実ファイルでも 0
+    let mut restart = RecordSpec::restart(cpu_nr, START - 1, 12, 26, 39);
+    restart.uptime = 0;
+    spec.records = std::iter::once(restart)
+        .chain((0..counts.len()).map(|i| {
+            let mut rec = RecordSpec::stats(vec![0, 0], START + i as u64, 12, 26, 40 + i as u8);
+            // 100 jiffies = 1 秒 (旧世代は USER_HZ = 100 として読む)
+            rec.uptime = 100_000 + i as u64 * 100;
+            rec
+        }))
+        .collect();
+    let mut built = build(spec);
+    let header = built.record_header_size();
+    let cpu_bytes = a_cpu.nr as usize * a_cpu.size as usize;
+    // 先頭の RESTART を除いた統計レコード
+    let stats: Vec<usize> = built
+        .record_offsets
+        .iter()
+        .skip(1)
+        .map(|(off, _)| *off)
+        .collect();
+    for (off, row) in stats.into_iter().zip(counts) {
+        for (j, count) in row.iter().enumerate() {
+            let at = off + header + cpu_bytes + j * a_irq.size as usize;
+            built.bytes[at..at + 8].copy_from_slice(&count.to_le_bytes());
+        }
+    }
+    SaFile::from_bytes("old", built.bytes).unwrap()
+}
+
+/// **回帰テスト (指摘 10)**: 名前を持たない旧世代の `A_IRQ` は、どの出力でも
+/// 総和の行が `sum`、割り込み n が `n` になり、同じ区間値を出す。
+///
+/// 以前は `show` / `summarize` / `detect` が添字をそのままラベルにしており、
+/// 総和の行が `0`、割り込み 0 が `1` と 1 つずれていた (`sar -I` と `sadf` は
+/// `sum` / `0`)。集約の判定もラベルの文字列 (`sum`) で行っていたため、
+/// `summarize` は総和の減少をクランプせず除外し、`sadf` は総和以外の割り込みの
+/// 減少を符号なし減算の巨大値 (`18446744073709551616.00`) で出していた。
+/// 本家 12.8 で変換後のファイルを読んだ `sadf -d` は `0.00` を出す。
+#[test]
+fn old_generation_irq_rows_are_sum_and_interrupt_numbers() {
+    let file = old_irq_file(&IRQ_COUNTS);
+    let id = ActivityId::IRQ;
+    let expected = IRQ_EXPECTED;
+
+    // --- sar -I ALL (基準: 本家と同じ `sum` / 割り込み番号) ---
+    let sar = sar_text(&file, id);
+    for (label, values) in expected {
+        for (sec, v) in values.iter().enumerate() {
+            let time = format!("12:26:4{}", sec + 1);
+            let line = sar
+                .lines()
+                .find(|l| {
+                    let t: Vec<&str> = l.split_whitespace().collect();
+                    t.first() == Some(&time.as_str()) && t.get(1) == Some(&label)
+                })
+                .unwrap_or_else(|| panic!("{time} {label} の行が無い:\n{sar}"));
+            assert!(line.ends_with(&format!("{v:.2}")), "{line}");
+        }
+    }
+
+    // --- sadf -d / -j ---
+    let cfg = sadf_config(id);
+    let db = sadf_out(&file, &cfg, sadf::dbppc::write_db);
+    assert!(
+        db.contains(";2020-09-13 12:26:41 UTC;sum;90.00"),
+        "総和の行は sum:\n{db}"
+    );
+    assert!(db.contains(";2020-09-13 12:26:41 UTC;2;85.00"), "{db}");
+    // 総和以外の割り込みも減ったら 0 (以前は符号なし減算の巨大値が出ていた)
+    assert!(db.contains(";2020-09-13 12:26:42 UTC;2;0.00"), "{db}");
+    assert!(!db.contains(";3;"), "割り込み番号は 0 から 2 まで:\n{db}");
+    let json: Value = serde_json::from_str(&sadf_out(&file, &cfg, sadf::json::write_json)).unwrap();
+    let first = &json["sysstat"]["hosts"][0]["statistics"][0]["interrupts"];
+    let names: Vec<&str> = first
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["intr"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["sum", "0", "1", "2"], "{json:#}");
+
+    // --- show の json / csv / table / ndjson ---
+    let cfg = show_config(id);
+    let values = show_json_values(&file, &cfg, "rates");
+    for (label, v) in expected {
+        for (sec, v) in v.iter().enumerate() {
+            let key = (START + sec as u64 + 1, label.to_string());
+            let got = values
+                .get(&key)
+                .unwrap_or_else(|| panic!("{key:?} が無い: {:?}", values.keys()));
+            assert_eq!(got["intr"], (Some(*v), "ok".to_string()), "{key:?}");
+        }
+    }
+    assert!(
+        !values.keys().any(|(_, label)| label == "3"),
+        "総和の行が 0 番にずれ、割り込み 2 が 3 番にずれていない"
+    );
+
+    let csv = show_csv(&file, &cfg);
+    let labels: std::collections::BTreeSet<&str> = csv
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').nth(8).unwrap())
+        .collect();
+    assert_eq!(labels, ["0", "1", "2", "sum"].into_iter().collect());
+
+    let table = show(&file, &cfg, re_sar_ch::output::table::write_table);
+    assert!(table.contains("sum [CPU all]"), "{table}");
+    assert!(!table.contains(" 3 [CPU all]"), "{table}");
+
+    let ndjson = show(&file, &cfg, re_sar_ch::output::ndjson::write_ndjson);
+    let items: std::collections::BTreeSet<String> = ndjson
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|r| r["record"] == "sample")
+        .map(|r| r["item"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        items,
+        ["0", "1", "2", "sum"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+
+    // --- 集計: summarize (detect も同じラベルと区間値を読む) ---
+    let s = summarize(&file, id);
+    let mut labels: Vec<&str> = s
+        .activity(id)
+        .unwrap()
+        .items
+        .iter()
+        .map(|i| i.item.as_str())
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["0", "1", "2", "sum"]);
+    for (label, v) in expected {
+        assert_eq!(observed(&s, id, label, "intr"), v.to_vec(), "{label}");
+    }
+}
+
+// ===========================================================================
+// 3. 変換前後で割り込みの名前が一致する
+// ===========================================================================
+
+/// 変換 (`sadf -c` 相当) が書く `irq_name` と、変換前のファイルを直接読んだときの
+/// `show` / `summarize` のラベルが一致すること。値 (生値・区間値) も同じ item に付くこと。
+///
+/// どちらも `compute::irq_item_name` の規則 (添字 0 が `sum`、添字 n が n - 1) で
+/// 名前が付く。直接読んだときだけ添字のままだと、同じ割り込みが変換の前後で
+/// 別の名前になる。
+#[test]
+fn converted_irq_names_match_the_labels_of_direct_reading() {
+    let direct = old_irq_file(&IRQ_COUNTS);
+    let mut bytes = Vec::new();
+    convert::convert(&direct, &ConvertOptions { hz: Some(100) }, &mut bytes).unwrap();
+    let converted = SaFile::from_bytes("converted", bytes).unwrap();
+
+    let cfg = CustomConfig {
+        values: ValueScope::Both,
+        ..show_config(ActivityId::IRQ)
+    };
+    // (区間の終点, ラベル, 生値, 区間値)
+    let rows = |file: &SaFile| -> Vec<(u64, String, Option<f64>, Option<f64>)> {
+        let raw = show_json_values(file, &cfg, "raw");
+        let rates = show_json_values(file, &cfg, "rates");
+        rates
+            .iter()
+            .filter(|((end, _), _)| *end > START)
+            .map(|((end, label), fields)| {
+                (
+                    *end,
+                    label.clone(),
+                    raw[&(*end, label.clone())]["intr"].0,
+                    fields["intr"].0,
+                )
+            })
+            .collect()
+    };
+    let direct_rows = rows(&direct);
+    assert_eq!(direct_rows, rows(&converted));
+    for (label, values) in IRQ_EXPECTED {
+        for (sec, v) in values.iter().enumerate() {
+            let end = START + sec as u64 + 1;
+            assert!(
+                direct_rows
+                    .iter()
+                    .any(|(e, l, _, rate)| *e == end && l == label && *rate == Some(*v)),
+                "{end} {label} = {v}: {direct_rows:?}"
+            );
+        }
+    }
+
+    let labels = |s: &NativePeriodSummary| -> Vec<String> {
+        let mut v: Vec<String> = s
+            .activity(ActivityId::IRQ)
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.item.clone())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        labels(&summarize(&direct, ActivityId::IRQ)),
+        labels(&summarize(&converted, ActivityId::IRQ))
+    );
+}
+
+/// 名前を持たない自己記述世代 (`0x2175`、`A_IRQ` magic `0x8b`、v11.7.2〜v12.5.5) も
+/// 独自出力と集計は `sum` / 割り込み番号で表す。
+///
+/// 本家 12.8 はこの世代の `A_IRQ` を読み飛ばすので、互換出力 (`sar` / `sadf`) には
+/// 現れない (reSARch も合わせている)。独自出力と集計だけが読む。
+#[test]
+fn unnamed_irq_of_the_self_describing_generation_is_labelled_the_same() {
+    let file = file(
+        a_irq_unnamed(4),
+        IRQ_COUNTS
+            .iter()
+            .map(|row| row.iter().map(|c| irq(*c)).collect())
+            .collect(),
+    );
+    let id = ActivityId::IRQ;
+
+    let values = show_json_values(&file, &show_config(id), "rates");
+    for (label, v) in IRQ_EXPECTED {
+        for (sec, v) in v.iter().enumerate() {
+            let key = (START + sec as u64 + 1, label.to_string());
+            let got = values
+                .get(&key)
+                .unwrap_or_else(|| panic!("{key:?} が無い: {:?}", values.keys()));
+            assert_eq!(got["intr"], (Some(*v), "ok".to_string()), "{key:?}");
+        }
+    }
+
+    let s = summarize(&file, id);
+    for (label, v) in IRQ_EXPECTED {
+        assert_eq!(observed(&s, id, label, "intr"), v.to_vec(), "{label}");
     }
 }

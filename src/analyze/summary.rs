@@ -40,8 +40,8 @@ use crate::format::file::SaFile;
 use crate::layout::registry::{ColumnMeta, ItemShape, lookup};
 use crate::model::{ActivityId, Aggregation, Availability, Unit, ValueKind};
 use crate::series::compute::{
-    ComputeContext, RateSample, column_value_strict, prepare_item, rate_from_totals, rate_sample,
-    raw_column, tick_total,
+    ComputeContext, RateSample, column_value_strict, matching_prev_item, prepare_item,
+    rate_from_totals, rate_sample, raw_column, tick_total,
 };
 use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
@@ -671,6 +671,7 @@ impl NativeSummaryBuilder {
         } else {
             snap.items.len()
         };
+        let prev_items = prev_snap.map_or(&[][..], |s| s.items.as_slice());
         for (index, item) in snap.items.iter().take(item_count).enumerate() {
             let label = if snap.id == ActivityId::DISK {
                 let field = |name| {
@@ -686,19 +687,10 @@ impl NativeSummaryBuilder {
             } else {
                 item_label(snap.id, def.shape, index, item.key.as_deref())
             };
-            // 前サンプルの同一 item を探す。**位置ではなく識別子で対応付ける**。
-            let (prev_item, same_item) = match (prev_snap, item.key.as_deref()) {
-                (Some(p), Some(k)) => match p.item_by_key(k) {
-                    Some(pi) => (Some(pi), true),
-                    // 同じ名前の item が前サンプルに無い = 着脱または名前の再利用
-                    None => (None, false),
-                },
-                (Some(p), None) => match p.items.get(index) {
-                    Some(pi) => (Some(pi), true),
-                    None => (None, false),
-                },
-                (None, _) => (None, false),
-            };
+            // 前サンプルの同一 item を探す。規則は全出力と共有する
+            // (`A_DISK` は major / minor、名前を持つ item は名前、それ以外は位置)。
+            // 見つからない = 着脱・名前の再利用で、差分を作らない。
+            let prev_item = matching_prev_item(snap.id, plan, prev_items, item, index);
 
             let ctx = ComputeContext {
                 itv_cs: timing.itv_cs,
@@ -708,21 +700,14 @@ impl NativeSummaryBuilder {
                     (true, None) => None,
                     (false, _) => None,
                 },
-                continuous: view.continuous && same_item,
+                continuous: view.continuous && prev_item.is_some(),
                 has_prev: view.has_prev && prev_item.is_some(),
                 // CPU の `all` 行 / `A_IRQ` の合計列は集約 item として扱う
                 aggregate_item: label == "all" || label == "sum",
             };
 
-            let prepared = prepare_item(
-                snap.id,
-                plan,
-                index,
-                prev_snap.map_or(&[], |s| s.items.as_slice()),
-                &snap.items,
-                ctx,
-            )
-            .expect("現在の item は存在する");
+            let prepared = prepare_item(snap.id, plan, index, prev_items, &snap.items, ctx)
+                .expect("現在の item は存在する");
             let prev_item = prev_item.map(|_| &prepared.prev);
             let item = &prepared.curr;
             let ctx = prepared.ctx;
@@ -1289,7 +1274,17 @@ mod tests {
                 };
                 let lo = graded_item(&plan, 100, 7);
                 let hi = graded_item(&plan, 1_000, 37);
-                let (first, second) = if increasing { (lo, hi) } else { (hi, lo) };
+                let (first, mut second) = if increasing { (lo, hi) } else { (hi, lo) };
+                // 同じ item の 2 サンプルにするため、識別子列は揃える。
+                // `A_DISK` は major / minor が違うと別デバイスとして扱い、差分を作らない
+                // (本家 `check_disk_reg()`)。揃えないとディスクの列が検査から黙って抜ける。
+                for (column, meta) in def.columns.iter().enumerate() {
+                    if meta.kind == ValueKind::Identity
+                        && let Some(Some(field)) = plan.column_fields.get(column)
+                    {
+                        second.values[field.index()] = first.values[field.index()];
+                    }
+                }
 
                 let mut f = Feed::new(def.id, opts_all());
                 f.push(snapshot(def.id, 1_000, 100_000, vec![first]), true);
@@ -1995,5 +1990,76 @@ mod tests {
             .map(|i| i.item.as_str())
             .collect();
         assert_eq!(labels, vec!["all", "cpu0", "cpu1"]);
+    }
+
+    /// 区間値の時系列から値のある点だけを取り出す。
+    fn observed(s: &NativePeriodSummary, id: ActivityId, item: &str, column: &str) -> Vec<f64> {
+        s.timelines
+            .get(&MetricKey::new(id, item, column))
+            .map(|t| t.points.iter().filter_map(|p| p.value).collect())
+            .unwrap_or_default()
+    }
+
+    /// **回帰テスト (指摘 9)**: `A_DISK` の差分は `major` / `minor` が同じディスクと取る。
+    ///
+    /// 以前は前サンプルを位置で引いていたため、ディスクが 1 台消えると後ろの
+    /// ディスクが隣のディスクの前値と差分を取り、1 台増えると後ろのディスクが
+    /// 「前サンプルに居ない」扱いになっていた。`detect` もこの区間値を使う。
+    #[test]
+    fn disk_delta_follows_major_minor_when_disks_come_and_go() {
+        let id = ActivityId::DISK;
+        let plan = plan_for(id);
+        let mut f = Feed::new(id, opts_all());
+        let disk = |major: u64, minor: u64, ios: u64| {
+            item_of(
+                &plan,
+                &[("major", major), ("minor", minor), ("nr_ios", ios)],
+            )
+        };
+        f.push(
+            snapshot(
+                id,
+                1000,
+                100_000,
+                vec![disk(8, 0, 1_000), disk(8, 16, 50_000), disk(65, 16, 2_000)],
+            ),
+            true,
+        );
+        // dev8-16 が消え、dev65-16 が位置 2 → 1 へ
+        f.push(
+            snapshot(
+                id,
+                1001,
+                100_100,
+                vec![disk(8, 0, 1_010), disk(65, 16, 2_030)],
+            ),
+            true,
+        );
+        // dev8-32 が位置 1 に現れ、dev65-16 が位置 1 → 2 へ
+        f.push(
+            snapshot(
+                id,
+                1002,
+                100_200,
+                vec![disk(8, 0, 1_020), disk(8, 32, 700), disk(65, 16, 2_080)],
+            ),
+            true,
+        );
+        let s = f.finish();
+
+        // 1 秒ごとに +30 / +50 件
+        assert_eq!(observed(&s, id, "dev65-16", "tps"), vec![30.0, 50.0]);
+        let c = s.column(id, "dev65-16", "tps").expect("列");
+        assert_eq!(c.intervals, 2);
+        assert_eq!(c.mean, Some(40.0));
+        assert_eq!(observed(&s, id, "dev8-0", "tps"), vec![10.0, 10.0]);
+        // 新しく現れたディスクは差分を作らない (全ゼロからの差分を観測にしない)
+        let c = s.column(id, "dev8-32", "tps").expect("列");
+        assert_eq!(c.intervals, 0);
+        assert!(
+            c.exclusions
+                .iter()
+                .any(|e| e.reason == ExclusionReason::ItemReplaced)
+        );
     }
 }

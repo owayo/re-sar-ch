@@ -2486,6 +2486,8 @@ impl PreparedItem {
 }
 
 /// CPU の分母・端点、softnet hotplug、デバイス再登録を共通処理する。
+///
+/// 前サンプルの対応付けは [`matching_prev_item`] で行う。
 pub fn prepare_item(
     id: ActivityId,
     plan: &DecodePlan,
@@ -2495,12 +2497,7 @@ pub fn prepare_item(
     mut ctx: ComputeContext,
 ) -> Option<PreparedItem> {
     let curr = curr_items.get(index)?;
-    let prev = match curr.key.as_deref() {
-        Some(key) if id != ActivityId::IRQ => {
-            prev_items.iter().find(|p| p.key.as_deref() == Some(key))
-        }
-        _ => prev_items.get(index),
-    };
+    let prev = matching_prev_item(id, plan, prev_items, curr, index);
     let replaced = ctx.has_prev
         && (prev.is_none() || prev.is_some_and(|p| item_reregistered(id, plan, p, curr)));
     let mut out = PreparedItem {
@@ -2567,6 +2564,72 @@ pub fn prepare_item(
         _ => {}
     }
     Some(out)
+}
+
+/// 前サンプルの item 群から、現サンプルの `index` 番目の item (`curr`) と
+/// 同じ item を探す。
+///
+/// **全出力・集計はここで前サンプルを対応付ける。** 位置で突き合わせると、
+/// デバイスの着脱で配列がずれたときに別のデバイスの値と差分を取ってしまう
+/// (`A_DISK` で 1 台消えると、後ろのディスクがすべて隣のディスクの前値を引く)。
+///
+/// | activity | 対応付けの鍵 | 典拠 |
+/// |---|---|---|
+/// | `A_DISK` | `major` / `minor` (名前は wire に無い) | 本家 `check_disk_reg()` |
+/// | `A_IRQ` | 保存位置 (名前は CPU "all" 行にしか無く、本家も位置で引く) | 本家 `print_irq_stats()` |
+/// | 名前を持つ item | 名前 (`interface` / `fs_name` など) | 本家 `check_net_dev_reg()` など |
+/// | 名前を持たない item (CPU / センサなど) | 保存位置 | |
+///
+/// 見つからなければ `None` (新規登録。本家の `-1`)。
+/// 見つかったが再登録されたもの (本家の `-2`) の判定は [`item_reregistered`] が行う。
+pub fn matching_prev_item<'a>(
+    id: ActivityId,
+    plan: &DecodePlan,
+    prev_items: &'a [ItemSnapshot],
+    curr: &ItemSnapshot,
+    index: usize,
+) -> Option<&'a ItemSnapshot> {
+    if id == ActivityId::DISK {
+        return disk_prev_item(plan, prev_items, curr, index);
+    }
+    match curr.key.as_deref() {
+        Some(key) if id != ActivityId::IRQ => {
+            prev_items.iter().find(|p| p.key.as_deref() == Some(key))
+        }
+        _ => prev_items.get(index),
+    }
+}
+
+/// `A_DISK` の前サンプルを `major` / `minor` で探す (本家 `check_disk_reg()`)。
+///
+/// 本家と同じく**同じ位置から探し始め、末尾で先頭へ折り返して**一周し、
+/// 最初に一致したものを採る。開始位置は「前サンプルの item 数 − 1」で頭打ちにする。
+/// デバイス構成が変わらない普通の区間では 1 回目の比較で見つかる。
+///
+/// `major` / `minor` が読めない item は 0 とみなす。本家は 0 埋めした構造体の値を
+/// 比べており、`sar` 互換テキストの対応付け (`ItemKey::Dev`) も同じ扱いである。
+/// この 0 は同一性の鍵としてだけ使い、値の計算には入らない。どの item の番号も
+/// 読めなければ探索の開始位置で一致するので、位置で対応付けたのと同じ結果になる。
+fn disk_prev_item<'a>(
+    plan: &DecodePlan,
+    prev_items: &'a [ItemSnapshot],
+    curr: &ItemSnapshot,
+    index: usize,
+) -> Option<&'a ItemSnapshot> {
+    let device = |item: &ItemSnapshot| {
+        (
+            raw_column(plan, item, disk_col::MAJOR).unwrap_or(0),
+            raw_column(plan, item, disk_col::MINOR).unwrap_or(0),
+        )
+    };
+    // 前サンプルに 1 台も無ければ必ず新規
+    let last = prev_items.len().checked_sub(1)?;
+    let start = index.min(last);
+    let wanted = device(curr);
+    (start..prev_items.len())
+        .chain(0..start)
+        .map(|j| &prev_items[j])
+        .find(|p| device(p) == wanted)
 }
 
 /// item 群をフィールド単位で合算する。
@@ -5697,5 +5760,231 @@ mod tests {
             Err(ComputeIssue::UnsupportedBySource),
             "厳密モードは代用しない"
         );
+    }
+
+    // ---- 前サンプルの対応付け (指摘 9) ----
+
+    /// `A_DISK` の 1 台分 (`major` / `minor` / `nr_ios`)。
+    fn disk_item(plan: &DecodePlan, major: u64, minor: u64, ios: u64) -> ItemSnapshot {
+        let mut it = zeros(plan);
+        put(plan, &mut it, disk_col::MAJOR, major);
+        put(plan, &mut it, disk_col::MINOR, minor);
+        put(plan, &mut it, disk_col::TPS, ios);
+        it
+    }
+
+    /// **回帰テスト (指摘 9)**: `A_DISK` の前サンプルは位置ではなく
+    /// `major` / `minor` で対応付ける (本家 `check_disk_reg()`)。
+    ///
+    /// 以前は名前を持たない item を位置で突き合わせていたため、ディスクが 1 台
+    /// 消えると後ろのディスクが隣のディスクの前値と差分を取っていた
+    /// (`show` / `summarize` / `detect` / `sadf` で `tps` が 918 のような値になる)。
+    #[test]
+    fn disk_previous_sample_is_found_by_major_minor() {
+        let plan = plan_for(ActivityId::DISK);
+        let meta = &lookup(ActivityId::DISK).unwrap().columns[disk_col::TPS];
+        let prev = vec![
+            disk_item(&plan, 8, 0, 1_000),
+            disk_item(&plan, 8, 16, 50_000),
+            disk_item(&plan, 65, 16, 2_000),
+        ];
+        // dev8-16 が消え、dev65-16 が位置 2 → 1 へずれる
+        let curr = vec![
+            disk_item(&plan, 8, 0, 1_010),
+            disk_item(&plan, 65, 16, 2_030),
+        ];
+
+        let found = matching_prev_item(ActivityId::DISK, &plan, &prev, &curr[1], 1);
+        assert_eq!(
+            found.map(|p| raw_column(&plan, p, disk_col::TPS)),
+            Some(Ok(2_000)),
+            "位置 1 の dev8-16 ではなく dev65-16 を引く"
+        );
+
+        let p = prepare_item(
+            ActivityId::DISK,
+            &plan,
+            1,
+            &prev,
+            &curr,
+            ComputeContext::new(100),
+        )
+        .unwrap();
+        assert!(!p.replaced);
+        // 1 秒で 30 件 (隣の dev8-16 と差分を取ると再登録扱いの 2030 件になる)
+        for policy in [MissingPolicy::Compat, MissingPolicy::Strict] {
+            assert_eq!(
+                p.computed(ActivityId::DISK, disk_col::TPS, meta, &plan, policy),
+                Ok(30.0),
+                "{policy:?}"
+            );
+        }
+    }
+
+    /// 前サンプルに居ない `A_DISK` は新規登録 (本家の `-1`)。前値は全ゼロで、
+    /// 厳密モードは差分を作らない。
+    #[test]
+    fn disk_missing_from_the_previous_sample_is_new() {
+        let plan = plan_for(ActivityId::DISK);
+        let meta = &lookup(ActivityId::DISK).unwrap().columns[disk_col::TPS];
+        let prev = vec![disk_item(&plan, 8, 0, 1_000)];
+        let curr = vec![disk_item(&plan, 8, 0, 1_010), disk_item(&plan, 8, 32, 700)];
+
+        assert!(matching_prev_item(ActivityId::DISK, &plan, &prev, &curr[1], 1).is_none());
+        assert!(
+            matching_prev_item(ActivityId::DISK, &plan, &[], &curr[0], 0).is_none(),
+            "前サンプルに 1 台も無ければ新規"
+        );
+
+        let p = prepare_item(
+            ActivityId::DISK,
+            &plan,
+            1,
+            &prev,
+            &curr,
+            ComputeContext::new(100),
+        )
+        .unwrap();
+        assert!(p.replaced);
+        assert_eq!(
+            p.computed(
+                ActivityId::DISK,
+                disk_col::TPS,
+                meta,
+                &plan,
+                MissingPolicy::Compat
+            ),
+            Ok(700.0),
+            "互換出力は本家と同じく全ゼロからの差分"
+        );
+        assert_eq!(
+            p.computed(
+                ActivityId::DISK,
+                disk_col::TPS,
+                meta,
+                &plan,
+                MissingPolicy::Strict
+            ),
+            Err(ComputeIssue::Discontinuous(Discontinuity::ItemReplaced))
+        );
+    }
+
+    /// `A_DISK` の探索は同じ位置から始め、末尾で先頭へ折り返し、最初に一致した
+    /// ものを採る (本家 `check_disk_reg()` と同じ順序)。開始位置は
+    /// 「前サンプルの item 数 − 1」で頭打ちにする。同じ番号が重複した
+    /// ファイルでも本家と同じ相手を選ぶ。
+    #[test]
+    fn disk_search_starts_at_the_same_position_and_wraps_around() {
+        let plan = plan_for(ActivityId::DISK);
+        // dev8-0 が位置 0 と 2 に重複している
+        let prev = vec![
+            disk_item(&plan, 8, 0, 1),
+            disk_item(&plan, 8, 16, 2),
+            disk_item(&plan, 8, 0, 3),
+        ];
+        let matched = |index: usize, major: u64, minor: u64| {
+            let curr = disk_item(&plan, major, minor, 10);
+            matching_prev_item(ActivityId::DISK, &plan, &prev, &curr, index)
+                .map(|p| raw_column(&plan, p, disk_col::TPS).unwrap())
+        };
+        assert_eq!(matched(0, 8, 0), Some(1));
+        assert_eq!(matched(2, 8, 0), Some(3), "同じ位置から探す");
+        assert_eq!(matched(2, 8, 16), Some(2), "末尾で先頭へ折り返す");
+        assert_eq!(matched(9, 8, 0), Some(3), "開始位置は末尾で頭打ち");
+        assert_eq!(matched(1, 8, 48), None);
+    }
+
+    /// `A_DISK` 以外の対応付けは従来どおり
+    /// (名前を持つ item は名前、`A_IRQ` と名前を持たない item は位置)。
+    #[test]
+    fn other_activities_keep_their_matching_rules() {
+        let plan = plan_for(ActivityId::NET_DEV);
+        let named = |name: &str| {
+            let mut it = zeros(&plan);
+            it.key = Some(name.into());
+            it
+        };
+        let prev = vec![named("eth0"), named("eth1")];
+        let found = matching_prev_item(ActivityId::NET_DEV, &plan, &prev, &named("eth1"), 0);
+        assert_eq!(found.and_then(|p| p.key.as_deref()), Some("eth1"));
+        assert!(matching_prev_item(ActivityId::NET_DEV, &plan, &prev, &named("eth9"), 0).is_none());
+
+        // `A_IRQ` は名前があっても位置 (名前は CPU "all" 行にしか無い、02 §6.2)
+        let plan = plan_for(ActivityId::IRQ);
+        let named = |name: &str| {
+            let mut it = zeros(&plan);
+            it.key = Some(name.into());
+            it
+        };
+        let prev = vec![named("sum"), named("timer")];
+        let found = matching_prev_item(ActivityId::IRQ, &plan, &prev, &named("timer"), 0);
+        assert_eq!(found.and_then(|p| p.key.as_deref()), Some("sum"));
+
+        // 名前を持たない item は位置
+        let plan = plan_for(ActivityId::CPU);
+        let prev = vec![zeros(&plan), zeros(&plan)];
+        let found = matching_prev_item(ActivityId::CPU, &plan, &prev, &zeros(&plan), 1);
+        assert!(found.is_some_and(|p| std::ptr::eq(p, &prev[1])));
+        assert!(matching_prev_item(ActivityId::CPU, &plan, &prev, &zeros(&plan), 2).is_none());
+    }
+
+    /// 位置のずれたディスクの再登録 (本家の `-2`) は、**番号で見つけた前値**に対して
+    /// 判定する。位置の前値 (別のディスク) で判定すると再登録を見逃す。
+    #[test]
+    fn reregistration_is_judged_against_the_matched_disk() {
+        let plan = plan_for(ActivityId::DISK);
+        let meta = &lookup(ActivityId::DISK).unwrap().columns[disk_col::TPS];
+        let disk = |major, minor, ios, sectors| {
+            let mut it = disk_item(&plan, major, minor, ios);
+            put(&plan, &mut it, disk_col::RKB, sectors);
+            put(&plan, &mut it, disk_col::WKB, sectors);
+            it
+        };
+        let prev = vec![disk(8, 0, 10, 10), disk(8, 16, 50_000, 900_000)];
+        // dev8-16 が位置 0 へずれ、カウンタがすべて減っている (別のディスクに差し替わった)
+        let curr = vec![disk(8, 16, 100, 200)];
+
+        let p = prepare_item(
+            ActivityId::DISK,
+            &plan,
+            0,
+            &prev,
+            &curr,
+            ComputeContext::new(100),
+        )
+        .unwrap();
+        assert!(
+            p.replaced,
+            "番号で見つけた dev8-16 に対して再登録と判定する"
+        );
+        // 互換出力は全ゼロからの差分 (位置 0 の dev8-0 と差分を取ると 90 になる)
+        assert_eq!(
+            p.computed(
+                ActivityId::DISK,
+                disk_col::TPS,
+                meta,
+                &plan,
+                MissingPolicy::Compat
+            ),
+            Ok(100.0)
+        );
+    }
+
+    /// 番号 (`major` / `minor`) が読めない `A_DISK` は、探索の開始位置で一致する
+    /// = 位置で対応付けたのと同じになる。番号が読めないときは item のラベルも
+    /// 位置から作るので (`dev<添字>`)、系列の意味と対応付けが食い違わない。
+    #[test]
+    fn disk_without_readable_numbers_is_paired_by_position() {
+        let plan = plan_for(ActivityId::DISK);
+        // 値を 1 つも持たない item (番号が読めない)
+        let prev = vec![ItemSnapshot::default(); 3];
+        let curr = ItemSnapshot::default();
+        for (index, expected) in [(0, 0), (1, 1), (2, 2), (5, 2)] {
+            let found = matching_prev_item(ActivityId::DISK, &plan, &prev, &curr, index);
+            assert!(
+                found.is_some_and(|p| std::ptr::eq(p, &prev[expected])),
+                "位置 {index}"
+            );
+        }
     }
 }

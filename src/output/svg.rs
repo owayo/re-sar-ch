@@ -1,7 +1,9 @@
-//! SVG charts using the same selected values as sadf. The drawing is reSARch's own.
+//! `sadf -g` の SVG グラフ。値は sadf の他の形式と同じ選択・計算結果を使い、
+//! 描画 (装飾・座標) は reSARch 独自のもの。
 //!
-//! Two scans keep memory proportional to the number of series: measure ranges,
-//! then stream points and segments. Samples are never retained as a full history.
+//! ファイルを 2 回走査して、メモリを系列数に比例する量に抑える
+//! (1 回目で値域を測り、2 回目で点と線分をストリーミングで書く)。
+//! サンプルの全履歴は保持しない。
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -181,7 +183,7 @@ fn validate(options: &SadfOutputOptions) -> Result<()> {
     Ok(())
 }
 
-/// Already computed values for one sample; the output layer only scales coordinates.
+/// 1 サンプル分の計算済みの値。出力層は座標へ縮尺するだけで、値は計算しない。
 fn values(
     view: &IntervalView<'_>,
     cfg: &SadfConfig,
@@ -261,7 +263,7 @@ fn values(
     out
 }
 
-/// Write standalone SVG. Unsupported SVG suboptions are rejected before writing.
+/// 単体で開ける SVG を書く。未対応の `-O` サブオプションは書き始める前に拒否する。
 pub fn write_svg<W: Write>(
     out: &mut W,
     file: &SaFile,

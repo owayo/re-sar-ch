@@ -6,7 +6,7 @@ use re_sar_ch::model::ActivityId;
 use re_sar_ch::output::sadf::{self, SadfConfig};
 use re_sar_ch::output::sar_text::{CpuSelection, SarTextOptions, write_report};
 
-// Wire offsets are independently transcribed from docs/format/02-activities.md.
+// wire のオフセットは docs/format/02-activities.md から独立に書き起こしたもの。
 fn file(activity: ActivitySpec, samples: Vec<Vec<Vec<u8>>>) -> SaFile {
     let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
     spec.activities = vec![activity.clone()];
@@ -114,7 +114,7 @@ fn nic(name: &str, values: [u64; 7]) -> Vec<u8> {
     for (i, v) in values.into_iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
-    // 7 ull (56), speed uint (4), interface[16], duplex byte.
+    // ull 7 個 (56 バイト)、speed は uint (4)、interface[16]、duplex は 1 バイト。
     out[60..60 + name.len()].copy_from_slice(name.as_bytes());
     out
 }

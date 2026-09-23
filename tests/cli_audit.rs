@@ -1,4 +1,4 @@
-//! Independent end-to-end audit of native CLI dimensions and partial-result handling.
+//! 独自サブコマンドの各軸と、途中までしか読めなかった結果の扱いを、CLI の端から端まで独立に確かめる。
 mod fixtures;
 use fixtures::{ActivitySpec, FixtureAbi, FixtureSpec, Generation, RecordSpec, build};
 use std::process::Command;
@@ -177,7 +177,7 @@ fn overnight_filter_keeps_comments_inside_the_selected_window() {
 fn lenient_skips_a_structurally_corrupt_file_and_returns_valid_json_for_later_files() {
     let dir = tempfile::tempdir().unwrap();
     let mut bad = irq_bytes();
-    // 76 magic + 336 header + 36 activity + record hour offset 21.
+    // file_magic 76 + file_header 336 + file_activity 36 に、record_header 内の hour のオフセット 21 を足した位置。
     bad[76 + 336 + 36 + 21] = 99;
     let bad_path = dir.path().join("a-bad.sa");
     std::fs::write(&bad_path, &bad).unwrap();

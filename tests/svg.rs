@@ -12,7 +12,7 @@ use re_sar_ch::output::time_filter::{TimeBound, TimeFilter};
 fn sensor_file(counts: &[i32]) -> SaFile {
     let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
     spec.nodename = "chart<&\"host".into();
-    // docs/format/02-activities.md: A_PWR_FAN, two doubles then device[20], 40 bytes.
+    // docs/format/02-activities.md: A_PWR_FAN は double 2 個の後に device[20] が続く 40 バイト。
     spec.activities = vec![ActivitySpec {
         id: 31,
         magic: 0x8a,
@@ -220,7 +220,7 @@ fn restart_and_cpu_selection_are_respected() {
     );
     assert!(svg.contains("A_CPU / all /"));
     assert!(!svg.contains("A_CPU / 0 /"));
-    // Each series has two points before and two after restart, exactly two segments.
+    // どの系列も再起動の前後に 2 点ずつあり、線分はちょうど 2 本になる。
     assert_eq!(
         svg.matches("class=\"point\"").count(),
         svg.matches("class=\"series\"").count() * 2

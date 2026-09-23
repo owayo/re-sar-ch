@@ -1,4 +1,4 @@
-//! Issue #6/#7/#9: independently authored wire fixtures lock down invalid input and old formats.
+//! Issue #6/#7/#9: 独立に書き起こした wire fixture で、不正な入力と旧世代の扱いを固定する。
 mod fixtures;
 
 use fixtures::{ActivitySpec, ExtraSpec, FixtureAbi, FixtureSpec, Generation, RecordSpec, build};
@@ -246,7 +246,7 @@ fn declared_record_size_need_not_include_final_struct_padding() {
     let spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
     let mut fx = build(spec);
     let fh = fx.file_header_off;
-    // G5 file_header: rec_types_nr at 40,44,48; rec_size at 56 (01 §3.3.5).
+    // G5 の file_header: rec_types_nr は 40・44・48、rec_size は 56 (01 §3.3.5)。
     fx.bytes[fh + 48..fh + 52].copy_from_slice(&2u32.to_le_bytes());
     fx.bytes[fh + 56..fh + 60].copy_from_slice(&28u32.to_le_bytes());
     assert!(open(fx.bytes, Tolerance::Strict).is_ok());

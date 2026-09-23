@@ -494,6 +494,24 @@ SMP (`nr_ini > 1`) のとき、CPU "all" (添字 0) の統計は
   `%user + ... + %idle` は常に 100% になる。オフライン時間はそもそも分母に入らない。
 - `get_per_cpu_interval()` が `scp` を書き換えるため、**CPU "all" の合算値は
   補正後の prev を足し込んだもの**になる。合算を補正前に行うと値がずれる。
+- **`*scc = *scp` は現サンプルのバッファ `buf[curr]` そのものを書き換える。**
+  表示の後に `curr` と `prev` が入れ替わるので、書き換えた値が**次のレコードの前サンプル**
+  になる。1 区間だけオフラインになった CPU は、復帰した区間で「オフラインになる直前の値」
+  との差で行が出て、CPU "all" にも入る。生の前レコード (全ゼロ) を前サンプルにすると
+  「前サンプルでもオフライン」と判定されて行が消え、CPU "all" の値も変わる
+  (本家 `data.tmp` の `-u ALL -P ALL` の 13:20:39 の CPU8 と 13:20:49 の CPU6)。
+  `Average:` の終点 (最後に表示したレコード) も書き換え後の値なので、最後にオフラインだった
+  CPU は基準 (`buf[2]`) との差で平均行に出る (差が 0 なら tickless の固定行)。
+- `get_global_soft_statistics()` (`*ssnc = *ssnp`) と `get_global_int_statistics()`
+  (その CPU の割り込み `nr2` 個を `memcpy`) も同じ書き換えをする。softnet は前サンプルでも
+  オフラインなら書き換えない。割り込みは `-P` で選ばれていない CPU を書き換えない。
+  reSARch では `compute::carry_offline()` が書き換え後の現サンプルを返す。
+- `A_CPU` / `A_IRQ` / `A_NET_SOFT` は `AO_PERSISTENT` で、`read_file_stat_bunch()` は
+  レコードを読む前にバッファを **`nr_ini` 個 (× `nr2`) ぶんゼロで埋める**。
+  レコードごとの item 数 (`has_nr`) が少ないレコードでは、載っていない CPU が全ゼロ =
+  オフラインとして扱われ、上の書き換えの対象になる (`compute::pad_persistent()`)。
+  `nr_ini` はファイルの `file_activity.nr` で始まり、それを超える item 数のレコードを
+  読むと広がり、`LINUX RESTART` で CPU 数に戻る。
 
 ##### 1.4.4 表示される各列の式
 
@@ -618,9 +636,21 @@ sysstat の `Average:` 行には**性質の異なる 2 方式**がある。ど�
 
 `itv_total = get_interval(record_hdr[2].uptime_cs, record_hdr[curr].uptime_cs)`
 
-`avg_count` は「実際に表示されたサンプル数」。`write_stats()` が 1 サンプル表示するたびに
-+1 され、ファイル読み込み時は `write_stats_avg()` の最後に 0 にリセットされる。
+`avg_count` は `write_stats()` が `next_slice()` と `-e` の判定を通したレコードの数で、
+**その activity の item 数を見る前に** +1 される。したがって item が 0 個で行を出さなかった
+レコード (`f_print` を呼ばないレコード) も方式 B の分母に入る。
 **`-i` でスキップされたサンプルはカウントされない**。
+ファイル読み込み時は `write_stats_avg()` の最後に 0 にリセットされるが、`write_stats_avg()` が
+呼ばれるのは平均を出すとき (その activity で 1 回以上表示したとき、`davg > 0`) だけで、
+1 行も出さなかった activity が数えた分は**次に処理する activity の分母へ持ち越される**
+(`avg_count` はグローバル変数)。
+
+方式 B の平均は**保存値の合計を最後に 1 回だけ割る**。固定小数のゲージは
+`(double) Σx / (avg_count * 100)` (`ldavg-*` / `MHz` / PSI の `-10/-60/-300`) で、
+表示値 `x / 100` を足してから `avg_count` で割ると丸めが変わる
+(保存値 1 と 6 の平均は本家 `0.04`、表示値の平均は `0.03`)。瞬時値も `x / 100` の
+割り算で、`x * 0.01` とは値が違う (`35 * 0.01` = 0.35000000000000003 → `--dec=1` で `0.4`、
+本家は `0.3`)。`A_PWR_FAN` の `drpm` は `(Σrpm - Σrpm_min) / avg_count`。
 
 方式 B の実装上の落とし穴:
 
@@ -1289,7 +1319,7 @@ Last:             705       145     17.04     18.92   6008414    102818      1.6
 | `A_IRQ` | `curr.irq_nr == prev.irq_nr` |
 | `A_SERIAL` | `memcmp(prev, curr, STATS_SERIAL_SIZE) == 0` |
 | `A_DISK` | `memcmp(prev, curr, STATS_DISK_SIZE) == 0` |
-| `A_NET_DEV` | `memcmp(prev, curr, STATS_NET_DEV_SIZE2CMP) == 0`。`SIZE2CMP = SIZE - MAX_IFACE_LEN - 1` で、末尾の `interface[]` と `duplex`(1 バイト) を比較対象外にする |
+| `A_NET_DEV` | `memcmp(prev, curr, STATS_NET_DEV_SIZE2CMP) == 0`。`SIZE2CMP = SIZE - MAX_IFACE_LEN - 1`。構造体は 77 バイト + 詰め物 3 バイト = 80 バイトなので、比較範囲 63 バイトは**カウンタ 7 個と `speed` と `interface[]` の先頭 3 バイト**になる (`duplex` は範囲外) |
 | `A_NET_EDEV` | `memcmp(prev, curr, STATS_NET_EDEV_SIZE2CMP) == 0`。`SIZE2CMP = SIZE - MAX_IFACE_LEN` |
 | `A_FS` | `memcmp(prev, curr, STATS_FILESYSTEM_SIZE2CMP) == 0`。`SIZE2CMP = SIZE - 2 * MAX_FS_LEN` (`fs_name` と `mountp` を除外) |
 | `A_NET_SOFT` | `memcmp(prev, curr, STATS_SOFTNET_SIZE) == 0` |
@@ -1297,6 +1327,20 @@ Last:             705       145     17.04     18.92   6008414    102818      1.6
 `-z` 指定時は**ヘッダ行の出力条件が `dish || DISPLAY_ZERO_OMIT(flags)` になる**ため、
 「サンプルごとにヘッダが出る」挙動に変わる (該当 activity のみ)。
 これを再現しないと `-z` 併用時の出力が合わない。
+
+前サンプルに無い (新規登録) / 再登録された item は、`check_*_reg()` が -1 / -2 を返して
+**全ゼロの構造体**が前値になり、比較もその全ゼロ構造体と行う。比較範囲の違いで結果が分かれる。
+
+| activity | 新規・再登録の item |
+|---|---|
+| `A_NET_EDEV` | 比較範囲がカウンタだけなので、全カウンタが 0 なら**省かれる** (本家 `data1.tmp` の `-n EDEV -z`) |
+| `A_NET_DEV` | 比較範囲にインターフェース名の先頭 3 バイトが入るので省かれない |
+| `A_DISK` | 構造体全体 (major / minor を含む) を比べるので省かれない |
+| `A_FS` | 前サンプルに無ければ比べない (`found` が偽) |
+| `A_SERIAL` | 前サンプルに無い回線は `-z` に関係なく行そのものを出さない |
+
+平均行 (`f_print_avg`) でも同じ判定を基準レコード `buf[2]` との間で行う。
+例外は `A_FS` の `Summary:` で、同一判定をしない (§id=37)。
 
 #### 2.8 アイテム名の解決 (`-p` / `-j` / `--dev=` に関わる最重要注意点)
 
@@ -2182,6 +2226,16 @@ val = if c == 0 && curr.irq_nr < prev.irq_nr { 0.0 }        // CPU オフライ�
 `--int=` のリストがあれば `search_list_item(item_list, irq_name)` で絞る。
 CPU 列ループ上限は `c < min(a->nr[curr], a->bitmap->b_size + 1)`。
 
+- **見出しと値で CPU 列のループ上限が違う。** 見出し (`print_hdr_line()` の `*` 展開) は
+  `j < nr_ini` まで回し、値は `c < nr[curr]` (そのレコードに実際に載っていた行数) までしか
+  回さない。瞬時値では載っていない CPU は全ゼロ = masked なので差は出ないが、平均行では
+  前値を持ち越した CPU が unmasked になり、**見出しにだけ現れて値の列が無い**
+  (本家 `data.tmp` の `-I SUM -P ALL` の最後の区間の `CPU9`)。
+- masked の判定と前値の持ち越しは `-P` の選択に依存する (未選択の CPU は書き換えない)。
+- CPU 列が 1 つも残らなくても割り込みの行は出る (名前だけの行)。
+- 前サンプルとの対応は**位置** (`buf[prev] + i * msize`)。`-x` の極値も
+  `(cpu * nr2 + i)` の位置に持つので、列が詰まっても CPU を取り違えない。
+
 ---
 
 #### id=4 `A_SWAP` — `-W`
@@ -2297,8 +2351,9 @@ kbmemfree;kbavail;kbmemused;%memused;kbbuffers;kbcached;kbcommit;%commit;kbactiv
 > swap 側 (`%swpused` / `%swpcad`) と A_HUGE (`%hugused`) は浮動小数除算である。
 
 `avg_*` は瞬時値表示のたびに `+=` で累積され、`Average:` 出力後に 0 にリセットされる
-(`static` 変数)。累積は `!dispavg` のパスのみで行われるため、
-**`Average:` 行が計算に使う `avg_count` は `write_stats()` が数えた表示サンプル数**である。
+(`static` 変数)。累積は `!dispavg` のパスのみで行われる。一方
+**`Average:` 行が割る `avg_count` は `write_stats()` が数えたレコード数**で、
+item 数が 0 のレコードも含む (§1.6.1)。
 
 ##### 7-B swap ブロック (`-S`) — `print_hdr_line(..., SECOND, 0, 9, NULL)`
 
@@ -2932,6 +2987,9 @@ sadf (XML/JSON/CSV) 専用で、テキスト出力では使われない。
   `(bus_nr, vendor_id, product_id)` が一致するエントリを探し、無ければ
   `bus_nr == 0` の空きスロットに保存する。満杯なら `reallocate_buffers()`。
   → `Summary:` は**観測されたすべての USB デバイスの和集合**になる。
+  - `buf[2]` は区間の**基準レコード** (表示されない 1 本目) の複製から始まるので、
+    基準レコードにしかいない装置も `Summary:` に出る。並びは基準 → 途中で現れた順。
+  - 見つかった装置は**上書きしない** (値は最初に見たもの)。`A_FS` とは逆。
 - ヘッダ条件は `dish` のみ(`dispavg` との AND なし)。
 
 ---
@@ -2980,10 +3038,21 @@ iusedpct   = if f_files  != 0 { SP(f_ffree,  f_files,  f_files)  } else { 0.0 }
 
 - A_FS は**平均を取らない**。`Summary:`/`Last:` 行は `buf[2]` のサマリリストに保存された
   「各ファイルシステムの最後に観測された値」をそのまま再表示する。
+  - サマリリストは区間の**基準レコード**の複製から始まり、表示した行で更新される
+    (`fs_name` が一致する枠か空き枠 (`f_blocks == 0`) のうち先頭のものに上書き)。
+    **1 度も表示されなかった基準レコードの FS も出る** (値は基準レコードのまま)。
+    `-z` で省かれ続けた FS がこれに当たる (本家 `sar -z -A` の FS の `Summary:`)。
+  - Summary では `-z` の同一判定をしない (`DISPLAY_ZERO_OMIT(flags) && !dispavg`)。
+  - `-x` の極値は `xdev_list` に**表示名** (`dev_name`) で登録して引く。`-F MOUNT` で
+    マウントポイントを持たない世代を読むと全 FS の表示名が空文字になり、極値を共有する。
+    1 度も表示されなかった FS の極値は未初期化 (`DBL_MAX`) のまま出力される
+    (`Ifree` / `Iused` は `DBL_MAX` を整数へ変換するので処理系依存の値になる)。
+    reSARch はこの 2 行を出さない (§10.9)。
 - `dev_name` = `get_fs_name_to_display(a, flags, sfc)`(`-F` なら `fs_name`、
-  `-F MOUNT` なら `mountp`、`-j` 指定時は永続名)。
+  `-F MOUNT` なら `mountp`、`-j` 指定時は永続名)。`mountp` を持たない世代 (旧形式を
+  `sadf -c` で変換したもの) では `mountp` がゼロ埋めされているので空文字になる。
 - フィルタ: `match_sa_filesystem_item(a->item_list, sfc, dev_name)`
-  (`--fs=` はデバイス名とマウントポイントの**両方**に対してマッチする)。
+  (`--fs=` は表示名・デバイス名・マウントポイントのどれかに一致すれば選ぶ。空の名前は照合しない)。
 - `DISPLAY_ZERO_OMIT` 時: 前サンプルから `fs_name` 一致で探索し、
   `memcmp(sfp, sfc, STATS_FILESYSTEM_SIZE2CMP) == 0`(= `STATS_FILESYSTEM_SIZE - 2*MAX_FS_LEN`、
   名前 2 個を除いた部分)ならスキップ。
@@ -3200,7 +3269,22 @@ if read_from_file { avg_count = 0 }
   ファイルモードでは `davg > 0`(`handle_curr_act_stats()` 内で表示行が 1 回以上あったとき)。
   `interval == 0`(`sar -u` のみでブート以降の統計を出すケース)では
   `write_stats_startup()` が `exit(0)` するので **`Average:` は出ない**。
-- `act[i].nr[curr] > 0` が条件なので、アイテム数 0 のアクティビティは平均行も出ない。
+- `curr` は**最後に表示したレコード** (`handle_curr_act_stats()` が `write_stats_avg(!*curr, …)`
+  と呼ぶ)。`act[i].nr[curr] > 0` の `nr[curr]` もそのレコードの item 数である。
+- **item 数 0 のレコードは前サンプルにならない。** `write_stats()` は `f_print` を 1 回も
+  呼ばなければ 0 を返し、`*curr ^= 1` に届かない。したがって次に表示するレコードの差分・
+  区間長・ヘッダ行の時刻 (`timestamp[!curr]`) は、**最後に表示したレコード**との間で取られる
+  (本家 `data-nr0.tmp` の `sar -d` は見出しが 13:20:09、差分も 13:20:09 → 13:20:39)。
+  `cnt` も `lines` も動かない。ただし `avg_count` はその手前で +1 されている (§1.6.1)。
+  直前に読んだレコードを前サンプルにすると、item が全部「新規」になって全ゼロとの差が出る。
+- **平均行の item 集合と並びは最後に表示したレコードで決まる。** `f_print_avg` は
+  `f_print` と同じく `for (i = 0; i < a->nr[curr]; i++)` で最後のレコードの item を
+  その順に回し、`buf[2]` から同じ item を探して差を取る (`check_disk_reg()` などの照合規則は
+  瞬時値と同じ。見つからなければ全ゼロとの差)。途中で消えた item は平均行に出ず、
+  並びは「最初に見た順」ではなく最後のレコードの順になる
+  (本家 `data.tmp` の `sar -d` / `-n DEV` / `-n EDEV`)。累積配列を位置で持つ activity
+  (`A_PWR_BAT` など) は、最後のレコードに無い位置の平均も出さない。
+  例外は `A_FS` / `A_PWR_USB` の Summary 用リスト (§id=36 / §id=37)。
 
 **平均の計算方式は 2 系統ある**:
 
@@ -3215,9 +3299,11 @@ if read_from_file { avg_count = 0 }
 A_PSI_* の `%scpu` / `%sio` / `%fio` / `%smem` / `%fmem` も再計算、
 `-10`/`-60`/`-300` 列だけ累積平均。A_PWR_BAT の `cap/min` も再計算。
 
-`avg_count` は `write_stats()` が表示成功ごとに `avg_count++` する
-(`unsigned long`、`sar.c`)。ファイルモードでは `write_stats_avg()` の最後に 0 リセット
-(アクティビティごとに独立して数え直す)。
+`avg_count` (`unsigned long`、`sar.c`) は `write_stats()` が `next_slice()` と `-e` の
+判定を通したレコードごとに `avg_count++` する。**その activity の item 数が 0 でも数える**
+(`f_print` を呼ぶかどうかはこの後で決まる)。ファイルモードでは `write_stats_avg()` の最後に
+0 リセットするが、`write_stats_avg()` は `davg > 0` のときしか呼ばれないので、
+1 行も出さなかった activity の数は次の activity の分母へ持ち越される。
 
 #### 8.2 `Summary:` / `Last:` — `Average:` の代わりに出る行
 
@@ -3620,6 +3706,7 @@ Summary:          2      8087        24         0                         $
 | `%memused` / `%commit` の平均が整数除算 | ソース上は確定。`tests/` の値は `tlmkb` が一定かつ 1 サンプルのため差が出ず**実測では区別できない**。**要検証** |
 | `A_NET_FC` に `-z` 処理が無い | ソース上確定。`tests/` に FC + `-z` の組合せが無い。**要検証** |
 | `S_REPEAT_HEADER` の効果 | `tests/` に該当テストが無い(`sar -V` の env ダンプにのみ登場)。**要検証** |
+| 1 度も表示されなかった item の `-x` の極値 | 本家は未初期化の `DBL_MAX` / `-DBL_MAX` をそのまま出す (`sar -z -x -F` で基準レコードにしか現れない FS など)。整数列は `DBL_MAX` の整数変換で処理系依存になる (arm64 の macOS では `18446744073709551615`)。**reSARch は `Minimum:` / `Maximum:` の行を出さない** (意図した差) |
 
 ---
 

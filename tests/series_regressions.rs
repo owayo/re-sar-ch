@@ -423,9 +423,13 @@ fn irq_average_matches_cpu_identity_after_a_middle_column_goes_offline() {
         .lines()
         .find(|l| l.starts_with("Average:") && l.split_whitespace().nth(1) == Some("sum"))
         .unwrap();
+    // CPU1 の列は CPU1 どうしの差 (30.00) で、列が詰まって CPU0 と取り違えない。
+    // 途中でオフラインになった CPU0 は、本家が表示のときに前値 (10) で埋めた値が
+    // 平均行の終点になるので、基準 (10) との差 0 の列として平均行にだけ現れる
+    // (本家 12.8.0 で同じファイルを読んで確認した出力と同じ)。
     assert_eq!(
         average.split_whitespace().collect::<Vec<_>>(),
-        ["Average:", "sum", "60.00", "30.00"],
+        ["Average:", "sum", "60.00", "0.00", "30.00"],
         "{text}"
     );
 }

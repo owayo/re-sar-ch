@@ -70,6 +70,72 @@ fn index(dir: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap()
 }
 
+/// 言語を決める環境変数を外してから `envs` だけを与えて実行する。
+///
+/// 手元の `LANG` などが混ざると、`--lang` を付けない場合の結果が
+/// 実行する環境によって変わる。
+fn run_in_language(input: &Path, dir: &Path, extra: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_resarch"));
+    command
+        .arg("detect")
+        .arg(input)
+        .args(["--format", "json", "--svg-dir"])
+        .arg(dir)
+        .args(["--svg-context", "5m"])
+        .args(extra)
+        .env("TZ", "Pacific/Honolulu");
+    for key in ["RESARCH_LANG", "LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
+        command.env_remove(key);
+    }
+    command.envs(envs.iter().copied()).output().unwrap()
+}
+
+/// 保存された図をすべて読む。
+fn saved_svgs(dir: &Path) -> Vec<(String, String)> {
+    let manifest = index(dir);
+    let charts = manifest["charts"].as_array().unwrap();
+    assert!(!charts.is_empty(), "{manifest:#}");
+    charts
+        .iter()
+        .map(|chart| {
+            let file = chart["file"].as_str().unwrap().to_string();
+            let svg = std::fs::read_to_string(dir.join(&file)).unwrap();
+            (file, svg)
+        })
+        .collect()
+}
+
+/// `open` から最初の `close` までの中身。
+fn between<'a>(svg: &'a str, open: &str, close: &str) -> &'a str {
+    let start = svg.find(open).unwrap_or_else(|| panic!("{open} が無い")) + open.len();
+    let end = svg[start..].find(close).unwrap() + start;
+    &svg[start..end]
+}
+
+/// `class="{class}"` の `<text>` の中身をすべて。
+fn texts_of<'a>(svg: &'a str, class: &str) -> Vec<&'a str> {
+    let open = format!("class=\"{class}\">");
+    svg.match_indices(&open)
+        .map(|(at, _)| {
+            let rest = &svg[at + open.len()..];
+            &rest[..rest.find("</text>").unwrap()]
+        })
+        .collect()
+}
+
+/// 日本語の文字 (全角の記号・かな・漢字・全角英数) を含むか。
+fn has_japanese(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{3000}'..='\u{30ff}'
+                | '\u{3400}'..='\u{4dbf}'
+                | '\u{4e00}'..='\u{9fff}'
+                | '\u{ff00}'..='\u{ffef}'
+        )
+    })
+}
+
 #[test]
 fn detects_local_windows_per_resource_and_keeps_the_normal_report() {
     let temp = tempfile::tempdir().unwrap();
@@ -165,6 +231,108 @@ fn timezone_and_utc_cannot_be_combined() {
     assert!(err.contains("--utc"), "{err}");
 }
 
+/// 図の文は報告の言語に従う。`--lang` で決めても、環境から決めても同じ。
+///
+/// 英語の報告に日本語の図が付くと、図だけを切り出して共有したときに読めない。
+/// 図の言語宣言 (`lang`) と、title・desc・注記 (範囲・凡例)・線の説明を確かめる。
+#[test]
+fn chart_text_follows_the_report_language() {
+    /// 言語の決め方 1 通り。
+    struct Case {
+        name: &'static str,
+        flags: &'static [&'static str],
+        envs: &'static [(&'static str, &'static str)],
+        lang: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "flag-en",
+            flags: &["--lang", "en"],
+            envs: &[],
+            lang: "en",
+        },
+        Case {
+            name: "flag-ja",
+            flags: &["--lang", "ja"],
+            envs: &[],
+            lang: "ja",
+        },
+        // `C` ロケールは「決定的な英語」の指定で、`LANGUAGE` にも負けない
+        Case {
+            name: "c-locale",
+            flags: &[],
+            envs: &[("LC_ALL", "C"), ("LANGUAGE", "ja")],
+            lang: "en",
+        },
+        Case {
+            name: "app-env",
+            flags: &[],
+            envs: &[("RESARCH_LANG", "ja")],
+            lang: "ja",
+        },
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let input = source(temp.path(), "chart<&host", true);
+    for Case {
+        name,
+        flags,
+        envs,
+        lang,
+    } in cases
+    {
+        let dir = temp.path().join(name);
+        let out = run_in_language(&input, &dir, flags, envs);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for (file, svg) in saved_svgs(&dir) {
+            let at = format!("{name} {file}");
+            let root = between(&svg, "<svg ", ">");
+            assert!(root.contains(&format!(" lang=\"{lang}\"")), "{at}: {root}");
+            assert!(
+                root.contains(&format!(" xml:lang=\"{lang}\"")),
+                "{at}: {root}"
+            );
+            // 文を差し替えてもエスケープは保たれる
+            assert!(!svg.contains("chart<&host"), "{at}");
+            // title はホスト名と系列の識別子で、言語に依らない
+            let title = between(&svg, "<title id=\"chart-title\">", "</title>");
+            assert!(title.starts_with("chart&lt;&amp;host — "), "{at}: {title}");
+            assert!(!has_japanese(title), "{at}: {title}");
+
+            let desc = between(&svg, "<desc id=\"chart-description\">", "</desc>");
+            // 英語は語の切れ目で折り返すので、空白で継げば 1 文に戻る
+            let meta = texts_of(&svg, "meta").join(" ");
+            let note = texts_of(&svg, "note").concat();
+            let (desc_says, meta_says, legend_says, note_says) = if lang == "en" {
+                (
+                    "This is neither a probability nor a determination of the cause.",
+                    "s before and after (clipped at the edges of the input and the boot segment)",
+                    "Orange: range the detection rests on / Blue dots: sampled values / \
+                     Green dashes:",
+                    "Lines are visual aids and never join across missing samples",
+                )
+            } else {
+                (
+                    "確率や原因の断定ではない。",
+                    " 秒 (入力・起動区間の端で制限)",
+                    "橙: 検知を裏付けた採取の範囲　青点: 採取値　緑破線:",
+                    "線は補助線。欠測・非隣接・不連続をまたいで結びません。",
+                )
+            };
+            assert!(desc.contains(desc_says), "{at}: {desc}");
+            assert!(meta.contains(meta_says), "{at}: {meta}");
+            assert!(meta.contains(legend_says), "{at}: {meta}");
+            assert!(note.contains(note_says), "{at}: {note}");
+            for text in [desc, &meta, &note] {
+                assert_eq!(has_japanese(text), lang == "ja", "{at}: {text}");
+            }
+        }
+    }
+}
+
 #[test]
 fn report_window_keeps_surrounding_context_and_activity_selection() {
     let temp = tempfile::tempdir().unwrap();
@@ -254,27 +422,31 @@ fn lenient_output_marks_the_bundle_as_partial() {
 fn generated_detect_svgs_are_valid_xml() {
     let temp = tempfile::tempdir().unwrap();
     let input = source(temp.path(), "chart<&host", true);
-    let dir = temp.path().join("charts");
-    let result = run(&input, &dir, &["--svg-context", "5m"]);
-    assert!(result.status.success(), "{:?}", result);
-    let manifest = index(&dir);
-    let charts = manifest["charts"].as_array().unwrap();
-    assert!(!charts.is_empty());
-    for chart in charts {
-        let file = chart["file"].as_str().unwrap();
-        let xml = Command::new("xmllint")
-            .arg("--noout")
-            .arg(dir.join(file))
-            .output()
-            .expect("install xmllint");
-        assert!(
-            xml.status.success(),
-            "{file}: {}",
-            String::from_utf8_lossy(&xml.stderr)
-        );
-        if let Some(preview) = std::env::var_os("RESARCH_SVG_TEST_OUTPUT") {
-            std::fs::create_dir_all(&preview).unwrap();
-            std::fs::copy(dir.join(file), Path::new(&preview).join(file)).unwrap();
+    // 図の文は言語ごとに違うので、両方の言語で確かめる
+    for lang in ["ja", "en"] {
+        let dir = temp.path().join(format!("charts-{lang}"));
+        let result = run(&input, &dir, &["--svg-context", "5m", "--lang", lang]);
+        assert!(result.status.success(), "{:?}", result);
+        let manifest = index(&dir);
+        let charts = manifest["charts"].as_array().unwrap();
+        assert!(!charts.is_empty());
+        for chart in charts {
+            let file = chart["file"].as_str().unwrap();
+            let xml = Command::new("xmllint")
+                .arg("--noout")
+                .arg(dir.join(file))
+                .output()
+                .expect("install xmllint");
+            assert!(
+                xml.status.success(),
+                "{lang} {file}: {}",
+                String::from_utf8_lossy(&xml.stderr)
+            );
+            if let Some(preview) = std::env::var_os("RESARCH_SVG_TEST_OUTPUT") {
+                let preview = Path::new(&preview).join(lang);
+                std::fs::create_dir_all(&preview).unwrap();
+                std::fs::copy(dir.join(file), preview.join(file)).unwrap();
+            }
         }
     }
 }

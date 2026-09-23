@@ -766,12 +766,21 @@ impl SarOptions {
         self.activities.insert(act, flags);
     }
 
-    /// `add_list_item()` 相当。`max_len - 1` バイトで切り詰め、重複は追加しない。
+    /// `add_list_item()` 相当。重複は追加しない。
+    ///
+    /// **長すぎる名前は切り詰めずに捨てる。** 12.8.0 の `add_list_item()` は
+    /// `strnlen(item_name, max_len) == max_len` (= `max_len` バイト以上) なら
+    /// 何もせずに 0 を返す。`--int=nonexist` (8 バイト、`MAX_SA_IRQ_LEN` = 8) は
+    /// 登録されない。1 件も登録されなければリストは空のままで、
+    /// 本家は `item_list == NULL` として絞り込み自体を行わない
+    /// (空リストは [`SarOptions::list_on_cmdline`] が偽になり、出力層も絞らない)。
     fn add_list_item(&mut self, act: Activity, name: &str, max_len: usize) {
-        let name = truncate_bytes(name, max_len.saturating_sub(1)).to_string();
         let list = self.item_lists.entry(act).or_default();
-        if !list.contains(&name) {
-            list.push(name);
+        if name.len() >= max_len {
+            return;
+        }
+        if !list.iter().any(|n| n == name) {
+            list.push(name.to_string());
         }
     }
 
@@ -1981,10 +1990,26 @@ mod tests {
     }
 
     #[test]
-    fn int_item_names_are_truncated_and_deduplicated() {
-        let o = parse(&["--int=ABCDEFGHIJ,ABCDEFGHXX,LOC,LOC", "-f", "sa01"]);
-        // MAX_SA_IRQ_LEN = 8 → 7 バイトで切り詰め、重複は追加しない
+    fn int_item_names_that_are_too_long_are_dropped_and_duplicates_skipped() {
+        let o = parse(&["--int=ABCDEFGHIJ,ABCDEFGHXX,ABCDEFG,LOC,LOC", "-f", "sa01"]);
+        // MAX_SA_IRQ_LEN = 8 → 8 バイト以上の名前は切り詰めずに捨てる
+        // (12.8.0 の `add_list_item()`)。7 バイトまでは登録し、重複は追加しない。
         assert_eq!(o.item_list(Activity::Irq), ["ABCDEFG", "LOC"]);
+    }
+
+    /// 登録できる名前が 1 つも無ければ絞り込みそのものをしない。
+    ///
+    /// `--int=nonexist` は 8 バイトで `MAX_SA_IRQ_LEN` に達するので登録されず、
+    /// 本家は `item_list == NULL` のまま全割り込みを出す。
+    #[test]
+    fn list_of_only_too_long_names_means_no_filter() {
+        let o = parse(&["--int=nonexist", "-I", "ALL", "-f", "sa01"]);
+        assert!(o.item_list(Activity::Irq).is_empty());
+        assert!(!o.list_on_cmdline(Activity::Irq));
+        // 境界: 7 バイトは登録される
+        let o = parse(&["--int=nonexis", "-I", "ALL", "-f", "sa01"]);
+        assert_eq!(o.item_list(Activity::Irq), ["nonexis"]);
+        assert!(o.list_on_cmdline(Activity::Irq));
     }
 
     // ---------------------------------------------------------------
@@ -2025,8 +2050,13 @@ mod tests {
     }
 
     #[test]
-    fn iface_names_are_truncated_to_15_bytes() {
-        let o = parse(&["--iface=0123456789abcdefghij", "-f", "sa01"]);
+    fn iface_names_of_16_bytes_or_more_are_dropped() {
+        // MAX_IFACE_LEN = 16 → 16 バイト以上は登録しない (切り詰めない)
+        let o = parse(&[
+            "--iface=0123456789abcdefghij,0123456789abcdef,0123456789abcde",
+            "-f",
+            "sa01",
+        ]);
         assert_eq!(o.item_list(Activity::NetDev), ["0123456789abcde"]);
     }
 

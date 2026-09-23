@@ -47,6 +47,16 @@ skill   … AI エージェント向けスキルの埋め込みとインスト�
   `SarTextOptions` に載せて渡す。出力層が `std::env::var` を直接呼ぶと、
   同じ入力・同じオプションでも出力が変わる隠れた依存になり、ライブラリとして
   呼んだときやテストの並行実行で再現しない (`set_var` は edition 2024 で `unsafe`)。
+- **別の版の `sar` を再現する経路は現行版と共有しない。**
+  `--sar-profile sysstat-10.1.5-el7` (RHEL / CentOS 7 の `sar`) の計算は `series::el7`、
+  描画は `output::sar_el7`、引数は `cli::sar_el7_args` にあり、
+  `series::compute` / `output::sar_text` / `cli::sar_args` を分岐させない。
+  式・C の型の幅・演算順序・平均の丸め・描画の流れが版ごとに違い、共有すると片方の修正が
+  もう片方の出力を黙って変える。「出力層で値を計算しない」は el7 経路でも同じ。
+  プロファイルはファイルの版から自動で選ばない (`docs/design.md` §9.1)。
+- **数学的に等価な式へ整理しない。** 本家が `x / 10.0` と書くところを `x * 0.1` にすると、
+  0.1 が二進で正確に表せないため丸め境界で 1 桁ずれる (`%util` で実際に起きた)。
+  本家の演算の順序と割り算・掛け算の別をそのまま写す。
 
 ## 利用者から見える変更をしたとき
 
@@ -85,6 +95,19 @@ cargo run --example scan -- <sa ファイル>        # 単体確認 (exact=true 
 ```
 
 `exact=true` はレイアウト解釈が正しいことの強い証拠になる。ずれていれば必ず残余バイトが出る。
+
+### el7 の経路 (`series::el7` / `output::sar_el7` / `cli::sar_el7_args`) を触ったとき
+
+```bash
+cargo test --test sar_el7
+```
+
+これは自作 fixture で el7 の癖を固定するだけなので、値の変わる修正では
+**本家 el7 の `sar` とも突き合わせる。** CentOS の vault にある
+`sysstat-10.1.5-*.el7*.src.rpm` の全パッチを当ててビルドした `sar` と、
+同じ sa ファイル・引数・`LC_ALL=C`・`TZ` で stdout と終了コードを比べる
+(手順は `docs/format/05-sysstat-10.1.5-el7.md` §6.2)。
+GPL のソースとその出力はリポジトリの外に置く。
 
 ## テスト資産の扱い
 

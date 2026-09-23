@@ -8,8 +8,11 @@ description: >-
   0x2171 / 0x2173) のファイルも直読でき、32bit / big-endian で採取されたものも読める。
   どのバージョンの sysstat が書いたファイルかは resarch identify が答える
   (読めない最古世代 0x115a〜0x216f も識別できる)。
+  RHEL / CentOS 7 のホストの sa2 が書く sar テキストも --sar-profile sysstat-10.1.5-el7 で
+  バイト単位に再現できる (sa2sar / sar 互換入口)。
   sa ファイル・sar ログ・sadf・性能障害の事後調査・リソース異変の切り分け、
-  「このファイルはどの sysstat のものか」「sar が読めないと言う」場面で発動。
+  「このファイルはどの sysstat のものか」「sar が読めないと言う」
+  「CentOS 7 の sarDD と同じテキストを作りたい」場面で発動。
 allowed-tools: Bash(resarch:*)
 ---
 
@@ -34,10 +37,19 @@ macOS や Windows で Linux のログを読める。
 | 既存のツールやスクリプトに食わせる (本家と同じテキスト) | `resarch -u -f <file>` / `resarch sadf -j <file>` |
 | 旧世代のファイルを他ツールへ渡せる形に変換する | `resarch sadf -c <file> > out` |
 | sa バイナリを全項目の sar テキストへ保存する | `resarch sa2sar sa13 -o sar13` |
+| RHEL / CentOS 7 のホストの sa2 が書く sarDD と同じテキストを作る | `resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13` |
 
 `sa2sar` は平均・RESTART・COMMENT も含め、既定は採取元に記録された時刻、
 `--utc` で UTC に切り替える。`-o` 省略または `-o -` は標準出力。
 保存先は上書きせず、失敗時も途中までのファイルを保存先に残さない。
+
+**既定の書式は本家 sysstat 12.8.0。** RHEL / CentOS 7 のホスト (sysstat 10.1.5 の el7
+パッケージ) が書いた `sarDD` と突き合わせるときは `--sar-profile sysstat-10.1.5-el7` を付ける。
+列 (`-B` の `%vmeff`、`-d` の `rd_sec/s … svctm`、`-R` ブロック)、CPU `all` 行の求め方、
+平均の整数除算まで el7 の `sar` と同じになり、実ホストのレポートとバイト単位で一致する。
+読めるのは `format_magic` 0x2171 のファイルだけ。プロファイルは自動では選ばれない
+(ヘッダの版は `sadc` の版で、`sa2` の `sar` やパッチまでは分からないため)。
+`-R` を ppc64 系のホストに合わせるなら `--sar-page-size 65536`。
 
 **`sar` が「読めない」と言ったファイルでも読める。** `sar` は `format_magic` が現行と
 違うと即エラーにするが、`resarch` は 5 世代 (`0x1170` / `0x2170` / `0x2171` / `0x2173` /
@@ -230,6 +242,16 @@ resarch sadf -r sa07 -- -b               # 生カウンタ
 - `-P ALL` と `-P all` は別物
 - **`-h` は help ではなく `--pretty --human`**
 - `-s` に一致した**最初のレコードは表示されず、前サンプル (基準値) として消費される**
+
+**`--sar-profile sysstat-10.1.5-el7` を付けると、RHEL / CentOS 7 の `sar` の文法と出力になる。**
+`-h` はヘルプ、`-R` がある、`-I` は `SUM` / `ALL` (先頭 16 本) / `XALL` / 割り込み番号。
+10.1.5 に無いオプション (`--dec=` / `-x` / `-z` / `-r ALL` など) は usage エラー。
+`sadf` にはプロファイルが無く、指定するとエラーになる。
+
+```bash
+resarch --sar-profile sysstat-10.1.5-el7 -A -f sa07      # CentOS 7 の sar -A と同じ
+resarch --sar-profile sysstat-10.1.5-el7 -u -P ALL -f sa07
+```
 
 **互換出力では欠落がゼロ補完される。** 本家が「その世代に無いフィールドを 0 埋めした
 構造体」を読むため。欠落を欠落として知りたいなら独自出力を使うこと。

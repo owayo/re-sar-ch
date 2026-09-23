@@ -117,6 +117,7 @@ resarch -I --int=0,LOC -f sa01           # 割り込みを番号か名前で選�
 resarch sar -A -f sa01                   # 明示的な互換入口
 resarch sadf -j sa01                     # sadf 互換 JSON
 resarch sadf -g sa01 -- -u -P ALL > cpu.svg  # SVG グラフ (reSARch 独自描画)
+resarch --sar-profile sysstat-10.1.5-el7 -u -f sa01  # RHEL/CentOS 7 の sar と同じ出力
 ```
 
 `sar` の癖も意図的に再現しています。`-I` は数値を取らない、`-P ALL` と `-P all` は別物、
@@ -129,11 +130,18 @@ resarch sadf -g sa01 -- -u -P ALL > cpu.svg  # SVG グラフ (reSARch 独自描�
 resarch sa2sar sa13 -o sar13             # 全項目・平均・再起動・コメントを保存
 resarch sa2sar sa13 --utc -o sar13-utc   # UTC の時刻で保存
 resarch sa2sar sa13                     # 標準出力へ (パイプでも使える)
+resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13   # RHEL/CentOS 7 の sa2 が書くテキスト
 ```
 
 既定は `sar -A -C -t -f sa13` 相当で、採取元のホストが記録した時刻を使います。
 `-o` を省略するか `-o -` を指定すると標準出力へ書き出します。保存先に既存の
 ファイルがあっても上書きせず、変換に失敗した場合も書きかけのファイルを残しません。
+
+`--sar-profile sysstat-10.1.5-el7` を付けると、RHEL / CentOS 7 のホストの `sa2` が
+書くとおりのテキストになります。列の構成も計算も平均の丸めも、Red Hat が配布する
+sysstat 10.1.5 に従います。`sa2` がまだ書いていない日の `sarDD` を後から作れば、
+そのホストのほかの日のレポートとバイト単位で揃います。
+詳しくは [RHEL / CentOS 7 の `sar` を再現する](#rhel--centos-7-の-sar-を再現する) を参照してください。
 旧世代や big-endian の入力もそのまま読めます。CI では CLI が生成したファイルを、
 旧世代 3 本・現行 1 本・big-endian 1 本の計 5 本の本家期待出力と全文比較します
 (実行ホストで名前を解決できないディスクにだけ、既存のマスクを適用します)。
@@ -514,8 +522,9 @@ reSARch は他ホストで採取したログに誤った名前を付けないよ
 reSARch は**採取しません**。リアルタイム採取 (`sadc` 相当) は対象外です。
 バイナリの書き出しは、読んだファイルを別世代の配置で書き直す `sadf -c` に限られ、値そのものは変えません。
 テキストやグラフは `sa2sar` / `detect --svg-dir` などで保存できます。
-また「読むファイルの世代」と「再現する出力の世代」は別の設定で、
-v10 のファイルを v12 の `sar` 書式で出すこともその逆もできます。
+また「読むファイルの世代」と「再現する出力の世代」は別の設定です。
+既定ではどの世代のファイルも sysstat 12.8.0 の書式で出し、`--sar-profile` を指定すると
+別の版の `sar` の出力を再現します (次節)。
 
 構文としては解析できるものの、まだ動作しないオプションは、実行時に理由を添えて拒否します。
 
@@ -525,6 +534,48 @@ v10 のファイルを v12 の `sar` 書式で出すこともその逆もでき�
 | `sadf -l` | PCP は未対応 |
 | `sadf -g -O autoscale,packed,customcol` | この 3 つは明示的に拒否。skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday は対応 |
 | `sadf -H` と他形式の併用 | 未対応 (`resarch sadf -H <file>` を使う) |
+
+### RHEL / CentOS 7 の `sar` を再現する
+
+```bash
+resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13
+resarch --sar-profile sysstat-10.1.5-el7 -A -f sa13        # sar 互換入口 (el7 の文法)
+resarch --sar-profile sysstat-10.1.5-el7 -R -f sa13 --sar-page-size 65536   # ppc64le のホスト
+```
+
+| `--sar-profile` | 再現する `sar` | 読めるファイル |
+|---|---|---|
+| `current` (= `sysstat-12.8.0`、既定) | 本家 sysstat 12.8.0 | 全世代 |
+| `sysstat-10.1.5-el7` | RHEL / CentOS 7 の `sysstat-10.1.5-17.el7` 〜 `-20.el7_9` | `format_magic` 0x2171 だけ (10.1.5 本体と同じ) |
+
+RHEL 7 のホストが書くレポートは、既定の出力と列見出し以外にも違いがあるので、
+プロファイルはその `sar` をまるごと再現します。
+
+- **列**: `-B` の末尾が `%vmeff`、`-d` が `rd_sec/s … svctm`、`-A` が `-R`
+  (`frmpg/s bufpg/s campg/s`) を含む、`-r` が 10 列、`-n DEV` に `%ifutil` が無い
+- **計算**: CPU `all` 行は個別 CPU を足し直さず、ファイルの集約スロットを
+  レコードヘッダの uptime で割る。オフライン CPU は `0.00` を出して値を持ち越す。
+  平均の一部は整数で割ってから浮動小数にする (`kbswpcad` の平均 15.5 は `16` でなく `15`)
+- **体裁**: `LINUX RESTART` 行に CPU 数が付かない、`COM` 行の本文をそのまま出す。
+  Red Hat が `NR_CPUS` を 8192 に上げているので、`-A` では 11 サンプルごとに見出しが出る
+- **文法** (`sar` 互換入口): `-h` はヘルプ、`-R` がある、`-I` は `XALL` と割り込み番号を
+  取る。10.1.5 に無いオプションは usage エラー
+
+プロファイルを自動で選ぶことはしません。ファイルのヘッダに記録されているのは
+それを書いた `sadc` の版で、`sa2` が実行した `sar` の版やパッチまでは分からないため、
+推測で出力を切り替えると知らないうちにレポートが変わってしまいます。
+ファイルから決められない入力も 2 つあります。`-R` の kB → ページ換算は `sar` を
+実行したホストのページサイズを使います (`--sar-page-size`、既定 4096 = x86_64 の値)。
+`-p` / `-j` もそのホストでデバイス名を引きますが、reSARch は他ホストのログでは引かず
+`dev<major>-<minor>` のままにします (本家も別のホストで読めば同じになります)。
+`sadf` はプロファイルを持たず、指定するとエラーにします。
+
+検証は、RHEL 7 ホストが自分で書いたレポート (`sa` バイナリ 29 日分と、その `sa2` が
+書いた `sarDD`) とのバイト単位の一致に加え、CentOS のソース RPM からビルドした el7 の
+`sar` との突き合わせで行っています。後者は実データと、全 activity と端のケース
+(オフライン CPU、カウンタの巻き戻り、インターフェース・ディスクの付け外し、
+再起動、コメント) を含む合成データの両方です。規則と検証手順は
+[`docs/format/05-sysstat-10.1.5-el7.md`](docs/format/05-sysstat-10.1.5-el7.md) にあります。
 
 ### `sar` が参照する環境変数
 
@@ -551,6 +602,8 @@ reSARch もこれを再現します。
 
 これらは `sadf` には効きません。本家が `sadf` で `S_F_PREFD_TIME_OUTPUT` を立てないため、
 日付は常に `%Y-%m-%d`、時刻は常に `%H:%M:%S` です。
+`--sar-profile sysstat-10.1.5-el7` では `S_REPEAT_HEADER` も読みません
+(10.1.5 より後の版で入った変数のため)。`S_TIME_FORMAT` は上のとおり効きます。
 
 ## 設計上の要点
 

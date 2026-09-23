@@ -117,6 +117,7 @@ resarch -I --int=0,LOC -f sa01           # pick interrupts by number or name
 resarch sar -A -f sa01                   # explicit compatibility entry point
 resarch sadf -j sa01                     # sadf-compatible JSON
 resarch sadf -g sa01 -- -u -P ALL > cpu.svg  # SVG charts (reSARch drawing)
+resarch --sar-profile sysstat-10.1.5-el7 -u -f sa01  # as RHEL/CentOS 7's own sar prints it
 ```
 
 The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs from
@@ -129,11 +130,18 @@ The quirks are reproduced deliberately: `-I` takes no number, `-P ALL` differs f
 resarch sa2sar sa13 -o sar13             # All activities, averages, restarts and comments
 resarch sa2sar sa13 --utc -o sar13-utc   # Use UTC timestamps
 resarch sa2sar sa13                     # Write to stdout for piping
+resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13   # what a RHEL/CentOS 7 host's sa2 writes
 ```
 
 The default is equivalent to `sar -A -C -t -f sa13`, using timestamps recorded by
 the source host. Omit `-o` or use `-o -` for stdout. Existing destination files
 are never overwritten; failed conversion leaves no partial destination file.
+
+`--sar-profile sysstat-10.1.5-el7` renders the text the way the host's own `sa2` does
+on RHEL / CentOS 7 — the columns, the arithmetic and the rounding of averages all
+follow sysstat 10.1.5 as Red Hat ships it. Use it to fill in a `sarDD` that `sa2` never
+got to write, and it will sit alongside the host's other reports byte for byte.
+See [Reproducing RHEL / CentOS 7's `sar`](#reproducing-rhel--centos-7s-sar).
 Old and big-endian inputs are read directly. CI compares CLI-generated files
 against five upstream golden reports covering three old versions, a current
 format and big-endian data. Only disk names unavailable on the reading host
@@ -506,7 +514,8 @@ reSARch never collects: live sampling (`sadc`) is out of scope. Binary output is
 to re-encoding a file it just read (`sadf -c`), leaving every value alone.
 Text and charts can be saved with `sa2sar`, `detect --svg-dir`, and the other output commands.
 The generation of the file being read and the output format being reproduced are separate
-settings: a v10 file can be rendered in v12 `sar` style, and vice versa.
+settings. By default every generation is rendered the way `sysstat` 12.8.0 renders it;
+`--sar-profile` selects another `sar` to reproduce instead (see below).
 
 Options that are parsed but not yet acted upon are rejected at run time with a reason:
 
@@ -516,6 +525,49 @@ Options that are parsed but not yet acted upon are rejected at run time with a r
 | `sadf -l` | PCP output is not implemented |
 | `sadf -g -O autoscale,packed,customcol` | These SVG options are explicitly rejected; skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday are supported |
 | `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
+
+### Reproducing RHEL / CentOS 7's `sar`
+
+```bash
+resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13
+resarch --sar-profile sysstat-10.1.5-el7 -A -f sa13        # the sar entry point, el7 grammar
+resarch --sar-profile sysstat-10.1.5-el7 -R -f sa13 --sar-page-size 65536   # a ppc64le host
+```
+
+| `--sar-profile` | Reproduces | Reads |
+|---|---|---|
+| `current` (= `sysstat-12.8.0`, default) | upstream `sysstat` 12.8.0 | every generation |
+| `sysstat-10.1.5-el7` | RHEL / CentOS 7's `sysstat-10.1.5-17.el7` … `-20.el7_9` | `format_magic` 0x2171 only, as 10.1.5 itself |
+
+A report written by a RHEL 7 host differs from the default rendering in more than column
+headers, so the profile reproduces the whole of that `sar`:
+
+- **Columns**: `-B` ends with `%vmeff`, `-d` shows `rd_sec/s … svctm`, `-A` includes `-R`
+  (`frmpg/s bufpg/s campg/s`), `-r` has ten columns, `-n DEV` has no `%ifutil`
+- **Arithmetic**: the CPU `all` row divides the file's aggregate slot by the record
+  header's uptime instead of re-summing the CPUs; offline CPUs print `0.00` and carry their
+  last values forward; some averages divide integers before converting to floating point
+  (a `kbswpcad` average of 15.5 prints as `15`, not `16`)
+- **Layout**: `LINUX RESTART` lines carry no CPU count, `COM` lines keep their text as is,
+  and the header repeats every 11 samples under `-A` because Red Hat raised `NR_CPUS` to 8192
+- **Grammar** (on the `sar` entry point): `-h` is help, `-R` exists, `-I` takes `XALL` and
+  interrupt numbers; options that 10.1.5 does not have are usage errors
+
+The profile is never picked automatically. A file's header records the `sadc` that wrote
+it, not the `sar` that `sa2` ran or the patches it was built with, and switching the output
+on a guess would change reports behind your back. Two inputs cannot come from the file at
+all: `-R` converts kilobytes to pages with the page size of the host running `sar`
+(`--sar-page-size`, default 4096 — the x86_64 value), and `-p` / `-j` look up device names
+on that host, which reSARch does not do for a log collected elsewhere (`dev<major>-<minor>`
+stays, as it does when upstream reads the file off-host). `sadf` has no profile and refuses
+the option.
+
+This was checked against a RHEL 7 host's own reports — 29 days of `sa` binaries and the
+`sarDD` its `sa2` wrote match byte for byte — and against el7's `sar` built from the CentOS
+source RPM, on real files and on synthetic ones covering every activity and the corner
+cases (offline CPUs, counter wrap, interface and disk re-registration, restarts, comments).
+The rules and the verification procedure are in
+[`docs/format/05-sysstat-10.1.5-el7.md`](docs/format/05-sysstat-10.1.5-el7.md).
 
 ### Environment variables `sar` reads
 
@@ -542,6 +594,8 @@ in a pipe. reSARch reproduces this.
 
 These variables do not affect `sadf`: upstream never sets `S_F_PREFD_TIME_OUTPUT` there,
 so its dates stay `%Y-%m-%d` and its timestamps stay `%H:%M:%S` regardless.
+Under `--sar-profile sysstat-10.1.5-el7`, `S_REPEAT_HEADER` is not read either — that
+variable arrived after 10.1.5 — while `S_TIME_FORMAT` works as described.
 
 ## Design notes
 

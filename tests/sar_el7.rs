@@ -1797,30 +1797,40 @@ fn disk_rows_follow_check_disk_reg_and_the_extended_stats() {
 
 /// 前サンプルに無い NIC / ディスクは、空き枠 (NIC は名前が `?`、ディスクは
 /// major + minor が 0) が無ければ同じ位置の枠を 0 に戻して使う。そこにいた
-/// 別の NIC (eth0) / ディスク (dev8-16) の枠でも上書きする。
+/// 別の NIC (eth0) / ディスク (dev8-16) の枠でも上書きする。`-n EDEV` も
+/// `-n DEV` と同じ選び方をする。
 #[test]
 fn new_items_take_the_same_rank_without_a_free_slot() {
     let dir = tempfile::tempdir().unwrap();
     let nic = |name: &str, rx| net_dev(name, [rx, 0, 0, 0, 0, 0, 0]);
+    // rx_errors だけを持つ枠 (再登録の判定には rx_errors を使わない)
+    let nic_err = |name: &str, rx_errors| net_edev(name, [0, rx_errors, 0, 0, 0, 0, 0, 0, 0]);
     let dev = |minor, ios| disk((8, minor), ios, (0, 0), [0; 4]);
-    let bytes = samples(&[A_DISK.nr(2), A_NET_DEV.nr(2)], 3, |k| match k {
+    let acts = [A_DISK.nr(2), A_NET_DEV.nr(2), A_NET_EDEV.nr(2)];
+    let bytes = samples(&acts, 3, |k| match k {
         0 => vec![
             dev(0, 100),
             dev(16, 200),
             nic("eth0", 1000),
             nic("eth1", 2000),
+            nic_err("eth0", 1000),
+            nic_err("eth1", 2000),
         ],
         1 => vec![
             dev(0, 700),
             dev(32, 900),
             nic("eth9", 300),
             nic("eth1", 2600),
+            nic_err("eth9", 300),
+            nic_err("eth1", 2600),
         ],
         _ => vec![
             dev(0, 1300),
             dev(32, 1500),
             nic("eth9", 900),
             nic("eth1", 3200),
+            nic_err("eth9", 900),
+            nic_err("eth1", 3200),
         ],
     });
     let file = write(dir.path(), "el7-same-rank", bytes);
@@ -1867,6 +1877,28 @@ fn new_items_take_the_same_rank_without_a_free_slot() {
             nic_row("00:20:00", "eth1", "1.00"),
             nic_row("Average:", "eth9", "0.75"),
             nic_row("Average:", "eth1", "1.00"),
+        ])
+    );
+
+    let err_row = |ts: &str, name: &str, rx_errors: &str| {
+        let mut v = vec![name, rx_errors];
+        v.extend(["0.00"; 8]);
+        line(ts, &v)
+    };
+    assert_eq!(
+        run(&["-n", "EDEV", "-t"], &file),
+        report(&[
+            header(
+                "00:00:00",
+                "     IFACE   rxerr/s   txerr/s    coll/s  rxdrop/s  txdrop/s  txcarr/s  rxfram/s  rxfifo/s  txfifo/s",
+            ),
+            // -n DEV と同じく eth0 の枠を 0 に戻して使う
+            err_row("00:10:00", "eth9", "0.50"),
+            err_row("00:10:00", "eth1", "1.00"),
+            err_row("00:20:00", "eth9", "1.00"),
+            err_row("00:20:00", "eth1", "1.00"),
+            err_row("Average:", "eth9", "0.75"),
+            err_row("Average:", "eth1", "1.00"),
         ])
     );
 }

@@ -536,17 +536,25 @@ pub fn write_report<W: Write>(out: &mut W, file: &SaFile, opts: &El7Options) -> 
         )));
     };
     let cpu_nr = i64::from(cpu.nr);
-    let selected: Vec<FileActivityEntry> = known
+    // 選んだ activity がファイルに 1 つも無いときだけ止める。本家はこの判定で
+    // magic を見ないので、magic の違う activity も「ファイルにある」と数える。
+    // そうした activity は `selected` に入らず、バナー (と最初の統計レコードより
+    // 前の COMMENT / RESTART) だけを出して正常に終わる。
+    if !file
+        .activities()
         .iter()
-        .filter(|a| opts.activities.contains(&a.id))
-        .copied()
-        .collect();
-    if selected.is_empty() {
+        .any(|a| opts.activities.contains(&a.id))
+    {
         return Err(crate::Error::Other(format!(
             "Requested activities not available in file {}",
             file.path().display()
         )));
     }
+    let selected: Vec<FileActivityEntry> = known
+        .iter()
+        .filter(|a| opts.activities.contains(&a.id))
+        .copied()
+        .collect();
 
     let io = |e: io::Error| crate::Error::Io {
         path: file.path().to_path_buf(),

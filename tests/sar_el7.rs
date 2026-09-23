@@ -2838,6 +2838,44 @@ fn unknown_activities_are_skipped_by_their_declared_size() {
     assert_eq!(run(&["-q", "-t"], &bad_magic), expected);
 }
 
+/// 選んだ activity がファイルにあっても、magic が違えば読めない。本家はこれを
+/// 「ファイルにある」と数えて誤りにはせず、バナーと、最初の統計レコードより前の
+/// COMMENT / RESTART だけを出して正常に終わる。
+#[test]
+fn selected_activity_with_an_unknown_magic_prints_only_the_banner() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = || queue(1, 1, [1, 1, 1], 1);
+    let mut recs = vec![Rec::Comment {
+        hms: (0, 0, 0),
+        text: "boot",
+    }];
+    recs.extend((0..2).map(|k| sample(k, &[q()])));
+    recs.push(Rec::Comment {
+        hms: (0, 15, 0),
+        text: "later",
+    });
+    recs.push(sample(2, &[q()]));
+    let file = write(
+        dir.path(),
+        "el7-queue-magic",
+        build(&[A_CPU, A_QUEUE.magic(0x8a)], &recs),
+    );
+    assert_eq!(
+        run(&["-q", "-C", "-t"], &file),
+        report(&["00:00:00     COM boot".into()])
+    );
+    // 読める activity と一緒に選べば、そちらだけが出る
+    assert_eq!(
+        run(&["-q", "-u", "-t"], &file),
+        report(&[
+            header("00:00:00", CPU_HEADER),
+            idle_all("00:10:00"),
+            idle_all("00:20:00"),
+            idle_all("Average:"),
+        ])
+    );
+}
+
 /// 読める A_CPU (el7 と同じ magic のもの) が無いファイルは読めない。
 ///
 /// 本家は `handle_invalid_sa_file()` で終了コード 3 を返すが、reSARch は誤りを

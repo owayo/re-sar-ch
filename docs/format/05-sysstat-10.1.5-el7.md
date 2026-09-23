@@ -52,6 +52,15 @@ el7 のパッケージは upstream の 10.1.5 に 40 本以上のパッチを当
 
 骨格は現行版と同じ「区間 × activity ごとにファイルを読み直す」形だが、細部が違う。
 
+描画の前に、本家の `check_file_actlst()` と同じ判定でファイルの activity を選ぶ。
+
+| 場合 | 扱い |
+|---|---|
+| el7 が知らない id、または magic の違う activity | 宣言された `size × nr × nr2` だけ読み飛ばし、表示しない |
+| el7 と同じ magic の `A_CPU` が無い | `Invalid system activity file` で止める |
+| 選んだ activity の id がファイルに 1 つも無い | `Requested activities not available` で止める |
+| 選んだ activity の id はあるが magic が違う | 止めない。**この判定は magic を見ない**ので、バナーと、最初の統計レコードより前の COMMENT / RESTART だけを出して正常に終わる |
+
 ```mermaid
 flowchart TB
     B["バナー行 (print_report_hdr)"] --> R0

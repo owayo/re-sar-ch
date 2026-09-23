@@ -24,7 +24,7 @@
 //! 軸ラベルを作るときだけ [`DisplayTz`] で実時刻へ戻す。
 
 use crate::model::DisplayTz;
-use crate::output::json::{FieldOut, Quality, SampleOut};
+use crate::output::json::{FieldOut, SampleOut};
 
 use super::{display_item, visible_fields};
 
@@ -236,18 +236,10 @@ pub fn is_plottable(f: &FieldOut) -> bool {
     f.kind != "identity" && f.text.is_none() && f.unit != "identifier"
 }
 
-/// 列の品質が「値が無い」ことを示すか (ピッカーの注記に使う)。
-pub fn quality_note(q: Quality) -> Option<&'static str> {
-    match q {
-        Quality::Ok => None,
-        other => Some(other.label()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::json::{ActivityOut, ItemOut};
+    use crate::output::json::{ActivityOut, ItemOut, Quality};
 
     fn field(name: &'static str, value: Option<f64>, quality: Quality) -> FieldOut {
         FieldOut {

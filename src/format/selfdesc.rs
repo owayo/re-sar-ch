@@ -91,16 +91,6 @@ const RH_TAIL: &[WireField] = &[
     WireField::natural("second", FieldTy::U8),
 ];
 
-/// `extra_desc` の `int` グループ。
-const XD_INT: &[WireField] = &[
-    WireField::natural("extra_nr", FieldTy::U32),
-    WireField::natural("extra_size", FieldTy::U32),
-    WireField::natural("extra_next", FieldTy::U32),
-    WireField::natural("extra_types_nr_0", FieldTy::U32),
-    WireField::natural("extra_types_nr_1", FieldTy::U32),
-    WireField::natural("extra_types_nr_2", FieldTy::U32),
-];
-
 /// 型別フィールド数の申告値。`[unsigned long long, unsigned long, int]` の順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypesNr(pub [u32; 3]);
@@ -193,18 +183,6 @@ pub fn resolve_record_header(
     push_group(&mut fields, RH_INT, types_nr.int(), FieldTy::U32);
     fields.extend_from_slice(RH_TAIL);
     resolve_fields("record_header@2175", &fields, AlignSpec::Natural, enc)
-}
-
-/// `extra_desc` を構築して解決する。
-pub fn resolve_extra_desc(
-    types_nr: TypesNr,
-    enc: &SourceEncoding,
-) -> Result<ResolvedLayout, LayoutError> {
-    let mut fields: Vec<WireField> = Vec::with_capacity(8);
-    push_group(&mut fields, &[], types_nr.ull(), FieldTy::U64);
-    push_group(&mut fields, &[], types_nr.ul(), FieldTy::CULong);
-    push_group(&mut fields, XD_INT, types_nr.int(), FieldTy::U32);
-    resolve_fields("extra_desc@2175", &fields, AlignSpec::Natural, enc)
 }
 
 /// 統計構造体を、型グループの申告だけから解決する。

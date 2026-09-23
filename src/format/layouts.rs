@@ -17,7 +17,7 @@
 //! 読み替える (自己記述形式)。ここに置く定義は**現行版の基準レイアウト**であり、
 //! 読み替えの基準として使う。
 
-use super::wire::{AlignSpec, FieldTy, LayoutExpectation, WireField, WireLayout};
+use super::wire::{FieldTy, LayoutExpectation, WireField, WireLayout};
 
 /// `UTSNAME_LEN`: uname 由来文字列の配列長。全世代で 65。
 pub const UTSNAME_LEN: u16 = 65;
@@ -354,6 +354,10 @@ pub const RECORD_HEADER_G3_CURRENT: WireLayout = WireLayout::new(
 );
 
 /// `extra_desc` (v12.1.7 以降、`extra_next` が非 0 のときに続く)。
+///
+/// 本家は「将来も変えない」と定めており、読み取り側 (`format::file` の
+/// `skip_extra_chain`) はこの配置を固定オフセットで読む。両者がずれないことは
+/// テスト `extra_desc_is_six_ints_at_fixed_offsets` が固定する。
 pub const EXTRA_DESC: WireLayout = WireLayout::new(
     "extra_desc",
     &[
@@ -366,11 +370,6 @@ pub const EXTRA_DESC: WireLayout = WireLayout::new(
     ],
 );
 
-/// 構造体アラインメント指定を明示したい場合に使う補助。
-pub const fn packed_struct(layout: WireLayout) -> WireLayout {
-    layout.with_struct_align(AlignSpec::Packed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +377,24 @@ mod tests {
 
     fn lp64() -> SourceEncoding {
         SourceEncoding::new(Endian::Little, LayoutAbi::LP64)
+    }
+
+    /// `extra_desc` は `int` 6 個 (24 バイト) で、読み取り側はこのオフセットを
+    /// 直接使う (`format::file` の `skip_extra_chain`)。配置を変えるなら両方を直すこと。
+    #[test]
+    fn extra_desc_is_six_ints_at_fixed_offsets() {
+        let r = EXTRA_DESC.resolve(&lp64()).unwrap();
+        assert_eq!(r.size, 24);
+        for (name, offset) in [
+            ("extra_nr", 0),
+            ("extra_size", 4),
+            ("extra_next", 8),
+            ("extra_types_nr_0", 12),
+            ("extra_types_nr_1", 16),
+            ("extra_types_nr_2", 20),
+        ] {
+            assert_eq!(r.field(name).unwrap().offset, offset, "{name}");
+        }
     }
 
     #[test]

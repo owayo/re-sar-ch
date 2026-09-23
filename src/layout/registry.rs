@@ -82,12 +82,6 @@ impl ActivityDef {
         self.revisions.iter().find(|r| r.magic == magic)
     }
 
-    /// 型別フィールド数が一致する revision を探す。
-    /// ファイルの読込時は magic・サイズ・世代も検証する plan::select_revision を使う。
-    pub fn revision_for_types_nr(&self, types_nr: [u32; 3]) -> Option<&'static WireRevision> {
-        self.revisions.iter().find(|r| r.types_nr == types_nr)
-    }
-
     /// activity magic と 1 item の申告サイズの両方が一致する revision を探す。
     ///
     /// **同じ magic のまま構造体サイズが変わった版があるため、magic だけでは決まらない。**
@@ -179,11 +173,6 @@ pub fn all() -> impl Iterator<Item = &'static ActivityDef> {
 /// activity ID から定義を引く。未登録なら `None` (エラーではなくスキップ対象)。
 pub fn lookup(id: ActivityId) -> Option<&'static ActivityDef> {
     all().find(|d| d.id == id)
-}
-
-/// 定義済み activity の件数。
-pub fn defined_count() -> usize {
-    all().count()
 }
 
 #[cfg(test)]

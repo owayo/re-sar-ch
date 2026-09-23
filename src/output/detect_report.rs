@@ -850,9 +850,12 @@ fn write_detection<W: Write>(
     detail: Detail,
     lang: Lang,
 ) -> io::Result<()> {
+    // 行頭の記号も言語に合わせる (英語の報告に全角の「・」を残さない)。
+    // どちらも端末で 2 桁なので、続く行の字下げは変わらない
     writeln!(
         out,
-        "     ・[{}] {}",
+        "     {}[{}] {}",
+        text!(ja: "・", en: "- ").get(lang),
         d.route().label().get(lang),
         describe_detection(d, lang)
     )?;
@@ -1672,6 +1675,37 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         write_text(&mut buf, a, TZ, detail).expect("書き出し");
         String::from_utf8(buf).expect("UTF-8")
+    }
+
+    /// 英語の報告に日本語 (かな・漢字・全角の記号) が 1 文字も残らない。
+    /// 分析層の文 (優先度の理由など) と、この層の記号の両方を通す。
+    #[test]
+    fn the_english_report_has_no_japanese_left() {
+        let mut v = vec![80.0; 20];
+        for x in &mut v[10..14] {
+            *x = 2.0;
+        }
+        let ts = single(cpu_idle(&vals(&v)));
+        let opts = DetectOptions {
+            lang: Lang::En,
+            ..Default::default()
+        };
+        let a = assess(
+            detect(&ts, &opts),
+            SummarySource {
+                label: "example".to_string(),
+                ..Default::default()
+            },
+            period_of(&v),
+            &opts,
+        );
+        assert!(!a.episodes.is_empty(), "エピソードが出る入力で確かめる");
+        let japanese = |c: char| ('\u{3000}'..='\u{9fff}').contains(&c) || c == '\u{ff08}';
+        for detail in [Detail::Summary, Detail::Full] {
+            let text = render_with(&a, detail);
+            let bad: Vec<&str> = text.lines().filter(|l| l.chars().any(japanese)).collect();
+            assert!(bad.is_empty(), "{detail:?}: {bad:#?}");
+        }
     }
 
     #[test]

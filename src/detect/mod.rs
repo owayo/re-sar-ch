@@ -92,7 +92,7 @@ use serde::Serialize;
 use crate::analyze::assessment::SeriesEvaluation;
 use crate::analyze::metric_catalog::{self, CatalogEntry, ShiftMagnitude};
 use crate::analyze::timeline::{MetricKey, MetricTimeline, Timelines};
-use crate::model::{ActivityId, DisplayTz, Lang, Text, Unit, ValueKind};
+use crate::model::{ActivityId, DisplayTz, Lang, Text, Unit, ValueKind, count_en};
 use crate::text;
 
 /// 検出出力のスキーマ版。出力契約として固定する (`docs/design.md` §11)。
@@ -213,13 +213,16 @@ impl TemporalSupport {
         if secs == 0 {
             return match lang {
                 Lang::Ja => format!("1 時点の {n} 回の採取"),
-                Lang::En => format!("{n} samples at a single point in time"),
+                Lang::En => format!(
+                    "{} at a single point in time",
+                    count_en(n, "sample", "samples")
+                ),
             };
         }
         let duration = describe_duration(secs, lang);
         match lang {
             Lang::Ja => format!("{duration}にわたる {n} 回の採取"),
-            Lang::En => format!("{n} samples spanning {duration}"),
+            Lang::En => format!("{} spanning {duration}", count_en(n, "sample", "samples")),
         }
     }
 
@@ -255,13 +258,17 @@ pub fn describe_duration(secs: u64, lang: Lang) -> String {
     let (m, h) = (secs / 60, secs / 3600);
     match (secs, lang) {
         (s, Lang::Ja) if s < 60 => format!("{s} 秒"),
-        (s, Lang::En) if s < 60 => format!("{s} seconds"),
+        (s, Lang::En) if s < 60 => count_en(s, "second", "seconds"),
         (s, Lang::Ja) if s < 3600 => format!("{m} 分"),
-        (s, Lang::En) if s < 3600 => format!("{m} minutes"),
+        (s, Lang::En) if s < 3600 => count_en(m, "minute", "minutes"),
         (s, Lang::Ja) if s.is_multiple_of(3600) => format!("{h} 時間"),
-        (s, Lang::En) if s.is_multiple_of(3600) => format!("{h} hours"),
+        (s, Lang::En) if s.is_multiple_of(3600) => count_en(h, "hour", "hours"),
         (_, Lang::Ja) => format!("{h} 時間 {} 分", (secs % 3600) / 60),
-        (_, Lang::En) => format!("{h} hours {} minutes", (secs % 3600) / 60),
+        (_, Lang::En) => format!(
+            "{} {}",
+            count_en(h, "hour", "hours"),
+            count_en((secs % 3600) / 60, "minute", "minutes")
+        ),
     }
 }
 
@@ -1867,6 +1874,33 @@ mod tests {
         assert_eq!(describe_duration(600, Lang::Ja), "10 分");
         assert_eq!(describe_duration(7200, Lang::Ja), "2 時間");
         assert_eq!(describe_duration(5400, Lang::Ja), "1 時間 30 分");
+    }
+
+    /// 英語は数に合わせて単数形・複数形を選ぶ (「1 minutes」にしない)。
+    #[test]
+    fn english_durations_and_spans_agree_in_number() {
+        assert_eq!(describe_duration(1, Lang::En), "1 second");
+        assert_eq!(describe_duration(45, Lang::En), "45 seconds");
+        assert_eq!(describe_duration(60, Lang::En), "1 minute");
+        assert_eq!(describe_duration(600, Lang::En), "10 minutes");
+        assert_eq!(describe_duration(3600, Lang::En), "1 hour");
+        assert_eq!(describe_duration(7200, Lang::En), "2 hours");
+        assert_eq!(describe_duration(3660, Lang::En), "1 hour 1 minute");
+        assert_eq!(describe_duration(5400, Lang::En), "1 hour 30 minutes");
+
+        let span = |samples, secs| {
+            TemporalSupport {
+                start_ust: 0,
+                end_ust: secs,
+                samples,
+                ..Default::default()
+            }
+            .describe_span(Lang::En)
+        };
+        assert_eq!(span(1, 0), "1 sample at a single point in time");
+        assert_eq!(span(3, 0), "3 samples at a single point in time");
+        assert_eq!(span(1, 60), "1 sample spanning 1 minute");
+        assert_eq!(span(3, 1200), "3 samples spanning 20 minutes");
     }
 
     /// 不連続 (RESTART) を挟んだ区間は観測に数えず、連続区間を切る。

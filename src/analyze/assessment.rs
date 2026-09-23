@@ -815,7 +815,13 @@ impl AssessedDetection {
             && d.support.span_secs() >= th.persistence_secs
         {
             priority = priority.up();
-            reasons.push("この検出自身が複数回の採取にわたって続いた (+1 段)");
+            reasons.push(
+                text!(
+                    ja: "この検出自身が複数回の採取にわたって続いた (+1 段)",
+                    en: "this detection itself persisted across several samples (+1 level)",
+                )
+                .get(lang),
+            );
         }
         // 標本不足は**その判断が依存する根拠**にだけ効かせる。
         // 固定条件は比較基準を判定に使っていないので降格しない。
@@ -823,10 +829,22 @@ impl AssessedDetection {
             && sufficiency.basis.depends_on_the_input_distribution()
         {
             priority = priority.down();
-            reasons.push("この判断が依存する根拠の材料が乏しいので判断を控えた (−1 段)");
+            reasons.push(
+                text!(
+                    ja: "この判断が依存する根拠の材料が乏しいので判断を控えた (−1 段)",
+                    en: "the evidence this judgement depends on is thin, so the priority was held back (−1 level)",
+                )
+                .get(lang),
+            );
         }
         if reasons.is_empty() {
-            reasons.push("昇降なし (この検出が宣言する下地のまま)");
+            reasons.push(
+                text!(
+                    ja: "昇降なし (この検出が宣言する下地のまま)",
+                    en: "no change (stays at the baseline this detection declares)",
+                )
+                .get(lang),
+            );
         }
 
         Self {
@@ -1802,6 +1820,44 @@ mod tests {
         // 経路の数で上げていない: 3 経路当たっても昇格は 1 段まで
         assert!(ep.episode.viewpoints.len() > 1);
         assert!(ep.priority <= ep.base_priority.up());
+    }
+
+    /// 優先度の理由も報告の言語で書く。英語の報告に日本語の文が混ざらない。
+    #[test]
+    fn priority_reasons_follow_the_report_language() {
+        let mut v = vec![80.0; 20];
+        v[10] = 2.0;
+        v[11] = 2.0;
+        v[12] = 2.0;
+        v[13] = 2.0;
+        let ts = single(cpu_idle(&vals(&v)));
+        let a = assess_timelines(
+            &ts,
+            &DetectOptions {
+                lang: Lang::En,
+                ..Default::default()
+            },
+        );
+        let reasons: Vec<&str> = a
+            .episodes
+            .iter()
+            .flat_map(|ep| {
+                ep.priority_reasons
+                    .iter()
+                    .chain(ep.detections.iter().flat_map(|d| d.priority_reasons.iter()))
+                    .copied()
+            })
+            .collect();
+        assert!(
+            reasons.contains(&"this detection itself persisted across several samples (+1 level)"),
+            "{reasons:?}"
+        );
+        // かな・漢字が 1 文字も無いこと
+        let japanese = |c: char| ('\u{3040}'..='\u{9fff}').contains(&c);
+        assert!(
+            reasons.iter().all(|r| !r.chars().any(japanese)),
+            "{reasons:?}"
+        );
     }
 
     /// 別の検出の持続性を借りて昇格しない (Issue #5 ⑩)。

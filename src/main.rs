@@ -710,8 +710,8 @@ fn run_sar_el7(opts: SarEl7Options) -> anyhow::Result<ExitCode> {
         ),
         Some(El7Input::File(p)) => (p.clone(), false),
         // 10.1.5 の既定ファイルは `SA_DIR/saDD` だけ (`saYYYYMMDD` は後の版)
-        Some(El7Input::DefaultDaily) => {
-            let (_, _, day) = target_date(opts.day_offset);
+        Some(El7Input::DefaultDaily { day_offset }) => {
+            let (_, _, day) = target_date(*day_offset);
             (sa_dir().join(format!("sa{day:02}")), true)
         }
     };

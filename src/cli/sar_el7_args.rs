@@ -35,7 +35,10 @@ const DEF_TMEND: &str = "18:00:00";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum El7Input {
     /// `-f` のファイル名省略、または `-f` 自体の省略 (`SA_DIR/saDD`)。
-    DefaultDaily,
+    ///
+    /// 本家は `-f` を読んだ時点の `-N` でファイル名を決めるので、その日数を持つ。
+    /// `sar -f -1` は当日のファイル、`sar -1 -f` は前日のファイルになる。
+    DefaultDaily { day_offset: u32 },
     /// `-f <file>`。
     File(PathBuf),
 }
@@ -177,14 +180,21 @@ fn atol(s: &str) -> i64 {
     if neg { -v } else { v }
 }
 
+/// C の `atoi()`。glibc は `(int) strtol()` なので、`long` の値の下位 32 ビットを
+/// 符号付きで読んだものになる (`4294967296` → 0、`2147483648` → 負)。
+fn atoi(s: &str) -> i64 {
+    i64::from(atol(s) as i32)
+}
+
 /// `decode_timestamp()` (`hh:mm:ss`)。
 fn decode_timestamp(ts: &str) -> Option<Tstamp> {
     let b = ts.as_bytes();
     if b.len() != 8 {
         return None;
     }
-    // 本家は 2・5 文字目を NUL にして atoi する (区切り文字は問わない)
-    let field = |r: std::ops::Range<usize>| atol(std::str::from_utf8(&b[r]).unwrap_or(""));
+    // 本家は 2・5 文字目を NUL にして atoi する (区切り文字は問わない)。
+    // 多バイト文字の途中で切れても、手前の数字は読む
+    let field = |r: std::ops::Range<usize>| atol(&String::from_utf8_lossy(&b[r]));
     let (hour, min, sec) = (field(0..2), field(3..5), field(6..8));
     if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=59).contains(&sec) {
         return None;
@@ -232,7 +242,9 @@ pub fn parse_sar_el7_args(
                     opt += 2;
                 }
                 _ => {
-                    o.input = Some(El7Input::DefaultDaily);
+                    o.input = Some(El7Input::DefaultDaily {
+                        day_offset: o.day_offset,
+                    });
                     opt += 1;
                 }
             },
@@ -323,7 +335,9 @@ pub fn parse_sar_el7_args(
     }
     // `sar` 単独、または interval も -f も無い → 既定の日次ファイル
     if args.is_empty() || (o.interval < 0 && o.input.is_none()) {
-        o.input = Some(El7Input::DefaultDaily);
+        o.input = Some(El7Input::DefaultDaily {
+            day_offset: o.day_offset,
+        });
     }
     if let (Some(s), Some(e)) = (o.tm_start, o.tm_end.as_mut())
         && e.hour < s.hour
@@ -441,7 +455,7 @@ fn parse_i(o: &mut SarEl7Options, list: &str) -> Result<(), ()> {
                 if !all_digits(t) {
                     return Err(());
                 }
-                let i = atol(t);
+                let i = atoi(t);
                 if i < 0 || i as usize >= NR_IRQS {
                     return Err(());
                 }
@@ -462,7 +476,7 @@ fn parse_p(o: &mut SarEl7Options, list: &str) -> Result<(), ()> {
         if !all_digits(t) {
             return Err(());
         }
-        let i = atol(t);
+        let i = atoi(t);
         if i < 0 || i as usize >= NR_CPUS {
             return Err(());
         }
@@ -576,7 +590,45 @@ mod tests {
         assert_eq!(o.activities, BTreeSet::from([ActivityId::CPU]));
         assert!(!o.cpu_all);
         assert_eq!(o.cpu_bitmap.count_bits(), 1);
-        assert_eq!(o.input, Some(El7Input::DefaultDaily));
+        assert_eq!(o.input, Some(El7Input::DefaultDaily { day_offset: 0 }));
+    }
+
+    /// 既定ファイルの日付は `-f` を読んだ時点の `-N` で決まる。
+    /// `-f` を省いたときだけ、最後の `-N` を使う。
+    #[test]
+    fn default_file_uses_the_day_offset_seen_before_f() {
+        let day = |args: &[&str]| match parse(args).unwrap().input {
+            Some(El7Input::DefaultDaily { day_offset }) => day_offset,
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(day(&["-f", "-1"]), 0);
+        assert_eq!(day(&["-1", "-f"]), 1);
+        assert_eq!(day(&["-1", "-f", "-2"]), 1);
+        assert_eq!(day(&["-2"]), 2);
+        assert_eq!(day(&["-u", "-3"]), 3);
+    }
+
+    /// `-P` / `-I` の番号は `atoi()` (= `(int) strtol()`) で読む。
+    /// `long` に収まって `int` にあふれる値は下位 32 ビットになる。
+    #[test]
+    fn cpu_and_irq_numbers_wrap_like_atoi() {
+        let o = parse(&["-P", "4294967296", "-f", "x"]).unwrap();
+        assert!(o.cpu_bitmap.is_set(1), "4294967296 は CPU 0");
+        let o = parse(&["-I", "4294967301", "-f", "x"]).unwrap();
+        assert!(o.irq_bitmap.is_set(6), "4294967301 は割り込み 5");
+        // int として負になる値と、long にも収まらない値 (LONG_MAX → -1) は usage
+        assert!(parse(&["-P", "2147483648", "-f", "x"]).is_err());
+        assert!(parse(&["-P", "99999999999999999999", "-f", "x"]).is_err());
+    }
+
+    /// 時刻は 2・5 バイト目で切って `atoi()` する。多バイト文字の途中で切れても
+    /// 手前の数字は読む。
+    #[test]
+    fn timestamp_fields_are_read_bytewise() {
+        // "1é00:00" は UTF-8 で 8 バイト (é = 2 バイト)。時は "1\xc3" → 1
+        let o = parse(&["-e", "1é00:00", "-f", "x"]).unwrap();
+        let e = o.tm_end.unwrap();
+        assert_eq!((e.hour, e.min, e.sec), (1, 0, 0));
     }
 
     /// `-h` は現行版の `--pretty --human` ではなくヘルプ。

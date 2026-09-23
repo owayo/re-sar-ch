@@ -1692,7 +1692,8 @@ fn serial_rows(p: &Print<'_>, prev: &Buf, curr: &Buf) -> Vec<Row> {
         if ssc.v[LINE] == 0 {
             continue;
         }
-        let label = Label::Num3Wide(ssc.v[LINE] as i64 - 1);
+        // 本家は unsigned int の `line - 1` を `%3d` に渡すので、2^31 以上は負の数に見える
+        let label = Label::Num3Wide(i64::from((ssc.v[LINE] as u32).wrapping_sub(1) as i32));
         let cells = match prev.get(i) {
             Some(ssp) if ssp.v[LINE] == ssc.v[LINE] => (0..6)
                 .map(|f| Cell::F92(s_value(ssp.v[f], ssc.v[f], 32, p.itv)))
@@ -2650,6 +2651,24 @@ mod tests {
         assert_eq!(r[0].label, Label::All);
         // (2000 × 100 + 1000 × 300) / 400 = 1250
         assert_eq!(f92(&r[0].cells), ["1250.00"]);
+    }
+
+    /// TTY 番号は unsigned int の `line - 1` を `%3d` で出したもの。
+    /// 2^31 を超える回線番号 (細工したファイル) は本家どおり負の数になる。
+    #[test]
+    fn serial_line_numbers_are_printed_as_signed_ints() {
+        use field::serial::LINE;
+        let tty = |line: u64| {
+            let mut prev = vec![item(ActivityId::SERIAL, &[(LINE, line)], &[])];
+            let mut curr = prev.clone();
+            rows(ActivityId::SERIAL, 100, None, &mut prev, &mut curr, None, 1)
+                .remove(0)
+                .label
+        };
+        assert_eq!(tty(1), Label::Num3Wide(0));
+        assert_eq!(tty(0x8000_0000), Label::Num3Wide(2_147_483_647));
+        assert_eq!(tty(0x8000_0001), Label::Num3Wide(-2_147_483_648));
+        assert_eq!(tty(0xffff_ffff), Label::Num3Wide(-2));
     }
 
     /// センサ番号の起点: FAN と TEMP は 1、IN は 0 (本家のまま)。

@@ -1,6 +1,7 @@
 //! `sadf -x` (XML) の出力。
 //!
-//! 表示ループは JSON と同じ `logic1` (時刻順、`restarts` / `comments` は末尾)。
+//! 表示ループは JSON と同じ `logic1` (時刻順、`restarts` / `comments` は末尾。
+//! エンジンは `logic1` モジュール)。
 //!
 //! # 書式の要点 (§10)
 //!
@@ -8,63 +9,81 @@
 //! - `<sysdata-version>` は `sadf.h` の `XML_DTD_VERSION` = **3.18 固定**。
 //!   読み込んだファイルの版には依存しない。
 //! - インデントはタブ。深さは `<sysstat>`=0 … activity=4、その子=5、孫=6。
+//! - activity の並びは**固定の `act[]` 順** (ファイルの記載順ではない、§9.4)。
 //! - 値はほとんど属性。例外は `A_IO` の `<tps>` と、
 //!   `A_MEMORY` / `A_HUGE` の**全値** (テキスト内容)。
 //! - 属性名は JSON のキー名と微妙に違う (§10.6)。
 //! - `<network>` 内の配列 activity は自分のラッパを持たず、
 //!   子要素が直接 `<network>` の中に並ぶ。
+//! - 配列型の activity は、そのレコードに item があれば (`nr[curr] > 0`)
+//!   絞り込みで 0 件になっても**空のラッパ**として出る (`<network>` も開く)。
 
 use std::io::{self, Write};
 
-use super::access::{ActivityPair, ItemPair};
-use super::dbppc::{display_cpu_count, scan_comments, scan_restarts, selected_specs};
+use super::access::{ActivityPair, CompatFormat, ItemPair};
+use super::dbppc::{ActEntry, act_entries, display_cpu_count, selected_specs};
+use super::logic1::{self, Logic1Sink};
+use super::records::Rec;
 use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Field, Fmt, Group, Shape};
-use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, Stamp, interval_secs, render};
+use super::{ABSENT_XML, FileInfo, ItemLabel, SadfConfig, SadfExtra, Stamp, interval_secs, render};
 use crate::error::Result;
-use crate::format::file::{SaFile, ScanControl};
+use crate::format::file::SaFile;
 use crate::model::ActivityId;
-use crate::output::time_filter::Admit;
-use crate::series::{IntervalView, Selection, WalkItem, walk_items};
+use crate::series::IntervalView;
 
 /// `sadf.h` の `XML_DTD_VERSION`。
 pub const XML_DTD_VERSION: &str = "3.18";
 
 /// `-x` の出力。
 pub fn write_xml<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file_with(file, cfg.time_base);
-    let specs = selected_specs(file, cfg);
+    write_xml_with(out, file, cfg, &SadfExtra::default())
+}
+
+/// `-x` の出力 (`interval` / `count` と `-T` の TZ 名を指定する)。
+pub fn write_xml_with<W: Write>(
+    out: &mut W,
+    file: &SaFile,
+    cfg: &SadfConfig,
+    extra: &SadfExtra,
+) -> Result<()> {
+    let info = FileInfo::from_config(file, cfg, extra);
+    let displayed = selected_specs(file, cfg);
+    let ids: Vec<ActivityId> = displayed.iter().map(|s| s.id).collect();
+    let acts = act_entries(file, cfg, &displayed);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
 
-    let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
-    let mut cursor = cfg.time_filter.cursor();
-    walk_items(file, &Selection::Only(ids), |item| {
-        // `logic1` の統計ループは RESTART / COMMENT を見ない。
-        // `<restarts>` / `<comments>` は後段の別走査が出す。
-        let WalkItem::Sample(view) = item else {
-            return Ok(ScanControl::Continue);
-        };
-        match cursor.sample(view) {
-            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
-            Admit::Stop => return Ok(ScanControl::Stop),
-            Admit::Emit => {}
-        }
-        if !view.has_prev || !view.continuous {
-            return Ok(ScanControl::Continue);
-        }
-        write_timestamp(out, view, cfg, &info, &specs).map_err(super::wrap_io)?;
-        Ok(ScanControl::Continue)
-    })?;
-
-    let restarts = scan_restarts(file)?;
-    let comments = if cfg.comments {
-        scan_comments(file)?
-    } else {
-        Vec::new()
+    let mut sink = XmlSink {
+        out,
+        cfg,
+        info: &info,
+        acts: &acts,
     };
-    write_epilogue(out, cfg, &info, &restarts, &comments).map_err(super::wrap_io)?;
+    let specials = logic1::run(file, cfg, extra.select, &ids, &mut sink)?;
+    write_epilogue(out, cfg, &info, &specials.restarts, &specials.comments)
+        .map_err(super::wrap_io)?;
     Ok(())
+}
+
+/// `<statistics>` の要素を書き出す。
+struct XmlSink<'w, 'c, W: Write> {
+    out: &'w mut W,
+    cfg: &'c SadfConfig,
+    info: &'c FileInfo,
+    /// 出す activity (`act[]` 順)。
+    acts: &'c [ActEntry],
+}
+
+impl<W: Write> Logic1Sink for XmlSink<'_, '_, W> {
+    fn record(&mut self, view: Option<&IntervalView<'_>>) -> io::Result<()> {
+        // XML の `f_statistics(F_MAIN)` は何も出さないので、表示しなかった
+        // レコードは跡を残さない (JSON の空オブジェクトに当たるものは無い)
+        match view {
+            Some(view) => write_timestamp(self.out, view, self.cfg, self.info, self.acts),
+            None => Ok(()),
+        }
+    }
 }
 
 /// `<statistics>` までのヘッダ部。
@@ -112,7 +131,7 @@ fn write_timestamp<W: Write>(
     view: &IntervalView<'_>,
     cfg: &SadfConfig,
     info: &FileInfo,
-    specs: &[&'static ActivitySpec],
+    acts: &[ActEntry],
 ) -> io::Result<()> {
     let stamp = Stamp::new(
         cfg.time_base,
@@ -128,23 +147,25 @@ fn write_timestamp<W: Write>(
         esc(&stamp.tz),
         interval_secs(view.itv_cs)
     )?;
-    write_sample(out, view, cfg, specs)?;
+    write_sample(out, view, cfg, acts)?;
     writeln!(out, "\t\t\t</timestamp>")?;
     Ok(())
 }
 
 /// `</statistics>` 以降。`<restarts>` / `<comments>` は統計の後にまとめて出る。
+///
+/// どちらも `-s` / `-e` の範囲外は出ない (`print_special_record()`)。
 fn write_epilogue<W: Write>(
     out: &mut W,
     cfg: &SadfConfig,
     info: &FileInfo,
-    restarts: &[super::dbppc::RestartMark],
-    comments: &[(u64, (u8, u8, u8), String)],
+    restarts: &[(Rec, Option<u32>)],
+    comments: &[Rec],
 ) -> io::Result<()> {
     writeln!(out, "\t\t</statistics>")?;
 
     writeln!(out, "\t\t<restarts>")?;
-    for r in restarts {
+    for (r, cpu_nr) in restarts {
         let s = Stamp::new(cfg.time_base, r.ust_time, r.hms, info);
         writeln!(
             out,
@@ -152,22 +173,22 @@ fn write_epilogue<W: Write>(
             s.date,
             s.time,
             esc(&s.tz),
-            display_cpu_count(r.cpu_count)
+            display_cpu_count(*cpu_nr)
         )?;
     }
     writeln!(out, "\t\t</restarts>")?;
 
     if cfg.comments {
         writeln!(out, "\t\t<comments>")?;
-        for (ust, hms, text) in comments {
-            let s = Stamp::new(cfg.time_base, *ust, *hms, info);
+        for c in comments {
+            let s = Stamp::new(cfg.time_base, c.ust_time, c.hms, info);
             writeln!(
                 out,
                 "\t\t\t<comment date=\"{}\" time=\"{}\" tz=\"{}\" com=\"{}\"/>",
                 s.date,
                 s.time,
                 esc(&s.tz),
-                esc(text)
+                esc(c.comment.as_deref().unwrap_or(""))
             )?;
         }
         writeln!(out, "\t\t</comments>")?;
@@ -186,26 +207,29 @@ fn write_sample<W: Write>(
     out: &mut W,
     view: &IntervalView<'_>,
     cfg: &SadfConfig,
-    specs: &[&'static ActivitySpec],
+    acts: &[ActEntry],
 ) -> io::Result<()> {
     let mut open_group = Group::None;
 
-    for spec in specs {
-        let Some(pair) = ActivityPair::from_view(view, spec.id) else {
+    for act in acts {
+        let spec = act.spec;
+        let Some(pair) = act.pair(view) else {
             continue;
         };
+        // `IS_SELECTED && nr[curr] > 0` の activity だけが出る
         if pair.is_empty() {
             continue;
         }
+        // 絞り込みで item が 0 件でも activity は出る。`<network>` 内の配列は
+        // 自分のラッパを持たないので中身が空になるが、`<network>` 自体は開く
+        // (`xml_print_net_dev_stats()` は item の有無を見ずに
+        // `xml_markup_network(OPEN)` を呼ぶ)。
         let body = activity_body(
             &pair,
             cfg,
             spec,
             if spec.group == Group::None { 4 } else { 5 },
         );
-        if body.is_empty() {
-            continue;
-        }
         if spec.group != open_group {
             close_group(out, open_group)?;
             open_group = spec.group;
@@ -292,7 +316,7 @@ fn activity_body(
             let wrap = spec.group != Group::Network;
             let child_depth = if wrap { depth + 1 } else { depth };
             let mut rows = String::new();
-            for item in pair.selected_items(cfg, false) {
+            for item in pair.selected_items_in(cfg, CompatFormat::JsonXml) {
                 let attrs = attr_list(spec, &item, cfg);
                 rows.push_str(&format!(
                     "{}<{}{}/>\n",
@@ -301,9 +325,7 @@ fn activity_body(
                     attrs
                 ));
             }
-            if rows.is_empty() {
-                return String::new();
-            }
+            // 0 件でもラッパ (`<filesystems>` … `</filesystems>`) は出る
             if wrap {
                 format!(
                     "{}<{}{}>\n{rows}{}</{}>\n",
@@ -409,9 +431,7 @@ fn irq_body(pair: &ActivityPair<'_>, depth: usize, cfg: &SadfConfig) -> String {
             ));
         }
     }
-    if rows.is_empty() {
-        return String::new();
-    }
+    // `--int=` で 0 件でも `<interrupts>` / `<int-global>` は出る
     format!(
         "{t}<interrupts>\n{mid}<int-global per=\"second\">\n{rows}{mid}</int-global>\n{t}</interrupts>\n"
     )

@@ -11,6 +11,18 @@
 //! 仕様の出典は `docs/format/03-output-format.md` 第 V 部。
 //! フィールド名・キー名・書式の表は [`spec`] に集約してある。
 //!
+//! # 表示ループ
+//!
+//! **どのレコードを・どの順で・何回出すか**は形式ごとに書かず、
+//! 本家の `logic1_display_loop()` / `logic2_display_loop()` を写した
+//! 2 つのエンジン (`logic1` / `logic2`) だけが決める。各形式はエンジンから
+//! 「RESTART を出せ」「このレコードを出せ」と呼ばれて 1 行を書くだけにする。
+//! RESTART / COMMENT の時刻範囲判定、区間ごとの基準レコード、
+//! positional の `interval` / `count` ([`select`]) を形式ごとに持つと
+//! 形式ごとに規則がずれる (実際に 5 形式で食い違っていた)。
+//! 読み直す範囲はレコードの見出しだけの索引 (`records`) で決め、
+//! 統計値のデコードは表示する範囲に限る。
+//!
 //! # 値の扱い
 //!
 //! 表示値は `series` 層 ([`crate::series::compute`]) の結果だけを使う。
@@ -36,20 +48,25 @@ pub mod access;
 pub mod dbppc;
 pub mod header;
 pub mod json;
+mod logic1;
+mod logic2;
 pub mod raw;
+mod records;
 pub mod render;
+pub mod select;
 pub mod spec;
 pub mod xml;
 
 use std::fmt::Write as _;
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Offset, TimeZone, Timelike, Utc};
 
 use crate::format::file::SaFile;
 use crate::model::ActivityId;
 use crate::output::time_filter::TimeFilter;
 use crate::series::compute::{ComputeIssue, Computed, MissingKind, missing_kind};
 
+pub use select::RecordSelect;
 pub use spec::{ActivitySpec, Fmt, Group, ItemKind, SectionConfig, Shape};
 
 // ===========================================================================
@@ -93,11 +110,45 @@ pub struct SadfConfig {
     pub item_names: std::collections::BTreeMap<ActivityId, Vec<String>>,
 }
 
+/// [`SadfConfig`] に載せていない実行時の指定。
+///
+/// `SadfConfig` は項目をすべて並べた構造体リテラルで組み立てる呼び出し側が
+/// あるため、項目を足すとそれらが壊れる。後から加わった指定はこちらで渡す
+/// (`write_*_with` 系の関数)。既定値は本家の既定と同じ。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SadfExtra {
+    /// positional の `interval` / `count`。既定は全レコード。
+    pub select: RecordSelect,
+    /// `-T` のタイムゾーン欄に出す名前 (本家の `tzset(); tzname[0]`)。
+    ///
+    /// **CLI 層が解決して渡す。** 出力層で `TZ` を読むと、同じ入力・同じ設定でも
+    /// 出力が環境で変わる隠れた依存になる (`CLAUDE.md`「環境変数を読むのは CLI 層だけ」)。
+    /// `None` のときは実行環境の UTC オフセット表記 (`+09:00`) で代用する
+    /// ([`FileInfo::from_file_with`])。
+    pub local_tz: Option<String>,
+}
+
 impl SadfConfig {
     pub fn name_selected(&self, id: ActivityId, name: &str) -> bool {
         self.item_names
             .get(&id)
             .is_none_or(|names| names.is_empty() || names.iter().any(|n| n == name))
+    }
+
+    /// `--fs=` の照合 (`sa_common.c: match_sa_filesystem_item()`)。
+    ///
+    /// 表示名 (`-F` ならデバイス名、`-F MOUNT` ならマウントポイント) だけでなく、
+    /// デバイス名とマウントポイントの**どちらでも**当たる。空の名前は照合に使わない。
+    pub fn fs_selected(&self, displayed: &str, fs_name: &str, mountp: &str) -> bool {
+        let Some(names) = self.item_names.get(&ActivityId::FS) else {
+            return true;
+        };
+        if names.is_empty() {
+            return true;
+        }
+        [displayed, fs_name, mountp]
+            .iter()
+            .any(|s| !s.is_empty() && names.iter().any(|n| n == s))
     }
 }
 
@@ -254,12 +305,26 @@ pub struct FileInfo {
     pub ust_time: u64,
     /// 収集時のタイムゾーン名。古いファイルは空。
     pub tzname: String,
+    /// `-T` のタイムゾーン欄に出す名前 ([`SadfExtra::local_tz`])。
+    pub local_tz: String,
 }
 
 impl FileInfo {
     /// 既定の時刻基準でファイル情報を作る。
     pub fn from_file(file: &SaFile) -> Self {
         Self::from_file_with(file, TimeBase::default())
+    }
+
+    /// 設定に合わせてファイル情報を作る。
+    ///
+    /// `-T` のタイムゾーン名は CLI 層が解決した [`SadfExtra::local_tz`] を使う。
+    /// 互換出力の各形式はこちらを使うこと。
+    pub fn from_config(file: &SaFile, cfg: &SadfConfig, extra: &SadfExtra) -> Self {
+        let mut info = Self::from_file_with(file, cfg.time_base);
+        if let Some(tz) = &extra.local_tz {
+            info.local_tz.clone_from(tz);
+        }
+        info
     }
 
     /// 時刻基準を指定してファイル情報を作る。
@@ -289,6 +354,9 @@ impl FileInfo {
             }
             _ => format_date(utc.year(), utc.month(), utc.day()),
         };
+        // `-T` の名前を CLI 層から受け取らなかったときの代用。
+        // 環境変数は読まず、ファイル作成時刻での UTC オフセット (`+09:00`) を出す。
+        let local_tz = utc.with_timezone(&chrono::Local).offset().fix().to_string();
         Self {
             nodename: h.nodename.clone(),
             sysname: h.sysname.clone(),
@@ -299,6 +367,7 @@ impl FileInfo {
             file_utc_time: format!("{:02}:{:02}:{:02}", utc.hour(), utc.minute(), utc.second()),
             ust_time: h.ust_time,
             tzname: h.tzname.clone().unwrap_or_default(),
+            local_tz,
         }
     }
 }
@@ -322,6 +391,12 @@ pub struct Stamp {
     pub time: String,
     /// TZ 名。`-U` では空文字。
     pub tz: String,
+    /// `-t` (記録時の時刻) か。
+    ///
+    /// 統計行の `-d` / `-p` / `-r` は「`-t` かつ `sa_tzname` が空」のときだけ
+    /// TZ 欄を丸ごと省く (`print_dbppc_timestamp()` / `print_raw_timestamp()`)。
+    /// RESTART / COMMENT 行はこの判定を持たないので区切りの空白が残る。
+    pub true_time: bool,
 }
 
 impl Stamp {
@@ -336,6 +411,7 @@ impl Stamp {
                 date: String::new(),
                 time: ust_time.to_string(),
                 tz: String::new(),
+                true_time: false,
             },
             TimeBase::Utc => {
                 let t = utc_of(ust_time);
@@ -343,6 +419,7 @@ impl Stamp {
                     date: format_date(t.year(), t.month(), t.day()),
                     time: format_time(t.hour(), t.minute(), t.second()),
                     tz: "UTC".to_string(),
+                    true_time: false,
                 }
             }
             TimeBase::TrueTime => {
@@ -351,6 +428,7 @@ impl Stamp {
                     date: format_date(shifted.year(), shifted.month(), shifted.day()),
                     time: format_time(shifted.hour(), shifted.minute(), shifted.second()),
                     tz: info.tzname.clone(),
+                    true_time: true,
                 }
             }
             TimeBase::LocalTime => {
@@ -358,26 +436,58 @@ impl Stamp {
                 Stamp {
                     date: format_date(local.year(), local.month(), local.day()),
                     time: format_time(local.hour(), local.minute(), local.second()),
-                    tz: local_tz_name(),
+                    tz: info.local_tz.clone(),
+                    true_time: false,
                 }
             }
         }
     }
 
-    /// `<date> <time> <tz>` の 1 フィールド表記 (`-d` / `-p`)。
+    /// 統計行の TZ 欄を省くか (`-t` かつ `sa_tzname` が空)。
+    fn omits_tz(&self) -> bool {
+        self.true_time && self.tz.is_empty()
+    }
+
+    /// 統計行の `<date> <time> <tz>` (`-d` / `-p`、`print_dbppc_timestamp()`)。
     ///
-    /// `-U` のときは epoch 秒だけ。`-t` で `sa_tzname` が空でも
-    /// `print_dbppc_timestamp` と同じく TZ 前の区切り空白を残す。
+    /// `-U` のときは epoch 秒だけ。`-t` で `sa_tzname` が空なら TZ 欄を
+    /// **区切りの空白ごと**省く。
     pub fn dbppc(&self) -> String {
+        if self.date.is_empty() {
+            return self.time.clone();
+        }
+        if self.omits_tz() {
+            return format!("{} {}", self.date, self.time);
+        }
+        format!("{} {} {}", self.date, self.time, self.tz)
+    }
+
+    /// RESTART / COMMENT 行の `<date> <time> <tz>` (`-d` / `-p`、
+    /// `print_dbppc_restart()` / `print_dbppc_comment()`)。
+    ///
+    /// 統計行と違い TZ が空でも区切りの空白を残す (`printf(" %s", tz)`)。
+    pub fn dbppc_event(&self) -> String {
         if self.date.is_empty() {
             return self.time.clone();
         }
         format!("{} {} {}", self.date, self.time, self.tz)
     }
 
-    /// `<time> <tz>` 表記 (`-r`)。TZ が空なら時刻だけ。
+    /// 統計行の `<time> <tz>` (`-r`、`print_raw_timestamp()`)。
+    ///
+    /// `-U` (日付なし) と「`-t` かつ `sa_tzname` が空」は時刻だけ。
     pub fn raw(&self) -> String {
-        if self.tz.is_empty() {
+        if self.date.is_empty() || self.omits_tz() {
+            self.time.clone()
+        } else {
+            format!("{} {}", self.time, self.tz)
+        }
+    }
+
+    /// RESTART / COMMENT 行の `<time> <tz>` (`-r`、`print_raw_restart()` /
+    /// `print_raw_comment()`)。日付がある限り TZ が空でも区切りの空白を残す。
+    pub fn raw_event(&self) -> String {
+        if self.date.is_empty() {
             self.time.clone()
         } else {
             format!("{} {}", self.time, self.tz)
@@ -407,25 +517,6 @@ pub(crate) fn shift_to_recorded(ust_time: u64, (h, m, s): (u8, u8, u8)) -> u64 {
         diff -= DAY;
     }
     (ust_time as i64 + diff).max(0) as u64
-}
-
-/// `-T` で使う実行環境の TZ 略称。
-///
-/// `TZ` が IANA 名なら `chrono-tz` から略称を取る。取れない場合は
-/// `+09:00` のような数値オフセット表記へ落とす (空文字にはしない)。
-fn local_tz_name() -> String {
-    use chrono::Offset;
-    // 略称は chrono-tz 側のトレイト (`OffsetName`) にある
-    use chrono_tz::OffsetName;
-    if let Ok(tz) = std::env::var("TZ")
-        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
-    {
-        let now = Utc::now().naive_utc();
-        if let Some(abbr) = tz.offset_from_utc_datetime(&now).abbreviation() {
-            return abbr.to_string();
-        }
-    }
-    chrono::Local::now().offset().fix().to_string()
 }
 
 /// `interval` 欄の秒数 (§1.2)。
@@ -544,13 +635,63 @@ mod tests {
         assert_eq!(s.dbppc(), "2019-04-18 15:20:19 CET");
     }
 
-    /// `-t` かつ `sa_tzname` が空でも TZ の区切り空白は残す。
+    /// **回帰テスト**: `-t` かつ `sa_tzname` が空のとき、統計行は TZ 欄を
+    /// 区切りの空白ごと省き、RESTART / COMMENT 行は空白を残す。
+    ///
+    /// `print_dbppc_timestamp()` / `print_raw_timestamp()` だけが
+    /// `strlen(sa_tzname)` を見る (03 §1.1)。以前は統計行にも末尾空白が付いていた。
     #[test]
-    fn true_time_without_tzname_keeps_separator() {
+    fn true_time_without_tzname_drops_tz_only_on_data_lines() {
         let info = dummy_info();
         let s = Stamp::new(TimeBase::TrueTime, 1_555_593_619, (13, 20, 19), &info);
-        assert_eq!(s.dbppc(), "2019-04-18 13:20:19 ");
+        assert_eq!(s.dbppc(), "2019-04-18 13:20:19");
+        assert_eq!(s.dbppc_event(), "2019-04-18 13:20:19 ");
         assert_eq!(s.raw(), "13:20:19");
+        assert_eq!(s.raw_event(), "13:20:19 ");
+    }
+
+    /// TZ 名があれば統計行も特殊行も同じ形。`-U` はどちらも epoch 秒だけ。
+    #[test]
+    fn event_and_data_stamps_agree_when_tz_is_known() {
+        let mut info = dummy_info();
+        info.tzname = "CET".to_string();
+        let s = Stamp::new(TimeBase::TrueTime, 1_555_593_619, (15, 20, 19), &info);
+        assert_eq!(s.dbppc(), s.dbppc_event());
+        assert_eq!(s.raw(), s.raw_event());
+        assert_eq!(s.raw_event(), "15:20:19 CET");
+
+        let e = Stamp::new(TimeBase::SecEpoch, 1_555_593_619, (15, 20, 19), &info);
+        assert_eq!(e.dbppc_event(), "1555593619");
+        assert_eq!(e.raw_event(), "1555593619");
+    }
+
+    /// `-T` のタイムゾーン名は設定で渡したものを使う (出力層で `TZ` を読まない)。
+    #[test]
+    fn local_time_uses_the_resolved_zone_name() {
+        let mut info = dummy_info();
+        info.local_tz = "CET".to_string();
+        let s = Stamp::new(TimeBase::LocalTime, 1_555_593_619, (15, 20, 19), &info);
+        assert_eq!(s.tz, "CET");
+        assert!(s.dbppc().ends_with(" CET"), "{}", s.dbppc());
+    }
+
+    /// `--fs=` はデバイス名・マウントポイントのどちらにも当たる。空の名前は当てない。
+    #[test]
+    fn fs_selection_matches_either_name() {
+        let mut cfg = SadfConfig::default();
+        cfg.item_names
+            .insert(ActivityId::FS, vec!["/home".to_string()]);
+        assert!(cfg.fs_selected("/dev/sda12", "/dev/sda12", "/home"));
+        assert!(cfg.fs_selected("/home", "/dev/sda12", "/home"));
+        assert!(!cfg.fs_selected("/dev/sda6", "/dev/sda6", "/"));
+
+        cfg.item_names.insert(ActivityId::FS, vec![String::new()]);
+        assert!(
+            !cfg.fs_selected("", "", ""),
+            "空の名前どうしは一致扱いにしない"
+        );
+        // 指定なしは全件
+        assert!(SadfConfig::default().fs_selected("x", "x", ""));
     }
 
     /// 日付跨ぎでオフセットを足しても日付がずれないこと。
@@ -677,6 +818,7 @@ mod tests {
             file_utc_time: "13:20:09".to_string(),
             ust_time: 1_555_593_609,
             tzname: String::new(),
+            local_tz: "+00:00".to_string(),
         }
     }
 }
@@ -955,14 +1097,19 @@ mod smoke {
             return;
         };
         let cfg = SadfConfig::default();
-        let restarts = dbppc::scan_restarts(&file).unwrap();
+        let restarts = records::RecordIndex::build(&file, None)
+            .unwrap()
+            .recs
+            .iter()
+            .filter(|r| r.kind == records::RecKind::Restart)
+            .count();
 
         let mut buf = Vec::new();
         dbppc::write_db(&mut buf, &file, &cfg).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(
             s.matches("LINUX-RESTART\t(").count(),
-            restarts.len(),
+            restarts,
             "RESTART 行はブロックごとに 1 回"
         );
     }

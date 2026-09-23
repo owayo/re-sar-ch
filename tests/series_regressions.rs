@@ -368,14 +368,16 @@ fn sadf_preserves_activity_order_and_empty_statistics_spacing() {
     }
     let file = SaFile::from_bytes("synthetic", build(spec).bytes).unwrap();
     let cfg = SadfConfig::default();
+    // -d / -p / -r の縦並びはファイルの記載順 (`id_seq[]`)
     let db = emit(&file, &cfg, sadf::dbppc::write_db);
     assert!(db.find(";proc/s;cswch/s").unwrap() < db.find(";CPU;").unwrap());
+    // -j / -x は固定の `act[]` 順 (`generic_write_stats()` が act[] を回す、03 §9.4)
     let json = emit(&file, &cfg, sadf::json::write_json);
     assert!(
-        json.find("\"process-and-context-switch\"").unwrap() < json.find("\"cpu-load\"").unwrap()
+        json.find("\"cpu-load\"").unwrap() < json.find("\"process-and-context-switch\"").unwrap()
     );
     let xml = emit(&file, &cfg, sadf::xml::write_xml);
-    assert!(xml.find("<process-and-context-switch").unwrap() < xml.find("<cpu-load>").unwrap());
+    assert!(xml.find("<cpu-load>").unwrap() < xml.find("<process-and-context-switch").unwrap());
     let mut empty = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
     empty.activities = vec![ActivitySpec::a_cpu(3)];
     let file = SaFile::from_bytes("synthetic", build(empty).bytes).unwrap();

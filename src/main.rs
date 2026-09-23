@@ -50,7 +50,7 @@ use re_sar_ch::model::{
 };
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
-use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
+use re_sar_ch::output::sadf::{self, SadfConfig, SadfExtra, SectionConfig, TimeBase};
 use re_sar_ch::output::sar_el7;
 use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
@@ -475,6 +475,65 @@ fn sadf_config(opts: &SadfOptions) -> SadfConfig {
     }
 }
 
+/// [`SadfConfig`] に載せていない `sadf` の指定 (positional の `interval` / `count` と
+/// `-T` のタイムゾーン名)。
+fn sadf_extra(opts: &SadfOptions, cfg: &SadfConfig) -> SadfExtra {
+    SadfExtra {
+        // 本家はファイル読み出しでも `interval` / `count` を効かせる
+        // (`interval` 未指定は 1、`count` 0 / 未指定は全件、03 §5.3)
+        select: sadf::RecordSelect {
+            interval: opts.interval.unwrap_or(1).max(1),
+            count: opts.count,
+        },
+        // `-T` のときだけ環境のタイムゾーン名を引く (`tzset()` は TZ を読む)
+        local_tz: (cfg.time_base == TimeBase::LocalTime).then(sadf_local_tz_name),
+    }
+}
+
+/// `sadf -T` のタイムゾーン欄 (本家 `sadf.c` の `tzset(); tzname[0]`)。
+///
+/// `tzname[0]` は**標準時の略称**で、夏時間中でも `CET` / `EST` を返す
+/// (本家の `-T` は日付によらず同じ名前を出す)。環境変数 (`TZ`) を読むのは
+/// CLI 層だけという約束なので、ここで解決して [`SadfExtra::local_tz`] に渡す。
+#[cfg(unix)]
+fn sadf_local_tz_name() -> String {
+    use std::ffi::{CStr, c_char};
+
+    unsafe extern "C" {
+        static tzname: [*const c_char; 2];
+        fn tzset();
+    }
+    // SAFETY: `tzset()` は `TZ` を読んで libc 内部の `tzname` を設定するだけ。
+    // resarch は環境変数を書き換えないので、`setenv` との競合は起きない。
+    // `tzname[0]` は libc が持つ NUL 終端文字列を指す (NULL は念のため弾く)。
+    // 値はここで複製して持ち出し、ポインタは保持しない。
+    unsafe {
+        tzset();
+        let name = tzname[0];
+        if name.is_null() {
+            return String::new();
+        }
+        CStr::from_ptr(name).to_string_lossy().into_owned()
+    }
+}
+
+/// Windows には `tzname[0]` と同じ意味の値が無いので従来どおり
+/// `TZ` の IANA 名から略称を引き、引けなければ `+09:00` 形式で出す。
+#[cfg(not(unix))]
+fn sadf_local_tz_name() -> String {
+    use chrono::{Offset, TimeZone};
+    use chrono_tz::OffsetName;
+    if let Ok(tz) = std::env::var("TZ")
+        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
+    {
+        let now = chrono::Utc::now().naive_utc();
+        if let Some(abbr) = tz.offset_from_utc_datetime(&now).abbreviation() {
+            return abbr.to_string();
+        }
+    }
+    chrono::Local::now().offset().fix().to_string()
+}
+
 // ===========================================================================
 // `sar` 互換入口
 // ===========================================================================
@@ -820,8 +879,11 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
         );
     }
 
+    // 本家 `check_file_actlst()` と同じく「ファイルに載っているか」だけを見る。
+    // 形式が未知で表示できない activity しか選ばなかった場合はエラーにせず、
+    // RESTART 行 (`-j` / `-x` はタイムスタンプだけ) を出して正常終了する。
     if !matches!(format, SadfFormat::Conv | SadfFormat::Pcp)
-        && sadf::dbppc::selected_specs(&file, &cfg).is_empty()
+        && !sadf::dbppc::any_selected_in_file(&file, &cfg)
     {
         bail!(
             "Requested activities not available in file {}",
@@ -829,12 +891,13 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
         );
     }
 
+    let extra = sadf_extra(&opts, &cfg);
     let result = match format {
-        SadfFormat::Db => sadf::dbppc::write_db(&mut out, &file, &cfg),
-        SadfFormat::Ppc => sadf::dbppc::write_ppc(&mut out, &file, &cfg),
-        SadfFormat::Json => sadf::json::write_json(&mut out, &file, &cfg),
-        SadfFormat::Xml => sadf::xml::write_xml(&mut out, &file, &cfg),
-        SadfFormat::Raw => sadf::raw::write_raw(&mut out, &file, &cfg),
+        SadfFormat::Db => sadf::dbppc::write_db_with(&mut out, &file, &cfg, &extra),
+        SadfFormat::Ppc => sadf::dbppc::write_ppc_with(&mut out, &file, &cfg, &extra),
+        SadfFormat::Json => sadf::json::write_json_with(&mut out, &file, &cfg, &extra),
+        SadfFormat::Xml => sadf::xml::write_xml_with(&mut out, &file, &cfg, &extra),
+        SadfFormat::Raw => sadf::raw::write_raw_with(&mut out, &file, &cfg, &extra),
         SadfFormat::Conv => {
             // 変換後のバイナリは stdout のみ、進捗は stderr (01 §5.1)。
             let cvt = ConvertOptions {

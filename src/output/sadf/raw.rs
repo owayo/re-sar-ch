@@ -11,7 +11,11 @@
 //! - 区切りは `"; "` (セミコロン + 空白)、行末は `";"` + 改行。
 //! - アイテムを持たない activity はアイテム識別子フィールドが無い。
 //! - **オフライン CPU も必ず出す** (他形式は除外する、§11.3)。
+//!   `A_CPU` と `A_NET_SOFT` は `nr_ini` (採取時の CPU 数) まで回し、
+//!   そのレコードに無い CPU は 0 の値で出す (`raw_print_cpu_stats()`)。
 //! - `hdr_line` に無い直書きフィールド名が多数ある (§14.5-3)。
+//!
+//! 表示ループは `logic2` = **activity 順** (エンジンは `logic2` モジュール)。
 //!
 //! # 文字列フィールド
 //!
@@ -25,177 +29,136 @@
 //! 本家 `get_devname()` の最終フォールバックと同じ `dev<major>-<minor>` を
 //! 組み立てる (§2.8.1)。ローカルの `/sys` は引かない — 他ホストで採取した
 //! ファイルでは別デバイスの名前が出てしまう。
+//!
+//! # `-O debug` (§4.4)
+//!
+//! | 追加されるもの | 本家 |
+//! |---|---|
+//! | レコードヘッダを読むたびに `# uptime_cs; …` 行 (基準レコード・RESTART・COMMENT・拡張レコードも) | `read_record_hdr()` |
+//! | 表示するレコードごとに `# name; <activity>; nr_curr; …` 行 (`nr_curr` はそのレコードの item 数) | `generic_write_stats()` |
+//! | 前値より減ったカウンタ名の直後に ` [DEC]` | `pval()` |
+//! | 個別 CPU の名前の直後に ` [OFF]` (tick 和が 0) / ` [TLS]` (tick 差分が 0) | `raw_print_cpu_stats()` |
+//! | 前サンプルに無いデバイスの名前の直後に ` [NEW]` / 再登録なら ` [BCK]` | `raw_print_disk_stats()` ほか |
 
 use std::io::{self, Write};
 
 use super::access::{ActivityPair, ItemPair};
+use super::dbppc::{activity_passes, display_cpu_count, selected_specs};
+use super::logic2::{self, Logic2Sink, Pass, Shown};
+use super::records::{Rec, RecHeader};
 use super::render::{item_label_in, raw_pair};
-use super::spec::{ActivitySpec, ItemKind, RawField, RawSpec, RawStyle, Section};
+use super::spec::{ActivitySpec, FieldGate, ItemKind, RawField, RawSpec, RawStyle, Section};
 use super::{
-    ABSENT_TEXT, FileInfo, SadfConfig, Stamp, double_from_bits, render, spec, write_sensor,
+    ABSENT_TEXT, FileInfo, ItemLabel, SadfConfig, SadfExtra, Stamp, double_from_bits, render, spec,
+    write_sensor,
 };
 use crate::error::Result;
-use crate::format::file::{SaFile, ScanControl};
+use crate::format::file::SaFile;
 use crate::model::{ActivityId, Availability};
-use crate::output::time_filter::Admit;
-use crate::series::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
-
-use super::dbppc::{display_cpu_count, scan_blocks, selected_specs};
+use crate::series::compute::{self, ComputeContext, CpuRole};
+use crate::series::{IntervalView, ItemSnapshot};
 
 /// `-r` の出力。
 pub fn write_raw<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file_with(file, cfg.time_base);
-    let specs = selected_specs(file, cfg);
-    let blocks = scan_blocks(file)?;
-
-    for block in 0..blocks.len() {
-        if !blocks.has_output(block) {
-            if let Some(r) = blocks.restarts.get(block) {
-                write_restart_line(out, cfg, &info, r).map_err(super::wrap_io)?;
-            }
-            continue;
-        }
-        for spec in &specs {
-            for section in spec.active_sections(&cfg.section) {
-                if cfg.debug {
-                    write_activity_debug_header(out, file, spec).map_err(super::wrap_io)?;
-                }
-                write_activity_block(out, file, cfg, &info, spec, section, block)?;
-            }
-        }
-        if let Some(r) = blocks.restarts.get(block) {
-            write_restart_line(out, cfg, &info, r).map_err(super::wrap_io)?;
-        }
-    }
-    Ok(())
+    write_raw_with(out, file, cfg, &SadfExtra::default())
 }
 
-/// RESTART 行。nodename も interval も出さず、`;` の後に空白 1 個 (§1.3)。
-fn write_restart_line<W: Write>(
-    out: &mut W,
-    cfg: &SadfConfig,
-    info: &FileInfo,
-    r: &super::dbppc::RestartMark,
-) -> io::Result<()> {
-    let stamp = Stamp::new(cfg.time_base, r.ust_time, r.hms, info);
-    writeln!(
-        out,
-        "{}; LINUX-RESTART ({} CPU)",
-        stamp.raw(),
-        display_cpu_count(r.cpu_count)
-    )
-}
-
-/// `-O debug` のアクティビティヘッダ行 (§4.4-2)。
-fn write_activity_debug_header<W: Write>(
-    out: &mut W,
-    file: &SaFile,
-    spec: &ActivitySpec,
-) -> io::Result<()> {
-    if let Some(e) = file.activities().iter().find(|e| e.id == spec.id) {
-        writeln!(
-            out,
-            "# name; {}; nr_curr; {}; nr_alloc; {}; nr_ini; {}",
-            spec.name,
-            e.nr.max(0),
-            e.nr.max(0),
-            e.nr.max(0)
-        )?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_activity_block<W: Write>(
+/// `-r` の出力 (`interval` / `count` と `-T` の TZ 名を指定する)。
+pub fn write_raw_with<W: Write>(
     out: &mut W,
     file: &SaFile,
     cfg: &SadfConfig,
-    info: &FileInfo,
-    spec: &ActivitySpec,
-    section: &Section,
-    block: usize,
+    extra: &SadfExtra,
 ) -> Result<()> {
-    let mut current_block = 0usize;
-    let mut cursor = cfg.time_filter.cursor();
-
-    walk_items(file, &Selection::Only(vec![spec.id]), |item| {
-        match item {
-            // RESTART がブロックの境界 (`logic2`)。読んだ時点で次のブロックへ移る。
-            WalkItem::Event(RecordEvent::Restart { .. }) => current_block += 1,
-            // COMMENT は読んだ時点で出す。最後の統計レコードより後ろにあっても届く。
-            WalkItem::Event(ev) => {
-                if cfg.comments && current_block == block && cursor.event(ev.ust_time(), ev.time())
-                {
-                    emit_comment(out, &ev, cfg, info).map_err(super::wrap_io)?;
-                }
-            }
-            WalkItem::Sample(view) => match cursor.sample(view) {
-                Admit::Skip | Admit::Reference => {}
-                Admit::Stop => return Ok(ScanControl::Stop),
-                Admit::Emit => {
-                    if current_block == block {
-                        emit_sample(out, view, cfg, info, spec, section).map_err(super::wrap_io)?;
-                    }
-                }
-            },
-        }
-        Ok(ScanControl::Continue)
-    })?;
-    Ok(())
+    let info = FileInfo::from_config(file, cfg, extra);
+    let specs = selected_specs(file, cfg);
+    let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
+    let passes = activity_passes(&specs, cfg);
+    let mut sink = RawSink { out, cfg, info };
+    logic2::run(file, cfg, extra.select, &passes, &ids, cfg.debug, &mut sink)
 }
 
-/// COMMENT の 1 行 (`<時刻>; COM <本文>`)。
-fn emit_comment<W: Write>(
-    out: &mut W,
-    ev: &RecordEvent,
-    cfg: &SadfConfig,
-    info: &FileInfo,
-) -> io::Result<()> {
-    let RecordEvent::Comment { ust_time, text, .. } = ev else {
-        return Ok(());
-    };
-    let stamp = Stamp::new(cfg.time_base, *ust_time, ev.time(), info);
-    writeln!(out, "{}; COM {text}", stamp.raw())
+/// `-r` の書き出し。
+struct RawSink<'w, 'c, W: Write> {
+    out: &'w mut W,
+    cfg: &'c SadfConfig,
+    info: FileInfo,
 }
 
-/// 1 レコード分を書き出す。
-fn emit_sample<W: Write>(
-    out: &mut W,
-    view: &IntervalView<'_>,
-    cfg: &SadfConfig,
-    info: &FileInfo,
-    spec: &ActivitySpec,
-    section: &Section,
-) -> io::Result<()> {
-    // COMMENT はここでは出さない (走査で読んだ時点に [`emit_comment`] が出す)。
-    if !view.has_prev || !view.continuous {
-        return Ok(());
-    }
-
-    let stamp = Stamp::new(
-        cfg.time_base,
-        view.curr.ust_time,
-        (view.curr.hour, view.curr.minute, view.curr.second),
-        info,
-    );
-    let ts = stamp.raw();
-
-    if cfg.debug {
+impl<W: Write> Logic2Sink for RawSink<'_, '_, W> {
+    /// RESTART 行。nodename も interval も出さず、`;` の後に空白 1 個 (§1.3)。
+    fn restart(&mut self, rec: &Rec, cpu_nr: Option<u32>) -> io::Result<()> {
+        let stamp = Stamp::new(self.cfg.time_base, rec.ust_time, rec.hms, &self.info);
         writeln!(
-            out,
-            "# uptime_cs; {}; ust_time; {}; extra_next; 0; record_type; 1; HH:MM:SS; {:02}:{:02}:{:02}",
-            view.curr.uptime_cs,
-            view.curr.ust_time,
-            view.curr.hour,
-            view.curr.minute,
-            view.curr.second
-        )?;
+            self.out,
+            "{}; LINUX-RESTART ({} CPU)",
+            stamp.raw_event(),
+            display_cpu_count(cpu_nr)
+        )
     }
 
-    match spec.id {
-        ActivityId::IRQ => write_irq(out, view, &ts, cfg),
-        ActivityId::PWR_FREQ => write_wghfreq(out, view, &ts, cfg),
-        _ => write_generic(out, view, &ts, cfg, spec, section),
+    /// COMMENT の 1 行 (`<時刻>; COM <本文>`)。
+    fn comment(&mut self, rec: &Rec) -> io::Result<()> {
+        let stamp = Stamp::new(self.cfg.time_base, rec.ust_time, rec.hms, &self.info);
+        writeln!(
+            self.out,
+            "{}; COM {}",
+            stamp.raw_event(),
+            rec.comment.as_deref().unwrap_or("")
+        )
+    }
+
+    /// raw はフィールド名一覧行を持たない (`FO_FIELD_LIST` は `-d` だけ)。
+    fn begin_pass(&mut self, _pass: &Pass) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn sample(&mut self, pass: &Pass, shown: &Shown<'_, '_>) -> io::Result<()> {
+        let Pass::Activity { spec, section } = pass else {
+            return Ok(());
+        };
+        let view = shown.view;
+        let nr_curr = view.curr.activity(spec.id).map_or(0, |a| a.nr);
+        if self.cfg.debug {
+            writeln!(
+                self.out,
+                "# name; {}; nr_curr; {}; nr_alloc; {}; nr_ini; {}",
+                spec.name, nr_curr, shown.nr_alloc, shown.nr_ini
+            )?;
+        }
+        // `IS_SELECTED && nr[curr] > 0` のときだけ本体を出す
+        if nr_curr == 0 {
+            return Ok(());
+        }
+        let stamp = Stamp::new(
+            self.cfg.time_base,
+            view.curr.ust_time,
+            (view.curr.hour, view.curr.minute, view.curr.second),
+            &self.info,
+        );
+        let ts = stamp.raw();
+        match spec.id {
+            ActivityId::IRQ => write_irq(self.out, view, &ts, self.cfg),
+            ActivityId::PWR_FREQ => write_wghfreq(self.out, view, &ts, self.cfg),
+            ActivityId::CPU | ActivityId::NET_SOFT => {
+                // 表示関数は `nr[curr] > nr_ini` なら先に `nr_ini` を引き上げる
+                let nr_ini = shown.nr_ini.max(nr_curr);
+                write_per_cpu(self.out, view, &ts, self.cfg, spec, section, nr_ini)
+            }
+            _ => write_generic(self.out, view, &ts, self.cfg, spec, section),
+        }
+    }
+
+    /// `# uptime_cs; …` 行 (`read_record_hdr()` の debug 出力)。
+    ///
+    /// `extra_next` は索引が持たないので 0 を出す (拡張構造を持つファイルでだけ
+    /// 本家と食い違う)。
+    fn header(&mut self, h: &RecHeader) -> io::Result<()> {
+        writeln!(
+            self.out,
+            "# uptime_cs; {}; ust_time; {}; extra_next; 0; record_type; {}; HH:MM:SS; {:02}:{:02}:{:02}",
+            h.uptime_cs, h.ust_time, h.record_type, h.hms.0, h.hms.1, h.hms.2
+        )
     }
 }
 
@@ -214,7 +177,7 @@ fn write_generic<W: Write>(
     let Some(pair) = ActivityPair::from_view(view, spec.id) else {
         return Ok(());
     };
-    let fields = raw_fields(section);
+    let fields = raw_fields(section, cfg);
 
     // A_DISK だけは直書きの major / minor が hdr_line のアイテムラベルより
     // **前**に出る (§4.5)。ラベルを挟む位置をここで決める。
@@ -222,6 +185,12 @@ fn write_generic<W: Write>(
 
     for item in pair.selected_items(cfg, true) {
         let mut tok = vec![ts.to_string()];
+        // 前サンプルに無い回線は回線番号までで行を閉じる (`raw_print_serial_stats()`)
+        if pair.is_new_serial_line(&item) {
+            push_item_label(&mut tok, spec, section, &item, cfg);
+            out.write_all(join_tokens(&tok).as_bytes())?;
+            continue;
+        }
         for (i, f) in fields.iter().enumerate() {
             if i == label_at {
                 push_item_label(&mut tok, spec, section, &item, cfg);
@@ -266,17 +235,53 @@ fn push_item_label(
     let head = section.hdr_line.split(';').next().unwrap_or_default();
     let label = item_label_in(spec, section, item);
 
-    // -O debug では A_CPU のオフライン判定を名前の直後に付ける (§4.4-4)
-    if cfg.debug && spec.id == ActivityId::CPU && item.ctx.tick_total == Some(0) {
-        tok.push(format!("{head} [OFF]"));
+    // -O debug では前サンプルに相手が居ないデバイスに印を付ける (§4.4)
+    let mark = if cfg.debug {
+        registration_mark(spec, item)
     } else {
-        tok.push(head.to_string());
-    }
+        ""
+    };
+    tok.push(format!("{head}{mark}"));
     // A_FS のデバイス名だけダブルクォートが付く (§14.5-5)
     if spec.id == ActivityId::FS {
         tok.push(format!("\"{}\"", label.db));
     } else {
         tok.push(label.db);
+    }
+}
+
+/// `-O debug` の登録状態の印 (`check_*_reg()` の戻り値)。
+///
+/// | 状態 | 印 | 対象 |
+/// |---|---|---|
+/// | 前サンプルに相手が居ない (`-1`) | ` [NEW]` | disk / net-dev / net-edev / fchost / serial |
+/// | 相手は居るが全カウンタが減った = 再登録 (`-2`) | ` [BCK]` | disk / net-dev / net-edev |
+fn registration_mark(spec: &ActivitySpec, item: &ItemPair<'_>) -> &'static str {
+    let tracked = matches!(
+        spec.id,
+        ActivityId::DISK
+            | ActivityId::NET_DEV
+            | ActivityId::NET_EDEV
+            | ActivityId::NET_FC
+            | ActivityId::SERIAL
+    );
+    if !tracked {
+        return "";
+    }
+    // 相手が居たかは文脈の `has_prev` に出る (区間の前サンプルはある前提)
+    if !item.ctx.has_prev {
+        return " [NEW]";
+    }
+    let reregistered = item.prepared.as_ref().is_some_and(|p| p.replaced);
+    if reregistered
+        && matches!(
+            spec.id,
+            ActivityId::DISK | ActivityId::NET_DEV | ActivityId::NET_EDEV
+        )
+    {
+        " [BCK]"
+    } else {
+        ""
     }
 }
 
@@ -288,11 +293,11 @@ fn push_raw_field(
     cfg: &SadfConfig,
 ) {
     match f.style {
-        RawStyle::Pval | RawStyle::PvalSum(_) | RawStyle::PvalDiff(_, _) => {
+        RawStyle::Pval | RawStyle::Pair | RawStyle::PvalSum(_) | RawStyle::PvalDiff(_, _) => {
             let (prev, curr) = raw_pair(item, f);
-            // -O debug ではカウンタが減少したフィールド名の直後に [DEC] (§4.4-3)
-            let dec = cfg.debug
-                && matches!((prev, curr), (Availability::Present(p), Availability::Present(c)) if c < p);
+            // -O debug ではカウンタが減少したフィールド名の直後に [DEC] (§4.4-3)。
+            // `pval()` を通らない `Pair` には付かない。
+            let dec = cfg.debug && !matches!(f.style, RawStyle::Pair) && is_decrease(prev, curr);
             tok.push(if dec {
                 format!("{} [DEC]", f.name)
             } else {
@@ -314,6 +319,16 @@ fn push_raw_field(
                 return;
             }
             tok.push(u64_token(v));
+        }
+        RawStyle::IntCompat => {
+            tok.push(f.name.to_string());
+            tok.push(match item.computed_by_name(f.col) {
+                Ok(v) => super::truncate_u64(v).to_string(),
+                Err(e) if super::missing_kind(e) == Some(super::MissingKind::ZeroFilled) => {
+                    "0".to_string()
+                }
+                Err(_) => ABSENT_TEXT.to_string(),
+            });
         }
         RawStyle::Sensor => {
             tok.push(f.name.to_string());
@@ -345,6 +360,19 @@ fn push_raw_field(
     }
 }
 
+/// `pval()` の ` [DEC]` 判定 (現値が前値より小さい)。
+///
+/// 本家は 0 埋めした構造体どうしを比べるので、その世代に無いフィールドは
+/// 0 として比べる (`u64_token` と同じ扱い)。観測できていない値は比べない。
+fn is_decrease(prev: Availability<u64>, curr: Availability<u64>) -> bool {
+    let v = |a: Availability<u64>| match a {
+        Availability::Present(x) => Some(x),
+        Availability::UnsupportedBySource => Some(0),
+        Availability::MissingInSample => None,
+    };
+    matches!((v(prev), v(curr)), (Some(p), Some(c)) if c < p)
+}
+
 /// 生値 1 個のトークン。
 ///
 /// **欠落の 2 種類を区別する** (指摘 8 と同じ規則)。
@@ -365,13 +393,17 @@ fn u64_token(v: Availability<u64>) -> String {
     }
 }
 
-/// `RawSpec` を実フィールド列へ展開する。
+/// `RawSpec` を実フィールド列へ展開する (`-r ALL` でだけ出るフィールドの判定込み)。
 ///
 /// [`RawSpec::AllPval`] は `-d`/`-p` のフィールド名をそのまま使い、全部 `pval`
 /// にする (アイテムを持たないカウンタ系、§4.5)。
-fn raw_fields(section: &Section) -> Vec<RawField> {
+fn raw_fields(section: &Section, cfg: &SadfConfig) -> Vec<RawField> {
     match section.raw {
-        RawSpec::Fields(list) => list.to_vec(),
+        RawSpec::Fields(list) => list
+            .iter()
+            .filter(|f| cfg.section.allows_field(f.gate))
+            .copied()
+            .collect(),
         RawSpec::AllPval => section
             .fields
             .iter()
@@ -380,9 +412,105 @@ fn raw_fields(section: &Section) -> Vec<RawField> {
                 col: f.col,
                 name: f.pp,
                 style: RawStyle::Pval,
+                gate: FieldGate::Always,
             })
             .collect(),
     }
+}
+
+// ===========================================================================
+// A_CPU / A_NET_SOFT (CPU ごと、オフラインも出す)
+// ===========================================================================
+
+/// `A_CPU` / `A_NET_SOFT` を CPU ごとに出す (`raw_print_cpu_stats()` /
+/// `raw_print_softnet_stats()`)。
+///
+/// 本家は `nr_ini` (採取時の CPU 数。RESTART で置き換わる) まで回し、
+/// そのレコードに無い CPU は 0 埋めされたバッファの値を出す
+/// (`AO_PERSISTENT` の activity は読むたびに `nr_ini` 分を 0 で消してから読む)。
+/// 前値も同じで、前のレコードに無かった CPU は 0 になる。
+/// `A_NET_SOFT` はファイルに無い CPU "all" を出さず 1 から始める。
+///
+/// `-O debug` の印 (個別 CPU のみ):
+///
+/// - `A_CPU`: tick 8 フィールドの和が 0 なら ` [OFF]`、そうでなく
+///   `get_per_cpu_interval()` が 0 なら ` [TLS]`。後者は本家が前値の
+///   `iowait` / `idle` を補正して書き戻すので、**表示する前値も補正後**になる。
+/// - `A_NET_SOFT`: 6 つのカウンタがすべて 0 なら ` [OFF]`。
+fn write_per_cpu<W: Write>(
+    out: &mut W,
+    view: &IntervalView<'_>,
+    ts: &str,
+    cfg: &SadfConfig,
+    spec: &ActivitySpec,
+    section: &Section,
+    nr_ini: u32,
+) -> io::Result<()> {
+    let (Some(plan), Some(def), Some(curr_act)) = (
+        view.plan_for(spec.id),
+        crate::layout::registry::lookup(spec.id),
+        view.curr.activity(spec.id),
+    ) else {
+        return Ok(());
+    };
+    let prev_items: &[ItemSnapshot] = view
+        .prev
+        .activity(spec.id)
+        .map_or(&[], |a| a.items.as_slice());
+    let zero = compute::zero_item(plan);
+    let fields = raw_fields(section, cfg);
+    let head = section.hdr_line.split(';').next().unwrap_or_default();
+    let start = usize::from(spec.id == ActivityId::NET_SOFT);
+    let n = (nr_ini as usize).max(curr_act.items.len());
+
+    for i in start..n {
+        if !cfg.cpus.includes(i) {
+            continue;
+        }
+        let curr = curr_act.items.get(i).unwrap_or(&zero);
+        let prev_raw = prev_items.get(i).unwrap_or(&zero);
+        let mut mark = "";
+        let fixed;
+        let prev: &ItemSnapshot = if cfg.debug && i > 0 {
+            match spec.id {
+                ActivityId::CPU => {
+                    let iv = compute::cpu_interval(plan, prev_raw, curr, CpuRole::Single);
+                    if iv.is_offline() {
+                        mark = " [OFF]";
+                        prev_raw
+                    } else {
+                        if iv.is_tickless() {
+                            mark = " [TLS]";
+                        }
+                        fixed = iv.prev;
+                        &fixed
+                    }
+                }
+                _ => {
+                    if compute::is_unused_item(spec.id, i, plan, curr) {
+                        mark = " [OFF]";
+                    }
+                    prev_raw
+                }
+            }
+        } else {
+            prev_raw
+        };
+        let mut ctx = ComputeContext::new(view.itv_cs);
+        ctx.has_prev = true;
+        ctx.continuous = true;
+        let item = ItemPair::single(i, def, plan, prev, curr, ctx);
+        let mut tok = vec![
+            ts.to_string(),
+            format!("{head}{mark}"),
+            ItemLabel::cpu(i).db,
+        ];
+        for f in &fields {
+            push_raw_field(&mut tok, spec, &item, f, cfg);
+        }
+        out.write_all(join_tokens(&tok).as_bytes())?;
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -420,21 +548,23 @@ fn write_irq<W: Write>(
                 continue;
             }
             // フィールド名は `all` (CPU 0) / `CPU0` / `CPU1` … (§4.5)
-            tok.push(if cpu == 0 {
+            let name = if cpu == 0 {
                 "all".to_string()
             } else {
                 format!("CPU{}", cpu - 1)
+            };
+            let (prev, curr) = match pair.irq_item(cpu, irq) {
+                Some(item) => (item.raw_prev_by_name("intr"), item.raw_curr_by_name("intr")),
+                None => (Availability::MissingInSample, Availability::MissingInSample),
+            };
+            // 値は `pval()` で出るので、-O debug の [DEC] もここに付く
+            tok.push(if cfg.debug && is_decrease(prev, curr) {
+                format!("{name} [DEC]")
+            } else {
+                name
             });
-            match pair.irq_item(cpu, irq) {
-                Some(item) => {
-                    tok.push(u64_token(item.raw_prev_by_name("intr")));
-                    tok.push(u64_token(item.raw_curr_by_name("intr")));
-                }
-                None => {
-                    tok.push(ABSENT_TEXT.to_string());
-                    tok.push(ABSENT_TEXT.to_string());
-                }
-            }
+            tok.push(u64_token(prev));
+            tok.push(u64_token(curr));
         }
         out.write_all(join_tokens(&tok).as_bytes())?;
     }
@@ -460,11 +590,7 @@ fn write_wghfreq<W: Write>(
         if !cfg.cpus.includes(row) {
             continue;
         }
-        let mut tok = vec![
-            ts.to_string(),
-            "CPU".to_string(),
-            super::ItemLabel::cpu(row).db,
-        ];
+        let mut tok = vec![ts.to_string(), "CPU".to_string(), ItemLabel::cpu(row).db];
         for step in 0..nr2 {
             let Some(item) = pair.item(row * nr2 + step) else {
                 break;
@@ -483,6 +609,7 @@ fn write_wghfreq<W: Write>(
                     col: "time_in_state",
                     name: "tminst",
                     style: RawStyle::Pval,
+                    gate: FieldGate::Always,
                 },
                 cfg,
             );
@@ -498,13 +625,14 @@ fn pair_spec() -> &'static ActivitySpec {
 
 #[cfg(test)]
 mod tests {
+    use super::super::spec::SectionConfig;
     use super::*;
 
     /// `AllPval` はフィールド名を `-d`/`-p` から取り、全部 `pval` にする。
     #[test]
     fn all_pval_expands_from_dp_fields() {
         let pcsw = spec::lookup(ActivityId::PCSW).unwrap();
-        let fields = raw_fields(&pcsw.sections[0]);
+        let fields = raw_fields(&pcsw.sections[0], &SadfConfig::default());
         let names: Vec<_> = fields.iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["proc/s", "cswch/s"]);
         assert!(fields.iter().all(|f| f.style == RawStyle::Pval));
@@ -514,7 +642,7 @@ mod tests {
     #[test]
     fn sensor_raw_names_differ_from_hdr_line() {
         let fan = spec::lookup(ActivityId::PWR_FAN).unwrap();
-        let fields = raw_fields(&fan.sections[0]);
+        let fields = raw_fields(&fan.sections[0], &SadfConfig::default());
         let names: Vec<_> = fields.iter().map(|f| f.name).collect();
         // hdr_line は FAN;DEVICE;rpm;drpm だが raw は drpm の代わりに rpm_min を出す
         assert_eq!(names, vec!["DEVICE", "rpm", "rpm_min"]);
@@ -525,18 +653,93 @@ mod tests {
     #[test]
     fn memory_raw_uses_hardcoded_total_name() {
         let mem = spec::lookup(ActivityId::MEMORY).unwrap();
-        let fields = raw_fields(&mem.sections[0]);
+        let fields = raw_fields(&mem.sections[0], &SadfConfig::default());
         let names: Vec<_> = fields.iter().map(|f| f.name).collect();
         assert!(names.contains(&"kbttlmem"));
         assert!(!names.contains(&"kbmemused"));
         assert!(!names.contains(&"%memused"));
     }
 
+    /// **回帰テスト**: `kbanonpg` 以降は `-r ALL` のときだけ出る
+    /// (`raw_print_ram_memory_stats()` の `dispall`)。以前は `-r` でも出ていた。
+    #[test]
+    fn memory_raw_detail_fields_need_r_all() {
+        let mem = spec::lookup(ActivityId::MEMORY).unwrap();
+        let plain = SadfConfig {
+            section: SectionConfig {
+                mem_all: false,
+                ..SectionConfig::default()
+            },
+            ..SadfConfig::default()
+        };
+        let names: Vec<_> = raw_fields(&mem.sections[0], &plain)
+            .iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names.last(), Some(&"kbshmem"), "{names:?}");
+        assert!(!names.contains(&"kbanonpg"));
+
+        let all: Vec<_> = raw_fields(&mem.sections[0], &SadfConfig::default())
+            .iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(all.last(), Some(&"kbvmused"), "{all:?}");
+    }
+
+    /// **回帰テスト (バグ 10)**: `availablekb` を持たない旧世代の `kbavail` は
+    /// 本家の変換 (`availablekb = frmkb`) と同じく `kbmemfree` の値になる。
+    /// 以前はその世代に無いフィールドとして `0` を出していた。
+    #[test]
+    fn kbavail_falls_back_to_kbmemfree_on_old_generations() {
+        use crate::layout::plan::DecodePlan;
+        use crate::model::ActivityId;
+
+        let def = crate::layout::registry::lookup(ActivityId::MEMORY).unwrap();
+        let col = |name: &str| {
+            def.columns
+                .iter()
+                .position(|c| c.public_name == name)
+                .unwrap()
+        };
+        let enc = crate::format::abi::SourceEncoding::new(
+            crate::format::abi::Endian::Little,
+            crate::format::abi::LayoutAbi::LP64,
+        );
+        // `availablekb` を持たない revision の計画
+        let plan = def
+            .revisions
+            .iter()
+            .filter_map(|rev| DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).ok())
+            .find(|plan| plan.column_fields[col("kbavail")].is_none())
+            .expect("availablekb を持たない revision がある");
+
+        let mut curr = compute::zero_item(&plan);
+        let free = plan.column_fields[col("kbmemfree")]
+            .as_ref()
+            .expect("kbmemfree はある")
+            .index();
+        curr.values[free] = Availability::Present(1234);
+        let prev = curr.clone();
+        let mut ctx = ComputeContext::new(100);
+        ctx.has_prev = true;
+        ctx.continuous = true;
+        let item = ItemPair::single(0, def, &plan, &prev, &curr, ctx);
+
+        let mem = spec::lookup(ActivityId::MEMORY).unwrap();
+        let field = raw_fields(&mem.sections[0], &SadfConfig::default())
+            .into_iter()
+            .find(|f| f.name == "kbavail")
+            .unwrap();
+        let mut tok = Vec::new();
+        push_raw_field(&mut tok, mem, &item, &field, &SadfConfig::default());
+        assert_eq!(tok, vec!["kbavail".to_string(), "1234".to_string()]);
+    }
+
     /// A_DISK は直書きの major / minor が先頭に来る。
     #[test]
     fn disk_raw_starts_with_major_minor() {
         let disk = spec::lookup(ActivityId::DISK).unwrap();
-        let fields = raw_fields(&disk.sections[0]);
+        let fields = raw_fields(&disk.sections[0], &SadfConfig::default());
         assert_eq!(fields[0].name, "major");
         assert_eq!(fields[1].name, "minor");
         // await / %util は消費されない

@@ -1,7 +1,8 @@
 //! `sadf -j` (JSON) の出力。
 //!
-//! 表示ループは `logic1` = **時刻順**。1 タイムスタンプの中に全 activity を並べ、
-//! `restarts` / `comments` は `statistics` を全部出し終わった後にまとめて出る (§0.3)。
+//! 表示ループは `logic1` = **時刻順** (エンジンは `logic1` モジュール)。1 タイムスタンプの中に
+//! 全 activity を並べ、`restarts` / `comments` は `statistics` を全部出し終わった後に
+//! まとめて出る (§0.3)。
 //!
 //! # 書式の要点 (§9)
 //!
@@ -9,70 +10,91 @@
 //! - カンマは「次要素の直前」に出す。最後の要素に末尾カンマは付かない。
 //! - 小数は**全フィールド 2 桁固定** (`MBfsfree` / `MBfsused` だけ 0 桁)。
 //!   `--dec=` も `--human` も `sadf` には無い。
+//! - activity の並びは**固定の `act[]` 順** (ファイルの記載順ではない、§9.4)。
 //! - `network` / `power-management` / `psi` は遅延オープンのラッパ。
 //!   中身が 1 つも出ないときはラッパごと出ない。
+//! - 配列型の activity は、そのレコードに item があれば (`nr[curr] > 0`)
+//!   絞り込みで 0 件になっても**空の配列**として出る。
+//! - `next_slice()` で省いたレコードや `-e` を超えたレコードは
+//!   **空のオブジェクト**になる (本家の実測。理由は `logic1` モジュールの doc)。
 //! - キー名は XML の属性名と**微妙に違う** (§10.6)。機械変換してはいけない。
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
-use super::access::ActivityPair;
-use super::dbppc::{display_cpu_count, scan_comments, scan_restarts, selected_specs};
+use super::access::{ActivityPair, CompatFormat};
+use super::dbppc::{ActEntry, act_entries, display_cpu_count, selected_specs};
+use super::logic1::{self, Logic1Sink};
+use super::records::Rec;
 use super::render::{item_label_in, jx_fields};
 use super::spec::{ActivitySpec, Fmt, Group, Shape};
-use super::{ABSENT_JSON, FileInfo, SadfConfig, Stamp, interval_secs, render};
+use super::{ABSENT_JSON, FileInfo, SadfConfig, SadfExtra, Stamp, interval_secs, render};
 use crate::error::Result;
-use crate::format::file::{SaFile, ScanControl};
+use crate::format::file::SaFile;
 use crate::model::ActivityId;
-use crate::output::time_filter::Admit;
-use crate::series::{IntervalView, Selection, WalkItem, walk_items};
+use crate::series::IntervalView;
 
 /// `-j` の出力。
 pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &SadfConfig) -> Result<()> {
-    let info = FileInfo::from_file_with(file, cfg.time_base);
-    let specs = selected_specs(file, cfg);
+    write_json_with(out, file, cfg, &SadfExtra::default())
+}
+
+/// `-j` の出力 (`interval` / `count` と `-T` の TZ 名を指定する)。
+pub fn write_json_with<W: Write>(
+    out: &mut W,
+    file: &SaFile,
+    cfg: &SadfConfig,
+    extra: &SadfExtra,
+) -> Result<()> {
+    let info = FileInfo::from_config(file, cfg, extra);
+    let displayed = selected_specs(file, cfg);
+    let ids: Vec<ActivityId> = displayed.iter().map(|s| s.id).collect();
+    let acts = act_entries(file, cfg, &displayed);
 
     write_prologue(out, &info).map_err(super::wrap_io)?;
 
     // ---- statistics (時刻順に 1 回走査) ----
-    let mut first = true;
-    let ids: Vec<ActivityId> = specs.iter().map(|s| s.id).collect();
-    let mut cursor = cfg.time_filter.cursor();
-    walk_items(file, &Selection::Only(ids), |item| {
-        // `logic1` の統計ループは RESTART / COMMENT を見ない。
-        // `restarts` / `comments` は後段の別走査 (scan_restarts / scan_comments) が出す。
-        let WalkItem::Sample(view) = item else {
-            return Ok(ScanControl::Continue);
-        };
-        match cursor.sample(view) {
-            Admit::Skip | Admit::Reference => return Ok(ScanControl::Continue),
-            Admit::Stop => return Ok(ScanControl::Stop),
-            Admit::Emit => {}
-        }
-        if !view.has_prev || !view.continuous {
-            return Ok(ScanControl::Continue);
-        }
-        let body = sample_body(view, cfg, &info, &specs);
-        if body.is_empty() {
-            return Ok(ScanControl::Continue);
-        }
-        let sep = if first { "" } else { ",\n" };
-        first = false;
-        write!(out, "{sep}\t\t\t\t{{\n{body}\n\t\t\t\t}}").map_err(super::wrap_io)?;
-        Ok(ScanControl::Continue)
-    })?;
-
-    let restarts = scan_restarts(file)?;
-    let comments = if cfg.comments {
-        scan_comments(file)?
-    } else {
-        Vec::new()
+    let mut sink = JsonSink {
+        out,
+        cfg,
+        info: &info,
+        acts: &acts,
+        first: true,
     };
+    let specials = logic1::run(file, cfg, extra.select, &ids, &mut sink)?;
+    let first = sink.first;
     if !first {
         writeln!(out).map_err(super::wrap_io)?;
     }
-    write_epilogue(out, cfg, &info, &restarts, &comments).map_err(super::wrap_io)?;
+    write_epilogue(out, cfg, &info, &specials.restarts, &specials.comments)
+        .map_err(super::wrap_io)?;
     Ok(())
+}
+
+/// `statistics` の要素を書き出す。
+struct JsonSink<'w, 'c, W: Write> {
+    out: &'w mut W,
+    cfg: &'c SadfConfig,
+    info: &'c FileInfo,
+    /// 出す activity (`act[]` 順)。
+    acts: &'c [ActEntry],
+    /// まだ 1 要素も出していないか (カンマの要否)。
+    first: bool,
+}
+
+impl<W: Write> Logic1Sink for JsonSink<'_, '_, W> {
+    fn record(&mut self, view: Option<&IntervalView<'_>>) -> io::Result<()> {
+        let sep = if self.first { "" } else { ",\n" };
+        self.first = false;
+        match view {
+            Some(view) => {
+                let body = sample_body(view, self.cfg, self.info, self.acts);
+                write!(self.out, "{sep}\t\t\t\t{{\n{body}\n\t\t\t\t}}")
+            }
+            // 表示しなかったレコード: `f_statistics(F_MAIN)` の `{` だけが出る
+            None => write!(self.out, "{sep}\t\t\t\t{{\n\t\t\t\t}}"),
+        }
+    }
 }
 
 /// `"statistics": [` までのヘッダ部。
@@ -98,17 +120,18 @@ fn write_prologue<W: Write>(out: &mut W, info: &FileInfo) -> io::Result<()> {
 /// `statistics` を閉じてから `restarts` / `comments` を出す。
 ///
 /// `logic1` はファイルを 3 回走査するので、この 2 つは必ず統計の**後**に来る。
+/// どちらも `-s` / `-e` の範囲外は出ない (`print_special_record()`)。
 fn write_epilogue<W: Write>(
     out: &mut W,
     cfg: &SadfConfig,
     info: &FileInfo,
-    restarts: &[super::dbppc::RestartMark],
-    comments: &[(u64, (u8, u8, u8), String)],
+    restarts: &[(Rec, Option<u32>)],
+    comments: &[Rec],
 ) -> io::Result<()> {
     writeln!(out, "\t\t\t],")?;
 
     writeln!(out, "\t\t\t\"restarts\": [")?;
-    for (i, r) in restarts.iter().enumerate() {
+    for (i, (r, cpu_nr)) in restarts.iter().enumerate() {
         let s = Stamp::new(cfg.time_base, r.ust_time, r.hms, info);
         if i > 0 {
             writeln!(out, ",")?;
@@ -119,7 +142,7 @@ fn write_epilogue<W: Write>(
             s.date,
             s.time,
             esc(&s.tz),
-            display_cpu_count(r.cpu_count)
+            display_cpu_count(*cpu_nr)
         )?;
     }
     if !restarts.is_empty() {
@@ -129,8 +152,8 @@ fn write_epilogue<W: Write>(
     if cfg.comments {
         writeln!(out, "\t\t\t],")?;
         writeln!(out, "\t\t\t\"comments\": [")?;
-        for (i, (ust, hms, text)) in comments.iter().enumerate() {
-            let s = Stamp::new(cfg.time_base, *ust, *hms, info);
+        for (i, c) in comments.iter().enumerate() {
+            let s = Stamp::new(cfg.time_base, c.ust_time, c.hms, info);
             if i > 0 {
                 writeln!(out, ",")?;
             }
@@ -140,7 +163,7 @@ fn write_epilogue<W: Write>(
                 s.date,
                 s.time,
                 esc(&s.tz),
-                esc(text)
+                esc(c.comment.as_deref().unwrap_or(""))
             )?;
         }
         if !comments.is_empty() {
@@ -165,7 +188,7 @@ fn sample_body(
     view: &IntervalView<'_>,
     cfg: &SadfConfig,
     info: &FileInfo,
-    specs: &[&'static ActivitySpec],
+    acts: &[ActEntry],
 ) -> String {
     let stamp = Stamp::new(
         cfg.time_base,
@@ -185,14 +208,18 @@ fn sample_body(
     let mut open_group = Group::None;
     let mut children: Vec<String> = Vec::new();
 
-    // ファイルの activity 順 = JSON の出力順。通常の採取順ではグループが連続するので
+    // `act[]` 順 = JSON の出力順。グループは `act[]` の中で連続しているので
     // 順に走査しながら開閉できる。
-    for spec in specs {
+    for act in acts {
+        let spec = act.spec;
         if spec.group != open_group {
             flush_group(&mut entries, open_group, &mut children);
             open_group = spec.group;
         }
-        let Some(block) = activity_block(view, cfg, spec, group_tab(spec.group)) else {
+        let Some(pair) = act.pair(view) else {
+            continue;
+        };
+        let Some(block) = activity_block(&pair, cfg, spec, group_tab(spec.group)) else {
             continue;
         };
         if spec.group == Group::None {
@@ -230,12 +257,12 @@ fn flush_group(entries: &mut Vec<String>, group: Group, children: &mut Vec<Strin
 // ===========================================================================
 
 fn activity_block(
-    view: &IntervalView<'_>,
+    pair: &ActivityPair<'_>,
     cfg: &SadfConfig,
     spec: &ActivitySpec,
     tab: usize,
 ) -> Option<String> {
-    let pair = ActivityPair::from_view(view, spec.id)?;
+    // `IS_SELECTED && nr[curr] > 0` の activity だけが出る
     if pair.is_empty() {
         return None;
     }
@@ -264,7 +291,7 @@ fn activity_block(
         Shape::Array => {
             let inner = tabs(tab + 1);
             let mut rows: Vec<String> = Vec::new();
-            for item in pair.selected_items(cfg, false) {
+            for item in pair.selected_items_in(cfg, CompatFormat::JsonXml) {
                 let mut members: Vec<String> = Vec::new();
                 for section in spec.active_sections(&cfg.section) {
                     let label = item_label_in(spec, section, &item);
@@ -277,9 +304,9 @@ fn activity_block(
                 }
                 rows.push(format!("{inner}{{{}}}", members.join(", ")));
             }
-            if rows.is_empty() {
-                return None;
-            }
+            // 絞り込みで 0 件でも配列そのものは出る (`"key": [\n\n\t…]`)。
+            // 本家の `json_print_*()` は `nr[curr] > 0` なら必ず呼ばれて
+            // 開き括弧と閉じ括弧を出す。
             Some(format!(
                 "{t}\"{}\": [\n{}\n{t}]",
                 spec.json_key,
@@ -287,8 +314,8 @@ fn activity_block(
             ))
         }
         Shape::Custom => match spec.id {
-            ActivityId::IO => io_block(&pair, tab),
-            ActivityId::IRQ => irq_block(&pair, tab, spec, cfg),
+            ActivityId::IO => io_block(pair, tab),
+            ActivityId::IRQ => irq_block(pair, tab, spec, cfg),
             _ => None,
         },
     }
@@ -378,9 +405,7 @@ fn irq_block(
         }
         rows.push(format!("{inner}{{{}}}", members.join(", ")));
     }
-    if rows.is_empty() {
-        return None;
-    }
+    // 絞り込み (`--int=`) で 0 件でも空の配列として出る
     Some(format!(
         "{t}\"{}\": [\n{}\n{t}]",
         spec.json_key,

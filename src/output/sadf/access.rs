@@ -14,9 +14,106 @@ use crate::layout::registry::{ActivityDef, ColumnMeta, ItemShape};
 use crate::model::{ActivityId, Availability};
 use crate::series::compute::{
     self, ComputeContext, ComputeIssue, Computed, SadfUnitColumn, column_value,
-    column_value_strict, matrix_row_values, matrix_row_values_strict, sadf_unit_value, tick_total,
+    column_value_strict, disk_col, matrix_row_values, matrix_row_values_strict, sadf_unit_value,
+    tick_total,
 };
 use crate::series::{ActivitySnapshot, IntervalView, ItemSnapshot};
+
+/// 形式が未知で読めない単一 item の activity を、本家と同じく
+/// 「0 埋めのバッファ」として出すための器 (`-j` / `-x` / `-dh` 専用)。
+///
+/// 本家は形式 (activity magic) が未知の activity を `id_seq[]` から外すが、
+/// 選択は外さない。単一 item の activity は `act[]` の静的初期値が
+/// `nr = {1, 1, 1}` なので、`act[]` を回す `generic_write_stats()`
+/// (`-j` / `-x` / `-dh`) では `nr[curr] > 0` として扱われ、**読んでいない
+/// (0 のままの) バッファの値が出る**。`-d` / `-p` / `-r` の縦並びは
+/// `id_seq[]` を回すので出ない。可変個の activity は静的初期値が `-1` で出ない。
+#[derive(Debug)]
+pub struct ZeroActivity {
+    id: ActivityId,
+    def: &'static ActivityDef,
+    plan: DecodePlan,
+    snap: ActivitySnapshot,
+}
+
+impl ZeroActivity {
+    /// 最新 revision の配置で全フィールド 0 の item を 1 つ持つ器を作る。
+    pub fn new(id: ActivityId) -> Option<Self> {
+        let def = crate::layout::registry::lookup(id)?;
+        let rev = def.latest()?;
+        let enc = crate::format::abi::SourceEncoding::new(
+            crate::format::abi::Endian::Little,
+            crate::format::abi::LayoutAbi::LP64,
+        );
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).ok()?;
+        let snap = ActivitySnapshot {
+            id,
+            index: 0,
+            nr: 1,
+            nr2: 1,
+            items: vec![compute::zero_item(&plan)],
+        };
+        Some(Self {
+            id,
+            def,
+            plan,
+            snap,
+        })
+    }
+
+    /// 前値も現値も 0 の「前後 1 対」。
+    pub fn pair(&self, itv_cs: u64) -> ActivityPair<'_> {
+        ActivityPair {
+            id: self.id,
+            def: self.def,
+            plan: &self.plan,
+            curr: &self.snap,
+            prev: Some(&self.snap),
+            itv_cs,
+            has_prev: true,
+            continuous: true,
+        }
+    }
+}
+
+/// item の選び方が形式ごとに違う箇所を区別するための互換出力の系統。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatFormat {
+    /// `-d` / `-p` (`render_*()`)。
+    DbPpc,
+    /// `-j` / `-x` (`json_print_*()` / `xml_print_*()`)。
+    JsonXml,
+    /// `-r` (`raw_print_*()`)。
+    Raw,
+}
+
+/// 前サンプルの相手を名前ではなく**値の組**で探す activity か。
+///
+/// 名前 (`ItemSnapshot::key`) を持たないのに、item の並びが採取ごとに
+/// 変わり得る activity。位置で突き合わせると別の item を前値にしてしまう。
+fn matches_by_identity(id: ActivityId) -> bool {
+    matches!(id, ActivityId::DISK | ActivityId::SERIAL)
+}
+
+/// 前サンプルの item を、`pos` の位置から巡回しながら探す。
+///
+/// 本家の `check_disk_reg()` / `print_serial_stats()` と同じ順序
+/// (`pos` が前サンプルの個数を超えていれば末尾から始め、末尾の次は先頭)。
+/// 同じ値の組が 2 つあるときに、どちらを相手にするかまで揃える。
+fn search_from(
+    items: &[ItemSnapshot],
+    pos: usize,
+    matches: impl Fn(&ItemSnapshot) -> bool,
+) -> Option<&ItemSnapshot> {
+    let n = items.len();
+    if n == 0 {
+        return None;
+    }
+    let start = pos.min(n - 1);
+    (0..n)
+        .map(|k| &items[(start + k) % n])
+        .find(|item| matches(item))
+}
 
 /// activity の「前後 1 対」。
 ///
@@ -101,14 +198,32 @@ impl<'a> ActivityPair<'a> {
         base.has_prev = self.has_prev;
         base.continuous = self.continuous;
         base.aggregate_item = self.is_aggregate_slot(index, label_index);
-        let prepared = compute::prepare_item(
-            self.id,
-            self.plan,
-            index,
-            self.prev.map_or(&[], |p| p.items.as_slice()),
-            &self.curr.items,
-            base,
-        );
+        let prepared = if matches_by_identity(self.id) {
+            // 相手は識別子で見つけたものだけを渡す (計算層に位置で引かせない)。
+            // 見つからなければ空で渡し、「新規登録 = 前値ゼロ」として扱わせる。
+            let prev_items: &[ItemSnapshot] = if matched {
+                std::slice::from_ref(prev)
+            } else {
+                &[]
+            };
+            compute::prepare_item(
+                self.id,
+                self.plan,
+                0,
+                prev_items,
+                std::slice::from_ref(curr),
+                base,
+            )
+        } else {
+            compute::prepare_item(
+                self.id,
+                self.plan,
+                index,
+                self.prev.map_or(&[], |p| p.items.as_slice()),
+                &self.curr.items,
+                base,
+            )
+        };
         Some(ItemPair {
             index: label_index,
             def: self.def,
@@ -128,15 +243,54 @@ impl<'a> ActivityPair<'a> {
     /// 着脱で別デバイスの値を引く)。識別子を持たないスロットは位置で対応付ける。
     fn slot(&self, index: usize) -> Option<(&'a ItemSnapshot, &'a ItemSnapshot, bool)> {
         let curr = self.curr.items.get(index)?;
-        let prev = match (&curr.key, self.prev) {
-            (_, Some(p)) if self.id == ActivityId::IRQ => p.items.get(index),
-            (Some(key), Some(p)) => p.item_by_key(key),
-            (None, Some(p)) => p.items.get(index),
-            _ => None,
-        };
+        let prev = self.prev.and_then(|p| self.find_prev(p, index, curr));
         // 前サンプルに相手がいない = 差分が取れない。0 で埋めずに不連続として扱う。
         let matched = prev.is_some();
         Some((prev.unwrap_or(&EMPTY_ITEM), curr, matched))
+    }
+
+    /// 前サンプルから `curr` の相手を探す。
+    ///
+    /// | activity | 照合に使う値 | 本家 |
+    /// |---|---|---|
+    /// | `A_IRQ` | 位置 (行列の保存位置) | — |
+    /// | `A_DISK` | `major` / `minor` | `check_disk_reg()` |
+    /// | `A_SERIAL` | 回線番号 `line` | `print_serial_stats()` ほか |
+    /// | 名前を持つ activity | 名前 | `check_net_dev_reg()` ほか |
+    /// | それ以外 | 位置 | — |
+    ///
+    /// `A_DISK` のデバイス名はファイルに無い (`major` / `minor` から組み立てる) ので
+    /// 名前では引けない。以前は位置で対応付けていたため、デバイスの着脱で
+    /// 並びがずれると別デバイスの累積値を前値にしていた (`sadf -d` の
+    /// 13:20:49 `dev65-16` が本家 `8.93` に対し `918.58`)。
+    fn find_prev(
+        &self,
+        p: &'a ActivitySnapshot,
+        index: usize,
+        curr: &ItemSnapshot,
+    ) -> Option<&'a ItemSnapshot> {
+        match self.id {
+            ActivityId::IRQ => p.items.get(index),
+            ActivityId::DISK => {
+                let key = |item: &ItemSnapshot| {
+                    (
+                        compute::raw_column(self.plan, item, disk_col::MAJOR).ok(),
+                        compute::raw_column(self.plan, item, disk_col::MINOR).ok(),
+                    )
+                };
+                let want = key(curr);
+                search_from(&p.items, index, |x| key(x) == want)
+            }
+            ActivityId::SERIAL => {
+                let line = |item: &ItemSnapshot| compute::raw_column(self.plan, item, 0).ok();
+                let want = line(curr);
+                search_from(&p.items, index, |x| line(x) == want)
+            }
+            _ => match &curr.key {
+                Some(key) => p.item_by_key(key),
+                None => p.items.get(index),
+            },
+        }
     }
 
     /// 1 スロット分の計算コンテキスト。
@@ -225,23 +379,61 @@ impl<'a> ActivityPair<'a> {
             .into_iter()
             .filter(|it| !compute::is_unused_item(self.id, it.index, self.plan, it.curr))
             .filter(|it| !it.prepared.as_ref().is_some_and(|p| p.offline))
+            .filter(|it| !self.is_new_serial_line(it))
             .collect()
     }
 
     /// CLI の CPU と item 名選択をすべての互換形式に適用する。
+    ///
+    /// `raw` が偽なら `-d` / `-p` の規則。形式ごとの差を区別したい場合は
+    /// [`selected_items_in`](Self::selected_items_in) を使う。
     pub fn selected_items(&self, cfg: &super::SadfConfig, raw: bool) -> Vec<ItemPair<'a>> {
+        self.selected_items_in(
+            cfg,
+            if raw {
+                CompatFormat::Raw
+            } else {
+                CompatFormat::DbPpc
+            },
+        )
+    }
+
+    /// [`selected_items`](Self::selected_items) の形式別版。
+    ///
+    /// 本家は形式ごとに item の飛ばし方が違う箇所がある:
+    ///
+    /// | activity | `-d` / `-p` | `-j` / `-x` | `-r` |
+    /// |---|---|---|---|
+    /// | `A_PWR_CPU` の周波数 0 (オフライン) | 飛ばす | 出す | 出す |
+    /// | `A_NET_SOFT` の CPU "all" | 出す | 出す | 出さない (ファイルに無い) |
+    pub fn selected_items_in(
+        &self,
+        cfg: &super::SadfConfig,
+        format: CompatFormat,
+    ) -> Vec<ItemPair<'a>> {
+        let raw = format == CompatFormat::Raw;
         self.output_items()
             .into_iter()
             .filter(|it| {
+                // 周波数 0 の CPU を飛ばすのは `render_pwr_cpufreq_stats()` だけ
+                // (`json_print_*` / `xml_print_*` / `raw_print_*` は `cpufreq` を見ない)
+                let keeps_offline_cpu =
+                    self.id == ActivityId::PWR_CPU && format != CompatFormat::DbPpc;
                 // raw softnet は架空の all を出さず、個別 CPU の生値は offline でも残す。
                 if raw && self.id == ActivityId::NET_SOFT {
                     if it.index == 0 {
                         return false;
                     }
-                } else if compute::is_unused_item(self.id, it.index, self.plan, it.curr) {
+                } else if !keeps_offline_cpu
+                    && compute::is_unused_item(self.id, it.index, self.plan, it.curr)
+                {
                     return false;
                 }
                 if !raw && it.prepared.as_ref().is_some_and(|p| p.offline) {
+                    return false;
+                }
+                // 前サンプルに無い回線は raw 以外では行ごと出ない
+                if !raw && self.is_new_serial_line(it) {
                     return false;
                 }
                 if matches!(
@@ -262,9 +454,26 @@ impl<'a> ActivityPair<'a> {
                     .next()
                     .map(|section| super::render::item_label_in(spec, section, it).db)
                     .unwrap_or_default();
+                if self.id == ActivityId::FS {
+                    // `--fs=` は表示名・デバイス名・マウントポイントのどれでも当たる
+                    return cfg.fs_selected(
+                        &label,
+                        it.text("filesystem").unwrap_or(""),
+                        it.text("mountpoint").unwrap_or(""),
+                    );
+                }
                 cfg.name_selected(self.id, &label)
             })
             .collect()
+    }
+
+    /// 前サンプルに同じ回線番号が無い `A_SERIAL` の item か。
+    ///
+    /// 本家の `render_serial_stats()` / `json_print_serial_stats()` /
+    /// `xml_print_serial_stats()` は相手が見つからない回線を `continue` で飛ばす
+    /// (raw だけは回線番号までを出す)。
+    pub fn is_new_serial_line(&self, it: &ItemPair<'_>) -> bool {
+        self.id == ActivityId::SERIAL && self.has_prev && !it.ctx.has_prev
     }
 
     pub fn irq_dimensions(&self) -> (usize, usize) {
@@ -620,10 +829,16 @@ impl<'a> ItemPair<'a> {
         }
     }
 
-    /// 複数列の生値の合計 (`A_CPU` の `%system` 用)。
+    /// 複数列の生値の合計 (`A_CPU` の `%system` 用、**互換出力専用**)。
     ///
-    /// 1 つでも欠けていたら合計を作らない。0 で補うと「動いていない CPU」と
-    /// 区別できなくなる。
+    /// 欠落の扱いは 2 通りに分ける:
+    ///
+    /// - その世代にフィールドが無い (`UnsupportedBySource`) は **0 として足す**。
+    ///   本家は足りないフィールドを 0 埋めした構造体で式を計算するので
+    ///   (03 §1.9-1)、`guest_nice` を持たない旧世代でも `%nice` は
+    ///   `cpu_nice - 0` になる。式全体を欠落にすると本家の `389` が `0` に化ける。
+    /// - このレコードで読めていない (`MissingInSample`) は合計を作らない
+    ///   (観測できていない値に 0 を与えない)。
     pub fn raw_sum(&self, names: &[&str], previous: bool) -> Availability<u64> {
         let mut total: u64 = 0;
         for n in names {
@@ -634,24 +849,30 @@ impl<'a> ItemPair<'a> {
             };
             match v {
                 Availability::Present(x) => total = total.wrapping_add(x),
-                other => return other,
+                Availability::UnsupportedBySource => {}
+                Availability::MissingInSample => return Availability::MissingInSample,
             }
         }
         Availability::Present(total)
     }
 
-    /// 2 列の生値の差 (`A_CPU ALL` の `%usr` = `cpu_user - cpu_guest` 用)。
+    /// 2 列の生値の差 (`A_CPU ALL` の `%usr` = `cpu_user - cpu_guest` 用、
+    /// **互換出力専用**)。欠落の扱いは [`raw_sum`](Self::raw_sum) と同じ。
     pub fn raw_diff(&self, a: &str, b: &str, previous: bool) -> Availability<u64> {
         let (x, y) = if previous {
             (self.raw_prev_by_name(a), self.raw_prev_by_name(b))
         } else {
             (self.raw_curr_by_name(a), self.raw_curr_by_name(b))
         };
-        match (x, y) {
+        let zero_filled = |v: Availability<u64>| match v {
+            Availability::UnsupportedBySource => Availability::Present(0),
+            other => other,
+        };
+        match (zero_filled(x), zero_filled(y)) {
             (Availability::Present(x), Availability::Present(y)) => {
                 Availability::Present(x.wrapping_sub(y))
             }
-            (Availability::Present(_), other) | (other, _) => other,
+            _ => Availability::MissingInSample,
         }
     }
 
@@ -722,9 +943,14 @@ mod tests {
         }
     }
 
-    /// 欠落を 0 で埋めずに伝播すること。
+    /// **回帰テスト (raw の欠落)**: その世代に無いフィールドは 0 として式に入り、
+    /// レコードで読めていないフィールドだけが式全体を欠落にする。
+    ///
+    /// 本家は足りないフィールドを 0 埋めした構造体で計算する (03 §1.9-1)。
+    /// 以前は `guest_nice` を持たない旧世代で `%nice` (`nice - guest_nice`) が
+    /// 式ごと欠落して `0` と出ていた (本家は `nice` の値そのもの)。
     #[test]
-    fn raw_sum_propagates_absence() {
+    fn raw_formulas_zero_fill_unsupported_but_propagate_missing() {
         let def = crate::layout::registry::lookup(ActivityId::CPU).unwrap();
         let rev = def.latest().unwrap();
         let enc = crate::format::abi::SourceEncoding::new(
@@ -735,26 +961,54 @@ mod tests {
 
         let curr = item(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let prev = item(&[0; 10]);
-        let pair = ItemPair {
+        let make = |curr| ItemPair {
             index: 0,
             def,
             plan: &plan,
             prev: &prev,
-            curr: &curr,
+            curr,
             ctx: ComputeContext::new(100),
             row: None,
             prepared: None,
         };
 
         // sys + irq + soft = 3 + 7 + 8
+        let pair = make(&curr);
         assert_eq!(
             pair.raw_sum(&["sys", "irq", "soft"], false),
             Availability::Present(18)
         );
-        // 存在しない列が混ざると合計を作らない
+        // その世代に無い列 (ここでは列そのものが無い) は 0 として足す
         assert_eq!(
             pair.raw_sum(&["sys", "no_such_column"], false),
-            Availability::UnsupportedBySource
+            Availability::Present(3)
+        );
+        // 差も同じ: nice - (無い列) = nice
+        assert_eq!(
+            pair.raw_diff("nice", "no_such_column", false),
+            Availability::Present(2)
+        );
+
+        // レコードで読めていない値が混ざると式全体を作らない
+        let col = def
+            .columns
+            .iter()
+            .position(|c| c.public_name == "irq")
+            .unwrap();
+        let field = plan.column_fields[col]
+            .as_ref()
+            .expect("irq の wire フィールド")
+            .index();
+        let mut missing = curr.clone();
+        missing.values[field] = Availability::MissingInSample;
+        let pair = make(&missing);
+        assert_eq!(
+            pair.raw_sum(&["sys", "irq", "soft"], false),
+            Availability::MissingInSample
+        );
+        assert_eq!(
+            pair.raw_diff("irq", "sys", false),
+            Availability::MissingInSample
         );
     }
 

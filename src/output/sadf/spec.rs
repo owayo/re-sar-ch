@@ -134,12 +134,24 @@ pub struct Field {
 pub enum RawStyle {
     /// `名前; 前値; 現値;` — `pval()` 相当。
     Pval,
+    /// `名前; 前値; 現値;` — `pval()` を通らず `printf` で直接出す
+    /// (A_PWR_BAT の `%cap`)。見た目は [`RawStyle::Pval`] と同じだが、
+    /// `-O debug` の ` [DEC]` が付かない。
+    Pair,
     /// 複数列の合計を `pval` で出す (A_CPU の `%system`)。
     PvalSum(&'static [&'static str]),
     /// 2 列の差を `pval` で出す (A_CPU `ALL` の `%usr` / `%nice`)。
     PvalDiff(&'static str, &'static str),
     /// `名前; 値;` (`%llu`) — 瞬時値。
     Int,
+    /// `名前; 値;` (`%llu`) — 瞬時値。ただし**その世代に無いフィールドは
+    /// 本家の変換 (`sadf -c`) と同じ値で補う**。
+    ///
+    /// 本家は旧世代のファイルを読む前に現行形式へ変換し、欠けたフィールドを
+    /// 埋める (`sa_conv.c: upgrade_stats_memory()` の `availablekb = frmkb`)。
+    /// 補う規則は計算層が持っている ([`crate::series::compute::column_value`] の
+    /// 互換モード) ので、出力層で式を書き直さずにそちらの値を使う。
+    IntCompat,
     /// `名前; 値;` (`%f` = 小数 6 桁)。
     ///
     /// センサ値はファイル上で IEEE-754 の `double` なので、u64 のビット列を
@@ -161,6 +173,9 @@ pub struct RawField {
     /// 出力される名前。`hdr_line` 由来のものと C ソース直書きのものが混在する。
     pub name: &'static str,
     pub style: RawStyle,
+    /// 出す条件。`-r ALL` でだけ出るフィールドがある
+    /// (`raw_print_ram_memory_stats()` の `dispall`)。
+    pub gate: FieldGate,
 }
 
 /// raw のフィールド構成。
@@ -379,6 +394,15 @@ macro_rules! rawf {
             col: $col,
             name: $name,
             style: $style,
+            gate: FieldGate::Always,
+        }
+    };
+    ($col:literal, $name:literal, $style:expr, $g:ident) => {
+        RawField {
+            col: $col,
+            name: $name,
+            style: $style,
+            gate: FieldGate::$g,
         }
     };
 }
@@ -520,9 +544,13 @@ const MEMORY_FIELDS: &[Field] = &[
 
 /// メモリ行の raw。派生値 (`kbmemused` / `%memused` / `%commit`) は出さず、
 /// 代わりに `hdr_line` に無い直書き名 `kbttlmem` が入る (§4.5)。
+///
+/// `kbavail` は `availablekb` を持たない旧世代で本家の変換と同じく
+/// `kbmemfree` の値になる ([`RawStyle::IntCompat`])。
+/// `kbanonpg` 以降は `-r ALL` のときだけ出る (`dispall`)。
 const MEMORY_RAW: &[RawField] = &[
     rawf!("kbmemfree", "kbmemfree", RawStyle::Int),
-    rawf!("kbavail", "kbavail", RawStyle::Int),
+    rawf!("kbavail", "kbavail", RawStyle::IntCompat),
     rawf!("kbmemtotal", "kbttlmem", RawStyle::Int),
     rawf!("kbbuffers", "kbbuffers", RawStyle::Int),
     rawf!("kbcached", "kbcached", RawStyle::Int),
@@ -531,11 +559,11 @@ const MEMORY_RAW: &[RawField] = &[
     rawf!("kbinact", "kbinact", RawStyle::Int),
     rawf!("kbdirty", "kbdirty", RawStyle::Int),
     rawf!("kbshmem", "kbshmem", RawStyle::Int),
-    rawf!("kbanonpg", "kbanonpg", RawStyle::Int),
-    rawf!("kbslab", "kbslab", RawStyle::Int),
-    rawf!("kbkstack", "kbkstack", RawStyle::Int),
-    rawf!("kbpgtbl", "kbpgtbl", RawStyle::Int),
-    rawf!("kbvmused", "kbvmused", RawStyle::Int),
+    rawf!("kbanonpg", "kbanonpg", RawStyle::Int, MemAll),
+    rawf!("kbslab", "kbslab", RawStyle::Int, MemAll),
+    rawf!("kbkstack", "kbkstack", RawStyle::Int, MemAll),
+    rawf!("kbpgtbl", "kbpgtbl", RawStyle::Int, MemAll),
+    rawf!("kbvmused", "kbvmused", RawStyle::Int, MemAll),
 ];
 
 const SWAP_MEM_FIELDS: &[Field] = &[
@@ -1075,7 +1103,8 @@ const PWR_BAT_FIELDS: &[Field] = &[
 ];
 
 const PWR_BAT_RAW: &[RawField] = &[
-    rawf!("capacity_pct", "%cap", RawStyle::Pval),
+    // `printf(" %s; %u; %u;", …)` で直接出る (pval() を通らない)
+    rawf!("capacity_pct", "%cap", RawStyle::Pair),
     rawf!("status", "status", RawStyle::Int),
 ];
 

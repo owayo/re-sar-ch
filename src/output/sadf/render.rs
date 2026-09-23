@@ -28,14 +28,13 @@ pub fn bat_status(v: u64) -> &'static str {
 /// セクションを踏まえてアイテム識別子を組み立てる。
 ///
 /// `A_FS` だけは `-F` / `-F MOUNT` で表示するフィールドが変わる (§2.8.1)。
-/// 該当フィールドがその世代のファイルに無い場合は、
-/// 適当な値で埋めずアイテム添字へ落とす。
+/// 該当フィールドがその世代のファイルに無い (最古の `A_FS` は `mountp` を
+/// 持たない) か空の場合は、**空文字**にする。本家は 0 埋めした構造体の
+/// 文字列 (= 空) をそのまま出す (`get_fs_name_to_display()`、
+/// `"mountpoint": ""` / `mountp=""`)。item 番号で埋めると本家に無い名前になる。
 pub fn item_label_in(spec: &ActivitySpec, section: &Section, item: &ItemPair<'_>) -> ItemLabel {
     if !section.item_col.is_empty() {
-        return match item.text(section.item_col) {
-            Some(name) => ItemLabel::named(name),
-            None => ItemLabel::numbered("", item.index as u64),
-        };
+        return ItemLabel::named(item.text(section.item_col).unwrap_or(""));
     }
     item_label(spec, item)
 }

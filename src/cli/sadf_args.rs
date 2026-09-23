@@ -1184,15 +1184,16 @@ mod tests {
                 Activity::Fs,
                 &["/dev/sda1", "/home"],
             ),
+            // 12.8.0 の `add_list_item()` は長すぎる名前を切り詰めずに捨てる
             (
-                "--iface=0123456789abcdefghij",
+                "--iface=0123456789abcdefghij,0123456789abcde",
                 Activity::NetDev,
                 &["0123456789abcde"],
             ),
             (
                 "--int=3-5,4,4095-,MCE-XXX,ABCDEFXYZ",
                 Activity::Irq,
-                &["3", "4", "5", "4095", "MCE-XXX", "ABCDEFX"],
+                &["3", "4", "5", "4095", "MCE-XXX"],
             ),
         ];
         for &(arg, activity, expected) in cases {

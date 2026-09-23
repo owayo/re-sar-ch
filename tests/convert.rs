@@ -2468,6 +2468,12 @@ fn a_record_without_any_live_slot_is_written_with_a_zero_count() {
             "{who}: {:?}",
             report.warnings
         );
+        // 読み取り側が 0 を拒否すると書いていた時期がある。実際には読める (下で確かめる)
+        assert!(
+            !report.warnings[0].contains("拒否"),
+            "{who}: 事実と違う注意を出さない: {:?}",
+            report.warnings
+        );
 
         let dst = reopen_exact(&who, out);
         assert_eq!(
@@ -2546,13 +2552,16 @@ fn unrecognised_activities_are_passed_through_byte_for_byte() {
             "{who}"
         );
         assert_eq!(report.activities, 4, "{who}");
+        let opaque = report
+            .warnings
+            .iter()
+            .find(|w| w.contains("(A_UNKNOWN(200), A_PCSW)"))
+            .unwrap_or_else(|| panic!("{who}: 素通しを報告していない: {:?}", report.warnings));
+        // 本家が中断するのは未知 ID だけで、既知 ID の未知 magic では中断しない
+        // (12.8.0 の sadf -c で確認)。両方を区別して書く。
         assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("(A_UNKNOWN(200), A_PCSW)")),
-            "{who}: {:?}",
-            report.warnings
+            opaque.contains("未知の ID なら exit 1") && opaque.contains("magic が未知でも"),
+            "{who}: {opaque}"
         );
 
         let o = walk_output(&out, abi);

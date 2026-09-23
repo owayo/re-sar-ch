@@ -108,7 +108,8 @@ pub(crate) struct ActivityPlan {
     pub has_nr: bool,
     /// 既知 activity として構造を解釈できたか。
     ///
-    /// 偽なら旧バイト列を**そのまま**書き出す (本家は `exit(1)` する。§5.15)。
+    /// 偽なら旧バイト列を**そのまま**書き出す (本家は未知 ID なら `exit(1)` する。§5.15。
+    /// 既知 ID の未知 magic では中断せず、既知の形式とみなして書き換える)。
     pub known: bool,
     /// `A_IRQ` のように `nr` / `nr2` を入れ替えたか (診断用)。
     pub swapped_dimensions: bool,

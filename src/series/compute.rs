@@ -859,7 +859,7 @@ fn column_value_with(
                 None => ctx.itv_cs,
             };
             let rate = delta as f64 / denominator as f64 * 100.0;
-            Ok(rate * rate_scale(id, column))
+            Ok(rate / rate_divisor(id, column))
         }
     }
 }
@@ -894,33 +894,39 @@ pub fn gauge_scale(id: ActivityId, column: usize) -> f64 {
     }
 }
 
-/// カウンタ列の「生のレート」に掛けるスケール (**保存値 → 表示単位**)。
+/// カウンタ列の「生のレート」を割る除数 (**保存値 → 表示単位**)。
 ///
 /// 生のレートとは `S_VALUE(prev, curr, 分母)` = `Δ / 分母 × 100` のこと。
-/// この関数の戻り値を掛けたものが [`ColumnMeta::unit`] の単位になる。
+/// この関数の戻り値で割ったものが [`ColumnMeta::unit`] の単位になる。
 ///
-/// **期間集計はこの係数を必ず掛ける。** 掛け忘れると平均 `rkB/s` が 2 倍、
+/// **逆数を掛けてはいけない。** 本家は `S_VALUE(...) / 1000.0` や
+/// `xds.util / 10.0` と**割り算**で書いており、`0.1` や `0.001` は二進で
+/// 正確に表せないため、掛け算に置き換えると丸め境界で 1 桁ずれる
+/// (`Δtot_ticks = 7710`、`itv = 60000` の `%util` は本家が `1.2849999…` → `1.28`、
+/// `× 0.1` だと `1.2850000…1` → `1.29`)。
+///
+/// **期間集計もこの除数で必ず割る。** 割り忘れると平均 `rkB/s` が 2 倍、
 /// `aqu-sz` が 1,000 倍、`%util` が 10 倍、PSI が 10,000 倍になる (指摘 2)。
 /// 「差分合計 ÷ 分母合計」から表示値を出す入口は [`rate_from_totals`]。
 ///
 /// 典拠: 03 §id=11 (ディスク列の式) / §1.5.3 (PSI) / §1.10-11 / §1.10-15。
-pub fn rate_scale(id: ActivityId, column: usize) -> f64 {
+pub fn rate_divisor(id: ActivityId, column: usize) -> f64 {
     match id {
         ActivityId::DISK => match column {
-            // セクタ (512 B) → kB
-            disk_col::RKB | disk_col::WKB | disk_col::DKB => 0.5,
-            // rq_ticks は「I/O 待ちの重み付きミリ秒」。/1000 で平均キュー長
-            disk_col::AQU_SZ => 0.001,
-            // tot_ticks はミリ秒。1000 ms/s = 100% なので /10
-            disk_col::UTIL_PCT => 0.1,
+            // セクタ (512 B) → kB (`S_VALUE(...) / 2`)
+            disk_col::RKB | disk_col::WKB | disk_col::DKB => 2.0,
+            // rq_ticks は「I/O 待ちの重み付きミリ秒」。`S_VALUE(...) / 1000.0` で平均キュー長
+            disk_col::AQU_SZ => 1000.0,
+            // tot_ticks はミリ秒。1000 ms/s = 100% なので `xds.util / 10.0`
+            disk_col::UTIL_PCT => 10.0,
             _ => 1.0,
         },
         // PSI の累積 µs 列は本家が `Δµs / (100 × itv)` を出す (03 §1.5.3)。
-        // 生のレート `Δ/itv×100` からは 1/10000 で一致する
-        // (区間値は [`psi_pressure`] が直接その式で計算する)。
-        // この係数があるので、集計は PSI も他のカウンタと同じ経路で扱える。
+        // 生のレート `Δ/itv×100` からは 10000 で割って同じ量になる
+        // (区間値は [`psi_pressure`] が本家の式そのままで計算する)。
+        // この除数があるので、集計は PSI も他のカウンタと同じ経路で扱える。
         ActivityId::PSI_CPU | ActivityId::PSI_IO | ActivityId::PSI_MEM if is_psi_total(column) => {
-            1.0e-4
+            10_000.0
         }
         _ => 1.0,
     }
@@ -945,7 +951,7 @@ pub fn rate_from_totals(
         return None;
     }
     let rate = delta_total as f64 / denom_total as f64 * 100.0;
-    Some(rate * rate_scale(id, column))
+    Some(rate / rate_divisor(id, column))
 }
 
 /// カウンタ逆行を 0.0 にクランプする列か。
@@ -1041,8 +1047,8 @@ fn special_direct(
 /// 本家は `((double) curr - prev) / (100 * itv)` と **f64 で減算**している
 /// (`S_VALUE` の符号なし減算ではない)。計算順序もそのまま合わせる。
 ///
-/// **同じ係数が [`rate_scale`] にもある。** 区間値はここで直接 `100 × itv` で
-/// 割るが、期間集計は生のレート `Δ/itv×100` に `1e-4` を掛けて同じ値に到達する。
+/// **同じ係数が [`rate_divisor`] にもある。** 区間値はここで直接 `100 × itv` で
+/// 割るが、期間集計は生のレート `Δ/itv×100` を `10000` で割って同じ値に到達する。
 /// 2 箇所に分かれているのは本家の式の形をそのまま残すためで、
 /// 両者が一致することは `single_interval_aggregate_matches_instant_value` が固定する。
 fn psi_pressure(
@@ -3464,6 +3470,34 @@ mod tests {
         );
     }
 
+    /// `%util` / `aqu-sz` は本家と同じく**割り算**で縮める。
+    ///
+    /// `0.1` や `0.001` は二進で正確に表せないので、逆数の掛け算では
+    /// 丸め境界の値が本家と 1 桁ずれる。実データで見つかった組
+    /// (`Δtot_ticks = 7710`、10 分間隔 = `itv 60000`) を固定する。
+    /// 本家 v12.8.0 は `1.28` を出す (`× 0.1` の実装は `1.29` を出していた)。
+    #[test]
+    fn disk_scaling_divides_like_upstream() {
+        let plan = plan_for(ActivityId::DISK);
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, disk_col::UTIL_PCT, 7_710);
+        let ctx = ComputeContext::new(60_000);
+        let util = compute(ActivityId::DISK, disk_col::UTIL_PCT, &plan, &p, &c, &ctx).unwrap();
+        assert_eq!(util, 7_710.0 / 60_000.0 * 100.0 / 10.0);
+        assert_eq!(format!("{util:.2}"), "1.28");
+
+        // aqu-sz も同じ形 (`S_VALUE(rq_ticks) / 1000.0`)。
+        // 175 ms/s は `÷ 1000.0` なら 0.175 (→ 0.17)、`× 0.001` だと
+        // 0.17500000000000002 (→ 0.18) になる。
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, disk_col::AQU_SZ, 175);
+        let ctx = ComputeContext::new(100);
+        let aqu = compute(ActivityId::DISK, disk_col::AQU_SZ, &plan, &p, &c, &ctx).unwrap();
+        assert_eq!(aqu, 175.0 / 100.0 * 100.0 / 1000.0);
+        assert_eq!(format!("{aqu:.2}"), "0.17");
+    }
+
     // ---- A_NET_DEV ----
 
     /// `%ifutil` はバイト毎秒から計算する (1024 で割ってはいけない)。
@@ -4544,16 +4578,22 @@ mod tests {
     ///
     /// 機械的なテストが「たまたま全部 1.0 倍」で通っていないことの確認。
     #[test]
-    fn rate_scale_is_applied_to_scaled_columns() {
-        // ディスク: セクタ → kB (1/2)、rq_ticks → aqu-sz (1/1000)、tot_ticks → %util (1/10)
-        assert_eq!(rate_scale(ActivityId::DISK, disk_col::RKB), 0.5);
-        assert_eq!(rate_scale(ActivityId::DISK, disk_col::AQU_SZ), 0.001);
-        assert_eq!(rate_scale(ActivityId::DISK, disk_col::UTIL_PCT), 0.1);
-        assert_eq!(rate_scale(ActivityId::DISK, disk_col::TPS), 1.0);
+    fn rate_divisor_is_applied_to_scaled_columns() {
+        // ディスク: セクタ → kB (÷2)、rq_ticks → aqu-sz (÷1000)、tot_ticks → %util (÷10)
+        assert_eq!(rate_divisor(ActivityId::DISK, disk_col::RKB), 2.0);
+        assert_eq!(rate_divisor(ActivityId::DISK, disk_col::AQU_SZ), 1000.0);
+        assert_eq!(rate_divisor(ActivityId::DISK, disk_col::UTIL_PCT), 10.0);
+        assert_eq!(rate_divisor(ActivityId::DISK, disk_col::TPS), 1.0);
         // PSI の累積 µs は `Δµs / (100 × itv)` なので生のレートの 1/10000
-        assert_eq!(rate_scale(ActivityId::PSI_CPU, psi_col::SOME_TOTAL), 1.0e-4);
-        assert_eq!(rate_scale(ActivityId::PSI_IO, psi_col::FULL_TOTAL), 1.0e-4);
-        assert_eq!(rate_scale(ActivityId::PSI_IO, psi_col::SOME_10), 1.0);
+        assert_eq!(
+            rate_divisor(ActivityId::PSI_CPU, psi_col::SOME_TOTAL),
+            10_000.0
+        );
+        assert_eq!(
+            rate_divisor(ActivityId::PSI_IO, psi_col::FULL_TOTAL),
+            10_000.0
+        );
+        assert_eq!(rate_divisor(ActivityId::PSI_IO, psi_col::SOME_10), 1.0);
         // ゲージのスケールは別関数 (区間値には既に掛かっている)
         assert_eq!(gauge_scale(ActivityId::QUEUE, queue_col::LDAVG_1), 0.01);
         assert_eq!(gauge_scale(ActivityId::PWR_CPU, pwr_cpu_col::MHZ), 0.01);

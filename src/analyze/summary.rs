@@ -454,15 +454,15 @@ impl ColumnAccum {
             // 生の差分の単位がそのまま出てしまい、瞬時値から作る
             // 最大 / 最小 / p95 と平均の単位が食い違う
             // (`rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
-            // PSI の圧力割合が 10,000 倍)。列ごとの係数は計算層が
-            // [`rate_scale`] に持っているので、換算はそこへ一本化する。
+            // PSI の圧力割合が 10,000 倍)。列ごとの除数は計算層が
+            // [`rate_divisor`] に持っているので、換算はそこへ一本化する。
             AggregationMethod::RateOverValidIntervals => {
                 rate_from_totals(self.id, self.column, self.delta_total, self.denom_total)
             }
             // 差分の総量そのもの (`read_ticks` などの内部フィールド)。
-            // レートではないので `rate_scale` は掛けない。掛けてよい列が
+            // レートではないので `rate_divisor` では割らない。割るべき列が
             // `Aggregation::Sum` に現れないことは
-            // `sum_columns_need_no_rate_scale` が機械的に確認する。
+            // `sum_columns_need_no_rate_divisor` が機械的に確認する。
             AggregationMethod::DeltaSum => {
                 if self.intervals == 0 {
                     return None;
@@ -1268,7 +1268,7 @@ mod tests {
     /// **回帰テスト (指摘 2)**: 単一区間の平均は、その区間の瞬時値と一致する。
     ///
     /// 期間平均は「差分合計 ÷ 分母合計」から作るため、保存値 → 表示単位の
-    /// スケーリング ([`crate::series::compute::rate_scale`]) を掛け忘れると、
+    /// スケーリング ([`crate::series::compute::rate_divisor`]) で割り忘れると、
     /// 瞬時値から作る最大 / 最小 / p95 とだけ単位が食い違う
     /// (`rkB/s` が 2 倍、`aqu-sz` が 1,000 倍、`%util` が 10 倍、
     /// PSI の圧力割合が 10,000 倍)。
@@ -1401,18 +1401,18 @@ mod tests {
     /// `Aggregation::Sum` の列に保存値スケールが必要なものは無い。
     ///
     /// [`AggregationMethod::DeltaSum`] は差分の総量をそのまま平均欄に出すため、
-    /// レートのスケール係数を掛けない。スケールが必要な列が `Sum` で宣言されたら
+    /// レートの除数で割らない。スケールが必要な列が `Sum` で宣言されたら
     /// 単位が壊れるので、その組み合わせが現れないことを機械的に固定する。
     #[test]
-    fn sum_columns_need_no_rate_scale() {
-        use crate::series::compute::rate_scale;
+    fn sum_columns_need_no_rate_divisor() {
+        use crate::series::compute::rate_divisor;
         for def in crate::layout::registry::all() {
             for (column, meta) in def.columns.iter().enumerate() {
                 if meta.aggregation != Aggregation::Sum {
                     continue;
                 }
                 assert_eq!(
-                    rate_scale(def.id, column),
+                    rate_divisor(def.id, column),
                     1.0,
                     "{} {} は Sum 宣言だがレートのスケールを持つ",
                     def.id,

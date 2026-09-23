@@ -24,6 +24,7 @@ pub mod sadf_args;
 pub mod sar_args;
 pub mod sar_el7_args;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -769,6 +770,12 @@ pub enum CliError {
     /// `--sar-profile` / `--sar-page-size` の使い方の誤り。
     #[error("{0}")]
     ProfileUsage(String),
+    /// UTF-8 として読めない引数。`sar` / `sadf` 互換入口は引数を文字列として解析する。
+    #[error(
+        "UTF-8 として読めない引数があります: {0} \
+         (sar / sadf 互換の入口は UTF-8 の引数だけを受け付けます)"
+    )]
+    NonUtf8Arg(String),
     /// clap のエラー。`--help` / `--version` の正常表示もここに入る
     /// ([`clap::Error::exit`] でそのまま終了できる)。
     #[error(transparent)]
@@ -884,10 +891,43 @@ pub fn parse_sar_entry(args: &[String]) -> Result<Invocation, CliError> {
     }
 }
 
-/// `std::env::args()` から解釈する。
+/// OS から受け取った引数列 (プログラム名を**含まない**) を解釈する。
+///
+/// Linux のファイル名はバイト列なので、UTF-8 として読めない引数もありうる。
+/// そうした引数が混ざっていても panic しない。独自サブコマンドは clap が
+/// `OsString` のまま `PathBuf` に渡すので、そのまま読める。`sar` / `sadf` 互換入口は
+/// 引数を文字列として解析するので [`CliError::NonUtf8Arg`] を返す。
+pub fn dispatch_os(argv: &[OsString]) -> Result<Invocation, CliError> {
+    let utf8: Option<Vec<String>> = argv.iter().map(|a| a.to_str().map(str::to_owned)).collect();
+    if let Some(argv) = utf8 {
+        return dispatch(&argv);
+    }
+    match argv.first().and_then(|a| a.to_str()) {
+        Some(first)
+            if first != "sar"
+                && first != "sadf"
+                && (is_root_only(first) || is_subcommand_name(first)) =>
+        {
+            let full = std::iter::once(OsString::from("resarch")).chain(argv.iter().cloned());
+            Ok(Invocation::Native(Box::new(
+                Cli::try_parse_from(full)?.command,
+            )))
+        }
+        _ => {
+            let bad = argv
+                .iter()
+                .find(|a| a.to_str().is_none())
+                .map(|a| a.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Err(CliError::NonUtf8Arg(bad))
+        }
+    }
+}
+
+/// `std::env::args_os()` から解釈する。
 pub fn dispatch_from_env() -> Result<Invocation, CliError> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    dispatch(&argv)
+    let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
+    dispatch_os(&argv)
 }
 
 /// ルート (clap) 側の解析。
@@ -909,6 +949,40 @@ mod tests {
     #[test]
     fn clap_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// UTF-8 で読めない引数で panic しない (`std::env::args()` は panic する)。
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_do_not_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let os = |s: &str| OsString::from(s);
+        let bad = OsString::from_vec(vec![b's', b'a', 0xff]);
+
+        // 独自サブコマンドは clap が OsString のまま PathBuf に渡す
+        let Invocation::Native(cmd) = dispatch_os(&[os("info"), bad.clone()]).unwrap() else {
+            panic!("独自サブコマンドとして解釈されるべき");
+        };
+        let Commands::Info(args) = *cmd else {
+            panic!("info のはず");
+        };
+        assert_eq!(args.files, vec![PathBuf::from(bad.clone())]);
+
+        // 互換入口は文字列で解析するのでエラーにする
+        for argv in [
+            vec![os("sar"), os("-f"), bad.clone()],
+            vec![os("-f"), bad.clone()],
+            vec![os("sadf"), bad.clone()],
+        ] {
+            assert!(
+                matches!(dispatch_os(&argv), Err(CliError::NonUtf8Arg(_))),
+                "{argv:?}"
+            );
+        }
+        // UTF-8 だけなら従来の解釈と同じ
+        let Invocation::Sar(_) = dispatch_os(&[os("-u"), os("-f"), os("sa01")]).unwrap() else {
+            panic!("sar 互換として解釈されるべき");
+        };
     }
 
     // ---------------------------------------------------------------

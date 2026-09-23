@@ -117,9 +117,19 @@ impl<'a> ItemView<'a> {
     }
 }
 
+/// 採取器が予約枠に置く未使用マーカー。配置を作る段階で規則を選ぶ。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UnusedItem {
+    Column { index: usize, sentinel: u64 },
+    Key(&'static str),
+}
+
 /// activity 1 種分のデコード計画。
 #[derive(Debug, Clone)]
 pub struct DecodePlan {
+    /// モノリシック形式の集約行に続く、別配置の item 列。
+    pub(crate) following: Option<(usize, Box<DecodePlan>)>,
+    pub(crate) unused: Option<UnusedItem>,
     /// 1 item のストライド。**`file_activity.size` の申告値**をそのまま使う。
     ///
     /// 構造体定義から計算した値を使ってはいけない。旧版の `A_HUGE` のように
@@ -391,6 +401,8 @@ impl DecodePlan {
         let (value_template, numeric_reads) = fold_field_plans(&fields);
 
         Ok(Self {
+            following: None,
+            unused: None,
             // ストライドは常に申告値。導出値との差は診断で報告する。
             stride: shape.size,
             serial_line_offset: def.id == crate::model::ActivityId::SERIAL && rev.magic == 0x8a,
@@ -405,6 +417,58 @@ impl DecodePlan {
             value_template,
             numeric_reads,
         })
+    }
+
+    /// 文書化した旧形式の位置を、現在のフィールド索引へ対応付ける。
+    /// バイト列の書き換えや、欠落フィールドのゼロ補完は行わない。
+    pub(crate) fn from_positions(
+        def: &ActivityDef,
+        revision: &WireRevision,
+        size: usize,
+        nr: u32,
+        fields: &[(&'static str, FieldTy, usize)],
+        enc: &SourceEncoding,
+    ) -> Result<Self, crate::error::LayoutError> {
+        let mut plan = Self::build(def, revision, size, nr, 1, enc)?;
+        for field in &mut plan.fields {
+            field.read = fields.iter().find(|(name, _, _)| *name == field.name).map(
+                |&(name, ty, offset)| PlacedField {
+                    name,
+                    offset,
+                    width: ty.width(&enc.abi),
+                    value_width: ty.value_width(&enc.abi),
+                    ty,
+                },
+            );
+            field.read = field.read.filter(|read| fits_in(read, size));
+            if let Some(read) = field.read {
+                field.ty = read.ty;
+            }
+        }
+        (plan.value_template, plan.numeric_reads) = fold_field_plans(&plan.fields);
+        plan.derived_size = size;
+        Ok(plan)
+    }
+
+    /// 集約行と CPU 別行など、item ごとに異なる配置を解決する。
+    pub(crate) fn item_layout(&self, index: usize, stride: usize) -> (&Self, usize) {
+        if index > 0
+            && let Some((offset, plan)) = &self.following
+        {
+            (plan, offset + (index - 1) * plan.stride)
+        } else {
+            (self, index * stride)
+        }
+    }
+
+    pub(crate) fn is_unused(&self, values: &[Availability<u64>], key: Option<&str>) -> bool {
+        match self.unused {
+            Some(UnusedItem::Column { index, sentinel }) => {
+                self.column_value(values, index) == Availability::Present(sentinel)
+            }
+            Some(UnusedItem::Key(marker)) => key == Some(marker),
+            None => false,
+        }
     }
 
     /// このレコードで activity が占めるバイト数。
@@ -699,6 +763,8 @@ mod tests {
     fn payload_bytes_rejects_u32_overflow() {
         // data-12.7.1-A_IRQ_overflow 相当: 上限ぴったりの値で乗算が桁溢れする
         let plan = DecodePlan {
+            following: None,
+            unused: None,
             serial_line_offset: false,
             stride: 1024,
             nr: 8193,
@@ -723,6 +789,8 @@ mod tests {
     #[test]
     fn payload_bytes_for_list_ignores_nr2() {
         let plan = DecodePlan {
+            following: None,
+            unused: None,
             serial_line_offset: false,
             stride: 64,
             nr: 9,
@@ -744,6 +812,8 @@ mod tests {
         // 旧版の A_HUGE は宣言サイズと導出サイズが食い違う。
         // ストライドは必ず申告値側を使う。
         let plan = DecodePlan {
+            following: None,
+            unused: None,
             serial_line_offset: false,
             stride: 136,
             nr: 1,
@@ -764,6 +834,8 @@ mod tests {
     #[test]
     fn detects_fields_overflowing_declared_size() {
         let plan = DecodePlan {
+            following: None,
+            unused: None,
             serial_line_offset: false,
             stride: 16,
             nr: 1,

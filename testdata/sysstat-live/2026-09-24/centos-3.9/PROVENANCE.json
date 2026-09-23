@@ -1,0 +1,59 @@
+{
+  "case": "centos-3.9",
+  "rpm_target_release": "3.9",
+  "collected_at_utc": "2026-09-23T23:08:29.612815+00:00",
+  "runtime": "Apple Container 1.4.1",
+  "execution": "linux/amd64 via Rosetta on Apple Silicon",
+  "source_image": "docker.io/library/centos:5.11",
+  "image_index_digest": "sha256:b978b025318f4495632658cf5d9892fdbc89c8b372306ec68520060051b3a709",
+  "image_amd64_digest": "sha256:c40041f5894293d0df8f5c6c2049b92a82c53f1718ecdd73cbf3c1826a08ba4a",
+  "rootfs_release": "CentOS release 5.11 (Final)",
+  "kernel": "Linux 6.18.35",
+  "architecture": "x86_64",
+  "long_bits": 64,
+  "hostname": "resarch-fixture",
+  "package": "sysstat-5.0.5-11.rhel3",
+  "packages": [
+    {
+      "file": "sysstat-5.0.5-11.rhel3.x86_64.rpm",
+      "url": "https://vault.centos.org/3.9/os/x86_64/RedHat/RPMS/sysstat-5.0.5-11.rhel3.x86_64.rpm",
+      "sha256": "800d3eedd343345f270fc71e0691d952c5bc5ab8930ef6f8f6029e4631c1b5b9"
+    }
+  ],
+  "installation": "rpm -Uvh --nodeps (unmodified Vault RPMs; disposable container)",
+  "locale": "C",
+  "timezone": "UTC",
+  "commands": [
+    "/usr/lib64/sa/sadc 1 2 /out/sa",
+    "sar -A -t -f /out/sa"
+  ],
+  "interval_seconds": 1,
+  "requested_samples": 2,
+  "collection_exit": 0,
+  "sar_exit": 0,
+  "sar_repeat_matches": true,
+  "resarch_identify": {
+    "endian": "little",
+    "file": "sa",
+    "format_magic": "0x2163",
+    "magic_at": "file_hdr@4",
+    "note": "\u3053\u306e\u4e16\u4ee3\u306e\u8aad\u307f\u53d6\u308a\u306f\u672a\u5b9f\u88c5",
+    "readable": false,
+    "recorded_version": null,
+    "sysstat_versions": "4.1.7\u301c5.0.6"
+  },
+  "resarch_scan_exit": 1,
+  "resarch_scan_exact": null,
+  "resarch_commit": "feaf38d317fcc83ec2a824bd324a120229ac04ec",
+  "files": {
+    "sa": {
+      "bytes": 4720,
+      "sha256": "93d62ce6cad250b176cf8980e653fe754705a901ee12dcffa0c7b72dc049c4f8"
+    },
+    "sar-A.txt": {
+      "bytes": 7879,
+      "sha256": "542c93e49474620df63d2dde62f2ededb226a509c3769ceff7a15bd113c70bcc"
+    }
+  },
+  "image_registry_digest": "sha256:c40041f5894293d0df8f5c6c2049b92a82c53f1718ecdd73cbf3c1826a08ba4a"
+}

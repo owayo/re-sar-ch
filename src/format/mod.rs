@@ -6,6 +6,9 @@
 pub mod abi;
 pub mod file;
 pub mod layouts;
+pub(crate) mod legacy;
+pub(crate) mod legacy_layouts;
+pub(crate) mod packed_legacy;
 pub mod reader;
 pub mod registry;
 pub mod selfdesc;

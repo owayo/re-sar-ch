@@ -143,6 +143,8 @@ pub enum MagicLocation {
 /// 構造体レイアウトの供給元。
 #[derive(Debug, Clone, Copy)]
 pub enum StructSource {
+    /// sysstat 2.2 の選択列形式。メタデータ LE、統計値 native endian。
+    PackedLegacy,
     /// 固定レイアウト世代。
     Fixed {
         file_header: WireLayout,
@@ -166,7 +168,7 @@ pub enum StructSource {
     /// レコードは固定長 `file_stats` (サイズは `file_hdr.sa_st_size` の申告値) で始まり、
     /// 統計レコードのときだけ可変長ブロック群が続く。
     ///
-    /// **現状は識別まで。ヘッダ解釈と統計のデコードは未実装** (`docs/format/01-file-format.md` §2.8)。
+    /// 実測した全旧形式を専用の境界走査で読む (§2.8)。
     Legacy {
         /// 最初のレコードが始まるファイルオフセット (= 書き込まれるヘッダのバイト数)。
         header_size: usize,
@@ -218,23 +220,25 @@ pub enum RestartPayload {
 
 /// 既知の全世代。
 pub const FORMATS: &[FormatSpec] = &[
-    // ===================================================================
-    // 旧モノリシック世代 (sysstat 3.2.4 〜 8.1.2)
-    // ===================================================================
-    //
-    // `struct file_magic` が無く、magic は `file_hdr` 構造体の中にある。
-    // **しかもその位置が世代で 3 回動く (4 → 36 → 32)。**
-    // 「先頭 2 バイトが 0xd596」はこの世代には当てはまらない。
-    //
-    // レイアウトを実測できた世代だけ `Legacy` で登録する。配布アーカイブから
-    // ソースを入手できなかった版 (`0x215e` / `0x215f` / `0x2161` / `0x2162` / `0x2164`) は
-    // **登録しない**。推定で読むより「知らない」と言う方が安全である。
+    FormatSpec {
+        magic: 0x015d,
+        label: "015d",
+        versions: "2.2",
+        magic_at: MagicLocation::Embedded { offset: 0 },
+        structs: StructSource::PackedLegacy,
+        restart_payload: RestartPayload::None,
+    },
+    // 旧モノリシック形式。配置は docs/format/legacy-layouts.tsv の実測値。
     FormatSpec {
         magic: 0x115a,
         label: "115a",
-        versions: "〜3.2.4",
+        versions: "3.2.4",
         magic_at: MagicLocation::Embedded { offset: 4 },
-        structs: StructSource::Unverified,
+        structs: StructSource::Legacy {
+            header_size: 217,
+            st_size_at: 6,
+            st_size: 232,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -242,7 +246,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "215a",
         versions: "3.3.2",
         magic_at: MagicLocation::Embedded { offset: 4 },
-        structs: StructSource::Unverified,
+        structs: StructSource::Legacy {
+            header_size: 225,
+            st_size_at: 6,
+            st_size: 240,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -250,7 +258,11 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "215b",
         versions: "3.3.3〜3.3.5",
         magic_at: MagicLocation::Embedded { offset: 4 },
-        structs: StructSource::Unverified,
+        structs: StructSource::Legacy {
+            header_size: 225,
+            st_size_at: 6,
+            st_size: 228,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -258,7 +270,6 @@ pub const FORMATS: &[FormatSpec] = &[
         label: "215d",
         versions: "3.3.6〜4.0.7",
         magic_at: MagicLocation::Embedded { offset: 4 },
-        // sizeof は 232 だが、書き出されるのは 229 バイト。
         structs: StructSource::Legacy {
             header_size: 229,
             st_size_at: 6,
@@ -267,11 +278,63 @@ pub const FORMATS: &[FormatSpec] = &[
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
+        magic: 0x215e,
+        label: "215e",
+        versions: "4.1.1",
+        magic_at: MagicLocation::Embedded { offset: 4 },
+        structs: StructSource::Legacy {
+            header_size: 229,
+            st_size_at: 6,
+            st_size: 272,
+        },
+        restart_payload: RestartPayload::None,
+    },
+    FormatSpec {
+        magic: 0x215f,
+        label: "215f",
+        versions: "4.1.2〜4.1.3",
+        magic_at: MagicLocation::Embedded { offset: 4 },
+        structs: StructSource::Legacy {
+            header_size: 229,
+            st_size_at: 6,
+            st_size: 276,
+        },
+        restart_payload: RestartPayload::None,
+    },
+    FormatSpec {
         magic: 0x2160,
         label: "2160",
         versions: "4.1.4",
         magic_at: MagicLocation::Embedded { offset: 4 },
-        structs: StructSource::Unverified,
+        structs: StructSource::Legacy {
+            header_size: 232,
+            st_size_at: 6,
+            st_size: 264,
+        },
+        restart_payload: RestartPayload::None,
+    },
+    FormatSpec {
+        magic: 0x2161,
+        label: "2161",
+        versions: "4.1.5",
+        magic_at: MagicLocation::Embedded { offset: 4 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 6,
+            st_size: 264,
+        },
+        restart_payload: RestartPayload::None,
+    },
+    FormatSpec {
+        magic: 0x2162,
+        label: "2162",
+        versions: "4.1.6",
+        magic_at: MagicLocation::Embedded { offset: 4 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 6,
+            st_size: 272,
+        },
         restart_payload: RestartPayload::None,
     },
     FormatSpec {
@@ -283,6 +346,18 @@ pub const FORMATS: &[FormatSpec] = &[
             header_size: 240,
             st_size_at: 6,
             st_size: 288,
+        },
+        restart_payload: RestartPayload::None,
+    },
+    FormatSpec {
+        magic: 0x2164,
+        label: "2164",
+        versions: "5.1.1〜5.1.2",
+        magic_at: MagicLocation::Embedded { offset: 36 },
+        structs: StructSource::Legacy {
+            header_size: 240,
+            st_size_at: 38,
+            st_size: 384,
         },
         restart_payload: RestartPayload::None,
     },
@@ -406,18 +481,14 @@ pub const FORMATS: &[FormatSpec] = &[
         },
         restart_payload: RestartPayload::None,
     },
-    // `file_magic` が頭に付いた最初の世代。ただし**本体は旧形式のまま**で、
-    // `file_activity[]` への転換は次の `0x2170` から。ここを取り違えると
-    // 「先頭が 0xd596 なら現行形式」という誤った一般化になる。
     FormatSpec {
         magic: 0x216f,
         label: "216f",
         versions: "8.1.1〜8.1.2",
         magic_at: MagicLocation::FileMagic(layouts::FILE_MAGIC_G1),
         structs: StructSource::Legacy {
-            header_size: 8 + 304,
-            // `file_magic` 8 バイトの後に `file_hdr`。`sa_st_size` はその内側 32。
-            st_size_at: 8 + 32,
+            header_size: 312,
+            st_size_at: 40,
             st_size: 528,
         },
         restart_payload: RestartPayload::None,
@@ -522,7 +593,9 @@ impl FormatSpec {
             StructSource::Fixed { file_activity, .. } => file_activity.has_field("magic"),
             // 旧世代は `file_activity[]` 自体が無い (activity は `sa_actflag` のビット)。
             // レイアウト未実測の世代も「持たない」に倒す (安全側)。
-            StructSource::Legacy { .. } | StructSource::Unverified => false,
+            StructSource::Legacy { .. } | StructSource::PackedLegacy | StructSource::Unverified => {
+                false
+            }
         }
     }
 
@@ -543,10 +616,13 @@ impl FormatSpec {
     /// ヘッダ解釈・レコード境界・統計デコードが未実装なら読めない。
     /// **「読めない」を「壊れている」と混同して報告しないために分けている。**
     pub fn is_readable(&self) -> bool {
-        matches!(
-            self.structs,
-            StructSource::Fixed { .. } | StructSource::SelfDescribing
-        )
+        super::legacy_layouts::lookup(self.magic).is_some()
+            || matches!(
+                self.structs,
+                StructSource::Fixed { .. }
+                    | StructSource::SelfDescribing
+                    | StructSource::PackedLegacy
+            )
     }
 }
 
@@ -641,6 +717,26 @@ enum MagicVerdict {
 
 fn verify(bytes: &[u8], spec: &FormatSpec, endian: Endian) -> MagicVerdict {
     match spec.structs {
+        StructSource::PackedLegacy => {
+            // ヘッダは必ず LE。統計値の endian は候補判定と別に OpenOptions で決める。
+            // magic だけの偶然一致を避け、選択列の幅と申告長まで専用パーサで検証する。
+            if endian == Endian::Little
+                && [Endian::Little, Endian::Big].into_iter().any(|native| {
+                    super::packed_legacy::PackedLegacyFile::open(
+                        bytes,
+                        std::path::Path::new("probe"),
+                        spec,
+                        native,
+                        &super::file::OpenOptions::default(),
+                    )
+                    .is_ok()
+                })
+            {
+                MagicVerdict::Verified
+            } else {
+                MagicVerdict::Rejected
+            }
+        }
         // `file_magic` を先頭に持つ世代は、`sysstat_magic` と `format_magic` の
         // 4 バイトが所定の位置で一致している (`magic_matches` が両方を要求する)。
         // 偶然そうなる確率は旧世代の 2 バイト一致より桁違いに低い。
@@ -697,33 +793,18 @@ pub fn is_self_describing(spec: &FormatSpec) -> bool {
 mod tests {
     use super::*;
 
-    /// 現行 (activity リスト) 世代 — 識別でき、かつ読める。
-    const READABLE_MAGICS: &[u16] = &[0x1170, 0x2170, 0x2171, 0x2173, 0x2175];
-
-    /// 旧モノリシック世代 — 識別はできるが、読み取りは未実装。
-    const LEGACY_MAGICS: &[u16] = &[
-        0x115a, 0x215a, 0x215b, 0x215d, 0x2160, 0x2163, 0x2165, 0x2166, 0x2167, 0x2168, 0x2169,
-        0x216a, 0x216b, 0x216c, 0x216d, 0x216e, 0x216f,
-    ];
-
+    /// 実在する世代はすべて読める。欠番を範囲で登録しない。
     #[test]
     fn all_known_generations_are_registered() {
-        for &m in READABLE_MAGICS {
-            let spec = lookup(m).unwrap_or_else(|| panic!("0x{m:04x} が未登録"));
-            assert!(spec.is_readable(), "0x{m:04x} は読めるはず");
+        let expected = [
+            0x015d, 0x115a, 0x215a, 0x215b, 0x215d, 0x215e, 0x215f, 0x2160, 0x2161, 0x2162, 0x2163,
+            0x2164, 0x2165, 0x2166, 0x2167, 0x2168, 0x2169, 0x216a, 0x216b, 0x216c, 0x216d, 0x216e,
+            0x216f, 0x1170, 0x2170, 0x2171, 0x2173, 0x2175,
+        ];
+        assert_eq!(FORMATS.len(), expected.len());
+        for magic in expected {
+            assert!(lookup(magic).unwrap().is_readable(), "0x{magic:04x}");
         }
-        for &m in LEGACY_MAGICS {
-            let spec = lookup(m).unwrap_or_else(|| panic!("0x{m:04x} が未登録"));
-            assert!(
-                !spec.is_readable(),
-                "0x{m:04x} の読み取りはまだ未実装のはず"
-            );
-        }
-        assert_eq!(
-            FORMATS.len(),
-            READABLE_MAGICS.len() + LEGACY_MAGICS.len(),
-            "この表に載っていない世代が登録されている"
-        );
     }
 
     /// 同じ magic を 2 回登録すると `lookup` が先勝ちで黙って一方を隠す。
@@ -740,7 +821,7 @@ mod tests {
         }
     }
 
-    /// 読める世代は必ず `file_magic` を持つ。
+    /// activity リスト形式は必ず `file_magic` を持つ。
     ///
     /// `magic_at` と `structs` は独立したフィールドなので、型としては
     /// 「`Embedded` なのに `Fixed`」という組み合わせを書けてしまう。その状態だと
@@ -748,9 +829,12 @@ mod tests {
     /// 呼び出し側に到達しないはずの分岐が残る。
     /// **型で排除しきれていない不変条件なので、ここで機械的に守る。**
     #[test]
-    fn readable_generations_always_carry_a_file_magic() {
+    fn activity_list_generations_always_carry_a_file_magic() {
         for spec in FORMATS {
-            if spec.is_readable() {
+            if matches!(
+                spec.structs,
+                StructSource::Fixed { .. } | StructSource::SelfDescribing
+            ) {
                 assert!(
                     spec.file_magic_layout().is_some(),
                     "{}: 読める世代は file_magic を持つこと",
@@ -783,7 +867,7 @@ mod tests {
         }
         // `0x216f` だけは file_magic を持ちながら本体は旧形式、という中間世代。
         assert!(matches!(lookup(0x216f).unwrap().magic_at, FileMagic(_)));
-        assert!(!lookup(0x216f).unwrap().is_readable());
+        assert!(lookup(0x216f).unwrap().is_readable());
     }
 
     /// 旧世代の probe ケース。
@@ -1059,7 +1143,9 @@ mod tests {
                     spec.label
                 ),
                 // 旧世代は `file_activity[]` 自体を持たない。
-                StructSource::Legacy { .. } | StructSource::Unverified => {
+                StructSource::Legacy { .. }
+                | StructSource::PackedLegacy
+                | StructSource::Unverified => {
                     assert!(!has, "{}: 旧世代に activity magic は無い", spec.label)
                 }
             }

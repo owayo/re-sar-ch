@@ -671,26 +671,30 @@ fn info_json_is_parseable() {
 // identify
 // ===========================================================================
 
-/// `identify` は**読めない世代でも成功する**。
+/// `identify` は構造体をすべてデコードせず、対応済みの旧世代を同定する。
 ///
 /// 「どの sysstat が書いたか分かった」ことと「統計まで読める」ことは別で、
 /// 前者を失敗として返すと「sysstat のファイルではない」と区別がつかなくなる。
 #[test]
-fn identify_succeeds_for_a_generation_it_cannot_read() {
+fn identify_reports_2168_as_a_readable_generation() {
     let dir = tempfile::tempdir().expect("一時ディレクトリ");
     let p = dir.path().join("legacy");
 
-    // 0x2169 (sysstat 6.1.3〜7.0.4): magic@36 / sa_st_size@38 = 464 / ヘッダ 240。
+    // 0x2168 (sysstat 6.1.1〜6.1.2): magic@36 / sa_st_size@38 = 464 / ヘッダ 240。
     // 値は docs/format/01-file-format.md §2.8 から独立に書き写す。
     let mut b = vec![0u8; 240 + 464];
-    b[36..38].copy_from_slice(&0x2169u16.to_le_bytes());
+    b[36..38].copy_from_slice(&0x2168u16.to_le_bytes());
     b[38..40].copy_from_slice(&464u16.to_le_bytes());
     std::fs::write(&p, &b).expect("書き出せること");
 
     let out = run_ok(&["identify", as_str(&p)]); // 終了コード 0 であること
-    assert!(out.contains("0x2169"), "{out:.400}");
-    assert!(out.contains("6.1.3"), "{out:.400}");
-    assert!(out.contains("未実装"), "{out:.400}");
+    assert!(out.contains("0x2168"), "{out:.400}");
+    assert!(out.contains("6.1.1"), "{out:.400}");
+    assert!(
+        out.split_whitespace().any(|word| word == "yes"),
+        "{out:.400}"
+    );
+    assert!(!out.contains("未実装"), "{out:.400}");
 }
 
 /// 判定できない入力でも `identify` は落ちない (これも結果である)。

@@ -88,6 +88,11 @@ pub struct FileMagic {
 
 impl FileMagic {
     pub fn version_string(&self) -> String {
+        if registry::lookup(self.format_magic)
+            .is_some_and(|spec| spec.file_magic_layout().is_none())
+        {
+            return "unknown".to_owned();
+        }
         let (a, b, c, d) = self.version;
         if d == 0 {
             format!("{a}.{b}.{c}")
@@ -265,6 +270,10 @@ pub const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 /// オープン時の設定。
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
+    /// endian を記録しない列選択形式で使う明示指定。未指定なら LE と仮定する。
+    pub legacy_endian: Option<Endian>,
+    /// long 幅を記録しない 0x2163 で仮定する幅 (4 / 8)。
+    pub legacy_long_bytes: u8,
     /// `mmap` を使うかどうか。
     pub mmap: MmapPolicy,
     /// 破損への対応方針。
@@ -276,6 +285,8 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
+            legacy_endian: None,
+            legacy_long_bytes: 8,
             mmap: MmapPolicy::Auto,
             tolerance: Tolerance::Strict,
             assumed_hz: DEFAULT_ASSUMED_HZ,
@@ -290,9 +301,16 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+#[derive(Debug)]
+enum LegacySource {
+    Monolithic(Box<super::legacy::LegacyFile>),
+    Packed(Box<super::packed_legacy::PackedLegacyFile>),
+}
+
 /// オープン済みの `sa` ファイル。
 #[derive(Debug)]
 pub struct SaFile {
+    legacy: Option<LegacySource>,
     path: PathBuf,
     source: Source,
     options: OpenOptions,
@@ -436,6 +454,34 @@ impl SaFile {
                 format_magic,
                 versions: spec.versions,
             });
+        }
+
+        if super::legacy_layouts::lookup(format_magic).is_some() {
+            let legacy = super::legacy::LegacyFile::open(bytes, &path, spec, endian, &options)?;
+            return Self::from_legacy_source(
+                path,
+                source,
+                options,
+                spec,
+                LegacySource::Monolithic(Box::new(legacy)),
+            );
+        }
+        if matches!(spec.structs, StructSource::PackedLegacy) {
+            let native_endian = options.legacy_endian.unwrap_or(Endian::Little);
+            let legacy = super::packed_legacy::PackedLegacyFile::open(
+                bytes,
+                &path,
+                spec,
+                native_endian,
+                &options,
+            )?;
+            return Self::from_legacy_source(
+                path,
+                source,
+                options,
+                spec,
+                LegacySource::Packed(Box::new(legacy)),
+            );
         }
 
         // file_magic 自体は `unsigned long` を含まないので、暫定 ABI で解決できる。
@@ -749,6 +795,7 @@ impl SaFile {
             .unwrap_or(record_layout.size);
 
         Ok(Self {
+            legacy: None,
             path,
             source,
             options,
@@ -766,8 +813,67 @@ impl SaFile {
         })
     }
 
+    fn from_legacy_source(
+        path: PathBuf,
+        source: Source,
+        options: OpenOptions,
+        spec: &'static FormatSpec,
+        legacy: LegacySource,
+    ) -> Result<Self> {
+        let (encoding, magic, header, activities, diagnostics, records_offset) = match &legacy {
+            LegacySource::Monolithic(file) => (
+                file.encoding,
+                &file.magic,
+                &file.header,
+                &file.activities,
+                &file.diagnostics,
+                file.layout.prefix + file.layout.header.size,
+            ),
+            LegacySource::Packed(file) => (
+                file.encoding,
+                &file.magic,
+                &file.header,
+                &file.activities,
+                &file.diagnostics,
+                280,
+            ),
+        };
+        let empty = super::wire::WireLayout::new("legacy", &[]).resolve(&encoding)?;
+        Ok(Self {
+            encoding,
+            magic: magic.clone(),
+            header: header.clone(),
+            activities: activities.clone(),
+            diagnostics: diagnostics.clone(),
+            legacy: Some(legacy),
+            path,
+            source,
+            options,
+            spec,
+            record_layout: empty.clone(),
+            activity_layout: empty,
+            act_stride: 0,
+            rec_stride: 0,
+            records_offset,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn legacy(&self) -> Option<&super::legacy::LegacyFile> {
+        match &self.legacy {
+            Some(LegacySource::Monolithic(file)) => Some(file),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn packed_legacy(&self) -> Option<&super::packed_legacy::PackedLegacyFile> {
+        match &self.legacy {
+            Some(LegacySource::Packed(file)) => Some(file),
+            _ => None,
+        }
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -848,6 +954,16 @@ impl SaFile {
     where
         F: FnMut(&RawRecord<'_>) -> Result<ScanControl>,
     {
+        if let Some(legacy) = &self.legacy {
+            return match legacy {
+                LegacySource::Monolithic(file) => {
+                    file.scan(&self.source, &self.path, &self.options, visit)
+                }
+                LegacySource::Packed(file) => {
+                    file.scan(&self.source, &self.path, &self.options, visit)
+                }
+            };
+        }
         let bytes: &[u8] = &self.source;
         let cur = Cursor::new(bytes, self.encoding.endian);
         let rec_size = self.rec_stride;
@@ -1525,7 +1641,7 @@ fn resolve_file_header(
         }
         // 旧世代の `file_hdr` は別物 (レイアウトが世代ごとに違い、magic を内側に持つ)。
         // `FormatSpec::is_readable()` で先に弾いているのでここには来ない。
-        StructSource::Legacy { .. } | StructSource::Unverified => {
+        StructSource::Legacy { .. } | StructSource::PackedLegacy | StructSource::Unverified => {
             Err(crate::error::LayoutError::NoSuchStruct {
                 magic: spec.magic,
                 layout: "file_header",
@@ -1547,7 +1663,7 @@ fn resolve_file_activity(
         }
         // 旧世代に `file_activity[]` は無い。記録されている統計は
         // `file_hdr.sa_actflag` のビットマスクで表される。
-        StructSource::Legacy { .. } | StructSource::Unverified => {
+        StructSource::Legacy { .. } | StructSource::PackedLegacy | StructSource::Unverified => {
             Err(crate::error::LayoutError::NoSuchStruct {
                 magic: spec.magic,
                 layout: "file_activity",
@@ -1569,7 +1685,7 @@ fn resolve_record_header(
         }
         // 旧世代に `record_header` は無い。レコードは固定長 `file_stats` で始まり、
         // `record_type` はその構造体の中にある (位置も世代で動く)。
-        StructSource::Legacy { .. } | StructSource::Unverified => {
+        StructSource::Legacy { .. } | StructSource::PackedLegacy | StructSource::Unverified => {
             Err(crate::error::LayoutError::NoSuchStruct {
                 magic: spec.magic,
                 layout: "record_header",

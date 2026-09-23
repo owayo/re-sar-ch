@@ -1,4 +1,4 @@
-.PHONY: build release install install-bin uninstall skill-install clean test fmt check fixtures help
+.PHONY: build release install install-bin uninstall skill-install clean test fmt check fixtures sar-latest sar-matrix sar-generations sar-centos sar-all sar-upstream-all help
 
 # Default target
 .DEFAULT_GOAL := help
@@ -42,6 +42,24 @@ test: ## Run tests
 
 fixtures: ## Fetch upstream sysstat test data used by golden tests (not bundled: GPL)
 	cargo run --quiet --bin xtask -- fetch-fixtures
+
+sar-latest: ## Collect and compare an sa file with the latest upstream sysstat
+	./scripts/collect-sar-matrix.sh latest
+
+sar-matrix: ## Collect sa files from multiple Linux distribution packages
+	./scripts/collect-sar-matrix.sh distro
+
+sar-generations: ## Collect sa files across upstream sysstat format generations
+	./scripts/collect-sar-matrix.sh generations
+
+sar-centos: ## Collect eleven CentOS Vault RPM releases, including 6.5 and 7.5
+	./scripts/collect-sar-matrix.sh centos
+
+sar-all: ## Collect all twenty recorded distribution and upstream cases
+	./scripts/collect-sar-matrix.sh all
+
+sar-upstream-all: ## Build and verify every pinned official sysstat source release
+	./scripts/collect-sar-matrix.sh upstream-all
 
 fmt: ## Format code
 	cargo fmt

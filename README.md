@@ -402,11 +402,14 @@ is not a zero** — and lists which `--from` / `--to` means what in which subcom
 
 ## Supported Formats
 
-Every format generation, verified byte-for-byte against upstream's own test corpus:
+All 28 registered format magic values have readers. Legacy decoding limitations and
+the scope of scan and output verification are described below.
 
 | `format_magic` | sysstat versions | notes |
 |---|---|---|
-| `0x2170` | … 9.1.5 | oldest upstream generation reSARch can read; upstream itself cannot convert these |
+| `0x015d` | 2.2 | Packed selected columns; [limitations and ABI](docs/format/08-packed-legacy.md) |
+| `0x115a`, `0x215a`…`0x216f` (22 formats, excluding unused `0x215c`) | 3.2.4 … 8.1.2 | Monolithic formats, including CentOS 3/4/5 and `0x2168` from 6.1.1–6.1.2; [generation evidence](docs/format/09-legacy-generations.md) |
+| `0x2170` | 8.1.3 … 9.1.5 | Introduced activity arrays; upstream itself cannot convert these |
 | `0x1170` | 9.0.4 (RHEL/CentOS 6.5+) | **vendor variant** — Red Hat renumbered the magic to a value no upstream release uses; `stats_io` is 80 bytes instead of 20 |
 | `0x2171` | 9.1.6 … 10.2 | 8-byte file magic, no RESTART payload |
 | `0x2173` | 10.3 … 11.6 | RESTART records carry a volatile-activity list that changes item counts |
@@ -418,7 +421,7 @@ silently misread older files; the fix in RHEL 6.5 renumbered the magic instead. 
 upstream build ever emits a 20-byte-vs-80-byte ambiguity, the declared item size alone
 identifies the variant.
 
-### Older generations — identified, not yet readable
+### CentOS 3/4/5 and earlier formats
 
 sysstat 3.2.4 through 8.1.2 (`0x115a` … `0x216f`) use a fundamentally different layout:
 no `file_activity[]` array, no `record_header`, and — up to `0x216e` — no `file_magic` at
@@ -430,15 +433,28 @@ not identify them at all.
 of the file while the body was still the old layout. The switch to `file_activity[]` only
 happens in `0x2170`.
 
-reSARch identifies them and reports which sysstat wrote the file:
+All 22 monolithic formats can be read directly, including `0x2168` from sysstat 6.1.1–6.1.2.
+Layouts were measured from original sources. Native samples from 24 releases pass
+`exact=true` scans and rendering; independent fixtures cover both endiannesses,
+32/64-bit long widths, array boundaries, and truncation.
 
-```
-sa07: sysstat 6.1.3〜7.0.4 が書いた形式です (format_magic=0x2169)。この世代の読み取りは未実装です
-```
+The reader exposes supported fields present in each generation. Old per-CPU IRQ arrays are
+bounded and skipped; PID-bearing pipe streams are rejected. Reports use the current column
+layout and calculation rules: **successful scanning does not imply byte-identical historical
+`sar` output**. Unrecorded fields and values whose units cannot be established remain unavailable.
 
-That is deliberately distinct from "not a sysstat file" and from "unsupported format" —
-confusing the three sends you down the wrong debugging path. Decoding these generations
-is not implemented yet.
+Formats through `0x2167` do not record the long width; the default assumption is 8 bytes,
+with a diagnostic. Library callers can set `OpenOptions.legacy_long_bytes = 4`.
+The CLI currently has no override; use the library for 32-bit inputs that omit this width.
+`0x115a` has no epoch or timezone, so its date and clock values are interpreted as UTC.
+Formats through `0x216e` do not record the precise sysstat version or machine architecture.
+See [legacy format specifications and verification](docs/format/09-legacy-generations.md).
+
+sysstat 2.2 (`0x015d`) has a separate packed-column reader. Its payload endianness is not
+recorded; the default is little-endian with a diagnostic, overridable through
+`OpenOptions.legacy_endian`. Releases whose sources have not been recovered, such as 1.x and
+3.0–3.1, are not assumed to share a neighboring layout. **Supporting all registered formats
+is distinct from having verified every historical release.**
 
 Also handled:
 
@@ -469,9 +485,8 @@ and painful to read: you generally need a `sysstat` install of a compatible vint
 compatible architecture. A five-year-old log from a 32-bit PowerPC box is not something
 your laptop's `sar` will open.
 
-reSARch reads the bytes directly. It knows every on-disk format generation `sysstat` has
-shipped, resolves struct layouts from the producer's ABI rather than the host's, and runs
-anywhere Rust runs — including macOS and Windows, on logs collected from Linux.
+reSARch reads supported formats directly, resolves struct layouts for the producer's ABI,
+and runs anywhere Rust runs — including macOS and Windows, on logs collected from Linux.
 
 ## How the output is verified
 
@@ -499,6 +514,124 @@ line breaks at missing samples and restarts.
 Mismatches are never tolerated: a single one fails the suite. "Hard to implement" and
 "the number doesn't match" are not accepted reasons to mask something.
 
+### Verify all available official sysstat releases
+
+```bash
+make sar-upstream-all
+SAR_MATRIX_OUTPUT=target/sar-matrix/<run-directory> SAR_MATRIX_RESUME=1 make sar-upstream-all
+```
+
+The [pinned manifest](tools/sar-matrix/upstream.tsv) contains 181 cases: 133 official Git
+versions and 48 recovered archive releases. Each version gets an image, native collection,
+same-version `sar` rendering, and reSARch EOF scanning and rendering. Source commits and
+SHA-256 hashes are pinned. The run retains binaries, native text, provenance, hashes, diffs,
+and per-case logs. Failures do not prevent other cases from running; any failure makes the
+final exit status nonzero. Results are written to `SUMMARY.tsv`.
+
+On 2026-09-24, **all 181 cases passed collection, native rereading, and reSARch EOF scanning
+and rendering**. The [measurement manifest](docs/measurements/upstream-matrix-2026-09-24.tsv)
+and [sa/text pairs with provenance and SHA-256](testdata/sysstat-live/2026-09-24-official-all/)
+are tracked in Git. These cover 27 official-source formats; separately collected CentOS
+`0x1170` samples complete the 28 registered formats. Run `cargo test --test official_snapshots`
+to recheck scanning and decoding of the 181 stored files. `exact=true` denotes EOF alignment;
+historical `sar` text comparisons are recorded separately and are not implied by it.
+`activity_decode=complete` means every declared activity was planned and every sample
+decoded, with no skipped activities. Absent fields and values with unknown units remain unavailable.
+
+Run `python3 tools/sar-matrix/update-upstream.py` to add new official tags.
+**The manifest covers recovered and pinned releases, not every release ever published.**
+Unavailable historical sources are not counted as successful tests.
+See [the runbook](docs/format/06-live-matrix.md) for prerequisites and artifact details.
+
+### Live sysstat collection matrix (2026-09-24)
+
+In addition to the upstream golden suite, `sadc -S XALL` was run inside Apple Container
+against five distribution packages and four pinned upstream releases. Each case recorded
+two samples on Linux 6.18.35 / aarch64 / LP64, then reSARch followed record boundaries
+through the end of the file.
+
+In both tables below, **`exact=true` means that the scan finished without an early stop or
+incomplete record, and its final offset equals the file size**. It does not establish that
+every field was decoded or that computed values and text match native `sar`.
+Decoding coverage and output comparisons are described separately.
+
+| Source | sysstat | Format magic | reSARch scan to EOF |
+|---|---:|---:|:---:|
+| Alpine 3.23 | 12.7.8 | `0x2175` | `exact=true` |
+| Debian 13 | 12.7.5 | `0x2175` | `exact=true` |
+| Ubuntu 24.04 LTS | 12.6.1 | `0x2175` | `exact=true` |
+| Fedora 44 | 12.7.9 | `0x2175` | `exact=true` |
+| Rocky Linux 9 | 12.5.4 | `0x2175` | `exact=true` |
+| Upstream | 10.2.1 | `0x2171` | `exact=true` |
+| Upstream | 11.6.6 | `0x2173` | `exact=true` |
+| Upstream | 12.0.6 | `0x2175` | `exact=true` |
+| Upstream (latest at collection time) | 12.8.0 | `0x2175` | `exact=true` |
+
+For upstream 12.8.0, all displayed values matched. The only text difference was the disk
+name: upstream resolved `254:0` / `254:16` as `vda` / `vdb`, while reSARch deliberately
+kept the portable names `dev254-0` / `dev254-16`. Older versions use their own period's
+columns, so their text is retained as a diagnostic diff rather than compared against the
+current 12.8.0 rendering profile.
+
+The tracked [measurement manifest](docs/measurements/sar-matrix-2026-09-24.tsv) records
+the source image or pinned commit, ABI, record count, exact-EOF result, and SHA-256 of both
+files in every pair. The matching `sa` binary and upstream `sar -A -C -t` text are checked
+in under [testdata/sysstat-live/2026-09-24](testdata/sysstat-live/2026-09-24). They contain
+two samples from the disposable container VM and use the synthetic hostname
+`resarch-fixture`; they contain no production-host data. See the
+[snapshot notice](testdata/sysstat-live/README.md) for scope and provenance.
+
+```bash
+make sar-latest       # latest pinned upstream release
+make sar-matrix       # distribution packages
+make sar-generations  # format generations 0x2171, 0x2173 and 0x2175
+```
+
+See [the live-matrix runbook](docs/format/06-live-matrix.md) for artifact details and the
+Docker-compatible fallback.
+
+### CentOS Vault measurement pairs (2026-09-24)
+
+Official RPMs for eleven CentOS releases produced `sa` / matching-version `sar` text
+pairs, tracked under [testdata/sysstat-live/2026-09-24](testdata/sysstat-live/2026-09-24).
+Repeated reads with the native `sar` reproduced the stored text in all eleven cases.
+
+| Target CentOS RPM release | sysstat RPM version | Format magic | reSARch scan to EOF |
+|---|---|---|---|
+| 3.9 | 5.0.5-11.rhel3 | `0x2163` | `exact=true` |
+| 4.9 | 5.0.5-27.el4 | `0x2163` | `exact=true` |
+| 5.11 | 7.0.2-13.el5 | `0x2169` | `exact=true` |
+| 6.0 | 9.0.4-11.el6 | `0x2170` | `exact=true` |
+| 6.5 | 9.0.4-22.el6 | `0x1170` | `exact=true` |
+| 6.10 | 9.0.4-33.el6_9.1 | `0x1170` | `exact=true` |
+| 7.0 | 10.1.5-4.el7 | `0x2171` | `exact=true` |
+| 7.5 | 10.1.5-13.el7 | `0x2171` | `exact=true` |
+| 7.9 | 10.1.5-20.el7_9 | `0x2171` | `exact=true` |
+| 8.0 | 11.7.3-2.el8 | `0x2175` | `exact=true` |
+| 8.5 | 11.7.3-6.el8 | `0x2175` | `exact=true` |
+
+Collection used x86_64 / LP64 via Apple Container and Rosetta on Linux 6.18.35.
+The 3.9 / 4.9 RPMs ran on a 5.11 rootfs, 6.0 / 6.5 on 6.6, and 8.0 / 8.5 on 8.4.2105.
+Case names identify the target RPM release, not a recreation of the complete historical OS
+or kernel. Reading and scans to EOF are verified with reSARch for all eleven cases,
+including CentOS 3.9/4.9/5.11. See [legacy format coverage](#centos-345-and-earlier-formats)
+for their per-CPU IRQ and other limitations, and differences from historical `sar` output.
+Each pair's `PROVENANCE.json` records RPM URLs and SHA-256, OCI digests, environment and
+commands; the [measurement table](docs/measurements/centos-matrix-2026-09-24.tsv) records
+pair hashes and verification states.
+
+```bash
+make sar-all                         # Fetch, collect and verify all 20 recorded cases
+make sar-centos                      # Only the 11 CentOS cases
+scripts/collect-sar-matrix.sh centos-6.5  # Collect one case again
+```
+
+Each run creates `target/sar-matrix/<UTC timestamp>/`, containing each case's `sa`,
+`sar-A.txt`, provenance, SHA-256 and log, plus the combined `SUMMARY.tsv`.
+Failed cases are recorded, remaining cases continue, and the overall run exits nonzero.
+See the [runbook](docs/format/06-live-matrix.md) for prerequisites, collection settings
+and rootfs/RPM mappings.
+
 ## What "sar compatible" means here
 
 The phrase covers three separate things, and reSARch states each one explicitly rather
@@ -506,15 +639,16 @@ than implying all of them:
 
 | Axis | Scope |
 |---|---|
-| **Input compatibility** | Which format generations can be read — all four |
+| **Input compatibility** | The 28 [supported formats](#supported-formats), with legacy field and ABI limitations |
 | **Computation and output** | Which `sar` / `sadf` version's rendering is reproduced |
 | **CLI compatibility** | Which options and calling conventions are accepted |
 
-reSARch never collects: live sampling (`sadc`) is out of scope. Binary output is limited
+The `resarch` binary does not perform live sampling (`sadc`). The bundled collection
+script runs native `sadc` inside each image. Binary output from `resarch` is limited
 to re-encoding a file it just read (`sadf -c`), leaving every value alone.
 Text and charts can be saved with `sa2sar`, `detect --svg-dir`, and the other output commands.
 The generation of the file being read and the output format being reproduced are separate
-settings. By default every generation is rendered the way `sysstat` 12.8.0 renders it;
+settings. By default every supported format uses the `sysstat` 12.8.0 rendering profile;
 `--sar-profile` selects another `sar` to reproduce instead (see below).
 
 Options that are parsed but not yet acted upon are rejected at run time with a reason:
@@ -536,7 +670,7 @@ resarch --sar-profile sysstat-10.1.5-el7 -R -f sa13 --sar-page-size 65536   # a 
 
 | `--sar-profile` | Reproduces | Reads |
 |---|---|---|
-| `current` (= `sysstat-12.8.0`, default) | upstream `sysstat` 12.8.0 | every generation |
+| `current` (= `sysstat-12.8.0`, default) | upstream `sysstat` 12.8.0 | every supported input format |
 | `sysstat-10.1.5-el7` | RHEL / CentOS 7's `sysstat-10.1.5-17.el7` … `-20.el7_9` | `format_magic` 0x2171 only, as 10.1.5 itself |
 
 A report written by a RHEL 7 host differs from the default rendering in more than column

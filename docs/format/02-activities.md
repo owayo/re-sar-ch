@@ -386,15 +386,43 @@ per-activity の `magic` を上げ忘れた。** 一括昇格は v11.7.2 で行�
 結果として **v11.7.1 が書いたデータファイルは「新レイアウトなのに旧 magic」**という
 矛盾した状態になり、
 
-- v11.7.2 以降の sar / sadf は magic 不一致としてその 16 activity を読み飛ばす。
+- v11.7.2 以降の sar / sadf は magic 不一致としてその 17 activity を読み飛ばす。
 - `sadf -c` も「`format_magic` は既に現行」なので `File format already up-to-date` と
   言って何もしない。
 
-つまり **v11.7.1 のファイルの CPU / メモリ / ディスク / ネットワーク統計は本家では
-永久に読めない**。reSARch は本家互換 (スキップ) を既定にしつつ、
-`file_magic.sysstat_version == 11 && patchlevel == 7 && sublevel == 1` を検出したら
-該当 activity の magic に +1 して読む救済モードを用意すると本家より良い挙動になる
-(要検証: v11.7.1 実ファイルでの動作確認が必要)。
+reSARch は `format_magic=0x2175`、生成版 `11.7.1.0`、下表の旧magicが一致するときだけ、
+デコード計画の選択に翌版のmagicを使う。元のヘッダは書き換えず、現行sar互換出力の
+表示判定も元のmagicを使うため、互換出力では本家と同じスキップを保つ。
+独自出力・集計では復元した統計を利用できる。未知magicや他の版には適用しない。
+
+[11.7.1](https://github.com/sysstat/sysstat/blob/v11.7.1/rd_stats.h) と
+[11.7.2](https://github.com/sysstat/sysstat/blob/v11.7.2/rd_stats.h) の構造体定義は同一で、
+差分はコメントのみ。`activity.c` の対応する17箇所でmagicだけが更新されている。
+原典CをLinux x86_64/i386 ABIで測定した保存サイズと型数は次のとおり。
+
+| ID | activity | 旧→翌版magic | types_nr | LP64 / ILP32保存サイズ |
+|---:|---|---|---|---:|
+| 1 | CPU | 8a→8b | (10,0,0) | 80 / 80 |
+| 2 | PCSW | 8a→8b | (1,1,0) | 16 / 16 |
+| 3 | IRQ | 8a→8b | (1,0,0) | 8 / 8 |
+| 7 | MEMORY | 8a→8b | (17,0,0) | 136 / 136 |
+| 8 | KTABLES | 8a→8b | (4,0,0) | 32 / 32 |
+| 9 | QUEUE | 8b→8c | (3,0,3) | 40 / 36 |
+| 10 | SERIAL | 8a→8b | (0,0,7) | 28 / 28 |
+| 11 | DISK | 8b→8c | (1,2,6) | 48 / 48 |
+| 12 | NET_DEV | 8c→8d | (7,0,1) | 80 / 80 |
+| 13 | NET_EDEV | 8b→8c | (9,0,0) | 88 / 88 |
+| 17 | NET_IP | 8b→8c | (8,0,0) | 64 / 64 |
+| 18 | NET_EIP | 8b→8c | (8,0,0) | 64 / 64 |
+| 25 | NET_IP6 | 8b→8c | (10,0,0) | 80 / 80 |
+| 26 | NET_EIP6 | 8b→8c | (11,0,0) | 88 / 88 |
+| 34 | HUGE | 8a→8b | (2,0,0) | 136 / 136 |
+| 35 | PWR_FREQ | 8a→8b | (1,1,0) | 16 / 16 |
+| 37 | FS | 8a→8b | (5,0,0) | 296 / 296 |
+
+HUGEは実構造体が16バイトだが、本家が保存サイズをMEMORYの136バイトに取り違えたもの。
+全17組×両ABI×両endianの独立fixtureで値位置と境界を検証し、11.7.1の実採取でも
+宣言された全activityのデコードを確認する。
 
 同じ理由で **`A_IRQ` は v11.7.2 〜 v12.5.5 (および v12.4.x) が書いたものが
 v12.5.6 以降で読めない** (magic `0x8b` → `0x8c`)。これも `sadf -c` の対象外。
@@ -1510,8 +1538,9 @@ reSARch としては **`0x2175` のみをネイティブに読み、`0x2171`/`0x
 | **C** | `v12.7.3` 〜 `v12.8.0` (現行) | 「拡張レポート (sar -x)」対応で全 43 構造体に `STATS_*_XNR` を追加。**`XNR` は min/max スロット数でありフィールド数ではない** (例: `STATS_SERIAL_U = 7` だが `XNR = 6`、`STATS_PWR_USB_XNR = 0`)。ファイルフォーマットには影響しない |
 
 時代 A のファイルは `FORMAT_MAGIC` が `0x2171` / `0x2173` であり、現行フォーマット
-(`0x2175`) のパーサでは直接読めない。**reSARch が扱うのは実質「時代 B / C」= v11.7.1 以降**
-であり、activity 別差分もこの範囲が重要になる。
+(`0x2175`) と異なるヘッダ・レコード配置を持つ。reSARch は世代ごとの読み取り経路と
+activity revisionを使って時代 A / B / C を直接読む。さらに古い形式は
+[旧モノリシック形式](09-legacy-generations.md) と [2.2の列選択形式](08-packed-legacy.md) を参照。
 
 `STATS_NET_DEV_SIZE2CMP` / `STATS_NET_EDEV_SIZE2CMP` / `STATS_FILESYSTEM_SIZE2CMP`
 (名前フィールドを除いた比較用サイズ。`sar -z` 用) は v11.7.3 で追加。この 3 構造体のみ。
@@ -1852,8 +1881,8 @@ sysstat は「奇数マイナー = 開発版 (master)」「偶数マイナー = 
     `file_header` の 328 B 変種が 2 つ (`hdr_types_nr[2]` = 11 / 12)、
     `record_header` の 24 B 変種が 2 つ (`rec_types_nr[2]` = 0 / 1) あり、
     **サイズだけでは区別できない**。`types_nr` を必ず使う。
-22. **v11.7.1 が書いたファイルは新レイアウト + 旧 magic** で、本家では主要 activity が
-    読めない (§3.4)。`sadf -c` も救済してくれない。
+22. **v11.7.1 が書いたファイルは新レイアウト + 旧 magic** で、現行の本家は主要 activity を
+    表示しない。reSARchの独自出力では既知17組を復元する (§3.4)。`sadf -c` の変換対象ではない。
 23. **`upgraded != 0` は「`sadf -c` で変換されたファイル」の印**で、
     `sysstat_version` / `patchlevel` / `sublevel` は**変換元**のバージョンを指している。
     「11.5.5 なのに `format_magic` が `0x2175`」という一見矛盾したファイルが正常に存在する
@@ -1897,8 +1926,8 @@ reSARch 側では `sadf -j` (JSON) / `sadf -r` (raw) の出力と自前パーサ
 
 - `A_MEMORY` の 64 B (v9.1.5 / v9.1.6) は `sa_conv.h` の `stats_memory_8a` の先頭 8 本
   (`frmkb`〜`comkb`)。`types_nr=(0,8,0)` として登録し、32bit の UL 幅を保持する。
-- 自己記述形式は時代 A 専用 revision を候補から除く。v11.7.1 相当の旧 magic を
-  新配置へ推測で読み替えず、当該 activity をスキップして他の activity を処理する。
+- 自己記述形式は時代 A 専用 revision を候補から除く。版を特定できない旧magicは
+  推測で読み替えない。生成版11.7.1.0の既知17組のみ、§3.4の原典比較に基づいて補正する。
 - `A_DISK` の 64 B / `(1,3,7)` の順序は
   [v12.1.2 rd_stats.h](https://github.com/sysstat/sysstat/blob/v12.1.2/rd_stats.h) の
   `stats_disk` と一致する (`dc_sect` は UL 群の 3 本目、`dc_ticks` は末尾)。

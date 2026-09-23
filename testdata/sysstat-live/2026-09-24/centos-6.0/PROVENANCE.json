@@ -1,0 +1,59 @@
+{
+  "case": "centos-6.0",
+  "rpm_target_release": "6.0",
+  "collected_at_utc": "2026-09-23T23:08:45.035795+00:00",
+  "runtime": "Apple Container 1.4.1",
+  "execution": "linux/amd64 via Rosetta on Apple Silicon",
+  "source_image": "docker.io/library/centos:6.6",
+  "image_index_digest": "sha256:32b80b90ba17ed16e9fa3430a49f53ff6de0d4c76ad8631717a1373d5921fa26",
+  "image_amd64_digest": "sha256:70d8e39d464a6ff55b543642bf80789fcb2270012dac4be407c81180f33cabfb",
+  "rootfs_release": "CentOS release 6.6 (Final)",
+  "kernel": "Linux 6.18.35",
+  "architecture": "x86_64",
+  "long_bits": 64,
+  "hostname": "resarch-fixture",
+  "package": "sysstat-9.0.4-11.el6.x86_64",
+  "packages": [
+    {
+      "file": "sysstat-9.0.4-11.el6.x86_64.rpm",
+      "url": "https://vault.centos.org/6.0/os/x86_64/Packages/sysstat-9.0.4-11.el6.x86_64.rpm",
+      "sha256": "677cd2c8d2a784058cf9ff15282647865ef7959f550b6193a96327dac159558a"
+    }
+  ],
+  "installation": "rpm -Uvh --nodeps (unmodified Vault RPMs; disposable container)",
+  "locale": "C",
+  "timezone": "UTC",
+  "commands": [
+    "/usr/lib64/sa/sadc -S XALL 1 2 /out/sa",
+    "sar -A -C -t -f /out/sa"
+  ],
+  "interval_seconds": 1,
+  "requested_samples": 2,
+  "collection_exit": 0,
+  "sar_exit": 0,
+  "sar_repeat_matches": true,
+  "resarch_identify": {
+    "endian": "little",
+    "file": "sa",
+    "format_magic": "0x2170",
+    "magic_at": "file_magic@2",
+    "note": null,
+    "readable": true,
+    "recorded_version": "9.0.4",
+    "sysstat_versions": "\u301c9.1.5"
+  },
+  "resarch_scan_exit": 0,
+  "resarch_scan_exact": true,
+  "resarch_commit": "feaf38d317fcc83ec2a824bd324a120229ac04ec",
+  "files": {
+    "sa": {
+      "bytes": 12972,
+      "sha256": "4ff4836dfaab4501e1721d03e4625a1f6a5256fe0d9a20f31ff8ba12f541f655"
+    },
+    "sar-A.txt": {
+      "bytes": 13843,
+      "sha256": "3c8e628109de59ba6f20fb1985d820854828f64f9915efbc3c6d559a34c69a02"
+    }
+  },
+  "image_registry_digest": "sha256:32b80b90ba17ed16e9fa3430a49f53ff6de0d4c76ad8631717a1373d5921fa26"
+}

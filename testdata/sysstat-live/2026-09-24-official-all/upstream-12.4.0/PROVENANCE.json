@@ -1,0 +1,33 @@
+{
+  "case_id": "upstream-12.4.0",
+  "source_image": "resarch-sysstat-12.4.0:e36f848588eff8e8",
+  "sysstat": "sysstat version 12.4.0",
+  "source_version": "12.4.0",
+  "native_version_output": "sysstat version 12.4.0",
+  "source_commit": "26a5665e4eccdf56a686c80b6384dbfce9e97fcf",
+  "source_url": "https://codeload.github.com/sysstat/sysstat/tar.gz/26a5665e4eccdf56a686c80b6384dbfce9e97fcf",
+  "source_sha256": "e61d35acfab62866198ae76b350b73c0e03094d308a00346d838aea3f2003326",
+  "source_cflags": "-O2 -fcommon -fgnu89-inline -include sys/sysmacros.h",
+  "interval_seconds": "1",
+  "sample_count": "2",
+  "collector": "sadc",
+  "sadc_options": "-S XALL",
+  "architecture": "aarch64",
+  "long_bits": "64",
+  "kernel": "Linux 6.18.35",
+  "sar_repeat_matches": "true",
+  "sar_text_comparison": "different (see sar-A.diff)",
+  "format_magic": "0x2175",
+  "encoding": {
+    "abi": "lp64",
+    "endian": "little",
+    "sizeof_long": 8
+  },
+  "records": 2,
+  "scan_exact": true,
+  "resarch_render_success": true,
+  "activity_decode": "complete",
+  "hostname": "resarch-fixture",
+  "source_archive_member": "-",
+  "source_archive_member_sha256": "-"
+}

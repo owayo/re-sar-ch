@@ -1,0 +1,283 @@
+Linux 6.18.35 (resarch-fixture) 	09/24/26 	_aarch64_	(5 CPU)
+
+01:24:35        CPU      %usr     %nice      %sys   %iowait    %steal      %irq     %soft    %guest     %idle
+01:24:36        all      0.00      0.00      0.20      0.00      0.00      0.00      0.00      0.00     99.80
+01:24:36          0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+01:24:36          1      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+01:24:36          2      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+01:24:36          3      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+01:24:36          4      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+Average:        all      0.00      0.00      0.20      0.00      0.00      0.00      0.00      0.00     99.80
+Average:          0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+Average:          1      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+Average:          2      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+Average:          3      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+Average:          4      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00    100.00
+
+01:24:35       proc/s   cswch/s
+01:24:36         0.00    308.00
+Average:         0.00    308.00
+
+01:24:35         INTR    intr/s
+01:24:36          sum    210.00
+01:24:36            0      0.00
+01:24:36            1      0.00
+01:24:36            2     72.00
+01:24:36            3      0.00
+01:24:36            4      0.00
+01:24:36            5      0.00
+01:24:36            6      0.00
+01:24:36            7      0.00
+01:24:36            8      0.00
+01:24:36            9      0.00
+01:24:36           10      0.00
+01:24:36           11     71.00
+01:24:36           12      0.00
+01:24:36           13      3.00
+01:24:36           14      0.00
+01:24:36           15      0.00
+01:24:36           16      0.00
+01:24:36           17     63.00
+01:24:36           18      0.00
+01:24:36           19      1.00
+01:24:36           20      0.00
+01:24:36           21      0.00
+01:24:36           22      0.00
+01:24:36           23      0.00
+01:24:36           24      0.00
+01:24:36           25      0.00
+01:24:36           26      0.00
+01:24:36           27      0.00
+01:24:36           28      0.00
+01:24:36           29      0.00
+01:24:36           30      0.00
+01:24:36           31      0.00
+01:24:36           32      0.00
+01:24:36           33      0.00
+01:24:36           34      0.00
+01:24:36           35      0.00
+01:24:36           36      0.00
+01:24:36           37      0.00
+01:24:36           38      0.00
+01:24:36           39      0.00
+01:24:36           40      0.00
+01:24:36           41      0.00
+01:24:36           42      0.00
+01:24:36           43      0.00
+01:24:36           44      0.00
+01:24:36           45      0.00
+01:24:36           46      0.00
+01:24:36           47      0.00
+01:24:36           48      0.00
+01:24:36           49      0.00
+01:24:36           50      0.00
+01:24:36           51      0.00
+01:24:36           52      0.00
+01:24:36           53      0.00
+01:24:36           54      0.00
+01:24:36           55      0.00
+01:24:36           56      0.00
+01:24:36           57      0.00
+01:24:36           58      0.00
+01:24:36           59      0.00
+01:24:36           60      0.00
+01:24:36           61      0.00
+01:24:36           62      0.00
+01:24:36           63      0.00
+Average:          sum    210.00
+Average:            0      0.00
+Average:            1      0.00
+Average:            2     72.00
+Average:            3      0.00
+Average:            4      0.00
+Average:            5      0.00
+Average:            6      0.00
+Average:            7      0.00
+Average:            8      0.00
+Average:            9      0.00
+Average:           10      0.00
+Average:           11     71.00
+Average:           12      0.00
+Average:           13      3.00
+Average:           14      0.00
+Average:           15      0.00
+Average:           16      0.00
+Average:           17     63.00
+Average:           18      0.00
+Average:           19      1.00
+Average:           20      0.00
+Average:           21      0.00
+Average:           22      0.00
+Average:           23      0.00
+Average:           24      0.00
+Average:           25      0.00
+Average:           26      0.00
+Average:           27      0.00
+Average:           28      0.00
+Average:           29      0.00
+Average:           30      0.00
+Average:           31      0.00
+Average:           32      0.00
+Average:           33      0.00
+Average:           34      0.00
+Average:           35      0.00
+Average:           36      0.00
+Average:           37      0.00
+Average:           38      0.00
+Average:           39      0.00
+Average:           40      0.00
+Average:           41      0.00
+Average:           42      0.00
+Average:           43      0.00
+Average:           44      0.00
+Average:           45      0.00
+Average:           46      0.00
+Average:           47      0.00
+Average:           48      0.00
+Average:           49      0.00
+Average:           50      0.00
+Average:           51      0.00
+Average:           52      0.00
+Average:           53      0.00
+Average:           54      0.00
+Average:           55      0.00
+Average:           56      0.00
+Average:           57      0.00
+Average:           58      0.00
+Average:           59      0.00
+Average:           60      0.00
+Average:           61      0.00
+Average:           62      0.00
+Average:           63      0.00
+
+01:24:35     pswpin/s pswpout/s
+01:24:36         0.00      0.00
+Average:         0.00      0.00
+
+01:24:35     pgpgin/s pgpgout/s   fault/s  majflt/s  pgfree/s pgscank/s pgscand/s pgsteal/s    %vmeff
+01:24:36         0.00      0.00      2.00      0.00      4.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      2.00      0.00      4.00      0.00      0.00      0.00      0.00
+
+01:24:35          tps      rtps      wtps   bread/s   bwrtn/s
+01:24:36         0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00
+
+01:24:35      frmpg/s   bufpg/s   campg/s
+01:24:36       683.00      0.00     27.00
+Average:       683.00      0.00     27.00
+
+01:24:35    kbmemfree kbmemused  %memused kbbuffers  kbcached  kbcommit   %commit  kbactive   kbinact
+01:24:36       881656    246060     21.82     17580    119196     43740      3.88     33312    106828
+Average:       881656    246060     21.82     17580    119196     43740      3.88     33312    106828
+
+01:24:35    kbswpfree kbswpused  %swpused  kbswpcad   %swpcad
+01:24:36            0         0      0.00         0      0.00
+Average:            0         0      0.00         0      0.00
+
+01:24:35    kbhugfree kbhugused  %hugused
+01:24:36            0         0      0.00
+Average:            0         0      0.00
+
+01:24:35    dentunusd   file-nr  inode-nr    pty-nr
+01:24:36          151        32       784         0
+Average:          151        32       784         0
+
+01:24:35      runq-sz  plist-sz   ldavg-1   ldavg-5  ldavg-15   blocked
+01:24:36            0       100      0.00      0.00      0.00         0
+Average:            0       100      0.00      0.00      0.00         0
+
+01:24:35          DEV       tps  rd_sec/s  wr_sec/s  avgrq-sz  avgqu-sz     await     svctm     %util
+01:24:36     dev254-0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+01:24:36    dev254-16      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:     dev254-0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:    dev254-16      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35        IFACE   rxpck/s   txpck/s    rxkB/s    txkB/s   rxcmp/s   txcmp/s  rxmcst/s
+01:24:36           lo      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+01:24:36         eth0      1.00      3.00      0.14      0.24      0.00      0.00      0.00
+Average:           lo      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         eth0      1.00      3.00      0.14      0.24      0.00      0.00      0.00
+
+01:24:35        IFACE   rxerr/s   txerr/s    coll/s  rxdrop/s  txdrop/s  txcarr/s  rxfram/s  rxfifo/s  txfifo/s
+01:24:36           lo      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+01:24:36         eth0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:           lo      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         eth0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35       call/s retrans/s    read/s   write/s  access/s  getatt/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35      scall/s badcall/s  packet/s     udp/s     tcp/s     hit/s    miss/s   sread/s  swrite/s saccess/s sgetatt/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35       totsck    tcpsck    udpsck    rawsck   ip-frag    tcp-tw
+01:24:36            5         0         0         0         0         0
+Average:            5         0         0         0         0         0
+
+01:24:35       irec/s  fwddgm/s    idel/s     orq/s   asmrq/s   asmok/s  fragok/s fragcrt/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35    ihdrerr/s iadrerr/s iukwnpr/s   idisc/s   odisc/s   onort/s    asmf/s   fragf/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35       imsg/s    omsg/s    iech/s   iechr/s    oech/s   oechr/s     itm/s    itmr/s     otm/s    otmr/s  iadrmk/s iadrmkr/s  oadrmk/s oadrmkr/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35       ierr/s    oerr/s idstunr/s odstunr/s   itmex/s   otmex/s iparmpb/s oparmpb/s   isrcq/s   osrcq/s  iredir/s  oredir/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35     active/s passive/s    iseg/s    oseg/s
+01:24:36         0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00
+
+01:24:35     atmptf/s  estres/s retrans/s isegerr/s   orsts/s
+01:24:36         0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00
+
+01:24:35       idgm/s    odgm/s  noport/s idgmerr/s
+01:24:36         0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00
+
+01:24:35      tcp6sck   udp6sck   raw6sck  ip6-frag
+01:24:36            0         0         0         0
+Average:            0         0         0         0
+
+01:24:35      irec6/s fwddgm6/s   idel6/s    orq6/s  asmrq6/s  asmok6/s imcpck6/s omcpck6/s fragok6/s fragcr6/s
+01:24:36         1.00      0.00      1.00      3.00      0.00      0.00      1.00      3.00      0.00      0.00
+Average:         1.00      0.00      1.00      3.00      0.00      0.00      1.00      3.00      0.00      0.00
+
+01:24:35    ihdrer6/s iadrer6/s iukwnp6/s  i2big6/s  idisc6/s  odisc6/s  inort6/s  onort6/s   asmf6/s  fragf6/s itrpck6/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35      imsg6/s   omsg6/s   iech6/s  iechr6/s  oechr6/s  igmbq6/s  igmbr6/s  ogmbr6/s igmbrd6/s ogmbrd6/s irtsol6/s ortsol6/s  irtad6/s inbsol6/s onbsol6/s  inbad6/s  onbad6/s
+01:24:36         1.00      3.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      1.00      1.00      0.00      0.00      0.00      0.00
+Average:         1.00      3.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      1.00      1.00      0.00      0.00      0.00      0.00
+
+01:24:35      ierr6/s idtunr6/s odtunr6/s  itmex6/s  otmex6/s iprmpb6/s oprmpb6/s iredir6/s oredir6/s ipck2b6/s opck2b6/s
+01:24:36         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+01:24:35      idgm6/s   odgm6/s noport6/s idgmer6/s
+01:24:36         0.00      0.00      0.00      0.00
+Average:         0.00      0.00      0.00      0.00
+
+01:24:35        CPU       MHz
+01:24:36        all      0.00
+01:24:36          0      0.00
+01:24:36          1      0.00
+01:24:36          2      0.00
+01:24:36          3      0.00
+01:24:36          4      0.00
+Average:        all      0.00
+Average:          0      0.00
+Average:          1      0.00
+Average:          2      0.00
+Average:          3      0.00
+Average:          4      0.00

@@ -36,8 +36,9 @@
 //! v11.7.1 は構造体を時代 B へ移したが per-activity の `magic` を上げ忘れており、
 //! 「新レイアウトなのに旧 magic」という組み合わせが実在する
 //! (`A_CPU` = `0x8a`/80、`A_MEMORY` = `0x8a`/136、`A_QUEUE` = `0x8b`/40 など)。
-//! 自己記述形式では時代 A 専用の配置を候補から外す。未対応の旧 magic は
-//! 本家と同様に読み飛ばし、他 activity の処理を続ける。
+//! 自己記述形式では時代 A 専用の配置を候補から外す。v11.7.1 の既知17組は
+//! registry::activity_magic_for_source で翌版の magic に対応付けてデコードする。
+//! 互換出力の表示判定は元の magic を使い、現行の本家と同じ規則を保つ。
 
 use crate::format::wire::{FieldTy, WireField, WireLayout};
 use crate::layout::registry::{ActivityDef, ColumnMeta, ItemShape, WireRevision};

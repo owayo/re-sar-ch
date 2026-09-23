@@ -1,0 +1,5 @@
+runtime=container
+mode=upstream-all
+interval_seconds=1
+sample_count=2
+container CLI version 1.4.1 (build: release, commit: 9a8917c)

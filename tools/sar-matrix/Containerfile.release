@@ -1,0 +1,11 @@
+ARG COMPILER_IMAGE
+FROM ${COMPILER_IMAGE} AS build
+ARG SYSSTAT_VERSION
+ARG SRPM_MEMBER=-
+ARG MEMBER_SHA256=-
+COPY source.archive /tmp/source.archive
+COPY build-release.sh /tmp/build-release.sh
+RUN /bin/sh /tmp/build-release.sh && rm -f /tmp/source.archive
+
+FROM debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+COPY --from=build /opt/sysstat-runtime/ /opt/sysstat-source/

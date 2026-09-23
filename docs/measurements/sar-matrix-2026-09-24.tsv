@@ -1,0 +1,18 @@
+# collected_at_local=2026-09-24 Asia/Tokyo
+# runtime=Apple Container 1.4.1
+# kernel=Linux 6.18.35
+# architecture=aarch64
+# long_bits=64
+# collection=sadc -S XALL 1 2
+# text=LC_ALL=C TZ=UTC sar -A -C -t -f sa
+# hostname=resarch-fixture
+case	group	source	sysstat	format_magic	endian	abi	records	scan_exact	sar_text_comparison	pair_dir	sa_sha256	sar_text_sha256
+alpine-3.23	distro	alpine:3.23	12.7.8	0x2175	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/alpine-3.23	123feea3d416e9a8a5011c0151cba84380be4aa5e43ea41ecd45d19ab4a36b23	573854bf746adde31cd47f1c43538d58b054604fe2964a0892ed6abe2279a6b0
+debian-13	distro	debian:13-slim	12.7.5	0x2175	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/debian-13	4e6e14c3b463280354ff411dff732c7cba26e885a4d1788037e5587eaef68740	fcb4cfddc07b00b7cf2ed19b9e940e4f8d85633b053833f34e4b661324427266
+ubuntu-24.04	distro	ubuntu:24.04	12.6.1	0x2175	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/ubuntu-24.04	7aafca684584fa86a91221316c2fdb3d1371c9288dc978d70c62b9281c2cade0	e37853a84d1eb0497f1b5e66a1505e39d1295f9ac0b7494ea1ecbc3c652e4f05
+fedora-44	distro	fedora:44	12.7.9	0x2175	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/fedora-44	d84666dbf44ef3aaf31107427a0109e2ccbfbf5550c914af2e82359a4f77ac8e	68009c1dd22f35b0c7155dae755c145a8e0898b2d87eece24e4fe387914aa6ed
+rockylinux-9	distro	rockylinux:9	12.5.4	0x2175	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/rockylinux-9	4e40112cf272b0f91ade36647ae0ddb603fc452ac87ea26aa15509cd466d80bb	1be4e5750c54e129e785d334b93daff6f057cef17c9a637e4599ac6ccbd6d339
+upstream-10.2.1	upstream	7471c52d70b6c4ed91fb8e828435aea3a1a8678c	10.2.1	0x2171	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/upstream-10.2.1	64d7ee5944e8f145ebac2a5e147628c0cf6f3b2ae8744eda36db95f5a5f68c15	e0c906617751e6273778b317a76e93267263b1963c113dc91591fbbf11cb6834
+upstream-11.6.6	upstream	1e6e2c3d0866a7569046afedf957a40f7b0e4120	11.6.6	0x2173	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/upstream-11.6.6	888fe890390f085e5d03e2633cef08f7112d9592a641d2a34b2836ddc1d9826f	12c3faf8048c6ed330d8b83238e8ebaca1bc0dd387a555f67450c18283a1d36b
+upstream-12.0.6	upstream	1bc9295d81e2b85ef521c058dc980d116f7b550e	12.0.6	0x2175	little	lp64	2	true	different	testdata/sysstat-live/2026-09-24/upstream-12.0.6	4a65c85d423defd59bf3b374b87c8bf0f05a1e13a45bf2077839b6d482757a52	5289ec6ec86283cba330e91275129d2caf1dfbf909be4ed12bf0fc14463278cc
+upstream-12.8.0	upstream	ffabe8175aa9a7aa056380c66ed3648e50c1967d	12.8.0	0x2175	little	lp64	2	true	device_names_only	testdata/sysstat-live/2026-09-24/upstream-12.8.0	5b600d159358e8cd83543c62b5650aab836c98575cd24ee3bcb4b67b081ae68f	0ce85601135f082ae69ec602157ddf82d80e5ff01b3b3e92dfa811dc27422ed8

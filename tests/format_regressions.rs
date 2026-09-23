@@ -466,23 +466,23 @@ fn activities_are_planned_in_generations_without_activity_magic() {
 
 /// **回帰テスト**: 世代判定の結末が、それぞれ別のエラー種別で報告されること。
 ///
-/// 「まだ読めない世代」「未対応のフォーマット」「そもそも sysstat ではない」を
+/// 「既知世代の壊れたヘッダ」「未対応のフォーマット」「そもそも sysstat ではない」を
 /// 混同すると、原因調査が遠回りになる。実際、旧世代のファイルが
 /// 「sysstat のデータファイルではありません」と報告されていた。
 #[test]
-fn the_three_outcomes_of_generation_probing_are_reported_distinctly() {
+fn generation_probing_distinguishes_corruption_unknown_format_and_non_sysstat() {
     let variant = |bytes: Vec<u8>| -> String {
         let err = SaFile::from_bytes("synthetic", bytes).expect_err("開けないこと");
         fixtures::error_variant(&err).to_string()
     };
 
-    // (1) 旧世代 = 識別できるが読み取りは未実装。
+    // (1) 対応済みの旧世代だが long 幅・日付が不正。
     //     値は docs/format/01-file-format.md §2.8 から独立に書き写す
-    //     (0x2169: magic@36 / sa_st_size@38 = 464 / ヘッダ 240)。
+    //     (0x2168: magic@36 / sa_st_size@38 = 464 / ヘッダ 240)。
     let mut legacy = vec![0u8; 240 + 464];
-    legacy[36..38].copy_from_slice(&0x2169u16.to_le_bytes());
+    legacy[36..38].copy_from_slice(&0x2168u16.to_le_bytes());
     legacy[38..40].copy_from_slice(&464u16.to_le_bytes());
-    assert_eq!(variant(legacy), "UnreadableGeneration");
+    assert_eq!(variant(legacy), "InconsistentHeader");
 
     // (2) 先頭は sysstat の識別子だが、format_magic が未知 = 未対応フォーマット。
     let mut future = vec![0u8; 400];

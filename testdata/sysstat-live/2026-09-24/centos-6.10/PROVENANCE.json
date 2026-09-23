@@ -1,0 +1,59 @@
+{
+  "case": "centos-6.10",
+  "rpm_target_release": "6.10",
+  "collected_at_utc": "2026-09-23T23:08:55.550200+00:00",
+  "runtime": "Apple Container 1.4.1",
+  "execution": "linux/amd64 via Rosetta on Apple Silicon",
+  "source_image": "docker.io/library/centos:6.10",
+  "image_index_digest": "sha256:abc8bec96842a07c03274d3f1549bd37ec5dbfb0e36dcdfc31d70b1ad3281431",
+  "image_amd64_digest": "sha256:ea2905089c8cd9c420ca8b877c3e08ddd732be0fb1d350ae5b87a49e9119a4ff",
+  "rootfs_release": "CentOS release 6.10 (Final)",
+  "kernel": "Linux 6.18.35",
+  "architecture": "x86_64",
+  "long_bits": 64,
+  "hostname": "resarch-fixture",
+  "package": "sysstat-9.0.4-33.el6_9.1.x86_64",
+  "packages": [
+    {
+      "file": "sysstat-9.0.4-33.el6_9.1.x86_64.rpm",
+      "url": "https://vault.centos.org/6.10/os/x86_64/Packages/sysstat-9.0.4-33.el6_9.1.x86_64.rpm",
+      "sha256": "65fa114e7d947143580f98a5feeb652ceb7ebdd8b27fba65ba0b383b250c63d3"
+    }
+  ],
+  "installation": "rpm -Uvh --nodeps (unmodified Vault RPMs; disposable container)",
+  "locale": "C",
+  "timezone": "UTC",
+  "commands": [
+    "/usr/lib64/sa/sadc -S XALL 1 2 /out/sa",
+    "sar -A -C -t -f /out/sa"
+  ],
+  "interval_seconds": 1,
+  "requested_samples": 2,
+  "collection_exit": 0,
+  "sar_exit": 0,
+  "sar_repeat_matches": true,
+  "resarch_identify": {
+    "endian": "little",
+    "file": "sa",
+    "format_magic": "0x1170",
+    "magic_at": "file_magic@2",
+    "note": null,
+    "readable": true,
+    "recorded_version": "9.0.4",
+    "sysstat_versions": "9.0.4 (RHEL/CentOS 6.5 \u4ee5\u964d)"
+  },
+  "resarch_scan_exit": 0,
+  "resarch_scan_exact": true,
+  "resarch_commit": "feaf38d317fcc83ec2a824bd324a120229ac04ec",
+  "files": {
+    "sa": {
+      "bytes": 13092,
+      "sha256": "14a2afadc881d012a0c7f2d15751e52a7b081e6f1d0a962b89123c40365f347d"
+    },
+    "sar-A.txt": {
+      "bytes": 13843,
+      "sha256": "028a73e645d293fc74d38e39512fede22921a0cbe936c40191cb4ae889b1ff99"
+    }
+  },
+  "image_registry_digest": "sha256:abc8bec96842a07c03274d3f1549bd37ec5dbfb0e36dcdfc31d70b1ad3281431"
+}

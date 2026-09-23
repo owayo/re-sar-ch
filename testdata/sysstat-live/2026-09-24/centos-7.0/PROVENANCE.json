@@ -1,0 +1,64 @@
+{
+  "case": "centos-7.0",
+  "rpm_target_release": "7.0",
+  "collected_at_utc": "2026-09-23T23:09:00.312798+00:00",
+  "runtime": "Apple Container 1.4.1",
+  "execution": "linux/amd64 via Rosetta on Apple Silicon",
+  "source_image": "docker.io/library/centos:7.0.1406",
+  "image_index_digest": "sha256:182394d34a0d73e987ffacf6d0e0caa3a0fe7bc1738798872b41e6245e0ee99d",
+  "image_amd64_digest": "sha256:677a7e2e4aebf05b80331b573811fd00ba49905620943f4c013d668c15e6b66c",
+  "rootfs_release": "CentOS Linux release 7.0.1406 (Core)",
+  "kernel": "Linux 6.18.35",
+  "architecture": "x86_64",
+  "long_bits": 64,
+  "hostname": "resarch-fixture",
+  "package": "sysstat-10.1.5-4.el7.x86_64",
+  "packages": [
+    {
+      "file": "sysstat-10.1.5-4.el7.x86_64.rpm",
+      "url": "https://vault.centos.org/7.0.1406/os/x86_64/Packages/sysstat-10.1.5-4.el7.x86_64.rpm",
+      "sha256": "92d5c38e22efaac55c95475321b2a1859cd9ae5f6bf407c851da4e9b9d265123"
+    },
+    {
+      "file": "lm_sensors-libs-3.3.4-10.el7.x86_64.rpm",
+      "url": "https://vault.centos.org/7.0.1406/os/x86_64/Packages/lm_sensors-libs-3.3.4-10.el7.x86_64.rpm",
+      "sha256": "7963f591d6499fe7c8909e0112977f0be65978ed6792c69b3eda8966de8aa935"
+    }
+  ],
+  "installation": "rpm -Uvh --nodeps (unmodified Vault RPMs; disposable container)",
+  "locale": "C",
+  "timezone": "UTC",
+  "commands": [
+    "/usr/lib64/sa/sadc -S XALL 1 2 /out/sa",
+    "sar -A -C -t -f /out/sa"
+  ],
+  "interval_seconds": 1,
+  "requested_samples": 2,
+  "collection_exit": 0,
+  "sar_exit": 0,
+  "sar_repeat_matches": true,
+  "resarch_identify": {
+    "endian": "little",
+    "file": "sa",
+    "format_magic": "0x2171",
+    "magic_at": "file_magic@2",
+    "note": null,
+    "readable": true,
+    "recorded_version": "10.1.5",
+    "sysstat_versions": "9.1.6\u301c10.2.x"
+  },
+  "resarch_scan_exit": 0,
+  "resarch_scan_exact": true,
+  "resarch_commit": "feaf38d317fcc83ec2a824bd324a120229ac04ec",
+  "files": {
+    "sa": {
+      "bytes": 14400,
+      "sha256": "4229dc4a555edc67485d0f371839e06ad0ea281b52b6d3747da1ea78e1e5bd89"
+    },
+    "sar-A.txt": {
+      "bytes": 14220,
+      "sha256": "3068c794a7eb7b1bc493159e8ae6c389e19a27f87df689b87da21da3759fc0a5"
+    }
+  },
+  "image_registry_digest": "sha256:182394d34a0d73e987ffacf6d0e0caa3a0fe7bc1738798872b41e6245e0ee99d"
+}

@@ -1,0 +1,59 @@
+{
+  "case": "centos-4.9",
+  "rpm_target_release": "4.9",
+  "collected_at_utc": "2026-09-23T23:08:33.291409+00:00",
+  "runtime": "Apple Container 1.4.1",
+  "execution": "linux/amd64 via Rosetta on Apple Silicon",
+  "source_image": "docker.io/library/centos:5.11",
+  "image_index_digest": "sha256:b978b025318f4495632658cf5d9892fdbc89c8b372306ec68520060051b3a709",
+  "image_amd64_digest": "sha256:c40041f5894293d0df8f5c6c2049b92a82c53f1718ecdd73cbf3c1826a08ba4a",
+  "rootfs_release": "CentOS release 5.11 (Final)",
+  "kernel": "Linux 6.18.35",
+  "architecture": "x86_64",
+  "long_bits": 64,
+  "hostname": "resarch-fixture",
+  "package": "sysstat-5.0.5-27.el4",
+  "packages": [
+    {
+      "file": "sysstat-5.0.5-27.el4.x86_64.rpm",
+      "url": "https://vault.centos.org/4.9/updates/x86_64/RPMS/sysstat-5.0.5-27.el4.x86_64.rpm",
+      "sha256": "7015f4147f477a7670d6e399a9065a749dc53d8bdc5a704690a844febde03cb7"
+    }
+  ],
+  "installation": "rpm -Uvh --nodeps (unmodified Vault RPMs; disposable container)",
+  "locale": "C",
+  "timezone": "UTC",
+  "commands": [
+    "/usr/lib64/sa/sadc 1 2 /out/sa",
+    "sar -A -t -f /out/sa"
+  ],
+  "interval_seconds": 1,
+  "requested_samples": 2,
+  "collection_exit": 0,
+  "sar_exit": 0,
+  "sar_repeat_matches": true,
+  "resarch_identify": {
+    "endian": "little",
+    "file": "sa",
+    "format_magic": "0x2163",
+    "magic_at": "file_hdr@4",
+    "note": "\u3053\u306e\u4e16\u4ee3\u306e\u8aad\u307f\u53d6\u308a\u306f\u672a\u5b9f\u88c5",
+    "readable": false,
+    "recorded_version": null,
+    "sysstat_versions": "4.1.7\u301c5.0.6"
+  },
+  "resarch_scan_exit": 1,
+  "resarch_scan_exact": null,
+  "resarch_commit": "feaf38d317fcc83ec2a824bd324a120229ac04ec",
+  "files": {
+    "sa": {
+      "bytes": 4784,
+      "sha256": "c599c88c7a6098c7b7afc7b1c389bca9ab8b2af46e9baeb97b89b15595fc709c"
+    },
+    "sar-A.txt": {
+      "bytes": 7922,
+      "sha256": "a3e78d3d794677e319482f53011c2920660a21e9a970d44fb07bdf263d70027c"
+    }
+  },
+  "image_registry_digest": "sha256:c40041f5894293d0df8f5c6c2049b92a82c53f1718ecdd73cbf3c1826a08ba4a"
+}

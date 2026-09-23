@@ -165,6 +165,46 @@ pub fn format_compat(id: ActivityId, magic: Option<u32>) -> FormatCompat {
     }
 }
 
+/// v11.7.1 changed the structures but omitted 17 activity-magic increments.
+/// v11.7.2 changed these numbers without changing the structures (02-activities §3.4).
+/// Resolve only this known producer bug for decoding. Compatibility output must
+/// still compare the original on-disk magic, as current native sar does.
+pub(crate) fn activity_magic_for_source(
+    format_magic: u16,
+    version: (u8, u8, u8, u8),
+    id: ActivityId,
+    magic: u32,
+) -> u32 {
+    if format_magic != 0x2175 || version != (11, 7, 1, 0) {
+        return magic;
+    }
+    let omitted_increment = matches!(
+        (id, magic),
+        (
+            ActivityId::CPU
+                | ActivityId::PCSW
+                | ActivityId::IRQ
+                | ActivityId::MEMORY
+                | ActivityId::KTABLES
+                | ActivityId::SERIAL
+                | ActivityId::HUGE
+                | ActivityId::PWR_FREQ
+                | ActivityId::FS,
+            0x8a
+        ) | (
+            ActivityId::QUEUE
+                | ActivityId::DISK
+                | ActivityId::NET_EDEV
+                | ActivityId::NET_IP
+                | ActivityId::NET_EIP
+                | ActivityId::NET_IP6
+                | ActivityId::NET_EIP6,
+            0x8b
+        ) | (ActivityId::NET_DEV, 0x8c)
+    );
+    magic + u32::from(omitted_increment)
+}
+
 /// 定義済み activity を列挙する。
 pub fn all() -> impl Iterator<Item = &'static ActivityDef> {
     super::activities::GROUPS.iter().flat_map(|g| g.iter())
@@ -178,6 +218,22 @@ pub fn lookup(id: ActivityId) -> Option<&'static ActivityDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_magic_exception_preserves_other_formats_and_unknown_ids() {
+        assert_eq!(
+            activity_magic_for_source(0x2173, (11, 7, 1, 0), ActivityId::CPU, 0x8a),
+            0x8a
+        );
+        assert_eq!(
+            activity_magic_for_source(0x2175, (11, 7, 1, 0), ActivityId(255), 0x8a),
+            0x8a
+        );
+        assert_eq!(
+            activity_magic_for_source(0x2175, (11, 7, 1, 0), ActivityId::CPU, u32::MAX),
+            u32::MAX
+        );
+    }
 
     #[test]
     fn lookup_returns_none_for_unknown_id() {

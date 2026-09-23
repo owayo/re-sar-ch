@@ -52,8 +52,12 @@ macOS や Windows で Linux のログを読める。
 `-R` を ppc64 系のホストに合わせるなら `--sar-page-size 65536`。
 
 **`sar` が「読めない」と言ったファイルでも読める。** `sar` は `format_magic` が現行と
-違うと即エラーにするが、`resarch` は 5 世代 (`0x1170` / `0x2170` / `0x2171` / `0x2173` /
-`0x2175`) を直読する。32bit / big-endian で採取されたファイル (PowerPC など) も同じように開く。
+違うと即エラーにするが、`resarch` は登録済み28形式を直読する。`0x2168` を含む旧モノリシック22形式、
+2.2の `0x015d`、`0x1170` / `0x2170` / `0x2171` / `0x2173` / `0x2175` が対象。
+旧形式では未記録・単位不明の値は取得不可になり、CPU別IRQなど未デコードの配列もある。
+`exact=true` は末尾走査の一致であり、全指標や当時のsar表示との一致ではない。
+32bit / big-endian も扱えるが、long幅未記録の旧形式は既定8バイト、2.2のendianは既定littleと仮定する。
+CLIにABI上書きはないため、異なる入力ではライブラリの `OpenOptions` で指定する。
 
 ## どのバージョンの sysstat が書いたファイルか調べる
 
@@ -65,7 +69,7 @@ resarch identify sa*.bin --format json      # 機械可読
 ```
 FILE                   FORMAT  SYSSTAT                       RECORDED  ENDIAN  READ  NOTE
 sa01                   0x1170  9.0.4 (RHEL/CentOS 6.5 以降)  9.0.4     little  yes
-sa07                   0x2169  6.1.3〜7.0.4                  -         little  no    この世代の読み取りは未実装
+sa07                   0x2168  6.1.1〜6.1.2                  -         little  yes
 broken.bin             -       -                             -         -       -     sysstat のデータファイルではない
 ```
 

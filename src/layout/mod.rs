@@ -14,6 +14,8 @@
 //! - 値は `FieldId` で索引する配列に入れる。ホットパスに文字列キーの map を置かない。
 
 pub mod activities;
+pub(crate) mod legacy;
+pub(crate) mod packed_legacy;
 pub mod plan;
 pub mod registry;
 

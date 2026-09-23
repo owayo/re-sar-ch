@@ -247,8 +247,32 @@ pub fn plan_activities(file: &SaFile, selection: &Selection) -> Result<PlanSet> 
             continue;
         };
 
+        if let Some(legacy) = file.legacy() {
+            out.plans.push(ActivityPlan {
+                index,
+                id: act.id,
+                plan: crate::layout::legacy::plan(legacy, act, def, file.encoding())?,
+            });
+            continue;
+        }
+        if let Some(legacy) = file.packed_legacy() {
+            out.plans.push(ActivityPlan {
+                index,
+                id: act.id,
+                plan: crate::layout::packed_legacy::plan(legacy, act, def, file.encoding())?,
+            });
+            continue;
+        }
+
         let shape = DeclaredShape {
-            magic: has_activity_magic.then_some(act.magic),
+            magic: has_activity_magic.then(|| {
+                crate::layout::registry::activity_magic_for_source(
+                    file.magic().format_magic,
+                    file.magic().version,
+                    act.id,
+                    act.magic,
+                )
+            }),
             size: act.size as usize,
             types_nr: act.types_nr,
         };
@@ -644,7 +668,8 @@ fn decode_activity_into(
 
     let mut filled = 0usize;
     for i in 0..count {
-        let base = slice.offset + i * slice.stride;
+        let (plan, relative) = plan.item_layout(i, slice.stride);
+        let base = slice.offset + relative;
 
         // item ごとに「申告サイズ分だけ」のビューを作る。
         //
@@ -683,6 +708,9 @@ fn decode_activity_into(
             .ok()
             .flatten()
             .filter(|s| !s.is_empty());
+        if plan.is_unused(&item.values, key) {
+            continue;
+        }
         if item.key.as_deref() != key {
             item.key = key.map(|s| s.to_owned().into_boxed_str());
         }

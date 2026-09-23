@@ -32,7 +32,7 @@ use crate::format::reader::Cursor;
 use crate::format::wire::{FieldTy, PlacedField, ResolvedLayout};
 use crate::format::writer::{WriteCursor, value_fits};
 use crate::layout::plan::{DeclaredShape, select_revision};
-use crate::layout::registry::{self, WireRevision};
+use crate::layout::registry::{self, ActivityDef, WireRevision};
 use crate::model::ActivityId;
 use crate::series::compute;
 
@@ -158,9 +158,25 @@ impl ActivityPlan {
         src_nr2: u32,
         enc: &crate::format::abi::SourceEncoding,
     ) -> Result<Self, PlanError> {
-        let Some(def) = registry::lookup(id) else {
-            return Ok(Self::opaque(id, src_size, src_nr2));
-        };
+        match registry::lookup(id) {
+            Some(def) => Self::build_for_def(def, src_magic, src_size, src_nr, src_nr2, enc),
+            None => Ok(Self::opaque(id, src_size, src_nr2)),
+        }
+    }
+
+    /// [`ActivityPlan::build`] の本体。activity 定義を引数で受ける。
+    ///
+    /// 定義を外から渡せるようにしてあるのは、実在の定義では起こらない
+    /// 「定義側の矛盾」([`PlanError`]) を検出する経路をテストで確かめるためである。
+    fn build_for_def(
+        def: &ActivityDef,
+        src_magic: Option<u32>,
+        src_size: usize,
+        src_nr: u32,
+        src_nr2: u32,
+        enc: &crate::format::abi::SourceEncoding,
+    ) -> Result<Self, PlanError> {
+        let id = def.id;
         let Some(dst_rev) = def.latest() else {
             return Ok(Self::opaque(id, src_size, src_nr2));
         };

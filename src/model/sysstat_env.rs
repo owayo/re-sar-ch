@@ -134,6 +134,24 @@ pub fn header_rows_from_env(terminal_rows: Option<u16>) -> HeaderRows {
     resolve_header_rows(terminal_rows, &|k| std::env::var(k).ok())
 }
 
+/// sysstat 10.1.5 (el7) の `get_win_height()`。
+///
+/// ```text
+/// rows = 3600 * 24
+/// if ioctl(STDOUT_FILENO, TIOCGWINSZ) が成功 && ws_row > 2 { rows = ws_row - 2 }
+/// return rows
+/// ```
+///
+/// 現行版との違いは 2 つ。**`S_REPEAT_HEADER` を読まない** (この変数は後の版で
+/// 入った) ことと、`MIN_ROWS` の下限処理が無いこと (`ws_row > 2` のときしか
+/// 書き換えないので 1 未満にはならない)。環境変数を読まないので純粋関数になる。
+pub fn header_rows_el7(terminal_rows: Option<u16>) -> HeaderRows {
+    match terminal_rows {
+        Some(ws_row) if ws_row > 2 => HeaderRows::new(i32::from(ws_row) - 2),
+        _ => HeaderRows::default(),
+    }
+}
+
 /// [`header_rows_from_env`] の本体。
 ///
 /// 本家は `rows` を `int` で持ち、最後に `MIN_ROWS` で下限を取る。
@@ -293,5 +311,15 @@ mod tests {
         assert_eq!(HeaderRows::default().get(), DEFAULT_ROWS);
         assert_eq!(HeaderRows::new(0).get(), MIN_ROWS);
         assert_eq!(HeaderRows::new(-1).get(), MIN_ROWS);
+    }
+
+    /// el7 (10.1.5) は `S_REPEAT_HEADER` を持たず、端末の高さだけで決まる。
+    #[test]
+    fn el7_rows_depend_only_on_the_terminal() {
+        assert_eq!(header_rows_el7(None).get(), DEFAULT_ROWS);
+        assert_eq!(header_rows_el7(Some(40)).get(), 38);
+        // `ws_row > 2` でなければ書き換えない
+        assert_eq!(header_rows_el7(Some(2)).get(), DEFAULT_ROWS);
+        assert_eq!(header_rows_el7(Some(3)).get(), 1);
     }
 }

@@ -36,25 +36,28 @@ use re_sar_ch::analyze::{
 };
 use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
-    DetectFormat, IdentifyArgs, InfoArgs, Invocation, OptFlags, OutputFormat, PriorityArg,
-    Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarFlags, SarImmediate,
-    SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs, TimeSpec, TimeZoneArgs,
-    TuiArgs, ValueKind,
+    DetectFormat, El7Input, IdentifyArgs, InfoArgs, Invocation, OptFlags, OutputFormat,
+    PriorityArg, Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarEl7Options,
+    SarFlags, SarImmediate, SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs,
+    TimeSpec, TimeZoneArgs, TuiArgs, ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
 use re_sar_ch::format::{MmapPolicy, OpenOptions, SaFile, Tolerance};
 use re_sar_ch::model::{
-    ActivityId, CompatDateFormat, DisplayTz, KNOWN_ACTIVITIES, Lang, header_rows_from_env,
+    ActivityId, CompatDateFormat, DisplayTz, KNOWN_ACTIVITIES, Lang, SarProfile, header_rows_el7,
+    header_rows_from_env,
 };
 use re_sar_ch::multi::{self, BootSegment, FileErrorPolicy, GaugeFill, MultiOptions};
 use re_sar_ch::output::json::{CustomConfig, ValueScope};
 use re_sar_ch::output::sadf::{self, SadfConfig, SectionConfig, TimeBase};
+use re_sar_ch::output::sar_el7;
 use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
 use re_sar_ch::output::{csv, ndjson, table};
 use re_sar_ch::output::{detect_report, detect_svg};
 use re_sar_ch::series::Selection;
+use re_sar_ch::series::el7;
 
 /// 既定の日次データファイルを置くディレクトリ (`SA_DIR`)。
 ///
@@ -103,10 +106,11 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
             Commands::Compare(args) => run_compare(args),
             // `dispatch` は互換入口を直接互換パーサへ回すので通常ここには来ない。
             // ルート経由で来た場合も同じ結果になるよう解析し直す。
-            Commands::Sar(args) => run_sar(cli::parse_sar_args(&args.args)?),
+            Commands::Sar(args) => run(cli::parse_sar_entry(&args.args)?),
             Commands::Sadf(args) => run_sadf(cli::parse_sadf_args(&args.args)?),
         },
         Invocation::Sar(opts) => run_sar(*opts),
+        Invocation::SarEl7(opts) => run_sar_el7(*opts),
         Invocation::Sadf(opts) => run_sadf(*opts),
     }
 }
@@ -475,29 +479,78 @@ fn sadf_config(opts: &SadfOptions) -> SadfConfig {
 // `sar` 互換入口
 // ===========================================================================
 
-fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
-    let file = open_file(&args.file, &open_options(false, args.no_mmap))?;
-    report_diagnostics(&file);
-    // -A の CPU / memory / swap などの選択規則を互換入口と共有する。
-    let mut opts = cli::parse_sar_args(&["-A".into(), "-C".into()])?;
-    opts.flags.true_time = !args.utc;
-    opts.flags.local_time = false;
-    let mut text = sar_text_options(&opts);
-    // `-` と未指定は標準出力、それ以外はファイル。
-    let destination = args.output.as_deref().filter(|p| *p != Path::new("-"));
-    if destination.is_some() {
-        // 宛先がファイルなら端末の高さは関係ない。本家が標準出力を
-        // リダイレクトされたときと同じ扱い (= ioctl 失敗) に揃える。
-        // `S_REPEAT_HEADER` はこの経路でこそ効く。
-        text.header_rows = header_rows_from_env(None);
+/// `sa2sar` が使う描画 (`--sar-profile` で切り替える)。
+enum Sa2SarRender {
+    /// 現行版 (v12.8.0) の `sar -A -C -t`。
+    Current {
+        text: SarTextOptions,
+        activities: Vec<ActivityId>,
+    },
+    /// RHEL / CentOS 7 の sysstat 10.1.5 の `sar -A -C -t`。
+    El7(Box<sar_el7::El7Options>),
+}
+
+impl Sa2SarRender {
+    fn write<W: Write>(&self, out: &mut W, file: &SaFile) -> re_sar_ch::Result<()> {
+        match self {
+            Sa2SarRender::Current { text, activities } => {
+                sar_text::write_report(out, file, text, activities)
+            }
+            Sa2SarRender::El7(opts) => sar_el7::write_report(out, file, opts),
+        }
     }
-    let activities = sar_activities(&opts, &file);
-    if activities.is_empty() {
+}
+
+fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
+    if args.sar_page_size.is_some() && !args.sar_profile.uses_page_size() {
         bail!(
-            "Requested activities not available in file {}",
-            args.file.display()
+            "--sar-page-size は --sar-profile sysstat-10.1.5-el7 と一緒にしか使えません \
+             (現行版の sar は -R を持たないため、ページサイズを使う列がありません)"
         );
     }
+    let file = open_file(&args.file, &open_options(false, args.no_mmap))?;
+    report_diagnostics(&file);
+    // `-` と未指定は標準出力、それ以外はファイル。
+    let destination = args.output.as_deref().filter(|p| *p != Path::new("-"));
+    // 宛先がファイルなら端末の高さは関係ない。本家が標準出力を
+    // リダイレクトされたときと同じ扱い (= ioctl 失敗) に揃える。
+    let terminal_rows = if destination.is_some() {
+        None
+    } else {
+        stdout_terminal_rows()
+    };
+    let render = match args.sar_profile {
+        SarProfile::Sysstat1280 => {
+            // -A の CPU / memory / swap などの選択規則を互換入口と共有する。
+            let mut opts = cli::parse_sar_args(&["-A".into(), "-C".into()])?;
+            opts.flags.true_time = !args.utc;
+            opts.flags.local_time = false;
+            let mut text = sar_text_options(&opts);
+            // `S_REPEAT_HEADER` はパイプ・ファイル出力の経路でこそ効く。
+            text.header_rows = header_rows_from_env(terminal_rows);
+            let activities = sar_activities(&opts, &file);
+            if activities.is_empty() {
+                bail!(
+                    "Requested activities not available in file {}",
+                    args.file.display()
+                );
+            }
+            Sa2SarRender::Current { text, activities }
+        }
+        SarProfile::Sysstat1015El7 => {
+            let page = args.sar_page_size.unwrap_or_default();
+            let mut opts = sar_el7::El7Options::all(page.kb_shift());
+            opts.time = if args.utc {
+                TimeStyle::Utc
+            } else {
+                TimeStyle::Recorded
+            };
+            opts.date_format = CompatDateFormat::from_env();
+            // 10.1.5 は S_REPEAT_HEADER を読まない
+            opts.rows = u64::from(header_rows_el7(terminal_rows).get());
+            Sa2SarRender::El7(Box::new(opts))
+        }
+    };
     if let Some(path) = destination {
         // 同一ディレクトリの一時ファイルへストリーミングし、成功後に公開する。
         // persist_noclobber は入力自身・hardlink・symlink も上書きしない。
@@ -509,7 +562,7 @@ fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
             .with_context(|| format!("出力先に一時ファイルを作成できません: {}", path.display()))?;
         {
             let mut out = BufWriter::new(temp.as_file_mut());
-            sar_text::write_report(&mut out, &file, &text, &activities)?;
+            render.write(&mut out, &file)?;
             out.flush()?;
         }
         temp.persist_noclobber(path).with_context(|| {
@@ -520,7 +573,7 @@ fn run_sa2sar(args: Sa2SarArgs) -> anyhow::Result<ExitCode> {
         })?;
     } else {
         let mut out = stdout_writer();
-        let result = sar_text::write_report(&mut out, &file, &text, &activities);
+        let result = render.write(&mut out, &file);
         out.flush()?;
         result?;
     }
@@ -635,6 +688,102 @@ activity の選択:
   -f [<file>]     読み出し元 (ディレクトリなら日次ファイル名を付加)
   -[0-9]+         何日前の日次ファイルか
   --help / -V     このヘルプ / 版の表示
+";
+
+/// `--sar-profile sysstat-10.1.5-el7` の `sar` 互換入口。
+fn run_sar_el7(opts: SarEl7Options) -> anyhow::Result<ExitCode> {
+    match opts.immediate {
+        Some(SarImmediate::Help) => {
+            let mut out = stdout_writer();
+            write!(out, "{}", SAR_EL7_USAGE)?;
+            out.flush()?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(immediate) => return run_sar_immediate(immediate),
+        None => {}
+    }
+    let (path, default_used) = match &opts.input {
+        // interval を指定して -f を省くと、本家はライブ採取になる
+        None => bail!(
+            "読み出す sa ファイルがありません。reSARch はライブ採取を行わないので \
+             `-f <file>` を指定してください"
+        ),
+        Some(El7Input::File(p)) => (p.clone(), false),
+        // 10.1.5 の既定ファイルは `SA_DIR/saDD` だけ (`saYYYYMMDD` は後の版)
+        Some(El7Input::DefaultDaily) => {
+            let (_, _, day) = target_date(opts.day_offset);
+            (sa_dir().join(format!("sa{day:02}")), true)
+        }
+    };
+    check_readable(&path, default_used)?;
+    let file = open_file(&path, &OpenOptions::default())?;
+    report_diagnostics(&file);
+
+    let el7 = sar_el7::El7Options {
+        activities: opts.activities,
+        print: el7::PrintOptions {
+            cpu_all: opts.cpu_all,
+            cpu_bitmap: opts.cpu_bitmap,
+            irq_bitmap: opts.irq_bitmap,
+            fs_mount: opts.fs_mount,
+            kb_shift: opts.page_size.kb_shift(),
+        },
+        mem_dia: opts.mem_dia,
+        mem_amt: opts.mem_amt,
+        mem_swap: opts.mem_swap,
+        comment: opts.comment,
+        time: if opts.true_time {
+            TimeStyle::Recorded
+        } else {
+            TimeStyle::Local
+        },
+        date_format: CompatDateFormat::from_env(),
+        rows: u64::from(header_rows_el7(stdout_terminal_rows()).get()),
+        tm_start: opts.tm_start,
+        tm_end: opts.tm_end,
+        interval: opts.interval,
+        count: opts.count,
+    };
+    let mut out = stdout_writer();
+    let result = sar_el7::write_report(&mut out, &file, &el7);
+    out.flush()?;
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+const SAR_EL7_USAGE: &str = "\
+使い方: resarch --sar-profile sysstat-10.1.5-el7 [オプション...] [-f <sa ファイル>]
+
+RHEL / CentOS 7 の sysstat 10.1.5 の sar と同じ文法・同じ出力で sa ファイルを読む。
+読めるのは format_magic 0x2171 のファイルだけ。採取 (-o) は行わない。
+
+activity の選択:
+  -A                すべての activity (-P ALL / -I の全ビット / -u ALL / -R -r -S を含む)
+  -u [ALL]          CPU        -w   タスク生成 / コンテキストスイッチ
+  -B                ページング  -b   I/O 転送レート
+  -R / -r / -S      メモリのページ変化 / メモリ / スワップ
+  -q                負荷       -v   カーネルテーブル      -y   TTY
+  -d                ブロックデバイス      -F [MOUNT]  ファイルシステム
+  -n <キーワード>    ネットワーク (DEV EDEV NFS NFSD SOCK IP EIP ICMP EICMP TCP ETCP UDP
+                    SOCK6 IP6 EIP6 ICMP6 EICMP6 UDP6 ALL)
+  -m <キーワード>    電源管理 (CPU FAN IN TEMP FREQ USB ALL)
+  -I {SUM|ALL|XALL|<番号>}  割り込み (ALL は先頭 16 本)
+  -H                hugepages  -W   スワッピング
+
+絞り込みと書式:
+  -P {<cpu>[,...]|ALL}  CPU 別統計
+  -s [hh:mm:ss]         開始時刻 (省略時 08:00:00)
+  -e [hh:mm:ss]         終了時刻 (省略時 18:00:00)
+  -i <秒>               この間隔に近いレコードだけを出す
+  -t                    記録時のローカル時刻で表示
+  -C                    COM 行を表示
+  -p                    デバイス名 (他ホストの名前は引かないので dev<major>-<minor> のまま)
+  --sar-page-size <バイト>  -R のページサイズ (既定 4096)
+
+その他:
+  -f [<file>]     読み出し元 (省略時 SA_DIR/saDD)
+  -[0-9]{1,2}     何日前の日次ファイルか
+  -h / -V         このヘルプ / 版の表示
 ";
 
 // ===========================================================================

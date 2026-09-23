@@ -22,12 +22,14 @@
 
 pub mod sadf_args;
 pub mod sar_args;
+pub mod sar_el7_args;
 
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
-use crate::model::{DisplayTz, Lang};
+use crate::model::sar_profile::{ParsePageSizeError, ParseSarProfileError};
+use crate::model::{DisplayTz, Lang, PageSize, SarProfile};
 
 pub use sadf_args::{
     SadfArgError, SadfFormat, SadfImmediate, SadfOptions, SadfOutputOptions, SadfTimeBase,
@@ -37,6 +39,7 @@ pub use sar_args::{
     Activity, Caller, CpuBitmap, OptFlags, PersistentName, SarArgError, SarFlags, SarImmediate,
     SarInput, SarOptions, SarOutput, TimeSpec, parse_sar_args,
 };
+pub use sar_el7_args::{El7Input, SarEl7ArgError, SarEl7Options, parse_sar_el7_args};
 
 /// ルートが受け付けるサブコマンド名。
 ///
@@ -588,6 +591,20 @@ pub struct Sa2SarArgs {
     /// mmap を使わず BufReader で読む。
     #[arg(long)]
     pub no_mmap: bool,
+
+    /// 再現する sar の版。current (= sysstat-12.8.0、既定) / sysstat-10.1.5-el7。
+    ///
+    /// sysstat-10.1.5-el7 は RHEL / CentOS 7 の sar が出すテキストをそのまま再現する
+    /// (列・計算・平均の丸めまで)。読めるのは format_magic 0x2171 のファイルだけ。
+    #[arg(long, value_name = "PROFILE", default_value = "current")]
+    pub sar_profile: crate::model::SarProfile,
+
+    /// sysstat-10.1.5-el7 の -R (frmpg/s など) が使うページサイズ (バイト)。既定 4096。
+    ///
+    /// ファイルには記録されないので、再現したいホストの値を指定する
+    /// (x86_64 は 4096、ppc64 系は 65536 が多い)。他のプロファイルでは使えない。
+    #[arg(long, value_name = "BYTES")]
+    pub sar_page_size: Option<crate::model::PageSize>,
 }
 
 /// `resarch skill-install` の引数。
@@ -725,6 +742,8 @@ pub enum Invocation {
     Native(Box<Commands>),
     /// `sar` 互換。
     Sar(Box<SarOptions>),
+    /// `sar` 互換 (`--sar-profile sysstat-10.1.5-el7`)。
+    SarEl7(Box<SarEl7Options>),
     /// `sadf` 互換。
     Sadf(Box<SadfOptions>),
 }
@@ -738,6 +757,18 @@ pub enum CliError {
     /// `sadf` 互換パーサのエラー。
     #[error(transparent)]
     Sadf(#[from] SadfArgError),
+    /// `--sar-profile sysstat-10.1.5-el7` の `sar` 互換パーサのエラー。
+    #[error(transparent)]
+    SarEl7(#[from] SarEl7ArgError),
+    /// `--sar-profile` の値が不正。
+    #[error(transparent)]
+    SarProfile(#[from] ParseSarProfileError),
+    /// `--sar-page-size` の値が不正。
+    #[error(transparent)]
+    PageSize(#[from] ParsePageSizeError),
+    /// `--sar-profile` / `--sar-page-size` の使い方の誤り。
+    #[error("{0}")]
+    ProfileUsage(String),
     /// clap のエラー。`--help` / `--version` の正常表示もここに入る
     /// ([`clap::Error::exit`] でそのまま終了できる)。
     #[error(transparent)]
@@ -773,13 +804,83 @@ pub fn dispatch(argv: &[String]) -> Result<Invocation, CliError> {
         Some(first) if is_root_only(first) => Ok(Invocation::Native(Box::new(parse_root(argv)?))),
         // 互換入口は clap を通さず直接互換パーサへ渡す
         // (clap が `-h` や `--dec=0` を解釈してしまうのを避ける)。
-        Some("sar") => Ok(Invocation::Sar(Box::new(parse_sar_args(&argv[1..])?))),
-        Some("sadf") => Ok(Invocation::Sadf(Box::new(parse_sadf_args(&argv[1..])?))),
+        Some("sar") => parse_sar_entry(&argv[1..]),
+        Some("sadf") => {
+            // プロファイルは sar テキストだけの機能。sadf の形式 (JSON / XML / CSV など) は
+            // 版ごとのキー・構造を検証していないので、黙って現行版で出さずに止める。
+            if argv[1..]
+                .iter()
+                .any(|a| a == "--sar-profile" || a.starts_with("--sar-profile="))
+            {
+                return Err(CliError::ProfileUsage(
+                    "--sar-profile は sar / sa2sar のテキスト出力だけで使えます \
+                     (sadf 互換出力は現行版 sysstat-12.8.0 の書式のみ)"
+                        .into(),
+                ));
+            }
+            Ok(Invocation::Sadf(Box::new(parse_sadf_args(&argv[1..])?)))
+        }
         Some(first) if is_subcommand_name(first) => {
             Ok(Invocation::Native(Box::new(parse_root(argv)?)))
         }
         // 先頭がサブコマンド名でない (`-` 始まりを含む) → sar 互換として解釈。
-        Some(_) => Ok(Invocation::Sar(Box::new(parse_sar_args(argv)?))),
+        Some(_) => parse_sar_entry(argv),
+    }
+}
+
+/// `sar` 互換入口。`--sar-profile` / `--sar-page-size` を抜き出して、
+/// プロファイルに応じた文法のパーサへ渡す。
+///
+/// 2 つのオプションは本家に無い reSARch の拡張なので、どの位置に書いても
+/// 本家の文法を崩さないよう**先に取り除いてから**残りを解析する。
+/// `--sar-profile=X` と `--sar-profile X` の両方を受け付ける。
+pub fn parse_sar_entry(args: &[String]) -> Result<Invocation, CliError> {
+    let mut profile: Option<SarProfile> = None;
+    let mut page: Option<PageSize> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) if n == "--sar-profile" || n == "--sar-page-size" => (n, Some(v)),
+            _ => (a, None),
+        };
+        if name != "--sar-profile" && name != "--sar-page-size" {
+            rest.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        let value = match inline {
+            Some(v) => v.to_string(),
+            None => {
+                i += 1;
+                args.get(i)
+                    .cloned()
+                    .ok_or_else(|| CliError::ProfileUsage(format!("{name} には値が必要です")))?
+            }
+        };
+        if name == "--sar-profile" {
+            profile = Some(value.parse()?);
+        } else {
+            page = Some(value.parse()?);
+        }
+        i += 1;
+    }
+    match profile.unwrap_or_default() {
+        SarProfile::Sysstat1015El7 => Ok(Invocation::SarEl7(Box::new(parse_sar_el7_args(
+            &rest,
+            page.unwrap_or_default(),
+        )?))),
+        SarProfile::Sysstat1280 => {
+            if page.is_some() {
+                return Err(CliError::ProfileUsage(
+                    "--sar-page-size は --sar-profile sysstat-10.1.5-el7 と一緒にしか使えません \
+                     (現行版の sar は -R を持たないため、ページサイズを使う列がありません)"
+                        .into(),
+                ));
+            }
+            Ok(Invocation::Sar(Box::new(parse_sar_args(&rest)?)))
+        }
     }
 }
 

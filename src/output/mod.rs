@@ -10,6 +10,7 @@ pub mod detect_svg;
 pub mod json;
 pub mod ndjson;
 pub mod sadf;
+pub mod sar_el7;
 pub mod sar_text;
 pub mod table;
 pub mod time_filter;

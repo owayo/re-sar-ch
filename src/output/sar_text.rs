@@ -423,7 +423,7 @@ impl SarTextOptions {
 ///
 /// **パディングはバイト単位**。Rust の `{:>w$}` は文字数基準なので、
 /// マルチバイト文字 (`A_PWR_BAT` の矢印など) を含む列でずれる (03 §1.7.7)。
-fn pad_left(s: &str, width: usize) -> String {
+pub(crate) fn pad_left(s: &str, width: usize) -> String {
     let n = s.len();
     if n >= width {
         return s.to_string();
@@ -437,7 +437,7 @@ fn pad_left(s: &str, width: usize) -> String {
 }
 
 /// C の `printf("%-*s", width, s)` 相当 (バイト単位パディング)。
-fn pad_right(s: &str, width: usize) -> String {
+pub(crate) fn pad_right(s: &str, width: usize) -> String {
     let n = s.len();
     let mut out = String::with_capacity(width.max(n));
     out.push_str(s);
@@ -1636,7 +1636,7 @@ pub fn write_banner<W: Write>(out: &mut W, file: &SaFile, opts: &SarTextOptions)
 /// `sa_year` を使うのは `-t` のときだけである。両者は一致するのが普通だが、
 /// 食い違うファイルがある (本家テストデータ `data-ukwn` は
 /// `sa_ust_time` が 2019-09-15、ヘッダ日付が 2019-10-15)。
-fn banner_date(
+pub(crate) fn banner_date(
     ust_time: u64,
     year: i32,
     month: u8,
@@ -1741,7 +1741,13 @@ fn event_timestamp(ev: &RecordEvent, style: TimeStyle) -> String {
     time_string(ev.ust_time(), h, m, s, style)
 }
 
-fn time_string(ust_time: u64, hour: u8, minute: u8, second: u8, style: TimeStyle) -> String {
+pub(crate) fn time_string(
+    ust_time: u64,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    style: TimeStyle,
+) -> String {
     use chrono::{Local, TimeZone, Utc};
     match style {
         // `-t`: レコードに焼き込まれた時分秒をそのまま使う

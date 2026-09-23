@@ -6,6 +6,7 @@
 
 pub mod compute;
 pub mod delta;
+pub mod el7;
 pub mod snapshot;
 
 pub use compute::{ComputeContext, ComputeIssue, Computed, column_value, tick_total};

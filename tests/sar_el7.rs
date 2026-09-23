@@ -1431,6 +1431,51 @@ fn rate_activities_print_s_value_per_field() {
     }
 }
 
+/// CPU 1 個分の区間 (`uptime0` の差) を使う条件が、瞬時値と平均行で違う。
+///
+/// 瞬時値 (`get_itv_value()`) は `A_CPU` の `nr` が 2 を超えるときだけ `uptime0`、
+/// 平均行 (`write_stats_avg()`) は 1 を超えれば `uptime0`。`nr` = 2 (CPU 1 個) の
+/// ファイルで `uptime` と `uptime0` が違えば、瞬時値は `uptime` の差で割り、
+/// 平均行は `uptime0` の差で割る。`nr` = 1 ならどちらも `uptime`。
+#[test]
+fn rows_and_average_switch_to_uptime0_at_different_cpu_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    // uptime は uptime0 の 2 倍 (R0→R1 で 120000 と 60000)。pswpin は 600 ずつ増える
+    let file_with = |nr: i32| {
+        let recs: Vec<Rec> = (0..3u64)
+            .map(|k| {
+                let uptime0 = 100_000 + k * 60_000;
+                let mut parts = vec![cpu(0, 0, 2 * uptime0, 0)];
+                if nr == 2 {
+                    parts.push(cpu(0, 0, uptime0, 0));
+                }
+                parts.push(counters(16, 8, &[1000 + 600 * k, 0]));
+                stats(2 * uptime0, uptime0, at(k), &parts)
+            })
+            .collect();
+        build(&[A_CPU.nr(nr), A_SWAP], &recs)
+    };
+    let banner = "Linux 3.10.0-el7 (testhost) \t09/13/20 \t_x86_64_\t(1 CPU)";
+    let expect = |avg: &str| {
+        [
+            banner.to_string(),
+            header("00:00:00", "  pswpin/s pswpout/s"),
+            // 瞬時値はどちらも uptime の差 120000 で割る: 600 / 1200
+            line("00:10:00", &["0.50", "0.00"]),
+            line("00:20:00", &["0.50", "0.00"]),
+            line("Average:", &[avg, "0.00"]),
+        ]
+        .join("\n")
+            + "\n"
+    };
+    let one_cpu = write(dir.path(), "el7-one-cpu", file_with(2));
+    // 平均行は uptime0 の差 120000 で割る: 1200 / 1200
+    assert_eq!(run(&["-W", "-t"], &one_cpu), expect("1.00"));
+    let aggregate_only = write(dir.path(), "el7-cpu-all-only", file_with(1));
+    // 平均行も uptime の差 240000 で割る: 1200 / 2400
+    assert_eq!(run(&["-W", "-t"], &aggregate_only), expect("0.50"));
+}
+
 /// `-w` の `cswch/s` は `ll_s_value()` (el7 の `dyn-tick` パッチで逆行は 0.00)、
 /// `proc/s` は `unsigned long` の `S_VALUE`。`-B` の `%vmeff` は
 /// Δpgsteal / (Δpgscan_kswapd + Δpgscan_direct)。

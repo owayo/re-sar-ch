@@ -2394,4 +2394,276 @@ mod tests {
         assert_eq!(ll_sp_value(5, 10, 100), 5.0);
         assert_eq!(get_interval(7, 7), 1);
     }
+
+    // ---- activity ごとの計算 ----
+
+    /// レイアウト表から el7 の構造体の読み方を組み立てる (LP64)。
+    fn decoder(id: ActivityId) -> Decoder {
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        let s = spec(id).unwrap();
+        let def = registry::lookup(id).unwrap();
+        let shape = DeclaredShape {
+            magic: Some(s.magic),
+            size: s.size_lp64 as usize,
+            types_nr: None,
+        };
+        let rev = select_revision(def, &shape).unwrap();
+        let plan = DecodePlan::build_for(def, rev, &shape, 1, 1, &enc).unwrap();
+        Decoder::new(s, &plan, 64)
+    }
+
+    fn print_opts() -> PrintOptions {
+        let mut cpu_bitmap = Bitmap::cpu();
+        cpu_bitmap.set_all();
+        let mut irq_bitmap = Bitmap::irq();
+        irq_bitmap.set_all();
+        PrintOptions {
+            cpu_all: false,
+            cpu_bitmap,
+            irq_bitmap,
+            fs_mount: false,
+            kb_shift: 2,
+        }
+    }
+
+    /// 指定したフィールドだけ値を入れた item。
+    fn item(id: ActivityId, values: &[(usize, u64)], texts: &[&str]) -> Item {
+        let mut it = Item::zeroed(spec(id).unwrap());
+        for (f, v) in values {
+            it.v[*f] = *v;
+        }
+        for (i, t) in texts.iter().enumerate() {
+            it.t[i] = (*t).to_string();
+        }
+        it
+    }
+
+    fn rows(
+        id: ActivityId,
+        itv: u64,
+        avg: Option<u64>,
+        prev: &mut Buf,
+        curr: &mut Buf,
+        summary: Option<&mut Buf>,
+        nr2: usize,
+    ) -> Vec<Row> {
+        let dec = decoder(id);
+        let opts = print_opts();
+        let p = Print {
+            dec: &dec,
+            opts: &opts,
+            itv,
+            avg: avg.map(|count| AvgInfo { count }),
+            mem: MemOutput::Amt,
+            nr2,
+        };
+        print_rows(&p, prev, curr, summary, &mut Accum::default())
+    }
+
+    fn f92(cells: &[Cell]) -> Vec<String> {
+        cells
+            .iter()
+            .map(|c| match c {
+                Cell::F92(v) | Cell::P62(v) => format!("{v:.2}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// `user - guest` が前より減った分は CPU の区間に足し戻す (`ishift`)。
+    #[test]
+    fn per_cpu_interval_adds_back_the_guest_shift() {
+        use field::cpu::*;
+        let scp = item(
+            ActivityId::CPU,
+            &[(USER, 1000), (GUEST, 100), (IDLE, 9000)],
+            &[],
+        );
+        // user は 50 増えたが guest が 100 増え、user - guest は 900 → 850 に減った
+        let scc = item(
+            ActivityId::CPU,
+            &[(USER, 1050), (GUEST, 200), (IDLE, 9950)],
+            &[],
+        );
+        // tick の差 1000 (50 + 950) に ishift 50 を足す
+        assert_eq!(per_cpu_interval(&scc, &scp), 1050);
+    }
+
+    /// 3 つのカウンタが揃って減ったディスクは、基準の枠を 0 に戻してから差を取る。
+    #[test]
+    fn disk_reregistration_resets_the_reference_slot() {
+        use field::disk::*;
+        let mut prev = vec![item(
+            ActivityId::DISK,
+            &[(MAJOR, 8), (NR_IOS, 1000), (RD_SECT, 5000), (WR_SECT, 7000)],
+            &[],
+        )];
+        let mut curr = vec![item(
+            ActivityId::DISK,
+            &[(MAJOR, 8), (NR_IOS, 10), (RD_SECT, 50), (WR_SECT, 70)],
+            &[],
+        )];
+        let r = rows(ActivityId::DISK, 100, None, &mut prev, &mut curr, None, 1);
+        assert_eq!(r[0].label, Label::Name("dev8-0".into()));
+        // 0 からの差: tps 10、rd_sec/s 50、wr_sec/s 70、avgrq-sz (50+70)/10 = 12
+        assert_eq!(&f92(&r[0].cells)[..4], ["10.00", "50.00", "70.00", "12.00"]);
+        // 基準の枠そのものが 0 に戻っている (本家はバッファを書き換える)
+        assert_eq!(prev[0].v[NR_IOS], 0);
+        assert_eq!(prev[0].v[MAJOR], 8);
+    }
+
+    /// バイト数だけが減り、パケット数が増え、前の値が ULONG_MAX/2 を超えていれば
+    /// 桁あふれとみなして枠を戻さない (差は巻き戻った値で取る)。
+    #[test]
+    fn net_dev_counter_overflow_is_not_a_reregistration() {
+        use field::net_dev::*;
+        let mut prev = vec![item(
+            ActivityId::NET_DEV,
+            &[(RX_BYTES, u64::MAX - 1023), (RX_PACKETS, 100)],
+            &["eth0"],
+        )];
+        let mut curr = vec![item(
+            ActivityId::NET_DEV,
+            &[(RX_BYTES, 1024), (RX_PACKETS, 110)],
+            &["eth0"],
+        )];
+        let r = rows(
+            ActivityId::NET_DEV,
+            100,
+            None,
+            &mut prev,
+            &mut curr,
+            None,
+            1,
+        );
+        // rxpck/s 10、rxkB/s = 2048 B / 1 秒 / 1024 = 2.00
+        assert_eq!(&f92(&r[0].cells)[..3], ["10.00", "0.00", "2.00"]);
+        assert_eq!(prev[0].v[RX_BYTES], u64::MAX - 1023, "枠は書き換えない");
+    }
+
+    /// pgscan が増えていない区間の `%vmeff` は 0.00 (0 で割らない)。
+    #[test]
+    fn vmeff_is_zero_without_scans() {
+        use field::page::*;
+        let mut prev = vec![item(ActivityId::PAGE, &[(PGSTEAL, 10)], &[])];
+        let mut curr = vec![item(ActivityId::PAGE, &[(PGSTEAL, 20)], &[])];
+        let r = rows(ActivityId::PAGE, 100, None, &mut prev, &mut curr, None, 1);
+        assert_eq!(f92(&r[0].cells)[8], "0.00");
+        // 走査 40 ページのうち 30 ページ回収 → 75.00
+        let mut prev = vec![item(ActivityId::PAGE, &[(PGSCAN_KSWAPD, 100)], &[])];
+        let mut curr = vec![item(
+            ActivityId::PAGE,
+            &[(PGSCAN_KSWAPD, 120), (PGSCAN_DIRECT, 20), (PGSTEAL, 30)],
+            &[],
+        )];
+        let r = rows(ActivityId::PAGE, 100, None, &mut prev, &mut curr, None, 1);
+        assert_eq!(f92(&r[0].cells)[8], "75.00");
+    }
+
+    /// USB の要約リストが一杯になったら、最後の枠を「その他」の行にする (バス番号 -1)。
+    #[test]
+    fn usb_summary_marks_the_last_slot_as_other_devices() {
+        use field::usb::*;
+        let dev = |bus, vendor| {
+            item(
+                ActivityId::PWR_USB,
+                &[(BUS_NR, bus), (VENDOR_ID, vendor), (PRODUCT_ID, 1)],
+                &["maker", "product"],
+            )
+        };
+        let mut summary = vec![dev(1, 0xa), dev(2, 0xb)];
+        let mut curr = vec![dev(3, 0xc), dev(1, 0xa)];
+        let mut prev = Vec::new();
+        rows(
+            ActivityId::PWR_USB,
+            100,
+            None,
+            &mut prev,
+            &mut curr,
+            Some(&mut summary),
+            1,
+        );
+        assert_eq!(summary[0].v[BUS_NR], 1);
+        assert_eq!(summary[1].v[BUS_NR], 0xffff_ffff);
+        assert_eq!(summary[1].text(1), USB_OTHER_DEVICES);
+        // 平均行 (Summary) はこのリストを出し、ダミーのバス番号は -1 になる
+        let mut last = curr.clone();
+        let r = rows(
+            ActivityId::PWR_USB,
+            100,
+            Some(1),
+            &mut summary,
+            &mut last,
+            None,
+            1,
+        );
+        assert_eq!(r[1].label, Label::Bus(-1));
+    }
+
+    /// FS の要約リストは、同じ名前の枠を最新の値で上書きし、無ければ空き枠に入れる。
+    #[test]
+    fn fs_summary_keeps_the_latest_values_per_filesystem() {
+        use field::fs::*;
+        let fs = |name: &str, blocks| item(ActivityId::FS, &[(F_BLOCKS, blocks)], &[name, "/"]);
+        let mut summary = vec![
+            fs("/dev/sda1", 100),
+            Item::zeroed(spec(ActivityId::FS).unwrap()),
+        ];
+        let mut curr = vec![fs("/dev/sda1", 200), fs("/dev/sdb1", 300)];
+        let mut prev = Vec::new();
+        rows(
+            ActivityId::FS,
+            100,
+            None,
+            &mut prev,
+            &mut curr,
+            Some(&mut summary),
+            1,
+        );
+        assert_eq!(summary[0].v[F_BLOCKS], 200);
+        assert_eq!(summary[1].text(0), "/dev/sdb1");
+    }
+
+    /// 重み付き周波数は time_in_state の増分で重みを付けた MHz の平均。
+    #[test]
+    fn weighted_frequency_is_weighted_by_time_in_state() {
+        use field::wghfreq::*;
+        let slot = |freq, tis| {
+            item(
+                ActivityId::PWR_FREQ,
+                &[(FREQ, freq), (TIME_IN_STATE, tis)],
+                &[],
+            )
+        };
+        // CPU all (i = 0) の 2 スロット: 2000 MHz で 100、1000 MHz で 300
+        let mut prev = vec![slot(2_000_000, 0), slot(1_000_000, 0)];
+        let mut curr = vec![slot(2_000_000, 100), slot(1_000_000, 300)];
+        let r = rows(
+            ActivityId::PWR_FREQ,
+            100,
+            None,
+            &mut prev,
+            &mut curr,
+            None,
+            2,
+        );
+        assert_eq!(r[0].label, Label::All);
+        // (2000 × 100 + 1000 × 300) / 400 = 1250
+        assert_eq!(f92(&r[0].cells), ["1250.00"]);
+    }
+
+    /// センサ番号の起点: FAN と TEMP は 1、IN は 0 (本家のまま)。
+    #[test]
+    fn sensor_numbers_start_differently_per_activity() {
+        let one = |id: ActivityId| {
+            let mut prev = Vec::new();
+            let mut curr = vec![item(id, &[], &["dev"])];
+            rows(id, 100, None, &mut prev, &mut curr, None, 1)
+                .remove(0)
+                .label
+        };
+        assert_eq!(one(ActivityId::PWR_FAN), Label::Num3(1));
+        assert_eq!(one(ActivityId::PWR_TEMP), Label::Num3(1));
+        assert_eq!(one(ActivityId::PWR_IN), Label::Num3(0));
+    }
 }

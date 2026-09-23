@@ -72,6 +72,8 @@
 //!
 //! 典拠: `docs/format/03-output-format.md` 第 I 部 §1.2〜§1.5、第 III 部 §7。
 
+use std::borrow::Cow;
+
 use super::delta::{
     Delta, DeltaContext, Discontinuity, compute_delta, s_value_bits, wrapping_delta,
 };
@@ -805,7 +807,7 @@ fn column_value_with(
 
     match meta.kind {
         // ゲージは差分化しない
-        ValueKind::Gauge => Ok(curr_v as f64 * gauge_scale(id, column)),
+        ValueKind::Gauge => Ok(gauge_scale(id, column).apply(curr_v)),
         // 識別子は数値として扱わない
         ValueKind::Identity => Err(ComputeIssue::NotNumeric),
         ValueKind::Counter => {
@@ -864,12 +866,62 @@ fn column_value_with(
     }
 }
 
-/// ゲージ列に掛けるスケール (**保存値 → 表示単位**)。
+/// ゲージ列の保存値を表示単位に直す規則 (**保存値 → 表示単位**)。
 ///
 /// カーネル / sysstat が固定小数で保存している値を実単位に戻す。
 /// 期間集計でゲージ列を平均する場合、区間値 ([`column_value`]) には
-/// この係数が既に掛かっているので二重に掛けてはいけない。
-pub fn gauge_scale(id: ActivityId, column: usize) -> f64 {
+/// この換算が既に掛かっているので二重に掛けてはいけない。
+///
+/// **係数ではなく本家の演算そのものを表す。** 本家は `(double) x / 100` と
+/// 割り算で書いており、`0.01` は二進で正確に表せないため、掛け算に置き換えると
+/// 丸め境界で 1 桁ずれる (`ldavg` の保存値 435 は本家が `4.35` → `--dec=1` で
+/// `4.3`、`× 0.01` だと `4.3500000000000005` → `4.4`)。
+/// 平均も同じで、本家は `Σx / (avg_count × 100)` と**合計を 1 回だけ割る**
+/// ([`GaugeScale::mean`])。表示値 `x / 100` を足し込んでから割ると別の丸めになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaugeScale {
+    /// 保存値がそのまま表示単位。
+    Unit,
+    /// `(double) x / d` — 固定小数 (`load_avg_*` / `cpufreq` / PSI の移動平均)。
+    Divide(u32),
+    /// `(unsigned long long) (x << 1)` のような `unsigned int` 幅の整数倍
+    /// (`bMaxPower` は 2 mA 単位)。倍率を掛けた結果は 32bit で折り返す。
+    MultiplyU32(u32),
+}
+
+impl GaugeScale {
+    /// 瞬時値 1 個を表示単位に直す。
+    #[inline]
+    pub fn apply(self, raw: u64) -> f64 {
+        match self {
+            GaugeScale::Unit => raw as f64,
+            GaugeScale::Divide(d) => raw as f64 / f64::from(d),
+            GaugeScale::MultiplyU32(k) => f64::from((raw as u32).wrapping_mul(k)),
+        }
+    }
+
+    /// 保存値の合計から `Average:` の平均値を出す (本家の `dispavg` 分岐)。
+    ///
+    /// [`GaugeScale::Divide`] は本家どおり `(double) Σx / (avg_count × d)`。
+    /// 分母の積は本家の `unsigned long` の積なので整数で掛けてから `double` にする。
+    /// `count == 0` のときは `None` (平均が無い)。
+    #[inline]
+    pub fn mean(self, raw_sum: u64, count: u64) -> Option<f64> {
+        if count == 0 {
+            return None;
+        }
+        Some(match self {
+            GaugeScale::Unit => raw_sum as f64 / count as f64,
+            GaugeScale::Divide(d) => raw_sum as f64 / count.wrapping_mul(u64::from(d)) as f64,
+            // 本家に平均は無い (`A_PWR_USB` は最後に観測した値を再掲する)。
+            // 呼ばれた場合は保存値の平均を換算する。
+            GaugeScale::MultiplyU32(k) => raw_sum as f64 * f64::from(k) / count as f64,
+        })
+    }
+}
+
+/// ゲージ列の換算規則 ([`GaugeScale`])。
+pub fn gauge_scale(id: ActivityId, column: usize) -> GaugeScale {
     match id {
         // load_avg_* は 100 倍固定小数 (03 §1.5.4)
         ActivityId::QUEUE
@@ -878,19 +930,19 @@ pub fn gauge_scale(id: ActivityId, column: usize) -> f64 {
                 queue_col::LDAVG_1 | queue_col::LDAVG_5 | queue_col::LDAVG_15
             ) =>
         {
-            0.01
+            GaugeScale::Divide(100)
         }
         // cpufreq は MHz × 100 (03 §id=30)
-        ActivityId::PWR_CPU if column == pwr_cpu_col::MHZ => 0.01,
+        ActivityId::PWR_CPU if column == pwr_cpu_col::MHZ => GaugeScale::Divide(100),
         // PSI の移動平均は 100 倍固定小数 (03 §1.5.3)
         ActivityId::PSI_CPU | ActivityId::PSI_IO | ActivityId::PSI_MEM
             if is_psi_moving_average(column) =>
         {
-            0.01
+            GaugeScale::Divide(100)
         }
         // bMaxPower は 2 mA 単位 (03 §id=36)
-        ActivityId::PWR_USB if column == usb_col::MAX_POWER => 2.0,
-        _ => 1.0,
+        ActivityId::PWR_USB if column == usb_col::MAX_POWER => GaugeScale::MultiplyU32(2),
+        _ => GaugeScale::Unit,
     }
 }
 
@@ -2195,6 +2247,203 @@ fn soft_offline(plan: &DecodePlan, item: &ItemSnapshot) -> bool {
     (soft_col::TOTAL..=soft_col::BLG_LEN).all(|c| raw_column(plan, item, c).unwrap_or(0) == 0)
 }
 
+// ============================================================================
+// オフライン CPU の前値持ち越し (本家のバッファ書き換え)
+// ============================================================================
+
+/// 本家が表示のたびに行う「オフライン CPU の現値を前値で埋める」書き換えを再現する。
+///
+/// 本家の `get_global_cpu_statistics()` (`*scc = *scp`)・
+/// `get_global_soft_statistics()` (`*ssnc = *ssnp`)・
+/// `get_global_int_statistics()` (`memcpy`) は、現サンプルでオフラインの CPU について
+/// **現サンプルのバッファ (`buf[curr]`) そのものを前サンプルの値で上書きする**。
+/// 書き換えたバッファは次のレコードの前サンプル (`buf[!curr]`) になるので、
+/// CPU が 1 区間だけオフラインになって戻ってきたとき、本家は
+/// 「オフラインになる直前の値」との差分で復帰後の行を出し、CPU "all" にも加える。
+/// 生の前レコード (オフライン = 全ゼロ) を前サンプルにすると
+/// 「前サンプルでもオフライン = 基準値が無い」と判定されて行が消え、
+/// CPU "all" の合算からも落ちる (03 §1.4.3)。平均行も同じで、本家の
+/// `Average:` は書き換え後の最終サンプルと最初のサンプル (`buf[2]`) の差から出る。
+///
+/// 戻り値は**書き換え後の現サンプル** (= 次のレコードの前サンプル)。
+/// 書き換えが無ければ `Cow::Borrowed(curr)` を返すので、呼び出し側は
+/// 変化があったときだけ複製を持てばよい。**区間値の計算には使わない。**
+/// その区間のオフライン判定は生の現サンプルで行う必要があり
+/// ([`aggregate_cpu`] / [`aggregate_soft`] / [`prepare_item`] が
+/// 区間内の埋め合わせを自分で行う)、これは「次の区間の前サンプル」を作る関数である。
+///
+/// - `prev`: 前サンプル。**これ自体が前回この関数で書き換えた後の値**
+///   (本家の `buf[!curr]`) でなければならない。区間の最初は基準レコードの生の値。
+/// - `curr`: 生の現サンプル。
+/// - `cpu_selected`: item 添字 (0 = CPU "all"、`n` = CPU `n-1`) が `-P` で
+///   選択されているか。`A_IRQ` だけが使う (本家は未選択の CPU を書き換えない)。
+///
+/// | activity | 対象の添字 | 書き換える条件 | 書き換える範囲 |
+/// |---|---|---|---|
+/// | `A_CPU` | 1 以上 (個別 CPU) | 現サンプルの tick 8 フィールドの和が 0 | その CPU の item |
+/// | `A_NET_SOFT` | 1 以上 | 前サンプルの 6 カウンタの和が非 0、かつ現サンプルの和が 0 | その CPU の item |
+/// | `A_IRQ` | 0 以上 (CPU "all" を含む) | 選択されている、前サンプルのその CPU の総数 (割り込み 0 の値) が非 0、かつ現サンプルの総数が 0 | その CPU の割り込み `nr2` 個すべて |
+///
+/// item が 1 つしか無い `A_CPU` / `A_NET_SOFT` (UP 機) は対象が無い。
+/// 割り込み名を持たない旧世代の `A_IRQ` (`nr2 == 1`) は 1 item = 1 割り込みで
+/// CPU の次元が無いので書き換えない。それ以外の activity はそのまま返す。
+pub fn carry_offline<'a>(
+    id: ActivityId,
+    plan: &DecodePlan,
+    prev: &[ItemSnapshot],
+    curr: &'a [ItemSnapshot],
+    cpu_selected: impl Fn(usize) -> bool,
+) -> Cow<'a, [ItemSnapshot]> {
+    let mut out: Option<Vec<ItemSnapshot>> = None;
+    match id {
+        ActivityId::CPU => {
+            for i in 1..curr.len() {
+                if cpu_tick_sum(plan, &curr[i]) != 0 {
+                    continue;
+                }
+                if let Some(p) = prev.get(i) {
+                    out.get_or_insert_with(|| curr.to_vec())[i] = p.clone();
+                }
+            }
+        }
+        ActivityId::NET_SOFT => {
+            for i in 1..curr.len() {
+                let Some(p) = prev.get(i) else { continue };
+                // 前サンプルでもオフラインなら本家は書き換える前に `continue` する
+                if soft_offline(plan, p) || !soft_offline(plan, &curr[i]) {
+                    continue;
+                }
+                out.get_or_insert_with(|| curr.to_vec())[i] = p.clone();
+            }
+        }
+        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
+            let nr2 = plan.nr2.max(1) as usize;
+            let total = |items: &[ItemSnapshot], start: usize| {
+                items
+                    .get(start)
+                    .map_or(0, |it| raw_column(plan, it, irq_col::COUNT).unwrap_or(0))
+            };
+            for cpu in 0..curr.len() / nr2 {
+                let start = cpu * nr2;
+                if !cpu_selected(cpu) || total(prev, start) == 0 || total(curr, start) != 0 {
+                    continue;
+                }
+                let Some(src) = prev.get(start..start + nr2) else {
+                    continue;
+                };
+                out.get_or_insert_with(|| curr.to_vec())[start..start + nr2].clone_from_slice(src);
+            }
+        }
+        _ => {}
+    }
+    match out {
+        Some(v) => Cow::Owned(v),
+        None => Cow::Borrowed(curr),
+    }
+}
+
+/// 本家が CPU 系 activity の各レコードに行う「`nr_ini` 個までのゼロ埋め」を再現する。
+///
+/// `A_CPU` / `A_IRQ` / `A_NET_SOFT` は本家で `AO_PERSISTENT` の activity で、
+/// `read_file_stat_bunch()` はレコードを読む前にバッファを **`nr_ini` 個
+/// (× `nr2`) ぶんゼロで埋める**。レコードごとの item 数 (`has_nr`) が
+/// `nr_ini` より少ないレコードでは、載っていない CPU は全ゼロ = オフラインとして
+/// 扱われ、[`carry_offline`] の前値持ち越しの対象になる。載っていない CPU を
+/// 「存在しない」と扱うと、その CPU は前値を持ち越せず、次に現れたときに
+/// 基準値が無いとして行が消える (本家 `data.tmp` の `-P ALL` で CPU8 が出る区間)。
+///
+/// `nr_ini` は CPU の行数 (CPU "all" を含む)。本家はファイルの `file_activity.nr` で
+/// 始め、それを超えるレコードを読むと広げ、`LINUX RESTART` で CPU 数に戻す。
+/// 呼び出し側は「ファイルの `nr`・前サンプルの行数・現サンプルの行数」の最大を
+/// 渡せば同じ結果になる (余分なゼロ行はオフラインとして表示されない)。
+///
+/// 対象外の activity と、割り込み名を持たない旧世代の `A_IRQ` (行が CPU ではない) は
+/// そのまま返す。
+pub fn pad_persistent<'a>(
+    id: ActivityId,
+    plan: &DecodePlan,
+    items: &'a [ItemSnapshot],
+    nr_ini: usize,
+) -> Cow<'a, [ItemSnapshot]> {
+    let per_row = match id {
+        ActivityId::CPU | ActivityId::NET_SOFT => 1,
+        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
+            plan.nr2.max(1) as usize
+        }
+        _ => return Cow::Borrowed(items),
+    };
+    let want = nr_ini.saturating_mul(per_row);
+    if items.len() >= want {
+        return Cow::Borrowed(items);
+    }
+    let mut out = items.to_vec();
+    out.resize(want, zero_item(plan));
+    Cow::Owned(out)
+}
+
+/// tickless CPU について本家 `save_cpu_xstats()` が記録する極値 (`sar -x`)。
+///
+/// 本家の tickless 専用分岐の条件は `!cpu && !deltot_jiffies` で、`cpu == 0`
+/// (CPU "all") は分母を 1 に差し替えた後に呼ばれるので実際には通らない。
+/// 個別 CPU の tickless (`deltot_jiffies == 0`) は**通常の式に分母 0 を与えて**
+/// 記録される。表示行は固定値 (`0.00` × n と `%idle = 100.00`、03 §1.4.5) だが、
+/// 極値として記録される値は次のとおり別物になる。
+///
+/// - 差分 0 のフィールド → `0.0 / 0` = NaN。比較 (`<` / `>`) が偽なので最小・最大を更新しない
+/// - 本家の式が 0 にクランプするフィールド (逆行) → `0.0`
+/// - 差分が正のフィールド (tick 合計に入らない `guest` / `guest_nice`) → `+inf`
+///
+/// 列は表示と同じ `cpu_col` の添字で指定する。`prev` は [`per_cpu_interval`] で
+/// 補正済みの前サンプルを渡すこと (本家も `get_per_cpu_interval()` が
+/// 書き換えた `scp` で記録する)。CPU の列でなければ NaN (= 記録しない) を返す。
+pub fn cpu_tickless_extremum(
+    plan: &DecodePlan,
+    column: usize,
+    prev: &ItemSnapshot,
+    curr: &ItemSnapshot,
+) -> f64 {
+    let p = |c: usize| cpu_field(plan, prev, c);
+    let c = |c: usize| cpu_field(plan, curr, c);
+    // `ll_sp_value(v1, v2, 0)`: 逆行は 0、それ以外は `(double) (v2 - v1) / 0 * 100`
+    let zero_jiffies = 0.0_f64;
+    let llsp = |v1: u64, v2: u64| -> f64 {
+        if v2 < v1 {
+            0.0
+        } else {
+            v2.wrapping_sub(v1) as f64 / zero_jiffies * 100.0
+        }
+    };
+    let sum3 = |f: &dyn Fn(usize) -> u64| {
+        f(cpu_col::SYS)
+            .wrapping_add(f(cpu_col::IRQ))
+            .wrapping_add(f(cpu_col::SOFT))
+    };
+    match column {
+        cpu_col::USER => llsp(p(cpu_col::USER), c(cpu_col::USER)),
+        cpu_col::NICE => llsp(p(cpu_col::NICE), c(cpu_col::NICE)),
+        cpu_col::SYSTEM => llsp(sum3(&p), sum3(&c)),
+        cpu_col::USR | cpu_col::NICE_EXCL_GNICE => {
+            let (base, guest) = if column == cpu_col::USR {
+                (cpu_col::USER, cpu_col::GUEST)
+            } else {
+                (cpu_col::NICE, cpu_col::GNICE)
+            };
+            let pv = p(base).wrapping_sub(p(guest));
+            let cv = c(base).wrapping_sub(c(guest));
+            if cv < pv { 0.0 } else { llsp(pv, cv) }
+        }
+        cpu_col::IOWAIT
+        | cpu_col::STEAL
+        | cpu_col::IDLE
+        | cpu_col::SYS
+        | cpu_col::IRQ
+        | cpu_col::SOFT
+        | cpu_col::GUEST
+        | cpu_col::GNICE => llsp(p(column), c(column)),
+        _ => f64::NAN,
+    }
+}
+
 /// 全出力・集計で共有する、1 item の補正済み端点と状態。
 #[derive(Debug, Clone)]
 pub struct PreparedItem {
@@ -2862,6 +3111,43 @@ impl ItemAccum {
             return 0.0;
         }
         self.raw_sum.get(column).copied().unwrap_or(0) as f64 / self.count as f64
+    }
+}
+
+/// 方式 B (累積平均) の `Average:` 値 (本家の `print_avg_*` / `dispavg` 分岐)。
+///
+/// 本家は瞬時値を表示するたびに**保存値**を `static` 変数へ足し、
+/// `Average:` 行で 1 回だけ割る。式の形は列ごとに次の 3 通りで、
+/// 表示値を足してから割る [`ItemAccum::mean`] とは丸めが一致しないものがある。
+///
+/// | 列 | 本家の式 |
+/// |---|---|
+/// | 固定小数のゲージ ([`GaugeScale::Divide`]: `ldavg-*` / `MHz` / PSI の `-10/-60/-300`) | `(double) Σx / (avg_count × 100)` |
+/// | `A_PWR_FAN` の `drpm` | `(Σrpm − Σrpm_min) / avg_count` (`double` の和の差) |
+/// | それ以外 (整数ゲージ・`double` のセンサ値) | `(double) Σx / avg_count` |
+///
+/// 最後の行は表示値の和でよい。整数ゲージの表示値は保存値そのもので
+/// (和が 2⁵³ を超えない限り `f64` の和は正確)、`double` のセンサ値は
+/// 本家も表示値と同じ `double` を足している。`availablekb` を持たない世代の
+/// `kbavail` は代替値 (`frmkb`) が表示値に入るので、保存値の和では出せない。
+///
+/// `A_PWR_FAN` の `drpm` を使うには `rpm_min` の表示値も [`ItemAccum`] に
+/// 足し込んでおくこと (表示されない入力列)。
+pub fn average_mean(id: ActivityId, column: usize, acc: &ItemAccum) -> Computed {
+    if acc.count == 0 {
+        return Err(ComputeIssue::MissingInSample);
+    }
+    match (id, column) {
+        (ActivityId::PWR_FAN, fan_col::DRPM) => {
+            let sum = |c: usize| acc.value_sum.get(c).copied().unwrap_or(0.0);
+            Ok((sum(fan_col::RPM) - sum(fan_col::RPM_MIN)) / acc.count as f64)
+        }
+        _ => match gauge_scale(id, column) {
+            scale @ GaugeScale::Divide(_) => scale
+                .mean(acc.raw_sum.get(column).copied().unwrap_or(0), acc.count)
+                .ok_or(ComputeIssue::MissingInSample),
+            _ => acc.mean(column),
+        },
     }
 }
 
@@ -4295,6 +4581,230 @@ mod tests {
             Err(ComputeIssue::MissingInSample)
         );
     }
+
+    // ========================================================================
+    // 固定小数ゲージの換算は割り算 (0.01 を掛けない)
+    // ========================================================================
+
+    /// 瞬時値は本家どおり `(double) x / 100`。
+    ///
+    /// `0.01` は二進で正確に表せないので、`35 × 0.01` = 0.35000000000000003 と
+    /// `35 / 100` = 0.35 は別の値になり、`--dec=1` で `0.4` / `0.3` に分かれる。
+    #[test]
+    fn fixed_point_gauges_are_divided_not_multiplied() {
+        let plan = plan_for(ActivityId::QUEUE);
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, queue_col::LDAVG_1, 35);
+        let ctx = ComputeContext::new(100);
+        let v = compute(ActivityId::QUEUE, queue_col::LDAVG_1, &plan, &p, &c, &ctx).unwrap();
+        assert_eq!(v.to_bits(), 0.35_f64.to_bits());
+        assert_eq!(format!("{v:.1}"), "0.3", "本家の --dec=1 は 0.3");
+
+        assert_eq!(GaugeScale::Divide(100).apply(35), 0.35);
+        assert_eq!(GaugeScale::Unit.apply(35), 35.0);
+        // bMaxPower は unsigned int の 2 倍 (32bit で折り返す)
+        assert_eq!(GaugeScale::MultiplyU32(2).apply(250), 500.0);
+        assert_eq!(
+            GaugeScale::MultiplyU32(2).apply(0x8000_0001),
+            2.0,
+            "unsigned int の x << 1 は 2^32 で折り返す"
+        );
+    }
+
+    /// 固定小数ゲージの平均は `Σx / (avg_count × 100)` (合計を 1 回だけ割る)。
+    ///
+    /// 保存値 1 と 6 の平均は本家 `7 / 200` = 0.035 (二進では 0.035000…03 → `0.04`)。
+    /// 表示値 (`x / 100`) を足して 2 で割ると 0.034999999999999996 → `0.03` になる。
+    /// 表示値に `0.01` を掛けていた頃は保存値 0 と 35 の平均が 0.17500000000000002
+    /// (本家は 0.175 → `0.17`) になり、`ldavg-1` の `Average:` が 1 桁ずれていた。
+    #[test]
+    fn fixed_point_gauge_average_divides_the_raw_sum_once() {
+        let mut acc = ItemAccum::new(6);
+        for raw in [1u64, 6] {
+            let shown = GaugeScale::Divide(100).apply(raw);
+            acc.add(queue_col::LDAVG_1, Some(raw), Some(shown));
+            acc.add(queue_col::RUNQ_SZ, Some(raw), Some(raw as f64));
+        }
+        acc.count = 2;
+        let v = average_mean(ActivityId::QUEUE, queue_col::LDAVG_1, &acc).unwrap();
+        assert_eq!(v.to_bits(), 0.035_f64.to_bits());
+        assert_eq!(format!("{v:.2}"), "0.04");
+        assert_eq!(
+            format!("{:.2}", acc.mean(queue_col::LDAVG_1).unwrap()),
+            "0.03",
+            "表示値の平均は本家と丸めが違う (比較用)"
+        );
+        // 整数ゲージは表示値の平均 (= 保存値の平均) のまま
+        assert_eq!(
+            average_mean(ActivityId::QUEUE, queue_col::RUNQ_SZ, &acc),
+            Ok(3.5)
+        );
+        // `avg_count` が 0 なら平均は無い
+        acc.count = 0;
+        assert_eq!(
+            average_mean(ActivityId::QUEUE, queue_col::LDAVG_1, &acc),
+            Err(ComputeIssue::MissingInSample)
+        );
+    }
+
+    /// `A_PWR_FAN` の `drpm` の平均は `(Σrpm − Σrpm_min) / avg_count`。
+    ///
+    /// 本家は `rpm` と `rpm_min` を別々の `double` 配列に足してから引く。
+    /// 差を足していくと最下位ビットが食い違う組がある。
+    #[test]
+    fn fan_drpm_average_subtracts_the_sums() {
+        let rpm = [1104.639_f64, 4313.452, 3936.986];
+        let min = [202.028_f64, 298.174, 279.796];
+        let mut acc = ItemAccum::new(5);
+        for (r, m) in rpm.iter().zip(min.iter()) {
+            acc.add(fan_col::RPM, None, Some(*r));
+            acc.add(fan_col::RPM_MIN, None, Some(*m));
+            acc.add(fan_col::DRPM, None, Some(r - m));
+        }
+        acc.count = 3;
+        let upstream = ((rpm[0] + rpm[1] + rpm[2]) - (min[0] + min[1] + min[2])) / 3.0;
+        let per_sample = ((rpm[0] - min[0]) + (rpm[1] - min[1]) + (rpm[2] - min[2])) / 3.0;
+        assert_ne!(upstream.to_bits(), per_sample.to_bits(), "例の前提");
+        let v = average_mean(ActivityId::PWR_FAN, fan_col::DRPM, &acc).unwrap();
+        assert_eq!(v.to_bits(), upstream.to_bits());
+    }
+
+    // ========================================================================
+    // オフライン CPU の前値持ち越し
+    // ========================================================================
+
+    fn cpu_item(plan: &DecodePlan, user: u64, idle: u64) -> ItemSnapshot {
+        let mut it = zeros(plan);
+        put(plan, &mut it, cpu_col::USER, user);
+        put(plan, &mut it, cpu_col::IDLE, idle);
+        it
+    }
+
+    /// `A_CPU`: 現サンプルでオフライン (tick の和が 0) の CPU は前値で埋める。
+    #[test]
+    fn carry_offline_fills_an_offline_cpu_with_the_previous_values() {
+        let plan = plan_for(ActivityId::CPU);
+        let prev = vec![
+            cpu_item(&plan, 0, 0),
+            cpu_item(&plan, 100, 900),
+            cpu_item(&plan, 500, 500),
+        ];
+        // CPU1 がオフライン
+        let curr = vec![
+            cpu_item(&plan, 0, 0),
+            cpu_item(&plan, 200, 1_800),
+            cpu_item(&plan, 0, 0),
+        ];
+        let next = carry_offline(ActivityId::CPU, &plan, &prev, &curr, |_| true);
+        assert!(matches!(next, Cow::Owned(_)));
+        assert_eq!(
+            next[1].values, curr[1].values,
+            "オンラインの CPU はそのまま"
+        );
+        assert_eq!(next[2].values, prev[2].values, "オフラインの CPU は前値");
+        // 集約スロット (添字 0) は対象外
+        assert_eq!(next[0].values, curr[0].values);
+
+        // 全 CPU がオンラインなら複製しない
+        let online = vec![
+            cpu_item(&plan, 0, 0),
+            cpu_item(&plan, 300, 2_700),
+            cpu_item(&plan, 600, 600),
+        ];
+        assert!(matches!(
+            carry_offline(ActivityId::CPU, &plan, &curr, &online, |_| true),
+            Cow::Borrowed(_)
+        ));
+        // 持ち越しの対象でない activity はそのまま
+        assert!(matches!(
+            carry_offline(ActivityId::DISK, &plan, &prev, &curr, |_| true),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// `A_NET_SOFT`: 前サンプルでもオフラインなら書き換えない。
+    #[test]
+    fn carry_offline_softnet_needs_a_previous_value() {
+        let plan = plan_for(ActivityId::NET_SOFT);
+        let soft = |total: u64, blg: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, soft_col::TOTAL, total);
+            put(&plan, &mut it, soft_col::BLG_LEN, blg);
+            it
+        };
+        let prev = vec![soft(0, 0), soft(100, 7), soft(0, 0)];
+        let curr = vec![soft(0, 0), soft(0, 0), soft(0, 0)];
+        let next = carry_offline(ActivityId::NET_SOFT, &plan, &prev, &curr, |_| true);
+        assert_eq!(next[1].values, prev[1].values, "CPU0 は前値 (blg_len 込み)");
+        assert_eq!(
+            next[2].values, curr[2].values,
+            "前値も 0 の CPU1 は 0 のまま"
+        );
+    }
+
+    /// `A_IRQ`: CPU ごとに割り込み `nr2` 個をまとめて前値で埋める。未選択の CPU は書き換えない。
+    #[test]
+    fn carry_offline_irq_copies_the_whole_cpu_and_respects_the_selection() {
+        let plan = plan_for(ActivityId::IRQ);
+        let irq = |n: u64| {
+            let mut it = zeros(&plan);
+            put(&plan, &mut it, irq_col::COUNT, n);
+            it
+        };
+        let mut plan2 = plan.clone();
+        plan2.nr2 = 2;
+        // 並びは CPU 主: [all の割り込み 0, 1] [CPU0 の 0, 1] [CPU1 の 0, 1]
+        let prev = vec![irq(30), irq(3), irq(10), irq(1), irq(20), irq(2)];
+        let curr = vec![irq(40), irq(4), irq(0), irq(0), irq(25), irq(3)];
+        let next = carry_offline(ActivityId::IRQ, &plan2, &prev, &curr, |_| true);
+        assert_eq!(next[2].values, prev[2].values);
+        assert_eq!(next[3].values, prev[3].values, "総数以外の割り込みも前値");
+        assert_eq!(next[4].values, curr[4].values);
+        // CPU0 (item 添字 1) を選んでいなければ本家は書き換えない
+        let unselected = carry_offline(ActivityId::IRQ, &plan2, &prev, &curr, |i| i != 1);
+        assert!(matches!(unselected, Cow::Borrowed(_)));
+    }
+
+    /// `A_CPU` などはレコードに載っていない CPU も `nr_ini` まで全ゼロで埋める。
+    #[test]
+    fn pad_persistent_zero_fills_up_to_nr_ini() {
+        let plan = plan_for(ActivityId::CPU);
+        let items = vec![cpu_item(&plan, 1, 1), cpu_item(&plan, 2, 2)];
+        let padded = pad_persistent(ActivityId::CPU, &plan, &items, 3);
+        assert_eq!(padded.len(), 3);
+        assert_eq!(padded[2].values, zero_item(&plan).values);
+        assert!(matches!(
+            pad_persistent(ActivityId::CPU, &plan, &items, 2),
+            Cow::Borrowed(_)
+        ));
+        // 持ち越しの対象でない activity は埋めない
+        let dplan = plan_for(ActivityId::DISK);
+        let disks = vec![zeros(&dplan)];
+        assert_eq!(pad_persistent(ActivityId::DISK, &dplan, &disks, 5).len(), 1);
+    }
+
+    /// tickless CPU の極値は分母 0 の式で記録される (本家 `save_cpu_xstats()`)。
+    ///
+    /// 差分 0 は NaN (= 最小・最大を更新しない)、逆行は 0、正の差分は +inf。
+    #[test]
+    fn tickless_extremum_uses_a_zero_denominator() {
+        let plan = plan_for(ActivityId::CPU);
+        let mut p = cpu_item(&plan, 100, 900);
+        put(&plan, &mut p, cpu_col::STEAL, 50);
+        let mut c = cpu_item(&plan, 100, 900);
+        put(&plan, &mut c, cpu_col::STEAL, 40);
+        put(&plan, &mut c, cpu_col::GUEST, 5);
+        assert!(cpu_tickless_extremum(&plan, cpu_col::USER, &p, &c).is_nan());
+        assert!(cpu_tickless_extremum(&plan, cpu_col::IDLE, &p, &c).is_nan());
+        assert_eq!(cpu_tickless_extremum(&plan, cpu_col::STEAL, &p, &c), 0.0);
+        assert_eq!(
+            cpu_tickless_extremum(&plan, cpu_col::GUEST, &p, &c),
+            f64::INFINITY
+        );
+        // `%usr` = user - guest が減った → 0
+        assert_eq!(cpu_tickless_extremum(&plan, cpu_col::USR, &p, &c), 0.0);
+    }
     // ========================================================================
     // 指摘 1: CPU 使用率の分母 (guest の二重計上)
     // ========================================================================
@@ -4594,9 +5104,15 @@ mod tests {
             10_000.0
         );
         assert_eq!(rate_divisor(ActivityId::PSI_IO, psi_col::SOME_10), 1.0);
-        // ゲージのスケールは別関数 (区間値には既に掛かっている)
-        assert_eq!(gauge_scale(ActivityId::QUEUE, queue_col::LDAVG_1), 0.01);
-        assert_eq!(gauge_scale(ActivityId::PWR_CPU, pwr_cpu_col::MHZ), 0.01);
+        // ゲージの換算は別関数 (区間値には既に掛かっている)
+        assert_eq!(
+            gauge_scale(ActivityId::QUEUE, queue_col::LDAVG_1),
+            GaugeScale::Divide(100)
+        );
+        assert_eq!(
+            gauge_scale(ActivityId::PWR_CPU, pwr_cpu_col::MHZ),
+            GaugeScale::Divide(100)
+        );
 
         // 1 秒間に 1000 セクタ読んだ区間を 3 つ足した「期間平均」
         let totals = (1_000u128 * 3, 100u128 * 3);

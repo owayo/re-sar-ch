@@ -2685,4 +2685,433 @@ mod tests {
         assert_eq!(one(ActivityId::PWR_TEMP), Label::Num3(1));
         assert_eq!(one(ActivityId::PWR_IN), Label::Num3(0));
     }
+
+    // ---- 平均行の累積とビットマップ ----
+    //
+    // 以下の値の組は `tests/sar_el7.rs` の同名の場面と同じで、そちらは本家 el7 の
+    // `sar` と突き合わせてある。
+
+    /// 本家の `printf` と同じ桁で文字列にする (`%9.0f` は偶数丸め)。
+    fn shown(cells: &[Cell]) -> Vec<String> {
+        cells
+            .iter()
+            .map(|c| match c {
+                Cell::F92(v) | Cell::P62(v) | Cell::P72(v) => format!("{v:.2}"),
+                Cell::F90(v) => format!("{v:.0}"),
+                Cell::U9(v) => v.to_string(),
+                Cell::X9(v) => format!("{v:x}"),
+                Cell::Na => "N/A".into(),
+            })
+            .collect()
+    }
+
+    /// `rows` と同じだが、表示設定と平均の累積 (`print_*_stats()` の `static`) を
+    /// 呼び出し側が持つ。`itv` は 100 jiffies (1 秒) なので `S_VALUE` は差そのもの。
+    fn rows_with(
+        id: ActivityId,
+        opts: &PrintOptions,
+        avg: Option<u64>,
+        prev: &mut Buf,
+        curr: &mut Buf,
+        acc: &mut Accum,
+    ) -> Vec<Row> {
+        let dec = decoder(id);
+        let p = Print {
+            dec: &dec,
+            opts,
+            itv: 100,
+            avg: avg.map(|count| AvgInfo { count }),
+            mem: MemOutput::Amt,
+            nr2: 1,
+        };
+        print_rows(&p, prev, curr, None, acc)
+    }
+
+    /// 瞬時値を順に出したあと平均行を出す。`samples[0]` は区間の最初 (本家の `buf[2]`) で、
+    /// 表示しない。返すのは (瞬時値の行…, 平均行)。
+    fn with_average(
+        id: ActivityId,
+        opts: &PrintOptions,
+        samples: &[Buf],
+    ) -> (Vec<Vec<Row>>, Vec<Row>) {
+        let mut acc = Accum::default();
+        let mut shown_rows = Vec::new();
+        for w in samples.windows(2) {
+            let (mut prev, mut curr) = (w[0].clone(), w[1].clone());
+            shown_rows.push(rows_with(id, opts, None, &mut prev, &mut curr, &mut acc));
+        }
+        let mut first = samples[0].clone();
+        let mut last = samples[samples.len() - 1].clone();
+        let n = samples.len() as u64 - 1;
+        let avg = rows_with(id, opts, Some(n), &mut first, &mut last, &mut acc);
+        (shown_rows, avg)
+    }
+
+    /// `-q` は瞬時値を並べ替えて出し (nr_running, nr_threads, 負荷, procs_blocked)、
+    /// 平均は整数の件数を `(double) Σ / avg_count`、負荷だけ `Σ / (avg_count * 100)`。
+    #[test]
+    fn queue_average_divides_the_load_by_count_times_100() {
+        use field::queue::*;
+        let q = |run, blocked, load: [u64; 3], threads| {
+            vec![item(
+                ActivityId::QUEUE,
+                &[
+                    (NR_RUNNING, run),
+                    (PROCS_BLOCKED, blocked),
+                    (LOAD_AVG_1, load[0]),
+                    (LOAD_AVG_5, load[1]),
+                    (LOAD_AVG_15, load[2]),
+                    (NR_THREADS, threads),
+                ],
+                &[],
+            )]
+        };
+        let (rows, avg) = with_average(
+            ActivityId::QUEUE,
+            &print_opts(),
+            &[
+                q(50, 50, [5000; 3], 5000),
+                q(2, 1, [105, 210, 399], 301),
+                q(3, 2, [106, 211, 400], 302),
+            ],
+        );
+        assert_eq!(
+            shown(&rows[0][0].cells),
+            ["2", "301", "1.05", "2.10", "3.99", "1"]
+        );
+        // runq-sz 5 / 2 = 2.5 と plist-sz 603 / 2 = 301.5 は偶数丸めで 2 と 302。
+        // ldavg-1 = 211 / 200 = 1.055 は double で 1.05499… なので 1.05
+        assert_eq!(
+            shown(&avg[0].cells),
+            ["2", "302", "1.05", "2.10", "4.00", "2"]
+        );
+        // 区間の最初 (R0) の値は平均に入らない
+        assert!(matches!(avg[0].cells[0], Cell::F90(v) if v == 2.5));
+    }
+
+    /// `-v` / `-n SOCK` の平均は `(double) Σ / avg_count` (整数除算ではない)。
+    /// 1000.5 は切り捨てで 1000 になるのではなく、`%9.0f` の偶数丸めで 1000 になる
+    /// (2001.5 は 2002)。列は dentunusd → file-nr、tcp-tw は末尾。
+    #[test]
+    fn gauge_averages_are_double_divisions_in_the_printed_order() {
+        use field::ktables::*;
+        let kt = |file, inode, dentry, pty| {
+            vec![item(
+                ActivityId::KTABLES,
+                &[
+                    (FILE_USED, file),
+                    (INODE_USED, inode),
+                    (DENTRY_STAT, dentry),
+                    (PTY_NR, pty),
+                ],
+                &[],
+            )]
+        };
+        let (rows, avg) = with_average(
+            ActivityId::KTABLES,
+            &print_opts(),
+            &[
+                kt(9, 9, 9, 9),
+                kt(1000, 2000, 3000, 1),
+                kt(1001, 2003, 3004, 4),
+            ],
+        );
+        assert_eq!(shown(&rows[0][0].cells), ["3000", "1000", "2000", "1"]);
+        assert_eq!(shown(&avg[0].cells), ["3002", "1000", "2002", "2"]);
+        assert!(matches!(avg[0].cells[1], Cell::F90(v) if v == 1000.5));
+
+        let sock = |v: [u64; 6]| {
+            let fields: Vec<(usize, u64)> = v.iter().copied().enumerate().collect();
+            vec![item(ActivityId::NET_SOCK, &fields, &[])]
+        };
+        let (rows, avg) = with_average(
+            ActivityId::NET_SOCK,
+            &print_opts(),
+            &[
+                sock([9; 6]),
+                sock([100, 20, 5, 7, 1, 0]),
+                sock([103, 21, 6, 8, 2, 1]),
+            ],
+        );
+        assert_eq!(shown(&rows[1][0].cells), ["103", "21", "8", "2", "1", "6"]);
+        assert_eq!(shown(&avg[0].cells), ["102", "20", "8", "2", "0", "6"]);
+    }
+
+    /// hugepages の平均は `%hugused` だけ、Σtlhkb / n と Σfrhkb / n を整数で割ってから
+    /// 比を取る。tlhkb が 0 の瞬時値は 0.00。
+    ///
+    /// ファイル上の 1 item は `STATS_HUGE_SIZE` の不具合で `sizeof(struct stats_memory)`
+    /// (88 バイト) だが、読むのは先頭 16 バイトだけ。
+    #[test]
+    fn huge_average_divides_integers_before_the_ratio() {
+        use field::huge::*;
+        assert_eq!(spec(ActivityId::HUGE).unwrap().size_lp64, 88);
+        let h = |fr, tl| vec![item(ActivityId::HUGE, &[(FRHKB, fr), (TLHKB, tl)], &[])];
+        let (rows, avg) = with_average(
+            ActivityId::HUGE,
+            &print_opts(),
+            &[h(99, 99), h(3, 10), h(4, 11), h(0, 0)],
+        );
+        assert_eq!(shown(&rows[0][0].cells), ["3", "7", "70.00"]);
+        assert_eq!(shown(&rows[1][0].cells), ["4", "7", "63.64"]);
+        assert_eq!(shown(&rows[2][0].cells), ["0", "0", "0.00"]);
+        // kbhugfree 7 / 3 = 2.33、kbhugused 21 / 3 - 7 / 3 = 4.67、
+        // %hugused = (7 - 2) / 7 (浮動小数なら 4.67 / 7 = 66.67)
+        assert_eq!(shown(&avg[0].cells), ["2", "5", "71.43"]);
+    }
+
+    /// `-m CPU` は CPU のビットマップで行を選ぶ (0 番のビットが "all")。周波数 0 の
+    /// CPU (オフライン) も 0.00 の行を出し、平均の分母には数える。平均は
+    /// `(double) Σ / (100 * avg_count)`。
+    #[test]
+    fn cpu_frequency_follows_the_bitmap_and_counts_offline_cpus() {
+        let mut opts = print_opts();
+        opts.cpu_bitmap = Bitmap::cpu();
+        opts.cpu_bitmap.set(0);
+        opts.cpu_bitmap.set(2);
+        let f = |v: [u64; 3]| {
+            v.iter()
+                .map(|&x| item(ActivityId::PWR_CPU, &[(0, x)], &[]))
+                .collect::<Buf>()
+        };
+        let (rows, avg) = with_average(
+            ActivityId::PWR_CPU,
+            &opts,
+            &[
+                f([999_999; 3]),
+                f([250_000, 300_000, 0]),
+                f([150_050, 100_004, 200_000]),
+            ],
+        );
+        let labels: Vec<&Label> = rows[0].iter().map(|r| &r.label).collect();
+        assert_eq!(labels, [&Label::All, &Label::Num3(1)]);
+        assert_eq!(shown(&rows[0][1].cells), ["0.00"]);
+        assert_eq!(shown(&avg[0].cells), ["2000.25"]);
+        assert_eq!(shown(&avg[1].cells), ["1000.00"]);
+    }
+
+    /// `-I` のビットマップ: 0 番のビットが合計 (`sum`)、i 番が割り込み i - 1。
+    /// 値は `ll_s_value()` なので、逆行した割り込みは 0.00。
+    #[test]
+    fn irq_rows_follow_the_bitmap_and_clamp_backward_counters() {
+        let mut opts = print_opts();
+        opts.irq_bitmap = Bitmap::irq();
+        opts.irq_bitmap.set(0);
+        opts.irq_bitmap.set(3);
+        let b = |v: [u64; 5]| {
+            v.iter()
+                .map(|&n| item(ActivityId::IRQ, &[(0, n)], &[]))
+                .collect::<Buf>()
+        };
+        let mut prev = b([1000, 100, 200, 300, 400]);
+        let mut curr = b([7000, 700, 1400, 200, 3400]);
+        let r = rows_with(
+            ActivityId::IRQ,
+            &opts,
+            None,
+            &mut prev,
+            &mut curr,
+            &mut Accum::default(),
+        );
+        let got: Vec<(Label, Vec<String>)> = r
+            .iter()
+            .map(|row| (row.label.clone(), shown(&row.cells)))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Label::Sum, vec!["6000.00".to_string()]),
+                (Label::Num3Wide(2), vec!["0.00".to_string()]),
+            ]
+        );
+    }
+
+    /// `check_net_edev_reg()` は rx_errors の減少を再登録とみなさない。
+    /// 枠は戻らず、`unsigned long long` の差が巻き戻ったまま `S_VALUE` に入る。
+    /// 他のカウンタ (ここでは tx_carrier_errors) が減れば枠を 0 に戻す。
+    #[test]
+    fn net_edev_reregistration_ignores_rx_errors() {
+        use field::net_edev::*;
+        let e = |v: [u64; 9]| {
+            let fields: Vec<(usize, u64)> = v.iter().copied().enumerate().collect();
+            vec![item(ActivityId::NET_EDEV, &fields, &["eth1"])]
+        };
+        let mut prev = e([262_144; 9]);
+        let mut only_rx_errors = [262_144 + 16_384; 9];
+        only_rx_errors[RX_ERRORS] = 262_144 - 65_536;
+        let r = rows(
+            ActivityId::NET_EDEV,
+            65_536,
+            None,
+            &mut prev,
+            &mut e(only_rx_errors),
+            None,
+            1,
+        );
+        // (2^64 - 65536) / 65536 × 100。他の列は 16384 / 65536 × 100 = 25.00
+        assert_eq!(f92(&r[0].cells)[0], "28147497671065500.00");
+        assert_eq!(f92(&r[0].cells)[1], "25.00");
+        assert_eq!(prev[0].v[RX_ERRORS], 262_144, "枠は戻さない");
+
+        let mut carrier = [262_144 + 16_384; 9];
+        carrier[TX_CARRIER_ERRORS] = 1;
+        let r = rows(
+            ActivityId::NET_EDEV,
+            65_536,
+            None,
+            &mut prev,
+            &mut e(carrier),
+            None,
+            1,
+        );
+        // 0 からの差: 278528 / 65536 × 100 = 425.00
+        assert_eq!(f92(&r[0].cells)[0], "425.00");
+        assert_eq!(prev[0].v, vec![0; 9]);
+        assert_eq!(prev[0].text(0), "eth1");
+    }
+
+    /// 前サンプルに無い NIC は、名前が `?` の枠があればそこを、無ければ同じ位置の枠を
+    /// 0 に戻して使う (`check_net_dev_reg()` の後半)。同じ位置の枠に別の NIC が
+    /// いても上書きする。
+    #[test]
+    fn new_interfaces_take_the_question_mark_slot_or_the_same_rank() {
+        use field::net_dev::*;
+        let d = |name: &str, rx| item(ActivityId::NET_DEV, &[(RX_PACKETS, rx)], &[name]);
+        let mut prev = vec![d("eth0", 1000), d("?", 5000), d("", 0)];
+        let mut curr = vec![d("eth1", 6000), d("eth0", 1600), d("eth2", 600)];
+        let r = rows(
+            ActivityId::NET_DEV,
+            100,
+            None,
+            &mut prev,
+            &mut curr,
+            None,
+            1,
+        );
+        let rx: Vec<String> = r.iter().map(|row| f92(&row.cells)[0].clone()).collect();
+        assert_eq!(rx, ["6000.00", "600.00", "600.00"]);
+        assert_eq!(prev[0], d("eth0", 1000));
+        assert_eq!(prev[1], d("eth1", 0));
+        assert_eq!(prev[2], d("eth2", 0));
+
+        // `?` が無ければ、同じ位置にいる eth0 の枠でも 0 に戻して使う
+        let mut prev = vec![d("eth0", 1000), d("eth1", 2000)];
+        let mut curr = vec![d("eth9", 300), d("eth1", 2600)];
+        let r = rows(
+            ActivityId::NET_DEV,
+            100,
+            None,
+            &mut prev,
+            &mut curr,
+            None,
+            1,
+        );
+        let rx: Vec<String> = r.iter().map(|row| f92(&row.cells)[0].clone()).collect();
+        assert_eq!(rx, ["300.00", "600.00"]);
+        assert_eq!(prev[0], d("eth9", 0));
+    }
+
+    /// 再登録で枠を戻すときの名前は `strncpy(..., MAX_IFACE_LEN - 1)` で 15 バイトまで。
+    #[test]
+    fn interface_names_are_copied_up_to_15_bytes() {
+        assert_eq!(iface_name("eth0"), "eth0");
+        assert_eq!(iface_name("abcdefghijklmnop"), "abcdefghijklmno");
+    }
+
+    /// 前サンプルに無いディスクは、major + minor が 0 の空き枠が無ければ同じ位置の枠を
+    /// 0 に戻して使う (そこにいた別のディスクの枠でも上書きする)。
+    #[test]
+    fn disk_without_a_free_slot_takes_the_same_rank() {
+        use field::disk::*;
+        let d = |minor, ios| {
+            item(
+                ActivityId::DISK,
+                &[(MAJOR, 8), (MINOR, minor), (NR_IOS, ios)],
+                &[],
+            )
+        };
+        let mut prev = vec![d(0, 100), d(16, 200)];
+        let mut curr = vec![d(0, 150), d(32, 50)];
+        let r = rows(ActivityId::DISK, 100, None, &mut prev, &mut curr, None, 1);
+        assert_eq!(r[1].label, Label::Name("dev8-32".into()));
+        assert_eq!(f92(&r[1].cells)[0], "50.00");
+        assert_eq!(prev[1], d(32, 0));
+    }
+
+    /// センサの平均: FAN の drpm は (Σrpm - Σrpm_min) / n。TEMP / IN の % は
+    /// **最後のサンプルの**最小・最大で割る (本家は「変わらない」と仮定している)。
+    #[test]
+    fn sensor_averages_use_the_last_min_and_max() {
+        use field::sensor::*;
+        // FAN は値と最小の 2 つ、TEMP / IN は値・最小・最大の 3 つ
+        let s = |id, v: &[f64]| {
+            let fields: Vec<(usize, u64)> = [VALUE, MIN, MAX]
+                .iter()
+                .zip(v)
+                .map(|(&f, x)| (f, x.to_bits()))
+                .collect();
+            vec![item(id, &fields, &["dev"])]
+        };
+        let (rows, avg) = with_average(
+            ActivityId::PWR_TEMP,
+            &print_opts(),
+            &[
+                s(ActivityId::PWR_TEMP, &[1.0, 0.0, 2.0]),
+                s(ActivityId::PWR_TEMP, &[45.0, 20.0, 70.0]),
+                s(ActivityId::PWR_TEMP, &[57.0, 20.0, 100.0]),
+            ],
+        );
+        assert_eq!(shown(&rows[0][0].cells), ["45.00", "50.00"]);
+        assert_eq!(shown(&rows[1][0].cells), ["57.00", "46.25"]);
+        // (51 - 20) / (100 - 20)。最初のサンプルの最大 70 を使えば 62.00 になる
+        assert_eq!(shown(&avg[0].cells), ["51.00", "38.75"]);
+        assert_eq!(avg[0].tail, Tail::Sensor("dev".into()));
+
+        let (_, avg) = with_average(
+            ActivityId::PWR_FAN,
+            &print_opts(),
+            &[
+                s(ActivityId::PWR_FAN, &[1.0, 1.0]),
+                s(ActivityId::PWR_FAN, &[1200.0, 1000.0]),
+                s(ActivityId::PWR_FAN, &[1300.0, 1000.0]),
+            ],
+        );
+        assert_eq!(shown(&avg[0].cells), ["1250.00", "250.00"]);
+    }
+
+    /// `-u ALL` の `%usr` / `%nice` は `user - guest` / `nice - guest_nice` の差で、
+    /// 減っていれば 0.00。個別 CPU の区間はその減少分だけ広がる。
+    #[test]
+    fn cpu_all_clamps_user_and_nice_below_their_guest_time() {
+        use field::cpu::*;
+        let c = |v: [u64; 10]| {
+            let fields: Vec<(usize, u64)> = v.iter().copied().enumerate().collect();
+            item(ActivityId::CPU, &fields, &[])
+        };
+        // CPU 1: nice - guest_nice が 50 → 0 に減る (tick の差 60000 + 50)
+        let p = c([300, 100, 100, 50_000, 0, 0, 0, 0, 0, 50]);
+        let n = c([300, 150, 100, 109_950, 0, 0, 0, 0, 0, 150]);
+        let itv = per_cpu_interval(&n, &p);
+        assert_eq!(itv, 60_050);
+        let cells = cpu_values(true, &p, &n, itv);
+        assert_eq!(
+            shown(&cells),
+            [
+                "0.00", "0.00", "0.00", "0.00", "0.00", "0.00", "0.00", "0.00", "0.17", "99.83"
+            ]
+        );
+        // -u (既定) の %nice はゲスト時間を引かない: 50 / 60050
+        assert_eq!(shown(&cpu_values(false, &p, &n, itv))[1], "0.08");
+        // idle が減れば %idle (-u ALL の末尾の列) は 0.00
+        let back = c([31_300, 150, 30_050, 109_000, 0, 0, 0, 0, 0, 150]);
+        let itv = per_cpu_interval(&back, &n);
+        assert_eq!(itv, 60_000);
+        assert_eq!(
+            shown(&cpu_values(true, &n, &back, itv)),
+            [
+                "51.67", "0.00", "49.92", "0.00", "0.00", "0.00", "0.00", "0.00", "0.00", "0.00"
+            ]
+        );
+        assert!(back.v[IDLE] < n.v[IDLE]);
+    }
 }

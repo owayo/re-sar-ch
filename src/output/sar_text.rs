@@ -2785,17 +2785,14 @@ impl SarBlock {
         if self.view.id == ActivityId::FS && self.opts.mount {
             return fs_mountpoint(plan, item).to_string();
         }
+        // `A_IRQ` の `irq_name` は 12.5.6 で入ったフィールド。持たない世代では
+        // item 0 が総数 (`sum`)、item n が割り込み `n-1`。この規則は show / summarize /
+        // 変換と共有する ([`compute::irq_item_name`])。
+        if self.view.id == ActivityId::IRQ {
+            return compute::irq_item_name(index, item.key.as_deref());
+        }
         match item.key.as_deref() {
             Some(k) if !k.is_empty() => k.to_string(),
-            // `A_IRQ` の `irq_name` は 12.6 で入ったフィールド。
-            // 持たない世代では item 0 が総数 (`sum`)、item n が割り込み `n-1`。
-            _ if self.view.id == ActivityId::IRQ => {
-                if index == 0 {
-                    "sum".to_string()
-                } else {
-                    (index - 1).to_string()
-                }
-            }
             _ => String::new(),
         }
     }

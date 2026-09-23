@@ -2316,7 +2316,7 @@ pub fn carry_offline<'a>(
                 out.get_or_insert_with(|| curr.to_vec())[i] = p.clone();
             }
         }
-        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
+        ActivityId::IRQ if irq_has_cpu_rows(plan) => {
             let nr2 = plan.nr2.max(1) as usize;
             let total = |items: &[ItemSnapshot], start: usize| {
                 items
@@ -2367,9 +2367,7 @@ pub fn pad_persistent<'a>(
 ) -> Cow<'a, [ItemSnapshot]> {
     let per_row = match id {
         ActivityId::CPU | ActivityId::NET_SOFT => 1,
-        ActivityId::IRQ if plan.nr2 > 1 || plan.text_index("irq_name").is_some() => {
-            plan.nr2.max(1) as usize
-        }
+        ActivityId::IRQ if irq_has_cpu_rows(plan) => plan.nr2.max(1) as usize,
         _ => return Cow::Borrowed(items),
     };
     let want = nr_ini.saturating_mul(per_row);

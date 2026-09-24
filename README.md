@@ -24,7 +24,43 @@
   <a href="README.ja.md">日本語</a>
 </p>
 
-## Install
+Inspect `sa` files collected on Linux from your own PC, without installing `sar` or `sadf`
+on the machine doing the analysis. Start with Installation and Quickstart; use the contents
+below to look up commands, supported formats, and verification details.
+
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quickstart](#quickstart)
+- [Usage](#usage)
+- [CLI reference](#cli-reference)
+- [Use it from an AI agent](#use-it-from-an-ai-agent)
+- [Supported Formats](#supported-formats)
+- [Why](#why)
+- [How the output is verified](#how-the-output-is-verified)
+- [What "sar compatible" means here](#what-sar-compatible-means-here)
+- [Design notes](#design-notes)
+- [Development](#development)
+- [License](#license)
+
+## Features
+
+- `sar` / `sadf` compatible text, JSON, CSV, and XML reports
+- Interactive tables and graphs in a terminal UI
+- Anomaly detection, period summaries, host comparisons, and SVG charts
+- Readers for 28 registered formats from sysstat 2.2 through 12.8, with [legacy limitations](#centos-345-and-earlier-formats)
+- [Automated collection and verification](#verify-all-available-official-sysstat-releases) using distribution and official sysstat release images
+
+## Requirements
+
+Runs on Linux, macOS, and Windows. Supply an `sa` file collected by sysstat on Linux.
+The binary analyses saved files. To collect new data, use sysstat on Linux or the bundled
+[collection scripts](docs/format/06-live-matrix.md). The TUI requires an interactive terminal;
+building from source requires a Rust toolchain.
+
+## Installation
 
 ### Homebrew (macOS/Linux)
 
@@ -99,13 +135,30 @@ sudo mv resarch /usr/local/bin/
 
 Download `resarch-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/owayo/re-sar-ch/releases), extract it, and add its directory to PATH.
 
-> `winget install owayo.reSARch` does this for you (it registers `resarch` on PATH), so the manual download is only needed if you do not use winget. After a winget install, open a new terminal so the updated PATH takes effect.
+> winget registers `resarch` on PATH automatically. After installation, open a new terminal so the updated PATH takes effect.
+
+## Quickstart
+
+After installation, replace `sa01` with the path to your file. Copy it from the collecting
+host if you are analysing it on another machine.
+
+```bash
+resarch info sa01               # Inspect the format and recorded activities
+resarch -u -f sa01              # Display CPU utilisation
+resarch detect sa01             # Find times and metrics to investigate
+```
+
+An **activity** is a kind of statistic, such as CPU or memory; an **item** is an individual
+CPU, device, or other measured resource. Use `resarch --help` or `resarch detect --help`
+to look up commands and options.
 
 ## Usage
 
 ### As a drop-in for `sar`
 
-reSARch accepts `sar`'s own argument syntax. Omit the subcommand and it behaves like `sar`:
+Omit the subcommand to read saved files with `sar`-compatible arguments. Output defaults
+to the sysstat 12.8.0 profile, regardless of the input file's generation. See
+[compatibility](#what-sar-compatible-means-here) for supported options and output profiles:
 
 ```bash
 resarch -u -f sa01                       # CPU utilisation
@@ -139,8 +192,8 @@ are never overwritten; failed conversion leaves no partial destination file.
 
 `--sar-profile sysstat-10.1.5-el7` renders the text the way the host's own `sa2` does
 on RHEL / CentOS 7 — the columns, the arithmetic and the rounding of averages all
-follow sysstat 10.1.5 as Red Hat ships it. Use it to fill in a `sarDD` that `sa2` never
-got to write, and it will sit alongside the host's other reports byte for byte.
+follow sysstat 10.1.5 as Red Hat ships it. Use it to generate a `sarDD` that `sa2` has not
+written. Reproduction depends on the supported RPM version, page size, and device names.
 See [Reproducing RHEL / CentOS 7's `sar`](#reproducing-rhel--centos-7s-sar).
 Old and big-endian inputs are read directly. CI compares CLI-generated files
 against five upstream golden reports covering three old versions, a current
@@ -218,8 +271,7 @@ resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
 Recorded activities become tabs; pick an item and read its time series as a table with a
 graph above it.
 
-Every key is lower case or a symbol. When `Shift` selects a different action, a slip of
-the finger runs the wrong feature instead of doing nothing.
+Letter keys use lower case. The main controls are listed below.
 
 | Key | Action |
 |---|---|
@@ -239,8 +291,8 @@ Inside the `c` popup, `space` adds or removes a column from the table, `a` switc
 between every column and the default, and `enter` applies — the row under the cursor
 becomes the graphed metric. `esc` cancels, leaving both the table and the graph alone.
 
-Activities with many columns (MEMORY has 19) cannot all fit: laid out side by side they
-squash to a few digits each and none of them stay readable. The table narrows them two ways.
+For activities with many columns, such as memory, the table limits the visible columns
+to keep values readable.
 
 - **Columns that never carried a value are dropped by default.** Fields the source
   generation never had, and metrics that are not implemented, show `—` on every row and do
@@ -260,7 +312,7 @@ of the screen point at the same moment. On short terminals (24 rows or fewer) it
 to a couple of rows can no longer be navigated. `v` forces it down to 18 rows; below that
 it cannot be shown at all.
 
-It follows the same rules as every other output:
+It follows the same rules as the other native outputs:
 
 - **`—` means the value is absent, not zero.** Fields the source generation never had,
   missing samples and intervals where no delta can be taken are never filled with 0.
@@ -382,6 +434,27 @@ matching Linux on common architectures and the direct-reading path. This is the 
 input with a known different tick frequency; wall-clock gaps and suspend never change it.
 The chosen value and its source are reported on stderr.
 
+## CLI reference
+
+| Task | Command |
+|---|---|
+| Display `sar`-compatible reports | `resarch sar` (the subcommand may be omitted) |
+| Produce `sadf`-compatible output or convert old formats | `resarch sadf` |
+| Save a complete `sar` text report | `resarch sa2sar` |
+| View tables, JSON, and other formats | `resarch show` |
+| Browse interactively in a terminal | `resarch tui` |
+| Detect anomalies | `resarch detect` |
+| Summarise a period | `resarch summarize` |
+| Compare hosts | `resarch compare` |
+| Inspect headers and recorded activities | `resarch info` |
+| Identify the producing sysstat version | `resarch identify` |
+| Install an AI agent skill | `resarch skill-install` |
+
+Append `--help` to a native command such as `show` or `detect` to see its options.
+For `sar`, use `resarch sar --help`; for `sadf`, see [Usage](#usage) and the
+[output specification](docs/format/03-output-format.md). See
+[compatibility](#what-sar-compatible-means-here) for output limitations and environment variables.
+
 ## Use it from an AI agent
 
 `resarch` ships a skill describing its own commands, so an agent knows when to reach for it
@@ -456,7 +529,10 @@ recorded; the default is little-endian with a diagnostic, overridable through
 3.0–3.1, are not assumed to share a neighboring layout. **Supporting all registered formats
 is distinct from having verified every historical release.**
 
-Also handled:
+### Activity and ABI coverage
+
+The producer ABI determines details such as integer widths and byte order.
+The following are also supported, subject to the legacy limitations above:
 
 - **All 43 activities** — CPU, memory, disk, every IPv4/IPv6 protocol, PSI, power sensors,
   filesystems, HugePages, interrupts, and the rest
@@ -482,11 +558,11 @@ See [the activity specification](docs/format/02-activities.md) for revision deta
 
 `sar` writes its logs (`/var/log/sa/saXX`) as raw C structs. That makes them fast to write
 and painful to read: you generally need a `sysstat` install of a compatible vintage on a
-compatible architecture. A five-year-old log from a 32-bit PowerPC box is not something
-your laptop's `sar` will open.
+compatible architecture. For example, your laptop's `sar` may not be able to open an old
+log from a 32-bit PowerPC host.
 
 reSARch reads supported formats directly, resolves struct layouts for the producer's ABI,
-and runs anywhere Rust runs — including macOS and Windows, on logs collected from Linux.
+and reads logs collected on Linux from macOS and Windows too.
 
 ## How the output is verified
 
@@ -514,11 +590,23 @@ line breaks at missing samples and restarts.
 Mismatches are never tolerated: a single one fails the suite. "Hard to implement" and
 "the number doesn't match" are not accepted reasons to mask something.
 
+### Reading verification results
+
+Each status names what was checked; a generic “verified” would hide these distinctions.
+
+| Status | What was checked | What it does not establish |
+|---|---|---|
+| Scan to EOF (`exact=true`, or `scan_exact=true` in measurement tables) | No early stop or incomplete record; the final scan offset equals the file size | Decoding every field, or matching computed values and text |
+| All activities decoded (`activity_decode=complete`) | Every declared activity was planned and every sample decoded with no skipped activities | Availability of absent fields or unknown units, or matching historical `sar` output |
+| Native reread matched | The same version of `sar` reread the saved `sa` and reproduced the collected text | Equality between reSARch and native output |
+| Byte-identical / identical after masking | reSARch output matched native output in full or after excluding explicitly named columns | Equality for untested versions or activities |
+
 ### Verify all available official sysstat releases
 
 ```bash
 make sar-upstream-all
-SAR_MATRIX_OUTPUT=target/sar-matrix/<run-directory> SAR_MATRIX_RESUME=1 make sar-upstream-all
+# Replace the placeholder with the directory of the run to resume
+SAR_MATRIX_OUTPUT="target/sar-matrix/<run-directory>" SAR_MATRIX_RESUME=1 make sar-upstream-all
 ```
 
 The [pinned manifest](tools/sar-matrix/upstream.tsv) contains 181 cases: 133 official Git
@@ -533,10 +621,10 @@ and rendering**. The [measurement manifest](docs/measurements/upstream-matrix-20
 and [sa/text pairs with provenance and SHA-256](testdata/sysstat-live/2026-09-24-official-all/)
 are tracked in Git. These cover 27 official-source formats; separately collected CentOS
 `0x1170` samples complete the 28 registered formats. Run `cargo test --test official_snapshots`
-to recheck scanning and decoding of the 181 stored files. `exact=true` denotes EOF alignment;
-historical `sar` text comparisons are recorded separately and are not implied by it.
-`activity_decode=complete` means every declared activity was planned and every sample
-decoded, with no skipped activities. Absent fields and values with unknown units remain unavailable.
+to recheck scanning and decoding of the 181 stored files. All 181 also passed
+`activity_decode=complete`. Text comparisons differ in every case; none is byte-identical
+to its historical native `sar` output. See [verification statuses](#reading-verification-results)
+for the distinction between scanning, decoding, and output comparison.
 
 Run `python3 tools/sar-matrix/update-upstream.py` to add new official tags.
 **The manifest covers recovered and pinned releases, not every release ever published.**
@@ -550,10 +638,8 @@ against five distribution packages and four pinned upstream releases. Each case 
 two samples on Linux 6.18.35 / aarch64 / LP64, then reSARch followed record boundaries
 through the end of the file.
 
-In both tables below, **`exact=true` means that the scan finished without an early stop or
-incomplete record, and its final offset equals the file size**. It does not establish that
-every field was decoded or that computed values and text match native `sar`.
-Decoding coverage and output comparisons are described separately.
+In both tables below, `exact=true` means [a successful scan to EOF](#reading-verification-results).
+Decoding coverage and native output comparisons are described separately.
 
 | Source | sysstat | Format magic | reSARch scan to EOF |
 |---|---:|---:|:---:|
@@ -693,7 +779,7 @@ on a guess would change reports behind your back. Two inputs cannot come from th
 all: `-R` converts kilobytes to pages with the page size of the host running `sar`
 (`--sar-page-size`, default 4096 — the x86_64 value), and `-p` / `-j` look up device names
 on that host, which reSARch does not do for a log collected elsewhere (`dev<major>-<minor>`
-stays, as it does when upstream reads the file off-host). `sadf` has no profile and refuses
+stays). `sadf` has no profile and refuses
 the option.
 
 This was checked against a RHEL 7 host's own reports — 29 days of `sa` binaries and the
@@ -735,8 +821,10 @@ variable arrived after 10.1.5 — while `S_TIME_FORMAT` works as described.
 
 Things that turned out to matter, documented in [`docs/design.md`](docs/design.md):
 
-- `unsigned long` always occupies an **8-byte slot** on disk; on 32-bit producers only the
-  leading 4 bytes are meaningful. This is why struct sizes agree across word sizes.
+- In the statistical payload of self-describing formats, `unsigned long` occupies an
+  **8-byte slot**; on 32-bit producers only the leading 4 bytes hold the value. Older formats
+  use generation-specific widths and layouts ([2.2](docs/format/08-packed-legacy.md),
+  [3.2.4–8.1.2](docs/format/09-legacy-generations.md)).
 - An item's stride is **always the declared `file_activity.size`**, never a size computed
   from the struct definition — older `A_HUGE` records disagree with their own layout.
 - Two `0x2175` variants report an identical `header_size` of 328 while differing inside;
@@ -761,11 +849,16 @@ make uninstall    # remove both
 
 Upstream `sysstat` is GPL-licensed, so **none of its test data or expected output is
 vendored here**. `make fixtures` fetches it into `target/fixtures/` at a pinned tag with
-SHA-256 verification, for the conformance suite only. The fixtures committed to this
-repository are written from scratch and are MIT-licensed like the rest of the project.
+SHA-256 verification, for the conformance suite only. The data in `tests/fixtures/` is
+written from scratch and MIT-licensed like the rest of the project. Live snapshots in
+`testdata/sysstat-live/` are separate; see their [provenance and usage notice](testdata/sysstat-live/README.md).
 
 reSARch is an independent implementation written from the on-disk format, not a port of
 `sysstat` source.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes. Report bugs through
+[GitHub Issues](https://github.com/owayo/re-sar-ch/issues), including `resarch --version`,
+the command you ran, and the error message.
 
 ## License
 

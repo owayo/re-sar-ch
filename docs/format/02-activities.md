@@ -1319,7 +1319,7 @@ v12.5.6 の `nr_max = NR_IRQS + 1` (= 4097) は設計ミスで、`nr` が CPU �
 個々の値はすべて上限以内なので、`check_file_actlst()` の単項チェックは**全部通る**。
 しかし `allocate_structures()` での確保サイズは
 
-```
+```text
 msize × nr_ini × nr2 = 1024 × 8193 × 4096 = 34,363,932,672 バイト (≈ 32 GiB)
 ```
 
@@ -1441,7 +1441,7 @@ flowchart TB
 Rust 実装では `memmove` を真似る必要はなく、**「ファイル側の `types_nr` から各フィールドの
 バイトオフセットを計算して直接読む」**方が安全かつ簡単:
 
-```
+```text
 ull フィールド i の offset = i * 8                        (i < f0)
 ul  フィールド i の offset = f0*8 + i*8                   (i < f1)
 u   フィールド i の offset = f0*8 + f1*8 + i*4            (i < f2)
@@ -1798,7 +1798,7 @@ sysstat は「奇数マイナー = 開発版 (master)」「偶数マイナー = 
 
 ### 11.1 パース手順 (擬似コード)
 
-```
+```text
 1. file_magic を 76 バイト読む (この構造体のサイズは固定で、pad で将来拡張に備えている)
    - sysstat_magic で sysstat ファイル判定 + エンディアン判定
    - format_magic == 0x2175 を確認 (0x2171 / 0x2173 は sadf -c 案内)

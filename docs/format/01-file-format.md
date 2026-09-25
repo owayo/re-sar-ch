@@ -750,7 +750,7 @@ G4 に対して **末尾に `sa_tzname[8]` が追加**されただけ。
 
 sysstat のすべての「ファイルに書かれる構造体」は、次の**物理的な並び順**を守るという不変条件を持つ:
 
-```
+```text
 [ unsigned long long が n0 個 ]  各 8 バイト
 [ unsigned long      が n1 個 ]  各 8 バイトのスロット (32bit では先頭 4 バイトのみ有効)
 [ [unsigned] int     が n2 個 ]  各 4 バイト
@@ -772,7 +772,7 @@ sysstat のすべての「ファイルに書かれる構造体」は、次の**�
 
 ### 4.2 MAP_SIZE
 
-```
+```text
 ULL_W = 8    // unsigned long long のスロット幅
 UL_W  = 8    // unsigned long のスロット幅 (32bit ファイルでも 8)
 U_W   = 4    // int のスロット幅
@@ -818,7 +818,7 @@ flowchart TD
 
 #### 擬似コード (Rust 実装向け)
 
-```
+```text
 fn remap(buf: &mut [u8],           // 長さ b_size
          g: [u32; 3], f: [u32; 3], // gtypes_nr / ftypes_nr
          f_size: u32, g_size: u32) -> Result<()>
@@ -927,7 +927,7 @@ fn remap(buf: &mut [u8],           // 長さ b_size
 実際の検査は**全要素が増加方向 または 全要素が減少方向**であることの確認である
 (= 「ULL は増えたが int は減った」のような混在を禁止):
 
-```
+```text
 ok = (f[0] >= g[0] && f[1] >= g[1] && f[2] >= g[2])
   || (f[0] <= g[0] && f[1] <= g[1] && f[2] <= g[2])
 ```
@@ -1478,7 +1478,7 @@ reSARch が「読み取り専用 + 内部表現は常にネイティブ」で実
 `tests/data-9.1.6` / `data-10.3.1` / `data-11.6.5` に対してこの手順でバイト境界を追うと
 EOF がぴったり一致することを確認済み。
 
-```
+```text
 offset  = (magic == 0x2171 ? 8 : 76)                       // file_magic
         + (magic == 0x2171 ? 280 : file_magic.header_size)  // file_header (0x2173 は 288)
         + 20 * sa_act_nr                                    // old_file_activity[]
@@ -1574,7 +1574,7 @@ loop {
 
 読み込みループの擬似コード:
 
-```
+```text
 loop {
     read rec_size bytes -> buf            // EOF なら終了
     remap(buf, rec_types_nr(現行), file_hdr.rec_types_nr, rec_size, RECORD_HEADER_SIZE)
@@ -1624,7 +1624,7 @@ flowchart TD
 
 1 activity 分の読み取り手順:
 
-```
+```text
 for fal in file_activity[] {          // ファイル内の順序どおり
     // (1) 件数の決定
     let count: i32 = if fal.has_nr != 0 {
@@ -1706,7 +1706,7 @@ for fal in file_activity[] {          // ファイル内の順序どおり
 ファイル内を順次走査するだけなら明示的なサイズ計算は不要だが、
 インデックスを作る/シークする場合は次のとおり:
 
-```
+```text
 record_total_size =
       file_header.rec_size                                      // record_header
     + (extra チェーンのサイズ)                                    // extra_next != 0 のとき
@@ -1741,7 +1741,7 @@ record_total_size =
 
 ### 7.1 swap 判定
 
-```
+```text
 read file_magic の先頭 4 バイト
 match u16_native(bytes[0..2]) {
     0xd596 => endian_mismatch = false,   // SYSSTAT_MAGIC
@@ -1776,7 +1776,7 @@ match u16_native(bytes[0..2]) {
 
 擬似コード:
 
-```
+```text
 fn swap_struct(t: [u32;3], buf: &mut [u8], is64bit: bool) {
     let mut off = 0usize;
     for _ in 0 .. t[0] {                  // long long
@@ -1846,7 +1846,7 @@ swap の影響を受けず、remap 後 / swap 前に読める。
 
 `file_header.sa_sizeof_long` (`char`, 1 バイト) はファイルを作ったマシンの `sizeof(long)` = **4 または 8**。
 
-```
+```text
 arch_64 = (file_header.sa_sizeof_long == 8)
 ```
 
@@ -1883,7 +1883,7 @@ arch_64 = (file_header.sa_sizeof_long == 8)
 
 `unsigned long` フィールドは次のように読むのが最も安全:
 
-```
+```text
 fn read_sa_ulong(slot: &[u8; 8], file_endian: Endian, arch_64: bool) -> u64 {
     match (file_endian, arch_64) {
         (LE, true)  => u64::from_le_bytes(*slot),

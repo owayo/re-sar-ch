@@ -200,7 +200,7 @@ tick 合計差分で正規化するため、グローバル itv とは独立し�
 
 v12.8.0 の `common.h` では両者は**同一定義**である。
 
-```
+```text
 S_VALUE(m, n, p)  = ((double)(n - m)) / p * 100
 SP_VALUE(m, n, p) = ((double)(n - m)) / p * 100
 ```
@@ -289,7 +289,7 @@ sysstat は **ラップアラウンドを「積極的に補正しない」** 設
 「一度 unregister され再 register された」可能性を疑う。ただし次の条件のいずれかを満たす場合は
 **単なる 64bit オーバーフローとみなして継続**する:
 
-```
+```text
 ovfw = (rx_bytes 減 && rx_packets 増 && prev.rx_bytes > u64::MAX/2)
     || (tx_bytes 減 && tx_packets 増 && prev.tx_bytes > u64::MAX/2)
     || (rx_packets 減 && rx_bytes 増 && prev.rx_packets > u64::MAX/2)
@@ -312,7 +312,7 @@ ovfw = (rx_bytes 減 && rx_packets 増 && prev.rx_bytes > u64::MAX/2)
 `major`/`minor` が一致するエントリを探す。**すべてのカウンタが減っていたら**再登録、
 **1〜2 本だけ減っていたら**単なるラップとみなす。判定式:
 
-```
+```text
 再登録 = (curr.nr_ios < prev.nr_ios)
       && (prev.rd_sect == 0 || curr.rd_sect < prev.rd_sect)
       && (prev.wr_sect == 0 || curr.wr_sect < prev.wr_sect)
@@ -459,7 +459,7 @@ fn get_per_cpu_interval(scc: &StatsCpu, scp: &mut StatsCpu) -> u64 {
 SMP (`nr_ini > 1`) のとき、CPU "all" (添字 0) の統計は
 **`/proc/stat` の `cpu` 行ではなく、個別 CPU の合算**で作り直す。
 
-```
+```text
 擬似コード:
   if nr_ini > 1:
       buf[curr][0] = 0 でクリア   # CPU "all"
@@ -565,7 +565,7 @@ CPU "all" では `deltot_jiffies == 0` になったら **1 に差し替える**
 
 ##### 1.5.1 ディスク拡張統計 (`compute_ext_disk_stats()`)
 
-```
+```text
 util  = if c.tot_ticks < p.tot_ticks { 0.0 }
         else { S_VALUE(p.tot_ticks, c.tot_ticks, itv) }
         # tot_ticks はカーネルがミリ秒で提供。
@@ -608,7 +608,7 @@ areq-sz = if c.nr_ios > p.nr_ios {
 
 PSI の `total` フィールドはマイクロ秒の累計。itv は cs。
 
-```
+```text
 %scpu (瞬時値) = (c.some_cpu_total - p.some_cpu_total) as f64 / (100 * itv) as f64
 ```
 
@@ -704,7 +704,7 @@ sysstat の `Average:` 行には**性質の異なる 2 方式**がある。ど�
 
 `init_colors()` の判定:
 
-```
+```text
 if (S_COLORS 未設定 && stdout が TTY でない)
    || S_COLORS == "never"
    || (S_COLORS != "always" && stdout が TTY でない)
@@ -739,7 +739,7 @@ Rust 実装は「色なし」を既定にすれば十分で、`S_COLORS=always` 
 
 ##### 1.7.1 `cprintf_f(unit, sign, num, wi, wd, ...)` — 浮動小数
 
-```
+```text
 1. wd > 0 かつ dplaces_nr >= 0 (= --dec 指定あり) なら wd = dplaces_nr
 2. unit < 0 (NO_UNIT):
      sign なら  printf(" %+*.*f", wi, wd, val)
@@ -755,7 +755,7 @@ Rust 実装は「色なし」を既定にすれば十分で、`S_COLORS=always` 
 
 ##### 1.7.2 `cprintf_xpc(human, xtrem, num, wi, wd, ...)` — パーセント
 
-```
+```text
 1. wd > 0 かつ dplaces_nr >= 0 なら wd = dplaces_nr
 2. human > 0 (= DISPLAY_UNIT, --human 指定) なら:
      if wi < 4 { wi = 4 }      // "100%" が入る最小幅
@@ -770,7 +770,7 @@ Rust 実装は「色なし」を既定にすれば十分で、`S_COLORS=always` 
 
 ##### 1.7.3 `cprintf_u64(unit, num, wi, ...)` — 符号なし整数
 
-```
+```text
 unit < 0:  printf(" %*"PRIu64, wi, val)          // %*lu 相当
 unit >= 0: cprintf_unit(unit, wi, val as f64)
 ```
@@ -779,7 +779,7 @@ unit >= 0: cprintf_unit(unit, wi, val as f64)
 
 ##### 1.7.4 `cprintf_x(num, wi, ...)` — 16 進
 
-```
+```text
 printf(" %*x", wi, val)
 ```
 
@@ -909,7 +909,7 @@ fn cprintf_unit(mut unit: i32, mut wi: i32, mut dval: f64, dplaces_nr: i32) -> S
 
 `rx`, `tx` はバイト/秒、`speed` は Mbps (`stats_net_dev.speed`)。
 
-```
+```text
 if speed == 0 { return 0.0 }
 bps = speed * 1_000_000
 if duplex == C_DUPLEX_FULL {
@@ -1057,7 +1057,7 @@ flowchart TD
    `sar -C -A -f file` では同じ `COM xxx` 行が activity の数だけ繰り返し現れる。
    本家テスト `tests/expected.data-11.6.5` にそれが見える:
 
-   ```
+   ```text
    Average:          7      0.57      0.00      0.87      0.09      0.00      0.17      0.02      0.00      0.00     98.28
    09:34:30     COM Hello, world!
 
@@ -1140,7 +1140,7 @@ flowchart TD
 
 #### 2.4 各行の共通レイアウト
 
-```
+```text
 <11 桁左詰めラベル><アイテム名 (activity 依存)><値列…>\n
 ```
 
@@ -1156,7 +1156,7 @@ flowchart TD
 切り詰めないため、9 桁を超えるデバイス名が来ると**その行全体が右にずれる**。
 `tests/expected.data-12.5.6-A_QUEUE_modified` に実例がある (`virbr0-nic` は 10 文字):
 
-```
+```text
 07:55:25       wlp2s0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
 07:55:25    virbr0-nic      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
 ```
@@ -1167,7 +1167,7 @@ Rust では `format!("{:>9}", name)` が同じ挙動 (幅未満なら右詰め�
 ヘッダ行のタイムスタンプが `timestamp[!curr]` (= 1 つ前のサンプルの時刻) である点に注意。
 `tests/expected.data-11.6.5` の以下の抜粋では、ヘッダ行が `09:33:48`、データ行が `09:34:34` になっている:
 
-```
+```text
 09:33:48        CPU      %usr     %nice      %sys   %iowait    %steal      %irq     %soft    %guest    %gnice     %idle
 09:34:34        all      0.47      0.00      0.55      0.08      0.00      0.13      0.03      0.00      0.00     98.75
 ```
@@ -1186,7 +1186,7 @@ Rust では `format!("{:>9}", name)` が同じ挙動 (幅未満なら右詰め�
 
 アルゴリズム (擬似コード):
 
-```
+```text
 fn print_hdr_line(p_timestamp, a, pos, iwidth, vwidth, offline_bitmap):
     hl = a.hdr_line を '|' で分割した pos 番目のセグメント
     if hl が存在しない: return
@@ -1234,7 +1234,7 @@ fn print_hdr_line(p_timestamp, a, pos, iwidth, vwidth, offline_bitmap):
 
 ##### 2.6.1 `LINUX RESTART`
 
-```
+```text
 "\n" + format!("{:<11}", cur_time) + "  LINUX RESTART\t({} CPU)" + "\n"
 ```
 
@@ -1245,7 +1245,7 @@ fn print_hdr_line(p_timestamp, a, pos, iwidth, vwidth, offline_bitmap):
 
 実出力 (`tests/expected.data-11.6.5` 冒頭):
 
-```
+```text
 09:33:38     LINUX RESTART	(8 CPU)
 ```
 
@@ -1253,7 +1253,7 @@ fn print_hdr_line(p_timestamp, a, pos, iwidth, vwidth, offline_bitmap):
 
 ##### 2.6.2 COMMENT
 
-```
+```text
 format!("{:<11}", cur_time) + "  COM " + comment + "\n"
 ```
 
@@ -1263,7 +1263,7 @@ format!("{:<11}", cur_time) + "  COM " + comment + "\n"
 
 実出力:
 
-```
+```text
 09:34:30     COM Hello, world!
 ```
 
@@ -1287,7 +1287,7 @@ format!("{:<11}", cur_time) + "  COM " + comment + "\n"
 
 `tests/expected.data-11.6.5` の A_FS ブロック (`-x` なし):
 
-```
+```text
 09:34:34       280398     14766      5.00     10.09  19056385    145663      0.76 /dev/sda7
 Summary:        19832      9569     32.55     37.70   1666005    255355     13.29 /dev/sda9
 ```
@@ -1297,7 +1297,7 @@ Summary:        19832      9569     32.55     37.70   1666005    255355     13.2
 アイテムごとに「ヘッダ行 (`Summary:` ラベル) + `Minimum:` + `Maximum:` + 平均行」の
 4 行ブロックが繰り返される。`tests/expected.sar-Ax` の A_FS ブロック:
 
-```
+```text
 Summary:     MBfsfree  MBfsused   %fsused  %ufsused     Ifree     Iused    %Iused FILESYSTEM
 Minimum:          705       127      7.27     18.92   1621550    102818      0.78 /dev/sda7
 Maximum:         2496       845     25.29     46.57  19051710    299810     15.60 /dev/sda7
@@ -1391,7 +1391,7 @@ flowchart TD
 
 ##### 2.8.2 WWN 由来の安定 ID (`-j SID`)
 
-```
+```text
 if wwn[1] != 0 { xsid = format!("{:016x}", wwn[1]) } else { xsid = "" }
 if part_nr != 0 { pn = format!("-{}", part_nr) } else { pn = "" }
 sid = format!("{:#016x}{}{}", wwn[0], xsid, pn)
@@ -1488,7 +1488,7 @@ sar のテキスト出力には区切り文字も TSV も存在せず、すべ�
 
 ### 1. バナー行 (`print_gal_header()` in `common.c`)
 
-```
+```text
 printf("%s %s (%s) \t%s \t_%s_\t(%d CPU)\n", sysname, release, nodename, cur_date, machine, cpu_nr);
 ```
 
@@ -1553,7 +1553,7 @@ printf("%s %s (%s) \t%s \t_%s_\t(%d CPU)\n", sysname, release, nodename, cur_dat
 サンプルの時刻)、データ行に載るのは `timestamp[curr]`(現サンプルの時刻)。
 したがって
 
-```
+```text
 10:00:01        CPU     %user ...      ← ヘッダ = 前サンプル時刻
 10:10:01        all      1.00 ...      ← データ = 現サンプル時刻
 ```
@@ -1575,7 +1575,7 @@ printf("%s %s (%s) \t%s \t_%s_\t(%d CPU)\n", sysname, release, nodename, cur_dat
 
 アルゴリズム (擬似コード):
 
-```
+```text
 fn print_hdr_line(p_ts, hdr_line, pos, iwidth, vwidth, offline_bitmap, nr_ini, bitmap, opt_flags):
     hl = hdr_line.split('|')[pos]        // pos が範囲外なら何も出さずに return
     print!("\n{:<11}", p_ts)             // 先頭に必ず改行 = 空行が 1 行入る
@@ -1631,7 +1631,7 @@ fn print_hdr_line(p_ts, hdr_line, pos, iwidth, vwidth, offline_bitmap, nr_ini, b
 
 #### 4.1 カラーの有効化条件 (`init_colors()`)
 
-```
+```text
 無効化される条件:
   (S_COLORS 未設定 && !isatty(stdout))
   || S_COLORES == "never"
@@ -1643,7 +1643,7 @@ fn print_hdr_line(p_ts, hdr_line, pos, iwidth, vwidth, offline_bitmap, nr_ini, b
 
 #### 4.2 `cprintf_f(unit, sign, num, wi, wd, ...)` — double 値
 
-```
+```text
 1) if wd > 0 && dplaces_nr >= 0 { wd = dplaces_nr }     // --dec= の反映。wd==0 には効かない
 2) lim = if wd == 1 { 0.05 } else { 0.005 }
 3) 値ごと:
@@ -1661,7 +1661,7 @@ fn print_hdr_line(p_ts, hdr_line, pos, iwidth, vwidth, offline_bitmap, nr_ini, b
 
 #### 4.3 `cprintf_u64(unit, num, wi, ...)` — 64bit 符号なし整数
 
-```
+```text
 if unit < 0 { printf(" %*"PRIu64, wi, val) } else { cprintf_unit(unit, wi, (double) val) }
 ```
 幅 = `1 + wi` = 10 桁。`--dec=` は**無関係**(整数出力)。
@@ -1674,7 +1674,7 @@ if unit < 0 { printf(" %*"PRIu64, wi, val) } else { cprintf_unit(unit, wi, (doub
 
 #### 4.5 `cprintf_xpc(human, xtrem, num, wi, wd, ...)` — パーセント値
 
-```
+```text
 1) if wd > 0 && dplaces_nr >= 0 { wd = dplaces_nr }
 2) if human > 0:                       // human = DISPLAY_UNIT(flags) = --human / -h
        if wi < 4 { wi = 4 }
@@ -1706,7 +1706,7 @@ if unit < 0 { printf(" %*"PRIu64, wi, val) } else { cprintf_unit(unit, wi, (doub
 
 #### 4.6 `cprintf_unit(unit, wi, dval)` — `--human` 時の単位付き表示
 
-```
+```text
 if wi < 4 { wi = 4 }
 if unit == 0 (UNIT_SECTOR) { dval /= 2; unit = 2 }      // セクタ → kB
 while dval >= 1024 { dval /= 1024; unit += 1 }
@@ -1753,7 +1753,7 @@ type: `IS_STR=1`(通常)、`IS_ZERO=4`、`IS_RESTART=2`(= `IS_DEBUG`)、`IS_COMM
 
 `common.h`:
 
-```
+```text
 S_VALUE(m, n, p)   = ((double)((n) - (m))) / (p) * 100
 SP_VALUE(m, n, p)  = ((double)((n) - (m))) / (p) * 100        // 定義は同一、意味論のみ違う
 MINIMUM(a, b)      = (a) < (b) ? (a) : (b)
@@ -1783,7 +1783,7 @@ PG_TO_KB(k)        = (k) << kb_shift
 
 #### 5.1 ディスク派生量 (`compute_ext_disk_stats()` in `rd_stats.c`)
 
-```
+```text
 util  = if tot_ticks_c < tot_ticks_p { 0.0 } else { S_VALUE(tot_ticks_p, tot_ticks_c, itv) }
 d_ios = nr_ios_c - nr_ios_p
 await = if nr_ios_c > nr_ios_p {
@@ -1797,7 +1797,7 @@ arqsz = if nr_ios_c > nr_ios_p {
 
 #### 5.2 NIC 利用率 (`compute_ifutil()` in `sa_common.c`)
 
-```
+```text
 if speed == 0 { return 0 }
 speed_bps = (u64) speed * 1_000_000
 if duplex == C_DUPLEX_FULL { return max(rx, tx) * 800 / speed_bps }
@@ -2111,12 +2111,12 @@ sar の `flags` 初期値は `S_F_LOCAL_TIME` (0x00004000)。
 `print_hdr_line(ts_prev, a, FIRST + DISPLAY_CPU_ALL(opt_flags), 7, 9, NULL)`。
 
 `hdr_line` (2 セクション):
-```
+```text
 CPU;%user;%nice;%system;%iowait;%steal;%idle|CPU;%usr;%nice;%sys;%iowait;%steal;%irq;%soft;%guest;%gnice;%idle
 ```
 
 ヘッダ描画結果:
-```
+```text
 [10:00:01        CPU     %user     %nice   %system   %iowait    %steal     %idle]
 [10:00:01        CPU      %usr     %nice      %sys   %iowait    %steal      %irq     %soft    %guest    %gnice     %idle]
 ```
@@ -2176,7 +2176,7 @@ CPU;%user;%nice;%system;%iowait;%steal;%idle|CPU;%usr;%nice;%sys;%iowait;%steal;
 `f_print` = `f_print_avg` = `print_pcsw_stats`。`print_hdr_line(ts_prev, a, FIRST, 0, 9, NULL)`。
 `hdr_line` = `proc/s;cswch/s`
 
-```
+```text
 [10:00:01       proc/s   cswch/s]
 ```
 
@@ -2197,7 +2197,7 @@ CPU;%user;%nice;%system;%iowait;%steal;%idle|CPU;%usr;%nice;%sys;%iowait;%steal;
 
 `hdr_line` = `INTR;CPU*`
 
-```
+```text
 [10:00:01         INTR       all      CPU0      CPU1]        ← -P ALL で CPU0/1 選択時
 [10:00:01          all      CPU0      CPU1 INTR]             ← --pretty (-p) 時
 ```
@@ -2207,7 +2207,7 @@ CPU;%user;%nice;%system;%iowait;%steal;%idle|CPU;%usr;%nice;%sys;%iowait;%steal;
 
 各 CPU 列は `F(1,9,2)` で 1 値ずつ:
 
-```
+```text
 val = if c == 0 && curr.irq_nr < prev.irq_nr { 0.0 }        // CPU オフラインで総数が減った
       else { S_VALUE(prev.irq_nr, curr.irq_nr, itv) }
 ```
@@ -2243,7 +2243,7 @@ CPU 列ループ上限は `c < min(a->nr[curr], a->bitmap->b_size + 1)`。
 `f_print` = `f_print_avg` = `print_swap_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `pswpin/s;pswpout/s`
 
-```
+```text
 [10:00:01     pswpin/s pswpout/s]
 ```
 
@@ -2256,7 +2256,7 @@ CPU 列ループ上限は `c < min(a->nr[curr], a->bitmap->b_size + 1)`。
 `f_print` = `f_print_avg` = `print_paging_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `pgpgin/s;pgpgout/s;fault/s;majflt/s;pgfree/s;pgscank/s;pgscand/s;pgsteal/s;pgprom/s;pgdem/s`
 
-```
+```text
 [10:00:01     pgpgin/s pgpgout/s   fault/s  majflt/s  pgfree/s pgscank/s pgscand/s pgsteal/s  pgprom/s   pgdem/s]
 ```
 
@@ -2284,7 +2284,7 @@ CPU 列ループ上限は `c < min(a->nr[curr], a->bitmap->b_size + 1)`。
 `f_print` = `f_print_avg` = `print_io_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `tps;rtps;wtps;dtps;bread/s;bwrtn/s;bdscd/s`
 
-```
+```text
 [10:00:01          tps      rtps      wtps      dtps   bread/s   bwrtn/s   bdscd/s]
 ```
 
@@ -2309,13 +2309,13 @@ CPU 列ループ上限は `c < min(a->nr[curr], a->bitmap->b_size + 1)`。
 `--human` 時 `unit = UNIT_KILOBYTE`。
 
 `hdr_line`:
-```
+```text
 kbmemfree;kbavail;kbmemused;%memused;kbbuffers;kbcached;kbcommit;%commit;kbactive;kbinact;kbdirty;kbshmem&kbanonpg;kbslab;kbkstack;kbpgtbl;kbvmused|kbswpfree;kbswpused;%swpused;kbswpcad;%swpcad
 ```
 
 ##### 7-A RAM ブロック (`-r`) — `print_hdr_line(..., FIRST, 0, 9, NULL)`
 
-```
+```text
 [10:00:01    kbmemfree   kbavail kbmemused  %memused kbbuffers  kbcached  kbcommit   %commit  kbactive   kbinact   kbdirty   kbshmem]
 [10:00:01    kbmemfree   kbavail kbmemused  %memused kbbuffers  kbcached  kbcommit   %commit  kbactive   kbinact   kbdirty   kbshmem  kbanonpg    kbslab  kbkstack   kbpgtbl  kbvmused]
 ```
@@ -2357,7 +2357,7 @@ item 数が 0 のレコードも含む (§1.6.1)。
 
 ##### 7-B swap ブロック (`-S`) — `print_hdr_line(..., SECOND, 0, 9, NULL)`
 
-```
+```text
 [10:00:01    kbswpfree kbswpused  %swpused  kbswpcad   %swpcad]
 ```
 
@@ -2378,7 +2378,7 @@ swap の総量は変動し得る前提で `avg_tlskb` も累積する(RAM 側は
 `f_print` = `print_ktables_stats`、`f_print_avg` = `print_avg_ktables_stats`。
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。`hdr_line` = `dentunusd;file-nr;inode-nr;pty-nr`
 
-```
+```text
 [10:00:01    dentunusd   file-nr  inode-nr    pty-nr]
 ```
 
@@ -2400,7 +2400,7 @@ swap の総量は変動し得る前提で `avg_tlskb` も累積する(RAM 側は
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `runq-sz;plist-sz;ldavg-1;ldavg-5;ldavg-15;blocked`
 
-```
+```text
 [10:00:01      runq-sz  plist-sz   ldavg-1   ldavg-5  ldavg-15   blocked]
 ```
 
@@ -2424,7 +2424,7 @@ swap の総量は変動し得る前提で `avg_tlskb` も累積する(RAM 側は
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `TTY;rcvin/s;xmtin/s;framerr/s;prtyerr/s;brk/s;ovrun/s`
 
-```
+```text
 [10:00:01          TTY   rcvin/s   xmtin/s framerr/s prtyerr/s     brk/s   ovrun/s]
 ```
 
@@ -2435,7 +2435,7 @@ swap の総量は変動し得る前提で `avg_tlskb` も累積する(RAM 側は
 `brk/s`=`brk`、`ovrun/s`=`overrun`。
 
 **前サンプルの探索** (シリアル回線は動的に増減する):
-```
+```text
 if WANT_SINCE_BOOT { ssp = buf[prev][0](全ゼロ構造体); found = true }
 else if a.nr[prev] > 0 {
     j = min(i, a.nr[prev]-1); j0 = j;
@@ -2455,7 +2455,7 @@ if !found { continue }      // その回線は行を出さない
 `print_hdr_line(..., FIRST, DISPLAY_PRETTY(flags) ? -1 : 0, 9, NULL)`。
 `hdr_line` = `DEV;tps;rkB/s;wkB/s;dkB/s;areq-sz;aqu-sz;await;%util`
 
-```
+```text
 [10:00:01          DEV       tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util]
 [10:00:01          tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util DEV]
 ```
@@ -2494,13 +2494,13 @@ pretty は行末 `cprintf_in(IS_STR, " %s", dev_name, 0)` (幅指定なし)。
 `print_hdr_line(..., FIRST, DISPLAY_PRETTY(flags) ? -1 : 0, 9, NULL)`。
 `hdr_line` = `IFACE;rxpck/s;txpck/s;rxkB/s;txkB/s;rxcmp/s;txcmp/s;rxmcst/s;%ifutil`
 
-```
+```text
 [10:00:01        IFACE   rxpck/s   txpck/s    rxkB/s    txkB/s   rxcmp/s   txcmp/s  rxmcst/s   %ifutil]
 [10:00:01      rxpck/s   txpck/s    rxkB/s    txkB/s   rxcmp/s   txcmp/s  rxmcst/s   %ifutil IFACE]
 ```
 
 前処理:
-```
+```text
 rxkb   = S(rx_bytes)          // バイト毎秒
 txkb   = S(tx_bytes)
 ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
@@ -2534,7 +2534,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `print_hdr_line(..., FIRST, DISPLAY_PRETTY(flags) ? -1 : 0, 9, NULL)`。
 `hdr_line` = `IFACE;rxerr/s;txerr/s;coll/s;rxdrop/s;txdrop/s;txcarr/s;rxfram/s;rxfifo/s;txfifo/s`
 
-```
+```text
 [10:00:01        IFACE   rxerr/s   txerr/s    coll/s  rxdrop/s  txdrop/s  txcarr/s  rxfram/s  rxfifo/s  txfifo/s]
 [10:00:01      rxerr/s   txerr/s    coll/s  rxdrop/s  txdrop/s  txcarr/s  rxfram/s  rxfifo/s  txfifo/s IFACE]
 ```
@@ -2553,7 +2553,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_nfs_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `call/s;retrans/s;read/s;write/s;access/s;getatt/s`
 
-```
+```text
 [10:00:01       call/s retrans/s    read/s   write/s  access/s  getatt/s]
 ```
 
@@ -2567,7 +2567,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_nfsd_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `scall/s;badcall/s;packet/s;udp/s;tcp/s;hit/s;miss/s;sread/s;swrite/s;saccess/s;sgetatt/s`
 
-```
+```text
 [10:00:01      scall/s badcall/s  packet/s     udp/s     tcp/s     hit/s    miss/s   sread/s  swrite/s saccess/s sgetatt/s]
 ```
 
@@ -2583,7 +2583,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `totsck;tcpsck;udpsck;rawsck;ip-frag;tcp-tw`
 
-```
+```text
 [10:00:01       totsck    tcpsck    udpsck    rawsck   ip-frag    tcp-tw]
 ```
 
@@ -2603,7 +2603,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_ip_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `irec/s;fwddgm/s;idel/s;orq/s;asmrq/s;asmok/s;fragok/s;fragcrt/s`
 
-```
+```text
 [10:00:01       irec/s  fwddgm/s    idel/s     orq/s   asmrq/s   asmok/s  fragok/s fragcrt/s]
 ```
 
@@ -2617,7 +2617,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_eip_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `ihdrerr/s;iadrerr/s;iukwnpr/s;idisc/s;odisc/s;onort/s;asmf/s;fragf/s`
 
-```
+```text
 [10:00:01    ihdrerr/s iadrerr/s iukwnpr/s   idisc/s   odisc/s   onort/s    asmf/s   fragf/s]
 ```
 
@@ -2631,7 +2631,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_icmp_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `imsg/s;omsg/s;iech/s;iechr/s;oech/s;oechr/s;itm/s;itmr/s;otm/s;otmr/s;iadrmk/s;iadrmkr/s;oadrmk/s;oadrmkr/s`
 
-```
+```text
 [10:00:01       imsg/s    omsg/s    iech/s   iechr/s    oech/s   oechr/s     itm/s    itmr/s     otm/s    otmr/s  iadrmk/s iadrmkr/s  oadrmk/s oadrmkr/s]
 ```
 
@@ -2646,7 +2646,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_eicmp_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `ierr/s;oerr/s;idstunr/s;odstunr/s;itmex/s;otmex/s;iparmpb/s;oparmpb/s;isrcq/s;osrcq/s;iredir/s;oredir/s`
 
-```
+```text
 [10:00:01       ierr/s    oerr/s idstunr/s odstunr/s   itmex/s   otmex/s iparmpb/s oparmpb/s   isrcq/s   osrcq/s  iredir/s  oredir/s]
 ```
 
@@ -2661,7 +2661,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_tcp_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `active/s;passive/s;iseg/s;oseg/s`
 
-```
+```text
 [10:00:01     active/s passive/s    iseg/s    oseg/s]
 ```
 
@@ -2674,7 +2674,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_etcp_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `atmptf/s;estres/s;retrseg/s;isegerr/s;orsts/s`
 
-```
+```text
 [10:00:01     atmptf/s  estres/s retrseg/s isegerr/s   orsts/s]
 ```
 
@@ -2687,7 +2687,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_udp_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `idgm/s;odgm/s;noport/s;idgmerr/s`
 
-```
+```text
 [10:00:01       idgm/s    odgm/s  noport/s idgmerr/s]
 ```
 
@@ -2700,7 +2700,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `print_net_sock6_stats`、`f_print_avg` = `print_avg_net_sock6_stats`。
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。`hdr_line` = `tcp6sck;udp6sck;raw6sck;ip6-frag`
 
-```
+```text
 [10:00:01      tcp6sck   udp6sck   raw6sck  ip6-frag]
 ```
 
@@ -2718,7 +2718,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_ip6_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `irec6/s;fwddgm6/s;idel6/s;orq6/s;asmrq6/s;asmok6/s;imcpck6/s;omcpck6/s;fragok6/s;fragcr6/s`
 
-```
+```text
 [10:00:01      irec6/s fwddgm6/s   idel6/s    orq6/s  asmrq6/s  asmok6/s imcpck6/s omcpck6/s fragok6/s fragcr6/s]
 ```
 
@@ -2733,7 +2733,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_eip6_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `ihdrer6/s;iadrer6/s;iukwnp6/s;i2big6/s;idisc6/s;odisc6/s;inort6/s;onort6/s;asmf6/s;fragf6/s;itrpck6/s`
 
-```
+```text
 [10:00:01    ihdrer6/s iadrer6/s iukwnp6/s  i2big6/s  idisc6/s  odisc6/s  inort6/s  onort6/s   asmf6/s  fragf6/s itrpck6/s]
 ```
 
@@ -2748,7 +2748,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_icmp6_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `imsg6/s;omsg6/s;iech6/s;iechr6/s;oechr6/s;igmbq6/s;igmbr6/s;ogmbr6/s;igmbrd6/s;ogmbrd6/s;irtsol6/s;ortsol6/s;irtad6/s;inbsol6/s;onbsol6/s;inbad6/s;onbad6/s`
 
-```
+```text
 [10:00:01      imsg6/s   omsg6/s   iech6/s  iechr6/s  oechr6/s  igmbq6/s  igmbr6/s  ogmbr6/s igmbrd6/s ogmbrd6/s irtsol6/s ortsol6/s  irtad6/s inbsol6/s onbsol6/s  inbad6/s  onbad6/s]
 ```
 
@@ -2769,7 +2769,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_eicmp6_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `ierr6/s;idtunr6/s;odtunr6/s;itmex6/s;otmex6/s;iprmpb6/s;oprmpb6/s;iredir6/s;oredir6/s;ipck2b6/s;opck2b6/s`
 
-```
+```text
 [10:00:01      ierr6/s idtunr6/s odtunr6/s  itmex6/s  otmex6/s iprmpb6/s oprmpb6/s iredir6/s oredir6/s ipck2b6/s opck2b6/s]
 ```
 
@@ -2786,7 +2786,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `f_print_avg` = `print_net_udp6_stats`。`print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `idgm6/s;odgm6/s;noport6/s;idgmer6/s`
 
-```
+```text
 [10:00:01      idgm6/s   odgm6/s noport6/s idgmer6/s]
 ```
 
@@ -2801,7 +2801,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 ヘッダ条件: `dish && !(dispavg && DISPLAY_MINMAX(flags))`。
 `print_hdr_line(..., FIRST, 7, 9, NULL)`。`hdr_line` = `CPU;MHz`
 
-```
+```text
 [10:00:01        CPU       MHz]
 ```
 
@@ -2827,7 +2827,7 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `print_hdr_line(..., FIRST, -2, 9, NULL)` ← **`-2` なので第 2 トークン `DEVICE` が行末へ**。
 `hdr_line` = `FAN;DEVICE;rpm;drpm`
 
-```
+```text
 [10:00:01          FAN       rpm      drpm DEVICE]
 ```
 
@@ -2849,14 +2849,14 @@ ifutil = compute_ifutil(sndc, rxkb, txkb)     // §5.2
 `f_print` = `print_pwr_temp_stats`、`f_print_avg` = `print_avg_pwr_temp_stats`。
 `print_hdr_line(..., FIRST, -2, 9, NULL)`。`hdr_line` = `TEMP;DEVICE;degC;%temp`
 
-```
+```text
 [10:00:01         TEMP      degC     %temp DEVICE]
 ```
 
 アイテム列: `cprintf_in(IS_INT, "     %5d", "", i + 1)` → 10 桁、**1 起点**。
 
 前計算:
-```
+```text
 temppct = if (temp_max - temp_min) != 0.0 { (temp - temp_min) / (temp_max - temp_min) * 100.0 }
           else { 0.0 }
 ```
@@ -2877,7 +2877,7 @@ temppct = if (temp_max - temp_min) != 0.0 { (temp - temp_min) / (temp_max - temp
 `f_print` = `print_pwr_in_stats`、`f_print_avg` = `print_avg_pwr_in_stats`。
 `print_hdr_line(..., FIRST, -2, 9, NULL)`。`hdr_line` = `IN;DEVICE;inV;%in`
 
-```
+```text
 [10:00:01           IN       inV       %in DEVICE]
 ```
 
@@ -2903,7 +2903,7 @@ temppct = if (temp_max - temp_min) != 0.0 { (temp - temp_min) / (temp_max - temp
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `kbhugfree;kbhugused;%hugused;kbhugrsvd;kbhugsurp`
 
-```
+```text
 [10:00:01    kbhugfree kbhugused  %hugused kbhugrsvd kbhugsurp]
 ```
 
@@ -2924,7 +2924,7 @@ temppct = if (temp_max - temp_min) != 0.0 { (temp - temp_min) / (temp_max - temp
 ヘッダ条件: `dish && !((prev == 2) && DISPLAY_MINMAX(flags))`。
 `print_hdr_line(..., FIRST, 7, 9, NULL)`。`hdr_line` = `CPU;wghMHz`
 
-```
+```text
 [10:00:01        CPU    wghMHz]
 ```
 
@@ -2932,7 +2932,7 @@ temppct = if (temp_max - temp_min) != 0.0 { (temp - temp_min) / (temp_max - temp
 個別 CPU は `cprintf_in(IS_INT, "     %3d", "", i - 1)`(空白 5 + 3 桁 = 8 桁)。
 
 計算:
-```
+```text
 tisfreq = 0; tis = 0;
 for k in 0 .. nr2 {
     let ck = &buf[curr][i * nr2 + k];
@@ -2958,14 +2958,14 @@ wghmhz = if tis != 0 { tisfreq as f64 / tis as f64 } else { 0.0 }
 (後者は `stub_print_pwr_usb_stats(a, 2, TRUE)`、つまり **`buf[2]` のサマリリスト**を表示)。
 
 **`print_hdr_line()` を使わない唯一のアクティビティ**。ヘッダはハードコード:
-```
+```text
 printf("\n%-11s     BUS  idvendor    idprod  maxpower", dispavg ? "Summary:" : ts_prev);
 printf(" %-*s product\n", MAX_MANUF_LEN - 1 /* = 23 */, "manufact");
 ```
 `activity.c` の `hdr_line` (`manufact;product;BUS;idvendor;idprod;maxpower`) は
 sadf (XML/JSON/CSV) 専用で、テキスト出力では使われない。
 
-```
+```text
 [10:00:01        BUS  idvendor    idprod  maxpower manufact                product]
 ```
 
@@ -3003,17 +3003,17 @@ sadf (XML/JSON/CSV) 専用で、テキスト出力では使われない。
 ヘッダ条件: `(dish || DISPLAY_ZERO_OMIT(flags)) && !(dispavg && DISPLAY_MINMAX(flags))`。
 `print_hdr_line(dispavg ? "Summary:" : ts_prev, a, FIRST + DISPLAY_MOUNT(opt_flags), -1, 9, NULL)`。
 `hdr_line`:
-```
+```text
 FILESYSTEM;MBfsfree;MBfsused;%fsused;%ufsused;Ifree;Iused;%Iused|MOUNTPOINT;MBfsfree;MBfsused;%fsused;%ufsused;Ifree;Iused;%Iused
 ```
 
-```
+```text
 [10:00:01     MBfsfree  MBfsused   %fsused  %ufsused     Ifree     Iused    %Iused FILESYSTEM]
 [10:00:01     MBfsfree  MBfsused   %fsused  %ufsused     Ifree     Iused    %Iused MOUNTPOINT]
 ```
 
 前計算 (`f_bfree` / `f_blocks` / `f_bavail` はバイト単位):
-```
+```text
 mbfsfree   = if unit < 0 { f_bfree as f64 / 1024.0 / 1024.0 } else { f_bfree as f64 }
 mbfsused   = if unit < 0 { (f_blocks - f_bfree) as f64 / 1024.0 / 1024.0 }
              else { (f_blocks - f_bfree) as f64 }
@@ -3067,7 +3067,7 @@ iusedpct   = if f_files  != 0 { SP(f_ffree,  f_files,  f_files)  } else { 0.0 }
 `print_hdr_line(..., FIRST, -1, 9, NULL)` ← **`FCHOST` は行末へ**。
 `hdr_line` = `FCHOST;fch_rxf/s;fch_txf/s;fch_rxw/s;fch_txw/s`
 
-```
+```text
 [10:00:01    fch_rxf/s fch_txf/s fch_rxw/s fch_txw/s FCHOST]
 ```
 
@@ -3090,7 +3090,7 @@ iusedpct   = if f_files  != 0 { SP(f_ffree,  f_files,  f_files)  } else { 0.0 }
 `print_hdr_line(..., FIRST, 7, 9, NULL)`。
 `hdr_line` = `CPU;total/s;dropd/s;squeezd/s;rx_rps/s;flw_lim/s;blg_len`
 
-```
+```text
 [10:00:01        CPU   total/s   dropd/s squeezd/s  rx_rps/s flw_lim/s   blg_len]
 ```
 
@@ -3122,7 +3122,7 @@ iusedpct   = if f_files  != 0 { SP(f_ffree,  f_files,  f_files)  } else { 0.0 }
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。
 `hdr_line` = `%scpu-10;%scpu-60;%scpu-300;%scpu`
 
-```
+```text
 [10:00:01     %scpu-10  %scpu-60 %scpu-300     %scpu]
 ```
 
@@ -3148,12 +3148,12 @@ iusedpct   = if f_files  != 0 { SP(f_ffree,  f_files,  f_files)  } else { 0.0 }
 ヘッダ条件・`print_hdr_line` 引数は A_PSI_CPU と同じ。
 `hdr_line` = `%sio-10;%sio-60;%sio-300;%sio;%fio-10;%fio-60;%fio-300;%fio`
 
-```
+```text
 [10:00:01      %sio-10   %sio-60  %sio-300      %sio   %fio-10   %fio-60  %fio-300      %fio]
 ```
 
 前計算:
-```
+```text
 siopct = (curr.some_io_total as f64 - prev.some_io_total as f64) / (100.0 * itv as f64)
 fiopct = (curr.full_io_total as f64 - prev.full_io_total as f64) / (100.0 * itv as f64)
 ```
@@ -3176,11 +3176,11 @@ fiopct = (curr.full_io_total as f64 - prev.full_io_total as f64) / (100.0 * itv 
 構造は A_PSI_IO と完全に同形。
 `hdr_line` = `%smem-10;%smem-60;%smem-300;%smem;%fmem-10;%fmem-60;%fmem-300;%fmem`
 
-```
+```text
 [10:00:01     %smem-10  %smem-60 %smem-300     %smem  %fmem-10  %fmem-60 %fmem-300     %fmem]
 ```
 
-```
+```text
 smempct = (curr.some_mem_total as f64 - prev.some_mem_total as f64) / (100.0 * itv as f64)
 fmempct = (curr.full_mem_total as f64 - prev.full_mem_total as f64) / (100.0 * itv as f64)
 ```
@@ -3197,7 +3197,7 @@ fmempct = (curr.full_mem_total as f64 - prev.full_mem_total as f64) / (100.0 * i
 ヘッダ条件: `dish && !((prev == 2) && DISPLAY_MINMAX(flags))`。
 `print_hdr_line(..., FIRST, 0, 9, NULL)`。`hdr_line` = `BAT;%cap;cap/min;status`
 
-```
+```text
 [10:00:01          BAT      %cap   cap/min    status]
 ```
 
@@ -3248,7 +3248,7 @@ fmempct = (curr.full_mem_total as f64 - prev.full_mem_total as f64) / (100.0 * i
 
 `write_stats_avg(curr, read_from_file, act_id)` (`sar.c`):
 
-```
+```text
 itv = get_interval(record_hdr[2].uptime_cs, record_hdr[curr].uptime_cs)   // 全期間の interval
 timestamp[curr]  = _("Average:")
 timestamp[!curr] = if DISPLAY_MINMAX(flags) { _("Summary:") } else { _("Average:") }
@@ -3324,7 +3324,7 @@ A_PSI_* の `%scpu` / `%sio` / `%fio` / `%smem` / `%fmem` も再計算、
 (`pr_xstats.c` の `print_*_xstats()` 群)。
 
 `-x` 時の平均ブロックの構造(実測):
-```
+```text
 Summary:        CPU     %user     %nice   %system   %iowait    %steal     %idle
 Minimum:          7      1.86      0.00      0.93      0.02      0.00     86.63
 Maximum:          7      7.81      0.00      5.24      0.36      0.00     97.19
@@ -3337,7 +3337,7 @@ min/max は **LINUX RESTART の間ごとに初期化**される(`xinit` → `ini
 #### 8.4 `LINUX RESTART` 行
 
 `print_sar_restart()` (`sar.c`):
-```
+```text
 printf("\n%-11s", cur_time);
 sprintf(restart, "  LINUX RESTART\t(%u CPU)", file_hdr->sa_cpu_nr > 1 ? sa_cpu_nr - 1 : 1);
 cprintf_s(IS_RESTART, "%s", restart);
@@ -3350,7 +3350,7 @@ printf("\n");
 - `N` = `sa_cpu_nr - 1`(ただし `sa_cpu_nr <= 1` なら 1)。
 - 色は `sc_sa_restart`(既定 `C_LIGHT_RED`)。非 tty では無色。
 - 実測:
-```
+```text
 09:33:38     LINUX RESTART	(8 CPU)
 ```
 - RESTART レコードの直後には新しい CPU 数が格納されており、`print_special_record()` が
@@ -3362,7 +3362,7 @@ printf("\n");
 #### 8.5 `COM` 行 (コメント)
 
 `print_sar_comment()` (`sar.c`):
-```
+```text
 printf("%-11s", cur_time);
 cprintf_s(IS_COMMENT, "  COM %s", comment);
 printf("\n");
@@ -3375,7 +3375,7 @@ printf("\n");
   最大長 `MAX_COMMENT_LEN`。
 - **`-C` オプション (`S_F_COMMENT`) を付けたときだけ表示される。**
 - 実測:
-```
+```text
 09:34:30     COM Hello, world!
 ```
 - **ファイルモードではアクティビティごとにファイルを先頭から読み直すため、
@@ -3431,7 +3431,7 @@ sar テキスト出力に行末空白が出るのは **A_PWR_USB で `manufactur
 `int dish = TRUE;`(`sar.c` のファイルスコープ変数、初期値 TRUE)。
 
 `get_win_height()` (`common.c`):
-```
+```text
 rows = DEFAULT_ROWS                       // = SEC_PER_DAY = 3600*24 = 86400
 if ioctl(STDOUT_FILENO, TIOCGWINSZ, &win) != -1 {
     if win.ws_row > 2 { rows = win.ws_row - 2 }
@@ -3449,7 +3449,7 @@ return max(rows, MIN_ROWS /* = 1 */)
 
 ##### ファイル読み込みモード (`sar -f`)
 
-```
+```text
 rows = get_win_height()                  // read_stats_from_file() 冒頭で 1 回
 // handle_curr_act_stats() は「アクティビティ × 出力」ごとに呼ばれ、lines = 0 から開始
 loop {
@@ -3470,7 +3470,7 @@ if davg > 0 { write_stats_avg(...) }     // dish は最後のループ反復で�
 
 ##### リアルタイムモード (`sar [interval] [count]`)
 
-```
+```text
 dis_hdr = check_line_hdr()
 lines = rows = get_win_height()
 loop {
@@ -3483,7 +3483,7 @@ if avg_count > 0 { write_stats_avg(...) }
 ```
 
 `check_line_hdr()` (`sar.c`) の戻り値:
-```
+```text
 if get_activity_nr(act, AO_SELECTED, COUNT_OUTPUTS) > 1 { return TRUE }
 // 選択が 1 つだけのとき:
 最初に見つかった選択済みアクティビティについて
@@ -3562,7 +3562,7 @@ C〜F 群は逆に `-x` の平均出力ではヘッダを出さない(`print_*_x
 
 #### 10.2 バナー・特殊行(抜粋、`tests/expected.data-11.6.5`)
 
-```
+```text
 Linux 4.17.18-200.fc28.x86_64 (linux.home) 	08/29/18 	_x86_64_	(8 CPU)
 
 09:33:38     LINUX RESTART	(8 CPU)
@@ -3577,7 +3577,7 @@ Linux 4.17.18-200.fc28.x86_64 (linux.home) 	08/29/18 	_x86_64_	(8 CPU)
 
 `tests/expected.data-11.6.5` の A_CPU ブロック(行 6〜8、行末に空白なし):
 
-```
+```text
 09:33:48        CPU      %usr     %nice      %sys   %iowait    %steal      %irq     %soft    %guest    %gnice     %idle
 09:34:34        all      0.47      0.00      0.55      0.08      0.00      0.13      0.03      0.00      0.00     98.75
 09:34:34          0      0.55      0.00      0.24      0.13      0.00      0.04      0.02      0.00      0.00     99.02
@@ -3604,14 +3604,14 @@ A_MEMORY 短縮形 `-r` は `kbshmem` で終わり行長 **131**。
 ファイルモードでは `dish` が偽なので、ほとんどのブロックで `Average:` 行の前に
 **ヘッダも空行も入らない**:
 
-```
+```text
 09:34:34      4066192   5791704   2354884     28.91    183296   1486360   7907476     31.73 …
 Average:      4066192   5791704   2354884     28.91    183296   1486360   7907476     31.73 …
 ```
 
 A_IRQ だけは例外で、`Average:` が独立ブロック(空行 + `Average:` ヘッダ行)になる:
 
-```
+```text
 09:34:34           19     42.29
 
 Average:         INTR       all
@@ -3621,7 +3621,7 @@ Average:            0      0.00
 
 A_PWR_USB と A_FS は `Summary:`:
 
-```
+```text
 09:33:48        BUS  idvendor    idprod  maxpower manufact                product
 09:34:34          2       58f      6362       500 Generic                 Mass Storage Device
 Summary:          2       58f      6362       500 Generic                 Mass Storage Device
@@ -3633,7 +3633,7 @@ Summary:        19832      9569     32.55     37.70   1666005    255355     13.2
 `-x` 併用時は `Summary:` ヘッダ + `Minimum:` + `Maximum:` + `Average:` の 4 行組
 (`tests/expected.sar-ix`):
 
-```
+```text
 Summary:        CPU     %user     %nice   %system   %iowait    %steal     %idle
 Minimum:          7      1.86      0.00      0.93      0.02      0.00     86.63
 Maximum:          7      7.81      0.00      5.24      0.36      0.00     97.19
@@ -3642,7 +3642,7 @@ Average:          7      3.36      0.00      1.92      0.18      0.00     94.54
 
 #### 10.5 `--human` の実測 (`tests/expected.sar-human`)
 
-```
+```text
 13:20:19        all      2.1%     12.5%      1.8%      0.1%      0.0%      0.3%      0.2%      0.0%      0.0%     82.9%
 13:20:19         1.4G      4.2G      3.6G     46.1%    254.1M      2.7G     11.5G     48.5%      3.9G      1.7G    396.0k     85.9M …
 13:20:19          sda      0.00      0.0k      0.0k      0.0k      0.0k      0.00      0.00      0.0%
@@ -3662,7 +3662,7 @@ Average:          7      3.36      0.00      1.92      0.18      0.00     94.54
 
 #### 10.6 `--dec=0` の実測 (`tests/expected.sar-dec`)
 
-```
+```text
 13:20:19        all         2        12         2         0         0         0         0         0         0        83
 13:20:19      1437740   4389516   3755444        46    260172   2821596  12097852        49   4042384   1772396 …
 13:20:19          sda         0         0         0         0         0         0         0         0
@@ -3675,7 +3675,7 @@ Average:          7      3.36      0.00      1.92      0.18      0.00     94.54
 
 #### 10.7 `--pretty` / `-z` の実測
 
-```
+```text
 13:20:09          tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util DEV
 13:20:19         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00 sda
 ```
@@ -3689,7 +3689,7 @@ Average:          7      3.36      0.00      1.92      0.18      0.00     94.54
 `manufacturer` / `product` が両方空の行だけ(4 行)。`cat -et` で確認すると
 **25 個の空白 + 行末**、行長 74 バイト:
 
-```
+```text
 09:34:34          2      8087        24         0                         $
 Summary:          2      8087        24         0                         $
 ```
@@ -3855,7 +3855,7 @@ sysstat には時刻文字列を作る関数が **3 系統** あり、担当コ�
 
 `set_record_timestamp_string(l_flags, cur_date, cur_time, len, rectime)` の擬似コード:
 
-```
+```text
 if PRINT_SEC_EPOCH(l_flags) and cur_date != NULL:
     cur_time = decimal(rectime.epoch_time)      # "%llu"
     cur_date = ""                               # 空文字列
@@ -3870,7 +3870,7 @@ else:
 
 `S_F_PREFD_TIME_OUTPUT` (`0x00008000`) を立てるのは **`sar.c` の 1 箇所だけ**:
 
-```
+```text
 # sar.c, オプション解析完了後
 if not is_iso_time_fmt():
     flags |= S_F_PREFD_TIME_OUTPUT
@@ -3891,7 +3891,7 @@ if not is_iso_time_fmt():
 
 #### `is_iso_time_fmt()` のキャッシュ挙動
 
-```
+```text
 static is_iso = -1
 if is_iso < 0:
     e = getenv("S_TIME_FORMAT")
@@ -3906,7 +3906,7 @@ return is_iso
 `S_TIME_DEF_TIME` は **出力の表示タイムゾーンを変えない**。効果は `get_time()` 経由の
 「現在時刻の取得」だけである。
 
-```
+```text
 get_time(rectime, d_off):
     static utc = 0
     if utc == 0:                        # 初回のみ環境変数を読む
@@ -3937,7 +3937,7 @@ get_xtime(rectime, d_off, utc):
 
 `sa_get_record_timestamp_struct()` の擬似コード:
 
-```
+```text
 sa_get_record_timestamp_struct(l_flags, record_hdr, rectime):
     t = record_hdr.ust_time            # UTC epoch 秒
     rectime.epoch_time = t
@@ -3964,7 +3964,7 @@ sa_get_record_timestamp_struct(l_flags, record_hdr, rectime):
 
 `tests/expected.sadf-d-tz` (作成 TZ=`Europe/Paris`、読み出し TZ=`America/New_York`):
 
-```
+```text
 SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;-1;2.15;12.50;2.36;0.12;0.00;82.88
 ```
 
@@ -3998,7 +3998,7 @@ SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;-1;2.15;12.50;2.36;0.12;0.00;82.88
 
 `tests/expected.sadf-d-t-tz` (記録 TZ=`Europe/Paris` → `tzname[0]`=`"CET"`):
 
-```
+```text
 SYSSTAT.TEST;31;2019-04-18 15:20:19 CET;-1;2.15;12.50;2.36;0.12;0.00;82.88
 ```
 
@@ -4007,7 +4007,7 @@ SYSSTAT.TEST;31;2019-04-18 15:20:19 CET;-1;2.15;12.50;2.36;0.12;0.00;82.88
 `sadf -c` 変換ファイルでは空になる) は、`print_dbppc_timestamp()` /
 `print_raw_timestamp()` の条件式によりラベルが付かない:
 
-```
+```text
 if len(cur_date) > 0 and (not TRUE_TIME or (TRUE_TIME and len(sa_tzname) > 0)):
     pre = "<host><sep><itv><sep><date> <time> <tzlabel>"
 else:
@@ -4016,7 +4016,7 @@ else:
 
 `tzlabel` の選択順は全フォーマット共通で:
 
-```
+```text
 PRINT_LOCAL_TIME ? my_tzname : (PRINT_TRUE_TIME ? file_hdr.sa_tzname : "UTC")
 ```
 
@@ -4024,7 +4024,7 @@ PRINT_LOCAL_TIME ? my_tzname : (PRINT_TRUE_TIME ? file_hdr.sa_tzname : "UTC")
 
 `get_file_timestamp_struct()`:
 
-```
+```text
 if PRINT_TRUE_TIME(flags):
     tm_time = get_time(now, 0)            # 既定値を埋めるためだけに現在時刻を使う
     tm_time.tm_mday = file_hdr.sa_day     # unsigned char
@@ -4052,7 +4052,7 @@ else:
 
 `-T` のラベル生成 (`sadf.c`, オプション解析後):
 
-```
+```text
 if PRINT_LOCAL_TIME(flags):
     tzset()
     my_tzname = tzname[0]
@@ -4061,7 +4061,7 @@ if PRINT_LOCAL_TIME(flags):
 **`tzname[0]` は「標準時側」の略称**である。夏時間中でも `tzname[1]` (`CEST`/`EDT`) は使われない。
 `tests/expected.sadf-T-s-epoch` (`TZ="Europe/Paris"`, epoch 1555595349 = 2019-04-18 13:49:09 UTC):
 
-```
+```text
 SYSSTAT.TEST;-1;2019-04-18 15:54:09 CET;LINUX-RESTART	(10 CPU)
 ```
 
@@ -4077,7 +4077,7 @@ SYSSTAT.TEST;-1;2019-04-18 15:54:09 CET;LINUX-RESTART	(10 CPU)
 db/ppc/raw の組み立てが「日付欄なし・TZ ラベルなし」の分岐に落ちる。
 `tests/expected.sadf-U-se-epoch`:
 
-```
+```text
 SYSSTAT.TEST;39;1555593639;-1;2.66;23.20;2.27;0.17;0.00;71.70
 ```
 
@@ -4140,7 +4140,7 @@ SYSSTAT.TEST;39;1555593639;-1;2.66;23.20;2.27;0.17;0.00;71.70
 `print_hdr_line()` のヘッダフィールドは `" %*s"` で `vwidth`(= 常に 9) または `iwidth`。
 `tests/expected.data-11.6.5`:
 
-```
+```text
 09:33:48        CPU      %usr     %nice      %sys ...
 09:34:34        all      0.47      0.00      0.55 ...
 Average:        all      0.47      0.00      0.55 ...
@@ -4154,7 +4154,7 @@ Average:        all      0.47      0.00      0.55 ...
 (`print_hdr_line()`) または RESTART 行が先頭に `\n` を出すことで**空行 1 行**が生じる。
 COMMENT 行 (`print_sar_comment()`) は先頭改行を出さない。レポート末尾に追加の空行は出ない。
 
-```
+```text
 Linux 4.17.18-200.fc28.x86_64 (linux.home) 	08/29/18 	_x86_64_	(8 CPU)
                                                     ← print_sar_restart() の先頭 "\n"
 09:33:38     LINUX RESTART	(8 CPU)
@@ -4171,7 +4171,7 @@ COMMENT 行は `"%-11s"` + `"  COM %s"` + `"\n"`。
 
 `parse_timestamp(argv, opt, tse, def_timestamp, flags)` の擬似コード:
 
-```
+```text
 ok = FALSE
 opt += 1                                        # ← 常に 1 進む
 if argv[opt] != NULL and argv[opt] does not start with "-":
@@ -4198,7 +4198,7 @@ return decode_timestamp(timestamp, tse)
 
 `decode_timestamp()`:
 
-```
+```text
 timestamp[2] = timestamp[5] = '\0'              # 引数バッファを破壊的に書き換える
 if strspn(timestamp,      DIGITS) != 2: return 1
 if strspn(&timestamp[3],  DIGITS) != 2: return 1
@@ -4211,7 +4211,7 @@ tse.use = USE_HHMMSS_T; return 0
 
 `decode_epoch()`:
 
-```
+```text
 tse.epoch_time = atol(timestamp)
 if tse.epoch_time == 0:                          # "0000000000" もエラー扱い
     tse.use = NO_TIME; return 1
@@ -4239,7 +4239,7 @@ tse.use = USE_EPOCH_T; return 0
 
 #### `check_time_limits()` — 日付跨ぎのラップ処理
 
-```
+```text
 check_time_limits(tm_start, tm_end):
     if tm_start.use == USE_HHMMSS_T and tm_end.use == USE_HHMMSS_T
        and tm_end.tm_hour < tm_start.tm_hour:
@@ -4259,7 +4259,7 @@ check_time_limits(tm_start, tm_end):
 
 ### 1.9 `datecmp()` と day-rollover
 
-```
+```text
 datecmp(rectime, tse, cross_day):
     switch tse.use:
         case USE_HHMMSS_T:
@@ -4294,7 +4294,7 @@ datecmp(rectime, tse, cross_day):
 
 `sar` (`write_stats()`, `static int cross_day`):
 
-```
+```text
 prev_hour = sa_get_record_timestamp_struct(flags, record_hdr[!curr]).tm_hour
 rectime   = sa_get_record_timestamp_struct(flags, record_hdr[curr])
 if use_tm_start == USE_HHMMSS_T                    # -s が hh:mm:ss 形式のときのみ
@@ -4306,7 +4306,7 @@ if use_tm_start == USE_HHMMSS_T                    # -s が hh:mm:ss 形式の�
 
 `sadf` (`generic_write_stats()`):
 
-```
+```text
 if use_tm_start != NO_TIME                         # epoch 形式でも立つ
    and record_hdr[!curr].ust_time != 0
    and record_hdr[curr].ust_time > record_hdr[!curr].ust_time
@@ -4357,7 +4357,7 @@ flowchart TD
 
 擬似コードにすると:
 
-```
+```text
 # ---- 外側ループ: -s/-e の範囲内にある最初の R_STATS を探す ----
 repeat:
     rec = read_record_hdr()
@@ -4406,7 +4406,7 @@ for act in selected_activities:
 **統計行として表示されない**。`tests/expected.sar-se` (`sar -s 13:20:20 -e 13:20:40`、
 データは `13:20:09/19/29/39/49`) が以下のようになるのはこのため。
 
-```
+```text
 13:20:29        CPU     %user     %nice   %system   %iowait    %steal     %idle
 13:20:39        all      2.66     23.20      2.27      0.17      0.00     71.70
 Average:        all      2.66     23.20      2.27      0.17      0.00     71.70
@@ -4451,7 +4451,7 @@ Average:        all      2.66     23.20      2.27      0.17      0.00     71.70
 
 ### 2.1 `units[]` と `cprintf_unit()` のスケーリングアルゴリズム
 
-```
+```text
 # common.c
 char units[] = {'s', 'B', 'k', 'M', 'G', 'T', 'P', '?'};    /* NR_UNITS = 8 */
 
@@ -4460,7 +4460,7 @@ char units[] = {'s', 'B', 'k', 'M', 'G', 'T', 'P', '?'};    /* NR_UNITS = 8 */
 enum { UNIT_SECTOR = 0, UNIT_BYTE = 1, UNIT_KILOBYTE = 2 };
 ```
 
-```
+```text
 cprintf_unit(unit, wi, dval):
     if wi < 4: wi = 4                       # 例: "1.3M" を出すための最小幅
     if unit == 0:                           # UNIT_SECTOR
@@ -4490,7 +4490,7 @@ cprintf_unit(unit, wi, dval):
 
 `tests/expected.sar-human` の実例:
 
-```
+```text
 13:20:09    kbmemfree   kbavail kbmemused  %memused kbbuffers  kbcached ...   kbdirty ...  kbvmused
 13:20:19         1.4G      4.2G      3.6G     46.1%    254.1M      2.7G ...    396.0k ...      0.0k
 ```
@@ -4514,19 +4514,19 @@ cprintf_unit(unit, wi, dval):
 
 `A_NET_DEV` と `A_FS` は **`--human` の有無で渡す値そのものが変わる**。実装パターン:
 
-```
+```text
 cprintf_f(unit, FALSE, 2, 9, 2,
           unit < 0 ? rxkb / 1024 : rxkb,      # 非 human は kB/s、human は B/s
           unit < 0 ? txkb / 1024 : txkb);
 ```
 
-```
+```text
 mbfsfree = (unit < 0) ? f_bfree / 1024 / 1024 : f_bfree;   # 非 human は MB、human は B
 ```
 
 そのため列名 (`rxkB/s`, `MBfsfree`) と実際に出る単位が `--human` 時に食い違う:
 
-```
+```text
 13:20:09        IFACE   rxpck/s   txpck/s    rxkB/s    txkB/s ...
 13:20:19       virbr0      3.21      0.00     25.7B      3.2B ...     ← ヘッダは "rxkB/s" だが値は B/s
 
@@ -4548,7 +4548,7 @@ mbfsfree = (unit < 0) ? f_bfree / 1024 / 1024 : f_bfree;   # 非 human は MB、
 `DISPLAY_UNIT(flags)` である。すなわち `--human` を付けると**すべてのパーセント列に
 リテラル `%` が付き、幅と小数桁が調整される**。
 
-```
+```text
 cprintf_xpc(human, xtrem, num, wi, wd, ...):
     if wd > 0 and dplaces_nr >= 0:
         wd = dplaces_nr                 # ← --dec の適用が先
@@ -4578,7 +4578,7 @@ cprintf_xpc(human, xtrem, num, wi, wd, ...):
 
 `tests/expected.sar-human`:
 
-```
+```text
 13:20:09        CPU      %usr     %nice      %sys ...     %idle
 13:20:19        all      2.1%     12.5%      1.8% ...     82.9%
 ```
@@ -4599,7 +4599,7 @@ cprintf_xpc(human, xtrem, num, wi, wd, ...):
 
 man `sar.1` (`man/sar.in`) の記述も一致している:
 
-```
+```text
 .B \-H
 Report hugepages utilization statistics.
 ...
@@ -4608,7 +4608,7 @@ This option is equivalent to specifying
 .BR "\-\-pretty \-\-human" "."
 ```
 
-```
+```text
 \t-H\tHugepages utilization statistics [A_HUGE]      ← sar --help の出力
 ```
 
@@ -4642,7 +4642,7 @@ This option is equivalent to specifying
 
 解析 (`sar.c` / `sadf.c` 共通の形):
 
-```
+```text
 if argv[opt] starts with "--dec=" and len(argv[opt]) == 7:
     if not isdigit(argv[opt][6]): usage()
     dplaces_nr = atoi(argv[opt] + 6)
@@ -4656,7 +4656,7 @@ if argv[opt] starts with "--dec=" and len(argv[opt]) == 7:
 
 適用条件 (`cprintf_f()` と `cprintf_xpc()` に同一のコードが入っている):
 
-```
+```text
 if wd > 0 and dplaces_nr >= 0:
     wd = dplaces_nr
 ```
@@ -4684,7 +4684,7 @@ if wd > 0 and dplaces_nr >= 0:
 `" %*.*f"` の幅指定 `wi` は `--dec` では変更されないため、
 `--dec=0` なら `" %9.0f"` → 小数点と小数部が消えた分だけ**左側の空白が増える**。
 
-```
+```text
 # 既定 (--dec 未指定 = 2 桁)
 13:20:19        all      2.15     12.50      2.36      0.12      0.00     82.88
 # --dec=0
@@ -4700,13 +4700,13 @@ if wd > 0 and dplaces_nr >= 0:
 
 `--dec` が影響しない実例 (`tests/expected.sar-dec`):
 
-```
+```text
 13:20:09    kbmemfree   kbavail kbmemused  %memused ...   kbdirty ...
 13:20:19      1437740   4389516   3755444        46 ...       396 ...      ← kB 系は cprintf_u64 なので整数のまま
 Average:      1437740   4389516   3755444        46 ...       396 ...      ← 平均も wd=0 なので不変
 ```
 
-```
+```text
 13:20:09     MBfsfree  MBfsused   %fsused  %ufsused     Ifree     Iused    %Iused FILESYSTEM
 13:20:19          705       145        17        19   6008414    102818         2 /dev/sda9
                   ^^^ wd=0 なので --dec に関係なく常に整数   ^^ wd=2 なので --dec=0 で 0 桁に
@@ -4717,7 +4717,7 @@ Average:      1437740   4389516   3755444        46 ...       396 ...      ← �
 副作用として、色付け (`sc_zero_int_stat`) の判定しきい値が `wd` に連動する。
 バイト一致を狙う場合は色が無効 (非 tty) なら無関係だが、`S_COLORS=always` では差が出る。
 
-```
+```text
 lim = 0.005
 if wd == 1: lim = 0.05
 
@@ -4737,7 +4737,7 @@ if (wd > 0 and val < lim) or (wd == 0 and val <= 0.5):
 
 ### 3.1 `print_gal_header()` のバイトレイアウト
 
-```
+```text
 print_gal_header(tm_time, sysname, release, nodename, machine, cpu_nr, format):
     rc = set_report_date(tm_time, cur_date, TIMESTAMP_LEN)
     if format == PLAIN_OUTPUT:      # PLAIN_OUTPUT = 0
@@ -4784,7 +4784,7 @@ print_gal_header(tm_time, sysname, release, nodename, machine, cpu_nr, format):
 
 `print_hdr_header()` の出力順 (`F_BEGIN` のみ):
 
-```
+```text
 "System activity data file: %s (%#x)\n"           ← dfile, file_magic.format_magic
 display_sa_file_version(stdout, file_magic)       ← "File created by sar/sadc from sysstat version X.Y.Z"
   (format_magic != FORMAT_MAGIC ならここで return)
@@ -4815,7 +4815,7 @@ display_sa_file_version(stdout, file_magic)       ← "File created by sar/sadc 
 `tests/expected.data-12.0.0-H` の短い抜粋 (`^I` は TAB。テストは
 `sadf -H ... | grep -v 0x2175` で 1 行目を除いている):
 
-```
+```text
 File created by sar/sadc from sysstat version 12.0.0
 Genuine sa datafile: yes (0)
 Host: Linux 5.0.16-100.fc28.x86_64 (linux.home) ^I06/30/19 ^I_x86_64_^I(8 CPU)
@@ -4860,7 +4860,7 @@ List of activities:
 `tests/00625` (`LC_ALL=C TZ=GMT ./sar -C -A -f tests/data-11.6.5.tmp`) →
 `tests/expected.data-11.6.5` の先頭 3 行:
 
-```
+```text
 Linux 4.17.18-200.fc28.x86_64 (linux.home) ^I08/29/18 ^I_x86_64_^I(8 CPU)
 
 09:33:38     LINUX RESTART^I(8 CPU)
@@ -4869,7 +4869,7 @@ Linux 4.17.18-200.fc28.x86_64 (linux.home) ^I08/29/18 ^I_x86_64_^I(8 CPU)
 `tests/00615` (`LC_ALL=C TZ=GMT ./sar -C -A -f tests/data-10.3.1.tmp`) →
 `tests/expected.data-10.3.1` の先頭 3 行:
 
-```
+```text
 Linux 4.4.14-200.fc22.x86_64 (kluane.home) ^I01/21/17 ^I_x86_64_^I(8 CPU)
 
 08:14:56     LINUX RESTART^I(8 CPU)
@@ -4906,7 +4906,7 @@ Linux 4.4.14-200.fc22.x86_64 (kluane.home) ^I01/21/17 ^I_x86_64_^I(8 CPU)
 
 データ行のパターン:
 
-```
+```text
 printf("%-11s", timestamp[curr])
 if not DISPLAY_PRETTY(flags):
     cprintf_in(IS_STR, " %9s", name, 0)        # 行頭・右寄せ幅 9
@@ -4918,13 +4918,13 @@ printf("\n")
 
 ヘッダ行側は `print_hdr_line()` の `iwidth` 引数で表現する:
 
-```
+```text
 print_hdr_line(timestamp[!curr], a, FIRST, DISPLAY_PRETTY(flags) ? -1 : 0, 9, bitmap)
 ```
 
 `print_hdr_line()` の擬似コード (該当部分):
 
-```
+```text
 printf("\n%-11s", p_timestamp)
 i = -1
 for tk in split(header_line, ";"):
@@ -4953,7 +4953,7 @@ printf("\n")
 
 非 pretty (`tests/expected.sar-A`、`-d` 部分):
 
-```
+```text
 12:53:20          DEV       tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util
 12:53:21          sda      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
 12:53:21          sdb      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
@@ -4962,7 +4962,7 @@ printf("\n")
 
 pretty (`tests/00170` = `sar --pretty -d -f ...` → `tests/expected.sar-pretty`):
 
-```
+```text
 13:20:09          tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util DEV
 13:20:19         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00 sda
 13:20:19         0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00 sda1
@@ -4980,7 +4980,7 @@ pretty (`tests/00170` = `sar --pretty -d -f ...` → `tests/expected.sar-pretty`
 `get_device_name(major, minor, wwn, part_nr, DISPLAY_PRETTY(flags), DISPLAY_PERSIST_NAME_S(flags), USE_STABLE_ID(flags), NULL)`。
 第 5 引数 `disp_devmap_name` が `DISPLAY_PRETTY(flags)` である。
 
-```
+```text
 get_device_name(...):
     if disp_persist_name:                                   # -j <type>
         name = get_persistent_name_from_pretty(get_devname(major, minor))
@@ -5001,7 +5001,7 @@ get_device_name(...):
 つまり `--pretty` を付けると **device-mapper 配下のデバイスが `dm-0` ではなく
 LVM/`/dev/mapper` の名前で出る**。`sadf.c` にも同じ前準備がある:
 
-```
+```text
 if DISPLAY_PRETTY(flags):
     dm_major = get_devmap_major()
 ```
@@ -5016,7 +5016,7 @@ if DISPLAY_PRETTY(flags):
 * `A_FS` (`-F`) の `FILESYSTEM` 列は **`--pretty` と無関係に常に行末**
   (`print_hdr_line(..., -1, 9, NULL)` が固定、データ行も `cprintf_in(IS_STR, " %s", ...)` 固定)。
 
-  ```
+  ```text
   13:20:09     MBfsfree  MBfsused   %fsused  %ufsused     Ifree     Iused    %Iused FILESYSTEM
   13:20:19          705       145        17        19   6008414    102818         2 /dev/sda9
   ```
@@ -5171,7 +5171,7 @@ JSON 出力では「行末にカンマが付くかどうかが後続要素の有
 `activity.c` の `act[]` 配列の並び順がそのまま XML/JSON 内の出力順になる。
 配列内には 3 つのグループ境界がコメントで示されている:
 
-```
+```text
 … disk_act,
 /* <network> */      net_dev_act … fchost_act, softnet_act   /* AO_CLOSE_MARKUP */
 /* <power-management> */ pwr_cpufreq_act … pwr_usb_act        /* AO_CLOSE_MARKUP */
@@ -5320,7 +5320,7 @@ return pre
 
 データは `TZ="Europe/Paris"` で収集、sadf は `TZ="America/New_York"` で実行:
 
-```
+```text
 # 既定 (UTC)
 SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;-1;2.15;12.50;2.36;0.12;0.00;82.88
 # -t (true time = 収集時ローカル)
@@ -5331,7 +5331,7 @@ SYSSTAT.TEST;31;2019-04-18 09:20:19 EST;-1;2.15;12.50;2.36;0.12;0.00;82.88
 
 `-U` (`tests/expected.sadf-U-se-epoch`, `sadf -d tests/data.tmp -U -s 1555593629 -e 1555594649`):
 
-```
+```text
 # hostname;interval;timestamp;CPU;%user;%nice;%system;%iowait;%steal;%idle
 SYSSTAT.TEST;39;1555593639;-1;2.66;23.20;2.27;0.17;0.00;71.70
 SYSSTAT.TEST;22;1555593649;-1;8.32;13.77;9.85;0.41;0.62;66.92
@@ -5368,7 +5368,7 @@ SYSSTAT.TEST;-1;1555594649;LINUX-RESTART	(9 CPU)
 
 #### 2.1 行の形
 
-```
+```text
 <nodename>\t<interval>\t<timestamp>\t[<item>\t]<fieldname>\t<value>\n
 ```
 
@@ -5380,7 +5380,7 @@ SYSSTAT.TEST;-1;1555594649;LINUX-RESTART	(9 CPU)
 
 ##### 検証 (`tests/expected.sadf-p`, `sadf -p tests/data.tmp -C -- -A`)
 
-```
+```text
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>all<TAB>%usr<TAB>2.15
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>all<TAB>%nice<TAB>12.50
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>-<TAB>proc/s<TAB>3.56
@@ -5390,7 +5390,7 @@ SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>-<TAB>proc/s<TAB>3.56
 
 ##### 検証 (`tests/expected.data-11.6.5-sadf-p`, `sadf -p tests/data-11.6.5.tmp -- -m FAN,IN,TEMP`)
 
-```
+```text
 linux.home<TAB>-1<TAB>2018-08-29 09:33:38 UTC<TAB>LINUX-RESTART<TAB>(8 CPU)
 linux.home<TAB>46<TAB>2018-08-29 09:34:34 UTC<TAB>fan1<TAB>DEVICE<TAB>f71858fg-isa-0200
 linux.home<TAB>46<TAB>2018-08-29 09:34:34 UTC<TAB>fan1<TAB>rpm<TAB>1283.00
@@ -5402,7 +5402,7 @@ linux.home<TAB>46<TAB>2018-08-29 09:34:34 UTC<TAB>fan1<TAB>drpm<TAB>1283.00
 
 ##### 検証 (`tests/expected.data-wghfreq-sadf-p`, `sadf -p … -- -m FREQ -P ALL`)
 
-```
+```text
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:10 UTC<TAB>all<TAB>wghMHz<TAB>1123.35
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:10 UTC<TAB>cpu0<TAB>wghMHz<TAB>1200.33
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:10 UTC<TAB>cpu1<TAB>wghMHz<TAB>872.73
@@ -5456,7 +5456,7 @@ emit("\n")
 
 ##### 検証 (`tests/expected.sadf-d`, `sadf -d tests/data.tmp -C -- -A`)
 
-```
+```text
 # hostname;interval;timestamp;CPU;%usr;%nice;%sys;%iowait;%steal;%irq;%soft;%guest;%gnice;%idle
 SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;-1;2.15;12.50;1.84;0.12;0.00;0.34;0.19;0.00;0.00;82.88
 …
@@ -5468,7 +5468,7 @@ CPU 集約行のアイテム値は **`-1`** (文字列 `all` ではない!)。�
 
 ##### 検証 (`tests/expected.data-11.6.5-sadf-d`, `sadf -d … -- -m FAN,IN,TEMP`)
 
-```
+```text
 linux.home;-1;2018-08-29 09:33:38 UTC;LINUX-RESTART	(8 CPU)
 # hostname;interval;timestamp;FAN;DEVICE;rpm;drpm
 linux.home;46;2018-08-29 09:34:34 UTC;1;f71858fg-isa-0200;1283.00;1283.00
@@ -5481,7 +5481,7 @@ linux.home;46;2018-08-29 09:34:34 UTC;1;f71858fg-isa-0200;34.00;48.57
 
 ##### 検証 (`tests/expected.sadf-se`, `sadf -d -s 13:20:20 -e 13:20:40 --iface=enp6s1 --dev=sda --fs=/dev/sda6 … -- -n DEV -Fdp`)
 
-```
+```text
 # hostname;interval;timestamp;DEV;tps;rkB/s;wkB/s;dkB/s;areq-sz;aqu-sz;await;%util
 SYSSTAT.TEST;39;2019-04-18 13:20:39 UTC;sda;1604.70;41499.97;10663.48;0.00;32.51;18.56;12.00;85.36
 # hostname;interval;timestamp;FILESYSTEM;MBfsfree;MBfsused;%fsused;%ufsused;Ifree;Iused;%Iused
@@ -5503,7 +5503,7 @@ SYSSTAT.TEST;39;2019-04-18 13:20:39 UTC;/dev/sda6;273;206;42.93;51.97;19201593;4
 
 ##### 検証 (`tests/expected.sadf-dh`, `sadf -dh tests/data.tmp -- -Iu ALL -P all,3`)
 
-```
+```text
 # hostname;interval;timestamp;CPU;%usr;%nice;%sys;%iowait;%steal;%irq;%soft;%guest;%gnice;%idle[...];INTR;CPU*[...]
 SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;-1;2.15;12.50;1.84;…;82.88;3;0.00;99.55;…;0.00;sum;31915.30;1027.05;0;0.00;0.00;8;…
 ```
@@ -5519,7 +5519,7 @@ CPU が 2 つ (all と 3) 選択されているため、INTR 部は「割込名 
 
 #### 4.1 行の形
 
-```
+```text
 <timestr>; <アクティビティ先頭フィールド名>; <アイテム識別子>; <名前1>; <値…>; <名前2>; <値…>;\n
 ```
 
@@ -5589,11 +5589,11 @@ emit("; " + valp + "; " + valc + ";")
 `-O debug` (= `S_F_DEBUG_MODE`) で以下が加わる。
 
 1. **レコードヘッダ行** (`sa_common.c: read_record_hdr()` 内):
-   ```
+   ```text
    # uptime_cs; <uptime_cs>; ust_time; <ust_time>; extra_next; <n>; record_type; <t>; HH:MM:SS; <hh>:<mm>:<ss>
    ```
 2. **アクティビティヘッダ行** (`sadf.c: generic_write_stats()` 内、アクティビティごと):
-   ```
+   ```text
    # name; <A_XXX>; nr_curr; <n>; nr_alloc; <n>; nr_ini; <n>
    ```
 3. **`[DEC]`** — `pval()` でカウンタが減少したフィールド名の直後。
@@ -5604,7 +5604,7 @@ emit("; " + valp + "; " + valc + ";")
 
 ##### 検証 (`tests/expected.sadf-r`, `sadf -r -O debug tests/data.tmp -C -- -A`)
 
-```
+```text
 # uptime_cs; 719255; ust_time; 1555593609; extra_next; 0; record_type; 1; HH:MM:SS; 13:20:09
 # uptime_cs; 722372; ust_time; 1555593619; extra_next; 0; record_type; 1; HH:MM:SS; 13:20:19
 # name; A_CPU; nr_curr; 9; nr_alloc; 10; nr_ini; 10
@@ -5618,7 +5618,7 @@ CPU 集約行のアイテム識別子は **`-1`** (`i - 1` の値、`i=0` が "a
 
 ##### 検証 (`tests/expected.sadf-r-tz`, `sadf -r tests/data-tz.tmp -- -uw` = `-u` のみ)
 
-```
+```text
 13:20:19 UTC; CPU; -1; %user; 96005; 96538; %nice; 2578701; 2581805; %system; 107589; 108174; %iowait; 60648; 60677; %steal; 0; 0; %idle; 3617879; 3638469;
 13:20:19 UTC; proc/s; 46972; 47083; cswch/s; 130465866; 132598184;
 ```
@@ -5630,7 +5630,7 @@ A_PCSW のようにアイテムを持たないアクティビティは**アイ�
 
 ##### 検証 (`tests/expected.data-11.6.5-sadf-r`, `sadf -r … -- -m FAN,IN,TEMP`)
 
-```
+```text
 09:33:38 UTC; LINUX-RESTART (8 CPU)
 09:34:34 UTC; FAN; 1; DEVICE; f71858fg-isa-0200; rpm; 1283.000000; rpm_min; 0.000000;
 09:34:34 UTC; TEMP; 1; DEVICE; f71858fg-isa-0200; degC; 34.000000; temp_min; 0.000000; temp_max; 70.000000;
@@ -5646,7 +5646,7 @@ A_PCSW のようにアイテムを持たないアクティビティは**アイ�
 
 ##### 検証 (`tests/expected.data-wghfreq-sadf-r`, `sadf -r … -- -m FREQ -P ALL`)
 
-```
+```text
 13:20:10 UTC; CPU; -1; freq; 2001000; tminst; 60804; 60811; freq; 2000000; tminst; 5734; 5725; …
 13:20:10 UTC; CPU; 0; freq; 2001000; tminst; 60803; 60813; freq; 2000000; tminst; 5734; 5724; …
 ```
@@ -5871,7 +5871,7 @@ SOCK6: `tcp6sck`, `udp6sck`, `raw6sck`, `ip6-frag`
 
 `Host:` 行 (`common.c: print_gal_header()`, `PLAIN_OUTPUT`):
 
-```
+```text
 %s %s (%s) \t%s \t_%s_\t(%d CPU)\n
  ↑sysname ↑release ↑nodename  ↑日付(%x 相当)  ↑machine  ↑CPU数
 ```
@@ -5881,7 +5881,7 @@ SOCK6: `tcp6sck`, `udp6sck`, `raw6sck`, `ip6-frag`
 
 アクティビティ行:
 
-```
+```text
 %02u: [%02x] %-20s %c:%4d[x%d]\t(%u,%u,%u)[ \t[Unknown format]]\n
   ↑id  ↑magic  ↑name(20桁左詰) ↑has_nr(Y/N):nr  ↑nr2(>1のとき)  ↑types_nr
 ```
@@ -5894,7 +5894,7 @@ SOCK6: `tcp6sck`, `udp6sck`, `raw6sck`, `ip6-frag`
   代入したときだけで、その代入は**自分の表に載っている ID** に対してしか起きない。
   `expected.sadf-data-ukwn` の 3 行がこの区別をそのまま示している:
 
-  ```
+  ```text
   01: [8b] A_CPU                Y:   3	(10,0,0)                  ← 既知・magic 一致
   02: [ff] A_PCSW               N:   1	(0,1,0) 	[Unknown format]  ← 既知・magic 不一致
   255: [8a] Unknown activity     Y:   2	(1,1,0)                   ← 未知 ID (印なし)
@@ -5907,7 +5907,7 @@ SOCK6: `tcp6sck`, `udp6sck`, `raw6sck`, `ip6-frag`
 
 ##### 検証 (`tests/expected.data-12.0.0-H`, `sadf -H tests/data-12.0.0 | grep -v 0x2175`)
 
-```
+```text
 File created by sar/sadc from sysstat version 12.0.0
 Genuine sa datafile: yes (0)
 Host: Linux 5.0.16-100.fc28.x86_64 (linux.home) 	06/30/19 	_x86_64_	(8 CPU)
@@ -5917,14 +5917,14 @@ Timezone:
 File composition: (1,1,11),(0,0,9),(2,0,0)
 ```
 
-```
+```text
 01: [8b] A_CPU                Y:   9	(10,0,0)
 03: [8b] A_IRQ                Y: 489	(1,0,0) 	[Unknown format]
 ```
 
 ##### 検証 (`tests/expected.sadf-H`, `sadf -H tests/data.tmp`) — 1 行目と `nr2` の例
 
-```
+```text
 System activity data file: tests/data.tmp (0x2175)
 File created by sar/sadc from sysstat version 99.9.9
 Timezone: GMT
@@ -5933,13 +5933,13 @@ Timezone: GMT
 
 ##### 検証 (`tests/expected.sadf-data-ukwn`, `sadf -H tests/data-ukwn | grep -v 0x2175`)
 
-```
+```text
 02: [ff] A_PCSW               N:   1	(0,1,0) 	[Unknown format]
 ```
 
 ##### 検証 (`tests/expected.sadf-H-hz`, `sadf -H tests/data-9.1.6-hz.tmp`)
 
-```
+```text
 File created by sar/sadc from sysstat version 9.1.6
 Genuine sa datafile: no (90a)
 HZ = 250
@@ -6051,7 +6051,7 @@ F_END:
 
 #### 7.2 各グラフの構造
 
-```
+```text
 <g id="g<activity_id>-<n>" transform="translate(X,Y)">
   <rect …/>                                  背景
   <text …>タイトル [アイテム名]<tspan>(Min, Max values)</tspan></text>
@@ -6067,7 +6067,7 @@ F_END:
 
 ##### 検証 (`tests/expected.data-11.6.5-sadf-g`, `sadf -g … -- -m FAN,IN,TEMP`)
 
-```
+```text
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg xmlns="http://www.w3.org/2000/svg" width="1060" height="9360" fill="black" stroke="#808080" stroke-width="1">
@@ -6080,7 +6080,7 @@ F_END:
 
 末尾:
 
-```
+```text
 </g>
 </g>
 </g>
@@ -6263,7 +6263,7 @@ render(isdb, pre, rflags, pptxt, dbtxt, mid, lluval, dval, sval):
 インデントは**タブ**。`tab` は各 `json_print_*()` に**値渡し**されるため、
 関数内の `tab++` / `--tab` は兄弟アクティビティに影響しない。
 
-```
+```text
 tab=0  {"sysstat": {
 tab=1  →	"hosts": [
 tab=2  →		{
@@ -6486,7 +6486,7 @@ xprintf0(--tab, "]")               # 閉じ括弧も改行しない
 
 #### 9.7 検証 (`tests/expected.sadf-j`, `sadf -j tests/data.tmp -C -- -A`)
 
-```
+```text
 					"queue": {"runq-sz": 3, "plist-sz": 956, "ldavg-1": 3.16, "ldavg-5": 3.24, "ldavg-15": 3.43, "blocked": 0},
 						"net-sock": {"totsck": 1316, "tcpsck": 10, "udpsck": 6, "rawsck": 0, "ip-frag": 0, "tcp-tw": 1},
 						"battery": [
@@ -6501,7 +6501,7 @@ xprintf0(--tab, "]")               # 閉じ括弧も改行しない
 
 #### 9.8 検証 (`tests/expected.data-11.6.5-sadf-j`)
 
-```
+```text
 						"fan-speed": [
 							{"number": 1, "rpm": 1283, "drpm": 1283, "device": "f71858fg-isa-0200"},
 						"temperature": [
@@ -6514,7 +6514,7 @@ xprintf0(--tab, "]")               # 閉じ括弧も改行しない
 
 #### 9.9 検証 (`tests/expected.data-wghfreq-sadf-j`)
 
-```
+```text
 						"cpu-weighted-frequency": [
 							{"number": "all", "weighted-frequency": 1123.35},
 							{"number": "0", "weighted-frequency": 1200.33},
@@ -6813,7 +6813,7 @@ cat tests/out.data-11.6.5-sadf-j.tmp | $VER_JSON
 
 #### 10.8 検証 (`tests/expected.sadf-x`, `sadf -x tests/data.tmp -C -- -A`)
 
-```
+```text
 				<io per="second">
 					<tps>20.85</tps>
 					<io-reads rtps="12.83" bread="57.43"/>
@@ -6826,7 +6826,7 @@ cat tests/out.data-11.6.5-sadf-j.tmp | $VER_JSON
 
 #### 10.9 検証 (`tests/expected.data-11.6.5-sadf-x`)
 
-```
+```text
 				<power-management>
 					<fan-speed unit="rpm">
 						<fan number="1" rpm="1283" drpm="1283" device="f71858fg-isa-0200"/>
@@ -6838,7 +6838,7 @@ cat tests/out.data-11.6.5-sadf-j.tmp | $VER_JSON
 
 #### 10.10 検証 (`tests/expected1.sadf-x`, `sadf -x tests/datax.tmp -C 1 2 -- -uw -P 0-2`)
 
-```
+```text
 					<cpu number="0" user="2.71" nice="0.03" system="3.12" iowait="0.00" steal="0.00" idle="94.14"/>
 					<cpu number="1" user="2.85" nice="0.00" system="5.16" iowait="0.00" steal="0.00" idle="91.99"/>
 					<cpu number="2" user="2.25" nice="0.03" system="1.86" iowait="0.68" steal="0.00" idle="95.18"/>
@@ -6849,7 +6849,7 @@ cat tests/out.data-11.6.5-sadf-j.tmp | $VER_JSON
 
 #### 10.11 検証 (`tests/expected2.sadf-fs`, `sadf -x --fs=/dev/sda6,/home tests/data.tmp -- -F MOUNT`)
 
-```
+```text
 					<filesystem mountp="/home" MBfsfree="705" MBfsused="145" fsused-percent="17.04" ufsused-percent="18.92" Ifree="6008414" Iused="102818" Iused-percent="1.68"/>
 					<filesystem mountp="/data" MBfsfree="273" MBfsused="206" fsused-percent="42.93" ufsused-percent="51.97" Ifree="19201593" Iused="455" Iused-percent="0.00"/>
 ```
@@ -6861,7 +6861,7 @@ cat tests/out.data-11.6.5-sadf-j.tmp | $VER_JSON
 
 #### 10.12 検証 (`tests/expected.data-wghfreq-sadf-x`, `sadf -x … -- -m FREQ -P ALL`)
 
-```
+```text
 				<power-management>
 					<cpu-weighted-frequency unit="MHz">
 						<cpuwfreq number="all" weighted-frequency="1123.35"/>
@@ -6955,12 +6955,12 @@ A_IRQ だけは「フィールド名の位置に CPU ラベルを入れる」逆
 
 ##### 検証 (`tests/expected.sadf-d` / `expected.sadf-p`)
 
-```
+```text
 # hostname;interval;timestamp;INTR;CPU*
 SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;sum;31915.30;5759.67;11829.29;2990.76;1027.05;2952.81;5880.88;4898.65;587.30
 SYSSTAT.TEST;31;2019-04-18 13:20:19 UTC;0;0.00;0.00;0.00;0.00;0.00;0.00;0.00;0.00;0.00
 ```
-```
+```text
 SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>sum<TAB>all<TAB>31915.30
 ```
 
@@ -6980,7 +6980,7 @@ SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>sum<TAB>all<TAB>31915.30
 
 列位置 (`kbdirty` の次) は一致しているので値は正しい。ラベルだけが違う。
 
-```
+```text
 tests/expected.sadf-p:2040  SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:19 UTC<TAB>-<TAB>kbshared<TAB>87980
 tests/expected.sadf-d:235   # hostname;interval;timestamp;…;kbdirty;kbshmem;kbanonpg;…
 ```
@@ -6991,7 +6991,7 @@ tests/expected.sadf-d:235   # hostname;interval;timestamp;…;kbdirty;kbshmem;kb
 実際の `render()` 呼び出し順は `BUS` → `idvendor` → `idprod` → `maxpower` →
 `manufact` → `product`。
 
-```
+```text
 tests/expected.sadf-d:561  # hostname;interval;timestamp;manufact;product;BUS;idvendor;idprod;maxpower
 tests/expected.sadf-d:562  SYSSTAT.TEST;31;2019-04-18 13:20:29 UTC;1;3f0;862;196;HP;HP Wireless Keyboard Mouse Kit
 tests/expected.sadf-d:563  SYSSTAT.TEST;31;2019-04-18 13:20:29 UTC;3;174c;55aa;0;ASMT;ASM1153
@@ -7001,7 +7001,7 @@ tests/expected.sadf-d:565  SYSSTAT.TEST;22;2019-04-18 13:20:49 UTC;3;5e3;608;200
 第 4 列はヘッダでは `manufact` だが実データは `1` (= BUS)。
 `-p` は毎行に名前が付くので影響なし:
 
-```
+```text
 tests/expected.sadf-p:4053  SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:29 UTC<TAB>bus1<TAB>idvendor<TAB>3f0
 tests/expected.sadf-p:4054  SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:29 UTC<TAB>bus1<TAB>idprod<TAB>862
 tests/expected.sadf-p:4055  SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:29 UTC<TAB>bus1<TAB>maxpower<TAB>196
@@ -7076,7 +7076,7 @@ tests/expected.sadf-p:4056  SYSSTAT.TEST<TAB>31<TAB>2019-04-18 13:20:29 UTC<TAB>
 
 `sadf -V` (`tests/expected.sadf-V-env`, `sadf --getenv -V`):
 
-```
+```text
 S_COLORS_PALETTE=0=000000:1=1a1aff
 S_TIME_DEF_TIME=UTC
 sysstat version 99.9.9
@@ -7564,7 +7564,7 @@ SOCK6 → IP6 → EIP6 → ICMP6 → EICMP6 → UDP6 → FC → SOFT。
 
 ##### (A) `parse_values()` — `-P` 用 (bitmap 方式)
 
-```
+```text
 parse_values(strargv, bitmap, max_val, __K_VALUE0)
 ```
 
@@ -7605,7 +7605,7 @@ parse_values(strargv, bitmap, max_val, __K_VALUE0)
 
 ##### (C) `parse_sa_devices()` — `--dev=` / `--fs=` / `--iface=` / `--int=` 用 (名前リスト方式)
 
-```
+```text
 parse_sa_devices(argv, a, max_len, &opt, pos, max_val)
 ```
 
@@ -7868,7 +7868,7 @@ TEST ビルド限定: `--getenv`。
 であり、**`check_format_options()` の「落とす」処理より前に実行される**。
 解析ループ後の処理順は以下の通り (`sadf.c` の `main()`):
 
-```
+```text
 init_colors()
   -> USE_OPTION_A なら set_bitmaps()
   -> dfile 未設定なら set_default_file(dfile, day_offset, -1)
@@ -8082,7 +8082,7 @@ man page に EXIT STATUS / RETURN VALUE セクションは**存在しない** (�
 
 `sar` が既定ファイルを読むのは次の条件のとき:
 
-```
+```text
 (argc == 1) || (((interval < 0) || INTERVAL_SET(flags)) && !from_file[0] && !to_file[0])
 ```
 
@@ -8224,7 +8224,7 @@ strspn(p+2, ";0123456789") == len - 2`。SGR 展開は `"\e[%sm"`。
 
 `S_COLORS_PALETTE` の既定値 (man page より):
 
-```
+```text
 0=000000:1=1a1aff:2=1affb2:3=b21aff:4=1ab2ff:5=ff1a1a:6=ffb31a:7=b2ff1a:
 8=efefef:9=000000:A=1a1aff:B=1affb2:C=b21aff:D=1ab2ff:E=ff1a1a:F=ffb31a:
 G=bebebe:H=000000:I=000000:K=ffffff:L=000000:T=000000:W=000000:X=000000
@@ -8250,7 +8250,7 @@ G=bebebe:H=000000:I=000000:K=ffffff:L=000000:T=000000:W=000000:X=000000
 
 #### 7.1 `sar` の `usage()` (stderr, exit 1)
 
-```
+```text
 Usage: %s [ options ] [ <interval> [ <count> ] ]
 Options are:
 [ -A ] [ -B ] [ -b ] [ -C ] [ -D ] [ -d ] [ -F [ MOUNT ] ] [ -H ] [ -h ]
@@ -8271,7 +8271,7 @@ Options are:
 
 #### 7.2 `sar` の `display_help()` (stdout, exit 0)
 
-```
+```text
 Usage: %s [ options ] [ <interval> [ <count> ] ]
 Main options and reports (report name between square brackets):
 	-B	Paging statistics [A_PAGE]
@@ -8339,7 +8339,7 @@ Main options and reports (report name between square brackets):
 
 #### 7.3 `sadf` の `usage()` (stderr, exit 1)
 
-```
+```text
 Usage: %s [ options ] [ <interval> [ <count> ] ] [ <datafile> | -[0-9]+ ]
 Options are:
 [ -C ] [ -c | -d | -g | -j | -l | -p | -r | -x ] [ -H ] [ -h ] [ -T | -t | -U ] [ -V ]
@@ -8480,7 +8480,7 @@ Rust 実装の互換性検証はこれを流用するのが最短である。
 
 `tests/expected2.sar-x2` の抜粋 (`--human` でパーセント表記になる例):
 
-```
+```text
 13:20:09        CPU     %user     %nice   %system   %iowait    %steal     %idle
 13:20:19        all      2.1%     12.5%      2.4%      0.1%      0.0%     82.9%
 ```

@@ -131,7 +131,7 @@ u32 × 6) で、`extra_nr × extra_size` バイトの本体が続き、`extra_ne
 
 #### 実測バイト列 (先頭 16〜28 バイト)
 
-```
+```text
 data-9.1.5       96 d5 70 21 09 01 05 00 | 68 09 c2 60 00 00 00 00
                  ^^^^^ ^^^^^ ^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^ sa_ust_time (u64)
                  magic fmt   9.1.5          = 0x60c20968 = 1623329128
@@ -477,7 +477,7 @@ flowchart TB
 
 `sadf -H` の出力書式は次の 13 項目 (実測)。
 
-```
+```text
 System activity data file: <path> (0x2175)
 File created by sar/sadc from sysstat version <v.p.s>
 Genuine sa datafile: yes (0)                 ← upgraded == 0 なら yes、非 0 なら no (16 進)
@@ -510,7 +510,7 @@ List of activities:
 `sadf -r -O debug` は**累積カウンタの前サンプル値と現サンプル値をそのまま並べる**
 ので、レート計算を挟まずにデコードの正しさだけを検証できる。Phase 2 の唯一の golden にすべき。
 
-```
+```text
 # uptime_cs; 719255; ust_time; 1555593609; extra_next; 0; record_type; 1; HH:MM:SS; 13:20:09
 # name; A_CPU; nr_curr; 9; nr_alloc; 10; nr_ini; 10
 13:20:19 UTC; CPU; -1; %usr; 96005; 96538; %nice; 2578701; 2581805; ...
@@ -683,7 +683,7 @@ SHA-256 を照合して `target/fixtures/` (gitignore 配下) に展開する。
 
 #### 案 D — CI で sysstat を**ソースからビルド**し、複数バージョンを同時に用意する
 
-```
+```text
 v9.1.6 / v10.3.1 / v11.6.5 / v12.0.0 / v12.7.6 の各タグを ./configure && make
 → それぞれの sadc で -DTEST ビルドしてデータ生成 + sar で期待出力生成
 ```
@@ -772,7 +772,7 @@ jobs:
 
 ### 7.2 案 B の実装 (`xtask fetch-fixtures`)
 
-```
+```text
 1. SYSSTAT_TAG (例 v12.7.6) と SYSSTAT_SHA256 を xtask 内に定数で持つ
 2. https://github.com/sysstat/sysstat/archive/refs/tags/<TAG>.tar.gz を取得
 3. SHA-256 を照合 (不一致なら失敗)
@@ -814,7 +814,7 @@ flowchart TB
 **オプションの組み合わせを列挙して両者に同じ引数を渡す**方式にすると、
 本家 golden に無い組み合わせまで検証できる。
 
-```
+```text
 activity 選択:  -u ALL / -r ALL / -b / -d / -q ALL / -n DEV,EDEV / -I ALL / -F / -v / -w / -y / -B / -S / -H / -m CPU / -A
 表示修飾:      (なし) / --pretty / --human / --dec=0 / --dec=2 / -h / -z / -x / -C
 CPU 選択:      (なし) / -P ALL / -P 0,1
@@ -909,7 +909,7 @@ conformance-live:
 
 ### 7.5 32bit / クロス検証ジョブ
 
-```
+```text
 - 32bit ファイルの生成: sysstat を -m32 でビルド (gcc-multilib + libc6-dev-i386)
   → sadc32 でデータ生成 → 64bit の resarch で読む
 - 32bit の resarch: cargo build --target i686-unknown-linux-gnu
@@ -936,7 +936,7 @@ conformance-live:
 
 `tests/32bits/README` の全文:
 
-```
+```text
 This is the directory where 32-bit versions of sar and sadc will be located.
 ```
 

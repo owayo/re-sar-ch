@@ -1,17 +1,14 @@
 # このリポジトリのツールチェーン。ローカルと CI の両方がここを正とする。
 # 開発のコマンドは make 経由で呼ぶ (Makefile が mise exec -- を付ける。初回は make setup)。
 #
-# mise 自身の版は mise.toml に書けないので、CI の workflow の env (MISE_VERSION) に書く。
+# mise 自身の版は mise.toml に書けないので固定しない。CI は mise-action の minimum_release_age (14d) で、
+# 公開から 14 日以上たった最新の版を入れる。
 # mise で入れないものは OS のものを使う: jq・curl・shasum と Apple container か Docker
 # (make sar-* の採取)、xmllint と sysstat の sar (make conformance の一部のテスト)。
 
 [tools]
 # components を明示する。未指定だと rustup の既定の profile しだいで入るものが変わり、
 # GitHub Actions のランナーでは cargo fmt / cargo clippy が無いと言われて落ちる。
-# 配布物のクロスビルドのターゲットは、CI と Release のジョブで rustup target add する
+# 配布物のターゲット (aarch64 Linux を含む) は CI と Release のジョブが各 OS のランナーで
+# rustup target add してそのままビルドするので、クロスビルドの道具は要らない
 rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }
-# aarch64 Linux の配布物のクロスビルド (CI と Release の Linux のジョブだけが使う)。
-# リリース版の 0.2.5 は古いので main の commit を固定する (Release が実際に使っていた commit)。
-# リポジトリには cross と xtask の 2 つの crate があるので crate で選び、locked で cross の
-# Cargo.lock のとおりに作る
-"cargo:https://github.com/cross-rs/cross" = { version = "rev:8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27", crate = "cross", locked = true, os = ["linux"] }

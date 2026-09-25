@@ -1,3 +1,9 @@
+# CI の正規形 (github-project-standard の ci-rust.yml) に、sysstat との互換検査の conformance ジョブを足したもの。
+#
+# - quality: Linux と macOS で make setup と make ci だけを呼ぶ (検査の中身は Makefile の ci が決める)
+# - conformance: 本家 sysstat のテストデータと sar / sadf を使う互換検査 (make conformance)
+# - build: release.yml の build と同じ組 (os / target) でビルドする。release.yml の dry_run では build が
+#   走らないので、配布物を作れることはここで確かめる。Windows はここでテストも回す
 name: CI
 
 on:
@@ -15,85 +21,56 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # mise 自身の版の正はここ (mise.toml には mise 自身を書けない)。release.yml と同じ値にそろえる。
-  # 公開から 14 日以上たった版を選ぶ。ツールの版は mise.toml が正
-  MISE_VERSION: "2026.9.5"
 
 jobs:
-  # 検査の中身は Makefile の ci が定義する (ここにコマンドを重ねて書かない。手元の make ci と同じになる)。
-  # Windows は入れない: ランナーの make は MinGW の mingw32-make の写しで、レシピの POSIX シェル前提の
-  # 解釈に癖がある。Windows のテストは下の build ジョブで回す。
-  test:
-    name: Test (${{ matrix.os }})
+  quality:
+    name: Quality (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Windows は入れない。ランナーの make は MinGW の mingw32-make の写しで、レシピの POSIX シェル前提
+        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは build で cargo を直接呼ぶ
         os: [ubuntu-latest, macos-latest]
-    env:
-      # make ci は Rust だけを使う。make の $(RUN) (= mise exec --) は mise.toml の全ツールを入れ、
-      # 名指しでは絞れないので、Linux でソースからビルドする cross を外す (名前は mise.toml のキーのまま)
-      MISE_DISABLE_TOOLS: cargo:https://github.com/cross-rs/cross
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # キャッシュは使わない。rust の実体は rustup が入れる (~/.rustup) のでキャッシュに入らず、
-      # mise のキャッシュだけ戻すと clippy / rustfmt が欠けたまま進む (jdx/mise-action#215)
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: actions/checkout@v7
         with:
-          version: ${{ env.MISE_VERSION }}
+          persist-credentials: false
+
+      # ツールの版は mise.toml が正。mise 本体は公開から 14 日以上たった最新の版を、署名付きの checksum で
+      # 確かめて入れる。cache は切る (効いた回だけ clippy / rustfmt が欠ける。jdx/mise-action#215)
+      - uses: jdx/mise-action@v4
+        with:
+          minimum_release_age: 14d
           cache: false
 
-      - name: Cache cargo registry
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # mise.toml も鍵に入れる。rustc の版が変わったのに古い target を完全一致で戻し続けると、
-          # 毎回全部を作り直すうえ、新しい成果物がキャッシュに保存されない
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'mise.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Show toolchain
-        run: mise ls --current
+      # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)
+      - uses: Swatinem/rust-cache@v2
 
       - run: make setup
       - run: make ci
 
   conformance:
     name: Conformance (vs upstream sysstat)
-    needs: test
-    # ubuntu-latest は使わない。現在は Ubuntu 24.04 (sysstat 12.6.1) を指すが、
-    # 切り替え時期が告知されないまま 26.04 (sysstat 12.7.7) に移ると
-    # 比較基準が無言で変わり golden が壊れる (docs/format/04-test-data.md §7.1 / §7.4)。
-    # 22.04 は 2026-09-17 から非推奨開始なので足場にしない。
+    needs: quality
+    # ランナーの版を固定する。比較の基準は Ubuntu 24.04 の sysstat (12.6.1) で、ubuntu-latest は
+    # 2026-10-19 から Ubuntu 26.04 (sysstat 12.7.7) へ移る。latest のままだと比較の基準が黙って変わり、
+    # golden が壊れる (docs/format/04-test-data.md §7.1 / §7.4)。22.04 は非推奨なので足場にしない
     runs-on: ubuntu-24.04
-    env:
-      MISE_DISABLE_TOOLS: cargo:https://github.com/cross-rs/cross
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: actions/checkout@v7
         with:
-          version: ${{ env.MISE_VERSION }}
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          minimum_release_age: 14d
           cache: false
 
-      - name: Cache cargo registry
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'mise.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install sysstat (provides sar / sadf for cross-checking)
-        # ランナーには sysstat はプリインストールされていないので必ず入れる。
+        # ランナーには sysstat が入っていないので必ず入れる。
         # sar が無いと、make conformance の sar を呼ぶテストはスキップと表示して通ってしまう。
         run: |
           sudo apt-get update
@@ -129,60 +106,50 @@ jobs:
         # ignored テストを回す。
         run: make conformance
 
-  # release.yml の build と同じ 6 ターゲットを同じ方法でビルドする。release.yml の dry_run では
-  # build が走らないので、配布物の作り方 (mise のツールチェーン、musl、cross) はここで確かめる。
-  # Windows は test ジョブで make ci を回さないので、ここでテストも回す (README の対応 OS の裏付け)
   build:
     name: Build (${{ matrix.target }})
-    needs: test
+    needs: quality
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # release.yml の build と同じ組 (行を足したら両方に足す)。musl は glibc の古いディストリビューション向け
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            cross: false
-            tools: rust
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            cross: false
-            tools: rust
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
-            tools: rust cargo:https://github.com/cross-rs/cross
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cross: false
-            tools: rust
           - os: macos-latest
             target: aarch64-apple-darwin
-            cross: false
-            tools: rust
+          - os: macos-latest
+            target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            cross: false
-            tools: rust
-
     steps:
-      # Windows のランナーは既定で LF を CRLF に変えて checkout する。release.yml の build にも
-      # 同じ行を置き、バイナリに埋め込むスキル本文 (include_str!) の改行を CI と配布物でそろえる
+      # Windows のランナーは既定で LF を CRLF に変えて checkout する。release.yml の build と同じく LF のまま取り、
+      # テストの期待値や include_str! で埋め込むスキルの本文の改行を配布物とそろえる
       - name: Keep LF line endings
-        if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # Rust と cross の版は mise.toml で固定する。ジョブに要るツールだけを入れる
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: actions/checkout@v7
         with:
-          version: ${{ env.MISE_VERSION }}
-          install_args: ${{ matrix.tools }}
+          persist-credentials: false
+
+      # ビルドに効く環境変数は mise.toml の [env] に置く。mise-action が後続のステップへ渡すので、
+      # ci.yml と release.yml と手元の make で同じ値になる (mise-guide 18 章)
+      - uses: jdx/mise-action@v4
+        with:
+          minimum_release_age: 14d
           cache: false
 
-      # mise が RUSTUP_TOOLCHAIN を mise.toml の版にするので、そのツールチェーンにターゲットを足す
-      - name: Add Rust target
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
+      - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
       - name: Install musl tools
@@ -191,16 +158,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      # make test と同じフラグで回す
+      # Windows は quality で make ci を回さないので、配る OS の裏付けとしてここでテストする
+      # (Makefile の test と同じ --all-features を付ける)
       - name: Test (Windows)
         if: runner.os == 'Windows'
         run: cargo test --locked --all-features
 
-      # ビルドは cross のコンテナの中で行う (コンテナにクロスのコンパイラがある)
-      - name: Build with cross
-        if: matrix.cross
-        run: cross build --release --locked --target ${{ matrix.target }}
-
       - name: Build
-        if: "!matrix.cross"
         run: cargo build --release --locked --target ${{ matrix.target }}

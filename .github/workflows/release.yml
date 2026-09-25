@@ -1,4 +1,4 @@
-# Rust の CLI のリリース (github-project-standard の release-rust.yml の正規形)。
+# Rust の CLI のリリース (標準の形)。
 #
 # このリポジトリ固有の点:
 #   - 添付に x86_64-unknown-linux-musl を足している (glibc の古いディストリビューション向け。ci.yml の build も同じ)

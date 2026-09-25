@@ -1,4 +1,4 @@
-# CI の正規形 (github-project-standard の ci-rust.yml) に、sysstat との互換検査の conformance ジョブを足したもの。
+# Rust の CLI の CI の標準の形に、sysstat との互換検査の conformance ジョブを足したもの。
 #
 # - quality: Linux と macOS で make setup と make ci だけを呼ぶ (検査の中身は Makefile の ci が決める)
 # - conformance: 本家 sysstat のテストデータと sar / sadf を使う互換検査 (make conformance)
@@ -138,7 +138,7 @@ jobs:
           persist-credentials: false
 
       # ビルドに効く環境変数は mise.toml の [env] に置く。mise-action が後続のステップへ渡すので、
-      # ci.yml と release.yml と手元の make で同じ値になる (mise-guide 18 章)
+      # ci.yml と release.yml と手元の make で同じ値になる
       - uses: jdx/mise-action@v4
         with:
           minimum_release_age: 14d

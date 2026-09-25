@@ -213,7 +213,7 @@ fn system_zone() -> Option<chrono_tz::Tz> {
 }
 
 /// IANA 名を解釈する。`TZ` が `:Asia/Tokyo` 形式でも受ける。
-fn parse_tz(name: &str) -> Option<chrono_tz::Tz> {
+pub(crate) fn parse_tz(name: &str) -> Option<chrono_tz::Tz> {
     let n = name.trim().trim_start_matches(':');
     if n.is_empty() {
         return None;

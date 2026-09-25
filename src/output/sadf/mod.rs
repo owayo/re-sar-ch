@@ -59,10 +59,11 @@ pub mod xml;
 
 use std::fmt::Write as _;
 
-use chrono::{DateTime, Datelike, Offset, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Timelike, Utc};
 
 use crate::format::file::SaFile;
 use crate::model::ActivityId;
+use crate::model::localtime::localtime;
 use crate::output::time_filter::TimeFilter;
 use crate::series::compute::{ComputeIssue, Computed, MissingKind, missing_kind};
 
@@ -349,14 +350,14 @@ impl FileInfo {
             TimeBase::TrueTime => format_date(h.year, u32::from(h.month), u32::from(h.day)),
             // `-T` は読み手のローカル時刻。レコードの [`Stamp`] と同じ基準に揃える
             TimeBase::LocalTime => {
-                let l = utc.with_timezone(&chrono::Local);
+                let l = local_of(utc);
                 format_date(l.year(), l.month(), l.day())
             }
             _ => format_date(utc.year(), utc.month(), utc.day()),
         };
         // `-T` の名前を CLI 層から受け取らなかったときの代用。
-        // 環境変数は読まず、ファイル作成時刻での UTC オフセット (`+09:00`) を出す。
-        let local_tz = utc.with_timezone(&chrono::Local).offset().fix().to_string();
+        // 名前は引かず、ファイル作成時刻での UTC オフセット (`+09:00`) を出す。
+        let local_tz = local_of(utc).offset().to_string();
         Self {
             nodename: h.nodename.clone(),
             sysname: h.sysname.clone(),
@@ -376,6 +377,12 @@ fn utc_of(secs: u64) -> DateTime<Utc> {
     Utc.timestamp_opt(secs as i64, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+}
+
+/// `-T` の読み手のローカル時刻 (本家の `localtime()`、[`localtime`])。
+/// 暦に開けない値は UTC のまま出す。
+pub(crate) fn local_of(utc: DateTime<Utc>) -> DateTime<FixedOffset> {
+    localtime(utc.timestamp()).unwrap_or_else(|| utc.fixed_offset())
 }
 
 // ===========================================================================
@@ -432,7 +439,7 @@ impl Stamp {
                 }
             }
             TimeBase::LocalTime => {
-                let local = utc_of(ust_time).with_timezone(&chrono::Local);
+                let local = local_of(utc_of(ust_time));
                 Stamp {
                     date: format_date(local.year(), local.month(), local.day()),
                     time: format_time(local.hour(), local.minute(), local.second()),

@@ -145,7 +145,7 @@ impl TimeFilter {
 
     /// 比較用の時刻へ換算する。
     fn rec_time(&self, ust_time: u64, hms: (u8, u8, u8)) -> RecTime {
-        use chrono::{Local, TimeZone, Timelike, Utc};
+        use chrono::{TimeZone, Timelike, Utc};
         let (h, m, s) = hms;
         let recorded = RecTime {
             hour: u32::from(h),
@@ -168,9 +168,7 @@ impl TimeFilter {
                 .single()
                 .map(|dt| from(&dt, ust_time))
                 .unwrap_or(recorded),
-            TimeBasis::Local => Local
-                .timestamp_opt(ust_time as i64, 0)
-                .single()
+            TimeBasis::Local => crate::model::localtime::localtime(ust_time as i64)
                 .map(|dt| from(&dt, ust_time))
                 .unwrap_or(recorded),
             TimeBasis::Zone(tz) => tz

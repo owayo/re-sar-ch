@@ -84,6 +84,7 @@ use std::io::{self, Write};
 use crate::format::SaFile;
 use crate::layout::plan::DecodePlan;
 use crate::layout::registry::{ActivityDef, lookup};
+use crate::model::localtime::localtime;
 use crate::model::{ActivityId, Availability, CompatDateFormat, HeaderRows, ValueKind};
 use crate::output::time_filter::{Admit, TimeFilter};
 use crate::series::compute::{
@@ -125,6 +126,8 @@ const UNKNOWN: &str = "?";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TimeStyle {
     /// 読み手のローカル時刻 (`sar` の既定 = `S_F_LOCAL_TIME`)。
+    ///
+    /// 本家の `localtime()` と同じく `TZ` に従う ([`crate::model::localtime`])。
     #[default]
     Local,
     /// UTC (`sadf` の既定)。
@@ -1632,7 +1635,7 @@ pub(crate) fn banner_date(
     style: TimeStyle,
     format: CompatDateFormat,
 ) -> String {
-    use chrono::{Datelike, Local, TimeZone, Utc};
+    use chrono::{Datelike, TimeZone, Utc};
 
     /// エポック秒から落とした日付を書式に合わせる。
     fn from_epoch<Tz: TimeZone>(dt: &chrono::DateTime<Tz>, format: CompatDateFormat) -> String {
@@ -1648,10 +1651,9 @@ pub(crate) fn banner_date(
             .timestamp_opt(ust_time as i64, 0)
             .single()
             .map_or_else(fallback, |dt| from_epoch(&dt, format)),
-        TimeStyle::Local => Local
-            .timestamp_opt(ust_time as i64, 0)
-            .single()
-            .map_or_else(fallback, |dt| from_epoch(&dt, format)),
+        TimeStyle::Local => {
+            localtime(ust_time as i64).map_or_else(fallback, |dt| from_epoch(&dt, format))
+        }
     }
 }
 
@@ -1736,7 +1738,7 @@ pub(crate) fn time_string(
     second: u8,
     style: TimeStyle,
 ) -> String {
-    use chrono::{Local, TimeZone, Utc};
+    use chrono::{TimeZone, Utc};
     match style {
         // `-t`: レコードに焼き込まれた時分秒をそのまま使う
         TimeStyle::Recorded => format!("{hour:02}:{minute:02}:{second:02}"),
@@ -1745,7 +1747,7 @@ pub(crate) fn time_string(
             Some(dt) => dt.format("%H:%M:%S").to_string(),
             None => format!("{hour:02}:{minute:02}:{second:02}"),
         },
-        TimeStyle::Local => match Local.timestamp_opt(ust_time as i64, 0).single() {
+        TimeStyle::Local => match localtime(ust_time as i64) {
             Some(dt) => dt.format("%H:%M:%S").to_string(),
             None => format!("{hour:02}:{minute:02}:{second:02}"),
         },

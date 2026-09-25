@@ -35,6 +35,7 @@ use std::io::{self, Write};
 use crate::format::SaFile;
 use crate::format::file::{FileActivityEntry, ScanControl};
 use crate::format::registry::RecordKind;
+use crate::model::localtime::localtime;
 use crate::model::{ActivityId, CompatDateFormat};
 use crate::output::sar_text::{TimeStyle, banner_date, pad_left, pad_right};
 use crate::series::el7::{
@@ -216,7 +217,7 @@ struct RecTime {
 ///
 /// 変換できない時刻は `None` (本家の `localtime()` が `NULL` を返す場合)。
 fn rectime(rec: &Rec, style: TimeStyle) -> Option<RecTime> {
-    use chrono::{Local, TimeZone, Timelike, Utc};
+    use chrono::{TimeZone, Timelike, Utc};
     fn hms<T: Timelike>(dt: &T) -> RecTime {
         RecTime {
             hour: dt.hour() as i32,
@@ -232,7 +233,7 @@ fn rectime(rec: &Rec, style: TimeStyle) -> Option<RecTime> {
             sec: i32::from(rec.second),
         }),
         TimeStyle::Utc | TimeStyle::Epoch => Some(hms(&Utc.timestamp_opt(epoch?, 0).single()?)),
-        TimeStyle::Local => Some(hms(&Local.timestamp_opt(epoch?, 0).single()?)),
+        TimeStyle::Local => Some(hms(&localtime(epoch?)?)),
     }
 }
 

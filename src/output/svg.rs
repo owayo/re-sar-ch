@@ -101,10 +101,9 @@ impl DayZone {
     }
 }
 
-/// 実行環境の TZ 名 (取れなければ数値オフセット)。
+/// 実行環境のローカル時刻の今の UTC オフセット (`+09:00`)。
 fn local_zone_label() -> String {
-    use chrono::Offset;
-    chrono::Local::now().offset().fix().to_string()
+    crate::model::localtime::now().offset().to_string()
 }
 
 /// `-O oneday` の基準を時刻基準から決める。
@@ -128,13 +127,8 @@ fn one_day_zone(base: TimeBase, info: &FileInfo, recorded_offset: Option<i64>) -
 fn day_start(ust: u64, zone: &DayZone) -> u64 {
     let shift = match zone {
         DayZone::Utc => 0,
-        DayZone::Local => {
-            use chrono::{Offset, TimeZone};
-            chrono::Local
-                .timestamp_opt(ust as i64, 0)
-                .single()
-                .map_or(0, |dt| i64::from(dt.offset().fix().local_minus_utc()))
-        }
+        DayZone::Local => crate::model::localtime::localtime(ust as i64)
+            .map_or(0, |dt| i64::from(dt.offset().local_minus_utc())),
         DayZone::Recorded { offset, .. } => *offset,
     };
     // 現地時刻へ寄せて日境界で切り、UTC へ戻す。

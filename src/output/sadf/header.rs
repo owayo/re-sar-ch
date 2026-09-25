@@ -142,11 +142,11 @@ pub fn write_gal_header<W: Write>(out: &mut W, file: &SaFile) -> io::Result<()> 
         Some(n) if n > 1 => n - 1,
         _ => 1,
     };
-    let local = Utc
-        .timestamp_opt(h.ust_time as i64, 0)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
-        .with_timezone(&chrono::Local);
+    let local = super::local_of(
+        Utc.timestamp_opt(h.ust_time as i64, 0)
+            .single()
+            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap()),
+    );
     let date = format!(
         "{:02}/{:02}/{:02}",
         local.month(),

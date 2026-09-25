@@ -183,13 +183,16 @@ fn sa_dir() -> PathBuf {
 /// 本家の `get_time(&rectime, N)` はローカル時刻基準だが、
 /// `S_TIME_DEF_TIME=UTC` のときは UTC 基準になる。
 fn target_date(day_offset: u32) -> (i32, u32, u32) {
-    use chrono::{Datelike, Duration, Local, Utc};
+    use chrono::{Datelike, Duration, Utc};
     let back = Duration::days(i64::from(day_offset));
+    let then = Utc::now() - back;
     if std::env::var("S_TIME_DEF_TIME").as_deref() == Ok("UTC") {
-        let d = (Utc::now() - back).date_naive();
+        let d = then.date_naive();
         (d.year(), d.month(), d.day())
     } else {
-        let d = (Local::now() - back).date_naive();
+        // 本家の `localtime()` と同じ読み手のローカル時刻 (Windows でも `TZ` に従う)
+        let d = re_sar_ch::model::localtime::localtime(then.timestamp())
+            .map_or_else(|| then.date_naive(), |l| l.date_naive());
         (d.year(), d.month(), d.day())
     }
 }

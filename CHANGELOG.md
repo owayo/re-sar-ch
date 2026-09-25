@@ -178,6 +178,12 @@
   与えると、本家 (64bit の Linux) と違う間隔で列見出しを出し直していた。
   C の `long` の幅を実行環境の ABI から取っていたため (Windows では 64bit でも 32bit)。
   本家が動く Linux と同じく、ポインタと同じ幅で読むようにした
+- Windows で互換出力の「読み手のローカル時刻」が `TZ` を無視していた。`-t` を付けない
+  `sar` の時刻とバナーの日付、`-s` / `-e` の比較、`sadf -T` の時刻、`sadf -g -O oneday` の
+  日の区切りが、`TZ=America/New_York` のような指定があっても OS のタイムゾーンで出ていた。
+  Windows の `chrono::Local` が `TZ` を読まないため。`TZ` が IANA 名ならそのタイムゾーンで
+  開くようにし、Linux / macOS (本家の `localtime()` と同じく `TZ` に従う) と同じ時刻にした。
+  `TZ` が無いときは従来どおり OS のタイムゾーンを使う。Linux / macOS の出力は変わらない
 
 ## v26.9.102
 

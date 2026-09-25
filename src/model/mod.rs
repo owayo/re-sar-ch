@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod lang;
+pub mod localtime;
 pub mod sar_profile;
 pub mod sysstat_env;
 pub mod text;

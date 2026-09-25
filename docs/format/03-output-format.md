@@ -5990,7 +5990,7 @@ stderr << "File successfully converted to sysstat format version <VERSION>\n"
 
 ##### 検証 (`tests/00620`)
 
-```sh
+```bash
 ./sadf -c ${T_SRCDIR}/tests/data-11.6.5 > tests/data-11.6.5.tmp
 ```
 
@@ -6802,7 +6802,7 @@ XSD の代表的な型:
 `xmllint --dtdvalid` が通るか)。
 
 テスト側の検証コマンド:
-```sh
+```bash
 # tests/01557 : XSD 検証
 cat tests/out.data-11.6.5-sadf-x.tmp | $VER_XML --schema ${T_SRCDIR}/xml/sysstat.xsd -
 # tests/01559 : DTD 検証

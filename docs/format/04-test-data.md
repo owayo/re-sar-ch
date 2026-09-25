@@ -832,7 +832,7 @@ sadf 形式:     -d / -p / -j / -x / -r / -H / -g
 | 利用可能なラベル | `ubuntu-26.04`, `ubuntu-26.04-arm`, `ubuntu-24.04`, `ubuntu-24.04-arm`, `ubuntu-22.04`, `ubuntu-22.04-arm`, `ubuntu-slim` |
 | `ubuntu-22.04` | **2026-09-17 から非推奨開始、2027-04-17 に完全サポート終了** (runner-images #14254)。旧版検証の足場にしてはいけない |
 | `ubuntu-26.04` | 2026-06-11 に全ユーザへ提供開始 (ドキュメント上は Public preview) |
-| `ubuntu-latest` → 26.04 の移行 | **時期未告知**。README は「`-latest` の切り替えは 1〜2 か月かけて段階的に進む」と記す |
+| `ubuntu-latest` → 26.04 の移行 | **2026-10-19 から移行を始めると告知された** (runner-images #14748。CI の実行にも注記が出る)。README は「`-latest` の切り替えは 1〜2 か月かけて段階的に進む」と記す |
 | sysstat のプリインストール | **無い**。`Ubuntu2404-Readme.md` / `Ubuntu2204-Readme.md` / `Ubuntu2604-Readme.md` の「Installed apt packages」表に `sysstat` / `sar` / `iostat` / `mpstat` / `pidstat` は 1 件も無く、`actions/runner-images` 全体のコード検索でも 0 件。`toolset-2404.json` / `toolset-2604.json` にも無く `install-sysstat.sh` も存在しない |
 
 → **`sudo apt-get install -y sysstat` を必ず書く**。
@@ -991,7 +991,7 @@ reSARch 本体の開発と単体テストは macOS で問題ない (`sa` ファ�
 
 ### 9.2 通常ビルドで採取する (最も簡単)
 
-```sh
+```bash
 # Docker 上の Ubuntu で
 apt-get update && apt-get install -y sysstat
 # sadc を直接叩く。1 秒間隔 × 3 サンプル
@@ -1033,7 +1033,7 @@ Docker のコンテナ名はホスト名になるので `--hostname test-host` �
 
 本家のテストと同じ「疑似 `/proc`」方式を使えば、**時刻も CPU 数もデバイス構成も固定**できる。
 
-```sh
+```bash
 git clone https://github.com/sysstat/sysstat && cd sysstat
 git checkout v11.6.5          # 任意のタグ
 ./do_test conf                # テストモードで configure
@@ -1060,7 +1060,7 @@ LC_ALL=C TZ=GMT ./sar -A -f tests/out.sa > tests/out.expected
 
 ### 9.4 32bit / big endian を作る
 
-```sh
+```bash
 # 32bit (LE)
 apt-get install -y gcc-multilib libc6-dev-i386
 ./configure CFLAGS="-m32" LDFLAGS="-m32" ...

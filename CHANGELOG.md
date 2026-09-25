@@ -137,6 +137,10 @@
   (表示範囲が 1 時間を超えたら秒を落として `HH:MM` にする)
 - Windows 版の `skill-install` が書き出す `SKILL.md` の改行を、ほかの OS と同じ LF にした
   (これまでは CRLF)。Claude Code / Codex の読み込みには影響しない
+- ソースから入れたときの `make uninstall` は、`INSTALL_PATH` のバイナリだけを消すようにした。
+  `make install` が書き出したスキル (`~/.claude/skills/resarch` など) は残るので、
+  要らなければ手で消す。スキルの置き場所はエージェントごとに違い、別の方法で入れた
+  reSARch のスキルまで消してしまうため
 
 ### 修正
 

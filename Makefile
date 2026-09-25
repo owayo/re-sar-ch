@@ -1,32 +1,29 @@
-# resarch の開発用タスク。引数なしの `make` でターゲット一覧を表示する。
+# Development tasks for resarch. Run `make` with no arguments to list the targets.
 #
-# ツールの版は mise.toml が正。mise があればコマンドを `mise exec --` 経由で呼ぶので、
-# シェルで mise を activate していなくても (IDE や GUI から make を呼んでも)
-# mise.toml の版で動く。mise を使わず PATH 上のツールで動かすなら SYSTEM_TOOLS=1 を
-# 付ける (その場合、版の再現性は保証しない)。
+# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
+# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
+# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
+# instead (the versions are then not guaranteed).
 #
-# CI の Test ジョブは make setup と make ci だけを呼ぶ。検査を変えるときは ci
-# (と、それが呼ぶターゲット) を直し、CI の workflow に検査コマンドを重ねて書かない。
+# The Quality job of CI runs only make setup and make ci. To change the checks, edit ci (and the
+# targets it calls) instead of adding commands to the CI workflow.
 #
-# macOS 標準の GNU Make 3.81 で動く書き方に限っている
-# (.ONESHELL / .SHELLFLAGS / $(file ...) / != は使わない)。
+# Only GNU Make 3.81 features are used (the make that ships with macOS):
+# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
 
 .DEFAULT_GOAL := help
 
-# Variables
 BINARY_NAME := resarch
 INSTALL_PATH ?= /usr/local/bin
-# AI エージェント側のスキルディレクトリ名 (skills/SKILL.md の frontmatter の name と揃える)
-SKILL_NAME := resarch
-# install / skill-install でスキルを入れる AI エージェント。make install SKILL_TARGETS= で入れない
+# AI agents that get the skill from install / skill-install. make install SKILL_TARGETS= skips the skills
 SKILL_TARGETS ?= claude codex
-# Cargo.lock をコミットしているので、依存の解決結果を CI とそろえる
+# Cargo.lock is committed, so resolve dependencies exactly as CI does
 CARGO_FLAGS ?= --locked
 
-# ---- ツールチェーン -----------------------------------------------------------
-# mise は PATH、よくある導入先の順に探す。GUI から起動した make はシェルの PATH を
-# 引き継がないことがあるため。make MISE=/path/to/mise で明示もできる。
-# mise が無い環境の振る舞いを試すときは MISE_CANDIDATES= で探す先を空にする。
+# ---- Toolchain ------------------------------------------------------------------
+# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
+# inherit the shell's PATH). Override with make MISE=/path/to/mise.
+# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -36,7 +33,7 @@ MISE := $(firstword $(shell command -v mise 2>/dev/null) $(wildcard $(MISE_CANDI
 endif
 ifeq ($(MISE),)
 ifneq ($(filter-out help,$(or $(MAKECMDGOALS),help)),)
-$(error mise not found. Install it from https://mise.jdx.dev, or add SYSTEM_TOOLS=1 to use the tools on PATH)
+$(error mise was not found. Install it from https://mise.jdx.dev, or add SYSTEM_TOOLS=1 to use the tools on PATH)
 endif
 endif
 RUN := $(if $(MISE),$(MISE) exec --,)
@@ -48,74 +45,78 @@ endif
 
 ## Setup
 
-setup: ## Install the toolchain (mise.toml) and fetch dependencies
+setup: ## Install the toolchain (mise) and dependencies
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-## Build Commands
+## Build
 
-build: ## Build debug version
+build: ## Build a debug binary
 	$(RUN) cargo build $(CARGO_FLAGS)
 
-release: ## Build release version
+release: ## Build a release binary
 	$(RUN) cargo build --release $(CARGO_FLAGS)
 
-run: ## Run the debug build (pass arguments with ARGS="...")
+run: ## Run the debug binary (arguments via ARGS="...")
 	$(RUN) cargo run $(CARGO_FLAGS) --bin $(BINARY_NAME) -- $(ARGS)
 
-## Installation
+## Install
 
-# スキルは入れたばかりのバイナリで書き出すので、バイナリとスキルの版がそろう
-install: install-bin ## Build release, install binary, and install skills (claude + codex)
+# The skills are written by the binary that was just installed, so the binary and the skills
+# always come from the same version
+install: install-bin ## Install the release binary to INSTALL_PATH (default /usr/local/bin) and the agent skills (claude, codex)
 	@for target in $(SKILL_TARGETS); do \
 		"$(INSTALL_PATH)/$(BINARY_NAME)" skill-install "$$target" || exit 1; \
 	done
 
-# 上書きコピーではなく一時ファイル + rename で置き換える。macOS はコード署名の
-# 検証結果を inode 単位でキャッシュするため、実行中や直前に実行したバイナリへ cp で
-# 上書きすると、新しいバイナリが起動直後に SIGKILL される (exit 137)。
-# 一時ファイルは rename が inode の差し替えになるよう、同じディレクトリに置く。
-install-bin: release ## Build release and install the binary only (no skills)
+# Replace the binary through a temporary file and a rename instead of copying over it. macOS
+# caches the code signature check per inode, so a binary copied over one that is running (or ran
+# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
+# in the same directory so that the rename swaps the inode.
+install-bin: release ## Install the release binary to INSTALL_PATH without the agent skills
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
 	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-skill-install: ## Install the AI agent skill from the installed binary (claude + codex)
+skill-install: ## Write the AI agent skill with the installed binary (SKILL_TARGETS, default claude codex)
 	@for target in $(SKILL_TARGETS); do \
 		"$(INSTALL_PATH)/$(BINARY_NAME)" skill-install "$$target" || exit 1; \
 	done
 
-# スキルの置き場所は、バイナリの skill-install が書き出す先 (~/.claude と ~/.codex) に合わせている
-uninstall: ## Remove the installed binary and the installed skills
+# Only the binary is removed. The skills stay in each agent's skills directory (for example
+# ~/.claude/skills/resarch): the location differs per agent, and a skill there may belong to
+# another installed copy of resarch. Delete that directory by hand when it is no longer needed.
+uninstall: ## Remove the binary from INSTALL_PATH
 	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"
-	rm -rf "$(HOME)/.claude/skills/$(SKILL_NAME)" "$(HOME)/.codex/skills/$(SKILL_NAME)"
 
-## Development
+## Checks
 
-# CI の Test ジョブと同じフラグ (--all-features) を付ける。いまは feature が無いので効果は無い
-test: ## Run tests
+# The same flags as the CI jobs (--all-features). The crate has no features yet, so it has no effect
+test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS) --all-features
 
 lint: ## Run clippy with warnings as errors
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets --all-features -- -D warnings
 
-fmt: ## Format code
+fmt: ## Format the code (rewrites files)
 	$(RUN) cargo fmt --all
 
-fmt-check: ## Check formatting (no rewrite)
+fmt-check: ## Check the formatting (no changes)
 	$(RUN) cargo fmt --all -- --check
 
-# lint は --all-features で回すので、既定の feature でのコンパイルもここで確かめる
-check: fmt-check lint ## Run fmt check, clippy, and check (no rewrite)
+# lint runs with --all-features, so compile with the default features here as well
+check: fmt-check lint ## Run fmt-check and lint (no changes), plus cargo check with the default features
 	$(RUN) cargo check $(CARGO_FLAGS)
 
-ci: check test ## Run the same checks as the CI Test job (no rewrite)
+ci: check test ## Run the same checks as CI (no changes)
+
+## Conformance
 
 fixtures: ## Fetch upstream sysstat test data used by golden tests (not bundled: GPL)
 	$(RUN) cargo run $(CARGO_FLAGS) --quiet --bin xtask -- fetch-fixtures
 
-# 本家データを取得して ignored のテストを回す (CI の Conformance ジョブと同じ)。
-# sar を呼ぶテストは、sysstat が無い環境ではスキップと表示して通る。detect_svg は xmllint を使う
+# Fetch the upstream data and run the ignored tests (the same as the Conformance job of CI).
+# The tests that call sar pass with a skip notice where sysstat is not installed; detect_svg uses xmllint
 conformance: fixtures ## Run conformance tests against upstream sysstat data (fetches fixtures)
 	$(RUN) cargo test $(CARGO_FLAGS) --test conformance -- --include-ignored --nocapture
 	$(RUN) cargo test $(CARGO_FLAGS) --test sa2sar -- --include-ignored --nocapture
@@ -124,9 +125,9 @@ conformance: fixtures ## Run conformance tests against upstream sysstat data (fe
 bench: ## Run benchmarks (set RESARCH_BENCH_FILE, or run make fixtures first)
 	$(RUN) cargo bench $(CARGO_FLAGS)
 
-## Data Collection
+## Data collection
 
-# 採取スクリプトはホストの cargo でビルドするので、mise の版で動かす
+# The collection script builds with the host's cargo, so run it with the pinned toolchain
 sar-latest: ## Collect and compare an sa file with the latest upstream sysstat
 	$(RUN) ./scripts/collect-sar-matrix.sh latest
 
@@ -147,21 +148,18 @@ sar-upstream-all: ## Build and verify every pinned official sysstat source relea
 
 ## Cleanup
 
-clean: ## Clean build artifacts
+clean: ## Remove build artifacts
 	$(RUN) cargo clean
 
 ## Help
 
-help: ## Show this help message
-	@echo "$(BINARY_NAME) Build Commands"
+help: ## Show this help
+	@echo "Development tasks for $(BINARY_NAME)"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "Usage: make <target>"
 	@echo ""
-	@echo "Targets:"
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Tool versions are pinned in mise.toml. Run make setup first."
 	@echo "Without mise, add SYSTEM_TOOLS=1 to use the tools on PATH."
-	@echo ""
-	@echo "Release:"
-	@echo "  Use GitHub Actions > Release > Run workflow"
+	@echo "Release: GitHub Actions > Release > Run workflow"

@@ -25,3 +25,6 @@ target
 
 # ローカル作業用
 .ruff_cache/
+# mise の個人用の上書き (版の正は mise.toml)
+mise.local.toml
+.mise.local.toml

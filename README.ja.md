@@ -14,8 +14,12 @@
   <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
-  <br>
+</p>
+
+<p align="center">
+  <a href="https://github.com/owayo/re-sar-ch/actions/workflows/release.yml"><img src="https://github.com/owayo/re-sar-ch/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
   <a href="https://github.com/owayo/re-sar-ch/actions/workflows/ci.yml"><img src="https://github.com/owayo/re-sar-ch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/owayo/re-sar-ch/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/re-sar-ch" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
@@ -43,6 +47,7 @@ Linux で採取した `sa` ファイルを、手元の PC で調べるための�
 - [「sar 互換」の意味](#sar-互換の意味)
 - [設計上の要点](#設計上の要点)
 - [開発](#開発)
+- [リリース](#リリース)
 - [ライセンス](#ライセンス)
 
 ## 主な機能
@@ -79,22 +84,37 @@ winget install owayo.reSARch
 Rust ツールチェーンが必要です。
 
 ```bash
-cargo install --git https://github.com/owayo/re-sar-ch
+cargo install --git https://github.com/owayo/re-sar-ch --locked --bin resarch
 ```
 
-リポジトリを手元でビルドする場合:
+リポジトリには開発用の `xtask` バイナリも入っているため、`--bin resarch` で CLI だけを入れます。
+
+リポジトリを手元でビルドする場合は `make` を使います。
+[mise](https://mise.jdx.dev/) が必要で、`mise.toml` で固定した版の Rust ツールチェーンを mise が入れます。
+mise を使わない場合は `SYSTEM_TOOLS=1` を付けると、PATH 上の Rust ツールチェーンでビルドします。
 
 ```bash
 git clone https://github.com/owayo/re-sar-ch.git
 cd re-sar-ch
+make setup
 make install
 ```
 
-`make install` はバイナリと Claude / Codex 向けスキルをインストールします。バイナリだけなら `make install-bin`。Windows では `cargo install --path .` を使います。
+`make install` はリリースビルドを `/usr/local/bin` に入れたあと、
+Claude Code と Codex 向けの reSARch スキルを `~/.claude/skills/resarch` と `~/.codex/skills/resarch` に書き出します。
+バイナリだけなら `make install-bin` を使います。入れる場所は `INSTALL_PATH`、スキルを入れる先は `SKILL_TARGETS` で変えられます。
+
+```bash
+make install INSTALL_PATH="$HOME/.local/bin"   # sudo の要らない場所に入れる
+make install SKILL_TARGETS=claude              # Claude Code のスキルだけ
+make install SKILL_TARGETS=                    # スキルを入れない
+```
+
+Windows では `cargo install --path . --locked --bin resarch` を使います。
 
 ### GitHub Releases から取得する
 
-リリース公開後は [Releases](https://github.com/owayo/re-sar-ch/releases) から環境別のバイナリを取得できます。
+[Releases](https://github.com/owayo/re-sar-ch/releases) から環境別のバイナリを取得できます。
 
 #### macOS (Apple Silicon)
 
@@ -831,16 +851,53 @@ reSARch もこれを再現します。
 
 ## 開発
 
+[mise](https://mise.jdx.dev/) が必要です。ツールの版は `mise.toml` で固定しています。
+`make` の各ターゲットは `mise exec` 経由でツールを呼ぶので、シェルで mise を有効にしていなくても固定した版で動きます。
+mise を使わない場合は `SYSTEM_TOOLS=1` を付けると PATH 上のツールを使います。その場合、版が CI と一致するとは限りません。
+
 ```bash
-make build        # デバッグビルド
-make test         # 単体テストと統合テスト
-make check        # clippy + fmt
-make fixtures     # 本家のテストデータを取得 (下記参照)
-make release      # 最適化ビルド
-make install      # バイナリとエージェント向けスキルを入れる (claude + codex)
-make install-bin  # バイナリだけ
-make uninstall    # 両方消す
+make setup   # ツールチェーンの導入 (mise install) と依存の取得
+make ci      # CI の Test ジョブと同じ検査
 ```
+
+引数なしの `make` でターゲットの一覧が出ます。次の表の説明は `make help` の出力そのままです。
+
+| コマンド | 説明 |
+|---|---|
+| `make setup` | Install the toolchain (mise.toml) and fetch dependencies |
+| `make build` | Build debug version |
+| `make release` | Build release version |
+| `make run` | Run the debug build (pass arguments with ARGS="...") |
+| `make install` | Build release, install binary, and install skills (claude + codex) |
+| `make install-bin` | Build release and install the binary only (no skills) |
+| `make skill-install` | Install the AI agent skill from the installed binary (claude + codex) |
+| `make uninstall` | Remove the installed binary and the installed skills |
+| `make test` | Run tests |
+| `make lint` | Run clippy with warnings as errors |
+| `make fmt` | Format code |
+| `make fmt-check` | Check formatting (no rewrite) |
+| `make check` | Run fmt check, clippy, and check (no rewrite) |
+| `make ci` | Run the same checks as the CI Test job (no rewrite) |
+| `make fixtures` | Fetch upstream sysstat test data used by golden tests (not bundled: GPL) |
+| `make conformance` | Run conformance tests against upstream sysstat data (fetches fixtures) |
+| `make bench` | Run benchmarks (set RESARCH_BENCH_FILE, or run make fixtures first) |
+| `make sar-latest` | Collect and compare an sa file with the latest upstream sysstat |
+| `make sar-matrix` | Collect sa files from multiple Linux distribution packages |
+| `make sar-generations` | Collect sa files across upstream sysstat format generations |
+| `make sar-centos` | Collect eleven CentOS Vault RPM releases, including 6.5 and 7.5 |
+| `make sar-all` | Collect all twenty recorded distribution and upstream cases |
+| `make sar-upstream-all` | Build and verify every pinned official sysstat source release |
+| `make clean` | Clean build artifacts |
+| `make help` | Show this help message |
+
+`make conformance` は `make fixtures` で本家のデータを取得してから、`make test` では飛ばす適合テストを回します。
+`xmllint` が必要です。macOS には標準で入っており、Debian / Ubuntu では `libxml2-utils` パッケージに含まれます。
+sysstat 本体の `sar` の版を記録するテストは、`sar` が無い環境ではスキップします。
+CI は Ubuntu 24.04 に sysstat を入れ、比較の基準となる版を固定したうえでジョブのサマリーに記録しています。
+
+`sar-*` のターゲットは、コンテナの中で実際の `sa` ファイルを採取して検証します
+([出力の正確さをどう検証しているか](#出力の正確さをどう検証しているか)を参照)。
+Apple container か Docker に加えて、ホスト側に `jq`・`curl`・`shasum` が必要です。
 
 本家 sysstat は GPL なので、**そのテストデータも期待出力もこのリポジトリには同梱していません**。
 `make fixtures` が固定タグから SHA-256 検証つきで `target/fixtures/` へ取得し、
@@ -854,6 +911,17 @@ reSARch は `sysstat` のソースを移植したものではなく、ディス�
 変更履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 不具合は [GitHub Issues](https://github.com/owayo/re-sar-ch/issues) へ、
 `resarch --version` の結果、実行コマンド、エラー内容を添えて報告してください。
+
+## リリース
+
+GitHub Actions の **Actions > Release > Run workflow** から出します。
+workflow は `Cargo.toml` と `Cargo.lock` の版を上げてタグを打ち、
+[GitHub Releases から取得する](#github-releases-から取得する)に挙げた 6 種類のバイナリをビルドして GitHub Release を公開します。
+続けて同じ workflow が Homebrew の tap を更新し、winget のマニフェストを提出します。
+
+- **dry_run** をオンにすると、次の版を計算するだけで終わります。コミット、タグ、ビルド、公開はしません。
+- 版は CalVer の `YY.M.PATCH` (例: `26.9.106`) で、`PATCH` は毎月 100 から始まります。
+  番号からは互換性を壊す変更かどうかが読み取れないので、更新する前に [CHANGELOG.md](CHANGELOG.md) の各版の先頭にある「⚠️ 破壊的変更」を確認してください。
 
 ## ライセンス
 

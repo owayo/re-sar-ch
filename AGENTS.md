@@ -69,9 +69,12 @@ skill   … AI エージェント向けスキルの埋め込みとインスト�
 
 ## 変更したときに必ず回すもの
 
+開発コマンドは `make help` で一覧できる。ツールの版は `mise.toml` が正で、各ターゲットは
+`mise exec --` 経由でその版を呼ぶ (初回は `make setup`)。make に無い `cargo` を直接打つときも
+`mise exec -- cargo ...` にすると、シェルの設定に左右されず同じ版で動く。
+
 ```bash
-cargo test        # 自己整合性テストを含む
-make check        # clippy -D warnings + fmt
+make ci           # CI の Test ジョブと同じ検査 (fmt・clippy -D warnings・check・自己整合性テストを含む test)
 ```
 
 ### レイアウト定義 (`src/layout/activities/*.rs`) を触ったとき
@@ -89,9 +92,8 @@ make check        # clippy -D warnings + fmt
 本家のテストデータで全世代を走査し、**ファイル末尾まで余りなく読めること**を確認する。
 
 ```bash
-make fixtures                                    # 本家データを target/fixtures/ へ
-cargo test --test conformance -- --include-ignored
-cargo run --example scan -- <sa ファイル>        # 単体確認 (exact=true になるか)
+make conformance                                        # 本家データを target/fixtures/ へ取得し、適合テストを回す
+mise exec -- cargo run --example scan -- <sa ファイル>  # 単体確認 (exact=true になるか)
 ```
 
 `exact=true` はレイアウト解釈が正しいことの強い証拠になる。ずれていれば必ず残余バイトが出る。
@@ -99,7 +101,7 @@ cargo run --example scan -- <sa ファイル>        # 単体確認 (exact=true 
 ### el7 の経路 (`series::el7` / `output::sar_el7` / `cli::sar_el7_args`) を触ったとき
 
 ```bash
-cargo test --test sar_el7
+mise exec -- cargo test --test sar_el7
 ```
 
 これは自作 fixture で el7 の癖を固定するだけなので、値の変わる修正では
@@ -142,7 +144,7 @@ GPL のソースとその出力はリポジトリの外に置く。
 解析速度は要件。最適化を入れるときは**必ずベンチ差分を添える**。
 
 ```bash
-cargo bench                # benches/decode.rs (criterion)
+make bench                 # benches/decode.rs (criterion)
 ```
 
 設計上の前提:

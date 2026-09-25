@@ -48,6 +48,15 @@ pub const DEFAULT_ROWS: u32 = 86_400;
 /// 本家の `MIN_ROWS`。
 const MIN_ROWS: u32 = 1;
 
+/// 本家 (Linux の sysstat) の C の `long`。
+///
+/// `std::ffi::c_long` は**実行するホストの** C の `long` で、64bit の Windows
+/// (LLP64) では 32bit になる。本家は Linux でしか動かず、Linux の ABI
+/// (LP64 / ILP32 / x32) では `long` がどれもポインタと同じ幅になる。
+/// そこでホストの ABI ではなくポインタ幅 (`isize`) で写し、64bit の Windows でも
+/// 64bit の Linux で動く本家と同じ値にする。
+type SysstatLong = isize;
+
 /// `sar` のバナー行に出す日付の書式 (03 §6.1)。
 ///
 /// | `S_TIME_FORMAT` | バナーの日付 | 各行のタイムスタンプ |
@@ -200,12 +209,10 @@ fn parse_repeat_header(value: Option<&str>) -> Option<i32> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // `strtol` の受け皿は `long`。**幅は環境依存**なので `c_long` で受ける。
-    // LP64 では 64bit、ILP32 では 32bit になり、飽和する閾値が本家と揃う。
-    // あふれたら `LONG_MAX` に張り付く (本家は errno を見ない)。
-    let parsed = value
-        .parse::<std::ffi::c_long>()
-        .unwrap_or(std::ffi::c_long::MAX);
+    // `strtol` の受け皿は `long`。**幅は ABI で変わる**ので本家の `long` の幅
+    // ([`SysstatLong`]) で受ける。LP64 では 64bit、ILP32 では 32bit になり、
+    // 飽和する閾値が本家と揃う。あふれたら `LONG_MAX` に張り付く (本家は errno を見ない)。
+    let parsed = value.parse::<SysstatLong>().unwrap_or(SysstatLong::MAX);
     if parsed <= 0 {
         return None;
     }
@@ -282,26 +289,39 @@ mod tests {
     }
 
     /// 桁あふれは「無効」ではなく `int` への切り詰め (本家 `(int) strtol(...)`)。
+    ///
+    /// 期待値は本家の `long` の幅で分かれる。分岐をポインタ幅で書くのは、
+    /// 64bit の Windows (C の `long` は 32bit) でも 64bit の Linux の本家と
+    /// 同じ値になることを、Windows の CI で確かめるため。
     #[test]
     fn repeat_header_overflow_wraps_like_the_c_cast() {
         let rows = |value: &'static str| {
             resolve_header_rows(None, &env(&[("S_REPEAT_HEADER", value)])).get()
         };
-        // 2^31 は int で負値 → MIN_ROWS へ丸められる。
-        assert_eq!(rows("2147483648"), MIN_ROWS);
-        // 2^32 + 1 は下位 32bit が 1。
-        assert_eq!(rows("4294967297"), 1);
-        // 2^32 は下位 32bit が 0 → MIN_ROWS。
-        assert_eq!(rows("4294967296"), MIN_ROWS);
         // int に収まる最大値はそのまま。
         assert_eq!(rows("2147483647"), 2_147_483_647);
-        // `long` を超える桁は strtol が LONG_MAX で頭打ちになる。
-        // LP64 では `(int) LONG_MAX` = -1 → MIN_ROWS、ILP32 では LONG_MAX がそのまま残る。
-        let saturated = rows("99999999999999999999999");
-        if std::mem::size_of::<std::ffi::c_long>() > 4 {
-            assert_eq!(saturated, MIN_ROWS);
+        if cfg!(target_pointer_width = "64") {
+            // LP64: long に収まった値を (int) で下位 32bit に切り詰める。
+            // 2^31 は int で負値 → MIN_ROWS へ丸められる。
+            assert_eq!(rows("2147483648"), MIN_ROWS);
+            // 2^32 + 1 は下位 32bit が 1。
+            assert_eq!(rows("4294967297"), 1);
+            // 2^32 は下位 32bit が 0 → MIN_ROWS。
+            assert_eq!(rows("4294967296"), MIN_ROWS);
+            // long を超える桁は strtol が LONG_MAX で頭打ちになり、
+            // `(int) LONG_MAX` = -1 → MIN_ROWS。
+            assert_eq!(rows("99999999999999999999999"), MIN_ROWS);
         } else {
-            assert_eq!(saturated, i32::MAX as u32);
+            // ILP32: long も 32bit なので、2^31 以上は strtol が LONG_MAX (= INT_MAX) で
+            // 頭打ちになり、そのまま残る。
+            for value in [
+                "2147483648",
+                "4294967296",
+                "4294967297",
+                "99999999999999999999999",
+            ] {
+                assert_eq!(rows(value), i32::MAX as u32, "S_REPEAT_HEADER={value}");
+            }
         }
     }
 

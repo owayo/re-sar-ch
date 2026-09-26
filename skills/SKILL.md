@@ -1,352 +1,374 @@
 ---
 name: resarch
 description: >-
-  sysstat の sa バイナリ (/var/log/sa/saXX) を sar/sadf/libc なしで解析する CLI。
-  「いつ・何に異変があったか」を当てる resarch detect、エージェント向け構造化出力の
-  show --format ndjson、期間集計の summarize、ホスト比較の compare を提供。
-  sar / sadf 互換出力 (-d -p -r -j -x) も本家と全文一致。旧世代 (0x1170 / 0x2170 /
-  0x2171 / 0x2173) のファイルも直読でき、32bit / big-endian で採取されたものも読める。
-  どのバージョンの sysstat が書いたファイルかは resarch identify が答える
-  (読めない最古世代 0x115a〜0x216f も識別できる)。
-  RHEL / CentOS 7 のホストの sa2 が書く sar テキストも --sar-profile sysstat-10.1.5-el7 で
-  バイト単位に再現できる (sa2sar / sar 互換入口)。
-  sa ファイル・sar ログ・sadf・性能障害の事後調査・リソース異変の切り分け、
-  「このファイルはどの sysstat のものか」「sar が読めないと言う」
-  「CentOS 7 の sarDD と同じテキストを作りたい」場面で発動。
+  Analyze sysstat sa binary logs (/var/log/sa/saXX) without sar, sadf, or libc.
+  Use for performance incident investigations, resource anomalies, sa files,
+  sar logs, sadf output, identifying the sysstat version that wrote a file,
+  files rejected by sar, or reproducing CentOS 7 sarDD reports.
+  Provides detect for anomaly triage, show for structured data, summarize for
+  period statistics, compare for host comparisons, identify for file versions,
+  and sar/sadf compatibility output. Reads legacy formats and files collected
+  on 32-bit or big-endian systems. The sysstat-10.1.5-el7 profile reproduces
+  RHEL/CentOS 7 sar text through sa2sar and the sar compatibility entry point.
 allowed-tools: Bash(resarch:*)
 ---
 
 # resarch
 
-sysstat が `/var/log/sa/saXX` に書く**バイナリログを直接読む** CLI。`sar` も `sadf` も
-C ライブラリも要らない。`sysstat` が出荷した全フォーマット世代を知っており、構造体の配置を
-「実行ホスト」ではなく「**ファイルを書いたホストの ABI**」から解決するので、
-macOS や Windows で Linux のログを読める。
+Read the **binary logs** sysstat writes to `/var/log/sa/saXX`, without `sar`,
+`sadf`, or a C library. resarch knows all format generations shipped by sysstat
+and resolves structure layouts from **the writer's ABI**, so Linux logs can be
+read on macOS and Windows.
 
-## 実行時の出力言語 (必須)
+## Output language (required)
 
-**エージェントが `detect` / `show` / `summarize` / `compare` / `tui` を実行するときは、
-毎回 `--lang en` を明示する。** トークン消費を抑えるため、コマンドの出力は英語で読む。
-JSON / NDJSON でも説明文が含まれるため省略しない。環境変数や実行環境の言語に依存しない。
-ユーザーへの回答はユーザーが指定した言語で書く。
+**Always pass `--lang en` when running `detect`, `show`, `summarize`, `compare`,
+or `tui` as an agent.** Read command output in English to reduce token usage.
+Include it for JSON and NDJSON too: these formats can contain explanatory text.
+Do not rely on environment variables or the host's language settings.
+Respond to the user in their requested language.
 
-`info` / `identify` / `sar` / `sadf` / `sa2sar` / `skill-install` とサブコマンド省略の
-sar 互換入口は `--lang` に対応しないため付けない。
+Do not add `--lang` to `info`, `identify`, `sar`, `sadf`, `sa2sar`, `skill-install`,
+or the implicit sar entry point: they do not support it.
 
-## いつ使うか
+## Choose a command
 
-| やりたいこと | コマンド |
+| Task | Command |
 |---|---|
-| **障害の事後調査。いつ何が起きたか当たりを付ける** | `resarch detect <file> --lang en` |
-| 検知リソースごとに前後の推移を SVG にする | `resarch detect <file> --lang en --svg-dir charts --svg-context 30m` |
-| 構造化データを取り出してエージェント自身で分析する | `resarch show <file> --lang en --format ndjson` |
-| 期間全体の平均・p95・ボトルネック判定 | `resarch summarize <file> --lang en --format json` |
-| 複数ホストを同じ時間窓で比べる | `resarch compare --lang en --host a=<f1> --host b=<f2>` |
-| **どのバージョンの sysstat が書いたファイルか調べる** | `resarch identify <file>...` |
-| ファイルの世代・ABI・収録 activity を知る | `resarch info <file>` |
-| 既存のツールやスクリプトに食わせる (本家と同じテキスト) | `resarch -u -f <file>` / `resarch sadf -j <file>` |
-| 旧世代のファイルを他ツールへ渡せる形に変換する | `resarch sadf -c <file> > out` |
-| sa バイナリを全項目の sar テキストへ保存する | `resarch sa2sar sa13 -o sar13` |
-| RHEL / CentOS 7 のホストの sa2 が書く sarDD と同じテキストを作る | `resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13` |
+| **Investigate an incident: find when and what looked unusual** | `resarch detect <file> --lang en` |
+| Plot context around detections as SVG | `resarch detect <file> --lang en --svg-dir charts --svg-context 30m` |
+| Extract structured data for agent analysis | `resarch show <file> --lang en --format ndjson` |
+| Compute period averages, p95, and bottleneck assessments | `resarch summarize <file> --lang en --format json` |
+| Compare hosts over a shared time window | `resarch compare --lang en --host a=<f1> --host b=<f2>` |
+| **Identify which sysstat versions could have written a file** | `resarch identify <file>...` |
+| Inspect the format generation, ABI, and recorded activities | `resarch info <file>` |
+| Feed existing tools or scripts with upstream-compatible output | `resarch -u -f <file>` / `resarch sadf -j <file>` |
+| Convert a legacy file for other tools | `resarch sadf -c <file> > out` |
+| Save all activities from an sa binary as sar text | `resarch sa2sar sa13 -o sar13` |
+| Reproduce sarDD written by sa2 on RHEL/CentOS 7 | `resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13` |
 
-`sa2sar` は平均・RESTART・COMMENT も含め、既定は採取元に記録された時刻、
-`--utc` で UTC に切り替える。`-o` 省略または `-o -` は標準出力。
-保存先は上書きせず、失敗時も途中までのファイルを保存先に残さない。
+`sa2sar` includes averages, RESTART, and COMMENT records. It uses the recorded
+source time by default; `--utc` selects UTC. Omitting `-o`, or using `-o -`,
+writes to stdout. Existing destination files are never overwritten, and a
+failure does not leave a partial file at the destination.
 
-**既定の書式は本家 sysstat 12.8.0。** RHEL / CentOS 7 のホスト (sysstat 10.1.5 の el7
-パッケージ) が書いた `sarDD` と突き合わせるときは `--sar-profile sysstat-10.1.5-el7` を付ける。
-列 (`-B` の `%vmeff`、`-d` の `rd_sec/s … svctm`、`-R` ブロック)、CPU `all` 行の求め方、
-平均の整数除算まで el7 の `sar` と同じになり、実ホストのレポートとバイト単位で一致する。
-読めるのは `format_magic` 0x2171 のファイルだけ。プロファイルは自動では選ばれない
-(ヘッダの版は `sadc` の版で、`sa2` の `sar` やパッチまでは分からないため)。
-`-R` を ppc64 系のホストに合わせるなら `--sar-page-size 65536`。
+**The default compatibility profile is upstream sysstat 12.8.0.** To compare
+against sarDD from RHEL/CentOS 7 (the sysstat 10.1.5 el7 package), pass
+`--sar-profile sysstat-10.1.5-el7`. This reproduces el7 columns (`%vmeff` in `-B`,
+`rd_sec/s ... svctm` in `-d`, and the `-R` block), CPU `all` calculations, and
+integer division in averages for byte-for-byte matching.
+The profile reads only `format_magic` 0x2171. It is never selected automatically:
+the header identifies `sadc`, not the version or patches of the `sar` used by
+`sa2`. For `-R` on ppc64 hosts, use `--sar-page-size 65536`.
 
-**`sar` が「読めない」と言ったファイルでも読める。** `sar` は `format_magic` が現行と
-違うと即エラーにするが、`resarch` は登録済み28形式を直読する。`0x2168` を含む旧モノリシック22形式、
-2.2の `0x015d`、`0x1170` / `0x2170` / `0x2171` / `0x2173` / `0x2175` が対象。
-旧形式では未記録・単位不明の値は取得不可になり、CPU別IRQなど未デコードの配列もある。
-`exact=true` は末尾走査の一致であり、全指標や当時のsar表示との一致ではない。
-32bit / big-endian も扱えるが、long幅未記録の旧形式は既定8バイト、2.2のendianは既定littleと仮定する。
-CLIにABI上書きはないため、異なる入力ではライブラリの `OpenOptions` で指定する。
+**A file rejected by sar may still be readable.** sar rejects a noncurrent
+`format_magic`; resarch directly reads 28 registered formats: 22 legacy
+monolithic formats including `0x2168`, sysstat 2.2's `0x015d`, and
+`0x1170` / `0x2170` / `0x2171` / `0x2173` / `0x2175`.
+Legacy values absent from the file or with unknown units are unavailable;
+some arrays, including per-CPU IRQ data, are not decoded.
+`exact=true` confirms scanning to the exact end of the file, not agreement on
+all metrics or with historical sar output.
+32-bit and big-endian inputs are supported, but legacy formats without a
+recorded long width default to 8 bytes, and sysstat 2.2 defaults to little-endian.
+The CLI has no ABI override; use the library's `OpenOptions` for other inputs.
 
-## どのバージョンの sysstat が書いたファイルか調べる
+## Identify the sysstat version
 
 ```bash
 resarch identify /var/log/sa/sa07
-resarch identify sa*.bin --format json      # 機械可読
+resarch identify sa*.bin --format json      # Machine-readable output
 ```
 
-```
-FILE                   FORMAT  SYSSTAT                       RECORDED  ENDIAN  READ  NOTE
-sa01                   0x1170  9.0.4 (RHEL/CentOS 6.5 以降)  9.0.4     little  yes
-sa07                   0x2168  6.1.1〜6.1.2                  -         little  yes
-broken.bin             -       -                             -         -       -     sysstat のデータファイルではない
-```
+Even an unreadable generation returns identification results with **exit code 0**.
+An unreadable format is not a command failure; failure to open the file is.
+Unlike `info`, which requires a decodable header, `identify` reads **only the
+first 1 KiB** to determine what the file is.
 
-読めない世代でも判定結果を返し、**終了コードは 0 のまま**である
-(「読めない」ことは失敗ではない)。ファイル自体が開けないときだけ非ゼロになる。
-`info` との違いは、`info` がヘッダを解釈できるファイルしか扱えないのに対し、
-`identify` は**先頭 1 KiB だけを読んで「何のファイルか」に答える**点にある。
+Do not confuse these columns:
 
-列の意味で取り違えやすいのは次の 2 つである。
+- **`SYSSTAT` is the version range inferred from the magic**, not the writer's
+  exact version. One magic can span multiple versions; for example, `0x2169`
+  covers four releases from 6.1.3 through 7.0.4.
+- **`RECORDED` is the version stored in the file itself.** Only generations with
+  `file_magic` (starting at `0x216f`) have it. Earlier files show `-`, meaning
+  the version was not recorded, not that reading it failed.
 
-- **`SYSSTAT` は magic から分かる範囲**であって、書き手のバージョンそのものではない。
-  1 つの magic が複数バージョンに跨る (例: `0x2169` は 6.1.3〜7.0.4 の 4 リリース)。
-- **`RECORDED` はファイル自身が記録しているバージョン**。`file_magic` を持つ世代
-  (`0x216f` 以降) にしか無いので、それ以前は `-` になる。**「記録が無い」であって
-  「読み取れなかった」ではない。**
+A header-layout mismatch in `NOTE` means the magic is known but the header is
+corrupt or truncated. An unknown-format-magic note means the generation is
+not yet recognized.
 
-`NOTE` が「ヘッダの構造が一致しない」なら、magic は既知だがヘッダが壊れているか
-途中で切れている。「この format_magic は未知」なら、こちらがまだ知らない世代である。
+## Start with detect
 
-## まず detect を打つ
-
-「このホストで何かあった」という調査の入口はこれ。**何を見ればいいか分かっていなくてよい。**
+Use this as the entry point when something happened on a host, even if you
+**do not yet know which metrics to inspect**.
 
 ```bash
 resarch detect /var/log/sa/sa07 --lang en
-resarch detect sa07 --lang en --format json    # エージェント向け (型のフィールドをそのまま出す)
-resarch detect sa07 --lang en --verbose        # text に検出ごとの内訳と解釈まで出す
-resarch detect sa07 --lang en --min-priority investigate   # 優先度の下限で絞る
-resarch detect sa07 --lang en --from 09:00 --to 10:00      # 報告範囲だけを絞る (下記の注意)
+resarch detect sa07 --lang en --format json    # Full structured fields for agents
+resarch detect sa07 --lang en --verbose        # Per-detection details and interpretations
+resarch detect sa07 --lang en --min-priority investigate   # Minimum priority
+resarch detect sa07 --lang en --from 09:00 --to 10:00      # Report window only; see below
 ```
 
-評価できるすべての系列に 3 つの観点を当て、当たったものを時間的に近いものごとに
-**エピソード**としてまとめる。
+Three detection routes evaluate every eligible series. Detections close in
+time are grouped into **episodes**.
 
-### 出力の言語
+### Output language
 
-`detect` のキーと列挙値は言語によらず英語で固定だが、説明文は言語指定で変わる。
-冒頭の必須規則に従い、`--format json` / `--format ndjson` にも `--lang en` を併用する。
+`detect` keys and enum values are always English, but explanatory text depends
+on the language setting. Follow the required rule above: combine
+`--format json` / `--format ndjson` with `--lang en`.
 
-### text は既定で要約 (エージェントは JSON を使う)
+### Text is a summary; agents should use JSON
 
-既定の `text` は**まず確認する対象を選ぶための要約**。エピソードを見出しの系列ごとに
-まとめ、優先度順に最大5系列を出す。各系列では優先度順に最大3件の時刻・採取回数と、
-代表例の観測値・判定理由を表示する。背景の所見は優先度順に最大3件。
-表示を省いた件数は明記される。**表示の省略は「検出なし」ではない。**
-**同時に別の系列が鳴ったエピソードには `+N 系列`** が付く — 重なりは
-「何かが起きた」手がかりなので、ここを読み飛ばさないこと。
+Default `text` helps choose what to inspect first. Episodes are grouped by
+headline series, showing up to five series in priority order. Each series
+shows up to three timestamps and sample counts in priority order, with observed
+values and a rationale for a representative detection. Up to three background
+findings are shown in priority order.
+Omitted counts are explicit. **Omitted output does not mean no detections.**
+The summary also marks episodes with detections in additional series; do not
+ignore these overlaps when investigating a possible event.
 
-代表例以外の根拠の内訳と「考えられる解釈」は省く。
-**`--format json` / `--format ndjson` は `--verbose` によらず全フィールドを出す**ので、
-機械可読で読むなら要約を気にしなくてよい (エピソードは 1 件ずつ入っており、
-`headline_series` / `headline_metric_label` でどの検出が見出しかも取れる)。
+Detailed evidence and possible interpretations are omitted except for the
+representative evidence described above.
+**JSON and NDJSON contain all fields regardless of `--verbose`.** Each episode
+has its own entry; `headline_series` / `headline_metric_label` identify its
+headline detection.
 
-省いても報告の義務は変わらない。要約でも次は必ず出る。
+The summary still includes:
 
-- 比較基準の出所 (ヘッダの `比較基準:` と末尾の `注意`)
-- **評価できた範囲** — 評価できなかった系列とその理由
-- 系列に固有の留保 — `! 比較基準に偏りがある可能性がある` 等
-- **この結果だけでは分からないこと** — エピソード本文ではなく末尾に、**指標ごとに 1 度**まとまる
+- The source of the comparison baseline, in the header and closing caveats.
+- **Evaluation coverage:** series that could not be evaluated and why.
+- Series-specific caveats, including a potentially biased baseline.
+- **What cannot be concluded from this result**, collected once per metric
+  at the end rather than repeated in every episode.
 
-`text` で全エピソードを1件ずつ追うには `--verbose` を付ける。
-要約で気になった系列・時刻の前後は `show --lang en --activity ... --from ... --to ...` で調べる。
+Use `--verbose` to inspect all episodes individually in text.
+Follow up on a series and time range with
+`show --lang en --activity ... --from ... --to ...`.
 
-| 観点 | 何を見るか |
+| Route | What it evaluates |
 |---|---|
-| 絶対水準 | 意味が確立している値への固定条件 (direct reclaim の発生、`%util` の高止まりなど) |
-| 参照分布からの逸脱 | そのファイル自身の median と MAD からの偏り |
-| 時間的変化 | 前後の窓の水準差 |
+| Absolute level | Fixed conditions on metrics with established meaning, such as direct reclaim or sustained high `%util` |
+| Reference-distribution deviation | Deviation from the input file's own median and MAD |
+| Temporal change | Level differences between adjacent windows |
 
-### detect の出力を読むときに必ず押さえること
+### Rules for interpreting detect output
 
-**この出力は「推測を測定のように見せない」ことに全力を使っている。** 添えられた留保は
-飾りではなく、そのまま判断に使う情報である。
+Treat the caveats as evidence constraints, not decoration.
 
-- **確信度のパーセントは出ない。** 1 ホストの 144 点から較正された確率は作れない。
-  代わりに**調査優先度** (順序尺度: 参考 / 注視 / 調査) と**判断に使えるデータ**が
-  **別のフィールド**で出る。2 つを掛け合わせて 1 つのスコアにしないこと
-- **`! 比較基準に偏りがある可能性がある`** が出たら、その系列の**逸脱判定は
-  当てにならない**。比較基準はそのファイル自身から作るので、異変がファイルの大半を
-  占めていれば基準もそちらへ寄る。`中央値そのものが固定条件を満たしている` と
-  書かれていたら、逸脱の数値を根拠にしてはいけない
-- **「20 分にわたる 3 回の採取」は「20 分間ずっと」ではない。** `sar` のデータは
-  離散的な採取で、採取と採取の間に何が起きたかは観測されていない
-- **「観点が 2 つ当たった」は裏付けが 2 倍ではない。** 3 経路は相関する
-  (`%idle` が下がれば 3 つとも鳴りやすい)。出力にもそう書いてある
-- **`前後で水準が違う境目` は「その時刻に変わった」ではない。** 指しているのは
-  採用した前後窓の分割時刻である
-- **背景の所見**は「重要でない」ではなく「**いつ起きたかの手がかりを持たない**」。
-  入力のほぼ全体を占める状態 (終日続くスワップ使用など) はここに分けられる
-- **`評価できなかった系列`** は「異変なし」ではない。理由つきで列挙されるので、
-  そこを読まずに「問題なし」と結論しないこと
-- **`先頭・末尾の前後比較ができず、計 N 回の採取は変化の判定対象外`** が出たら、ファイル端で起きた変化は
-  この経路では評価されていない
+- **No confidence percentages are provided.** A single host's 144 samples
+  cannot establish calibrated probabilities. **Investigation priority**
+  (ordinal: informational / watch / investigate) and **evidence sufficiency**
+  are separate fields. Never multiply them into a single score.
+- **A potentially biased baseline makes deviation assessments unreliable.**
+  The baseline comes from the input itself: if unusual behavior dominates
+  the file, it shifts the baseline. If the median itself meets a fixed
+  condition, do not rely on deviation values as evidence.
+- **Three samples spanning 20 minutes do not mean 20 continuous minutes.**
+  sar samples are discrete; behavior between samples is unobserved.
+- **Two firing routes do not mean twice the evidence.** The three routes are
+  correlated; a drop in `%idle` can trigger all three.
+- **A boundary between different levels is not the exact change time.**
+  It is the split selected between the adjacent comparison windows.
+- **Background findings lack timing clues; they are not necessarily
+  unimportant.** Conditions covering almost the entire input, such as swap
+  usage throughout the day, belong here.
+- **Unevaluated series do not mean no anomalies.** Read their reasons before
+  concluding that there is no problem.
+- If the report says edge samples lack before/after comparisons and were
+  excluded from change detection, changes at those file boundaries were
+  not evaluated by that route.
 
-## 検知箇所のグラフ
+## Plot detected regions
 
-`detect --lang en --svg-dir <新規ディレクトリ>` は、検知したホスト・起動区間・リソース・指標ごとに
-前後各30分のSVGを保存する。`--svg-context 300s/15m/1h/0` で幅を変えられる。
-重なる表示範囲は同一系列内でまとめ、離れた検知は別SVGにする。
-時刻は `--timezone` の基準 (既定はローカル) で表示し、`index.json` の `timezone` に
-実際に使った基準名を出す。`--from` / `--to` 外の文脈も入力にあれば残す。検知条件は変えない。
-`index.json` がファイルと検知の対応表、`report.json` が評価不能理由も含むレポート。
-検知なしはSVGを作らず空の一覧を残す。部分入力は一覧で `partial` と明記し非ゼロ終了。
-通常レポートも標準出力へ出る。既存ディレクトリは上書きしない。
+`detect --lang en --svg-dir <new-directory>` saves SVGs by detected host, boot
+segment, resource, and metric, with 30 minutes of context on either side.
+Use `--svg-context 300s/15m/1h/0` to change the context width.
+Overlapping windows within a series are merged; separated detections get
+separate SVGs.
+Times follow `--timezone` (local by default); `index.json` records the resolved
+zone in `timezone`. Available context outside `--from` / `--to` is retained.
+Plotting does not change detection conditions.
+`index.json` maps files to detections; `report.json` includes the report and
+reasons for unevaluated series. No detections produces an empty index and no
+SVGs. Partial input is marked `partial` in the index and exits nonzero.
+The normal report still goes to stdout. Existing directories are not overwritten.
 
-## 構造化データを取り出す
+## Extract structured data
 
-エージェント自身で分析するなら NDJSON か JSON。
+Use NDJSON or JSON for agent analysis.
 
 ```bash
 resarch show sa07 --lang en --format ndjson --activity cpu,disk
-resarch show sa07 --lang en --format ndjson --values both     # 生カウンタと派生値を別名前空間で
+resarch show sa07 --lang en --format ndjson --values both     # Separate raw and derived namespaces
 resarch show sa07 --lang en --format json --from 09:00 --to 18:00
 ```
 
-`--values` は `raw` (累積カウンタの生値) / `derived` (レート・割合、既定) / `both`。
+`--values` accepts `raw` (raw cumulative counters), `derived` (rates and
+percentages; default), or `both`.
 
-### 欠落とゼロは別
+### Missing is not zero
 
-**これが `resarch` の最重要の性質。** 独自出力では、値が無いことを理由つきで返す。
+Native output reports why a value is unavailable.
 
-| 品質 | 意味 |
+| Quality | Meaning |
 |---|---|
-| `unsupported_by_source` | **その世代のファイルにフィールドが無い。** 0 ではない |
-| `missing_in_sample` | フィールドはあるが、そのレコードで取得できていない |
-| 不連続 (`restart` / `item_replaced` / …) | 差分が作れない。レートを計算していない |
+| `unsupported_by_source` | **The source generation has no such field.** This is not zero. |
+| `missing_in_sample` | The field exists, but its value is unavailable in this record. |
+| Discontinuity (`restart` / `item_replaced` / ...) | No valid delta can be computed, so no rate was calculated. |
 
-`0` として扱うと平均・p95・閾値判定が静かに誤る。**独自出力で値が空なら、
-それは 0 ではない。**
+Treating missing values as `0` silently corrupts averages, p95, and threshold
+assessments. **An empty value in native output is not zero.**
 
-`u64` の生値は**十進文字列**で出る (JavaScript 系で 2^53 超が丸まるのを避けるため)。
+Raw `u64` values are **decimal strings** to avoid JavaScript rounding above 2^53.
 
-## 期間集計とホスト比較
+## Summarize periods and compare hosts
 
 ```bash
-resarch summarize sa07 sa08 --lang en --format json      # 複数ファイルを連結して集計
+resarch summarize sa07 sa08 --lang en --format json      # Aggregate multiple files
 resarch compare --lang en --host web1=web1/sa07 --host web2=web2/sa07
 ```
 
-判定には**ルール ID と観測根拠**が付く。閾値・継続時間・必要指標・欠損時の扱い・
-ルール版が出力に残るので、後から「なぜそう判定したか」を復元できる。
+Assessments include **rule IDs and observed evidence**. Thresholds, duration,
+required metrics, missing-data behavior, and rule versions remain in the output
+so the reasoning can be reconstructed later.
 
-`compare` の共通時間窓は各ホストの観測範囲の**交差**になる。
-片方に観測が無い区間を 0 と見なさない。
+`compare` uses the **intersection** of the hosts' observation windows.
+Never treat a window without observations from one host as zero.
 
-## sar / sadf 互換出力
+## sar / sadf compatibility output
 
-既存のスクリプトやツールに食わせるなら互換出力を使う。**本家の期待出力と全文一致**まで
-検証してある (21 ケース)。
+Use compatibility output for existing tools and scripts. Full output matching
+against upstream expectations has been verified in 21 cases.
 
 ```bash
-resarch -u -f sa07                       # サブコマンドを省略すると sar として振る舞う
+resarch -u -f sa07                       # No subcommand means sar mode
 resarch -r -f sa07
 resarch -n DEV,EDEV -f sa07
 resarch -u -P ALL -s 09:00:00 -e 18:00:00 -f sa07
-resarch -u -i 600 -f sa07                # 10 分刻みに間引く
-resarch -I --int=0,LOC -f sa07           # 割り込みを番号か名前で選ぶ
-resarch -A -f sa07 1 1                   # positional interval / count
-resarch sar -A -f sa07                   # 明示的な互換入口
+resarch -u -i 600 -f sa07                # Sample at 10-minute intervals
+resarch -I --int=0,LOC -f sa07           # Select interrupts by number or name
+resarch -A -f sa07 1 1                   # Positional interval / count
+resarch sar -A -f sa07                   # Explicit compatibility entry point
 resarch sadf -j sa07                     # JSON
-resarch sadf -d sa07 -- -d               # DB 形式 (`;` 区切り) でディスク統計
-resarch sadf -r sa07 -- -b               # 生カウンタ
+resarch sadf -d sa07 -- -d               # Disk statistics in semicolon-delimited DB format
+resarch sadf -r sa07 -- -b               # Raw counters
 ```
 
-**`sar` の癖は意図的に再現している。**
+**sar quirks are intentional:**
 
-- `-I` は数値を取らない
-- `-P ALL` と `-P all` は別物
-- **`-h` は help ではなく `--pretty --human`**
-- `-s` に一致した**最初のレコードは表示されず、前サンプル (基準値) として消費される**
+- `-I` does not take a numeric argument.
+- `-P ALL` and `-P all` are different.
+- **`-h` means `--pretty --human`, not help.**
+- The **first record matching `-s` is consumed as the previous sample
+  (baseline)** and is not displayed.
 
-**`--sar-profile sysstat-10.1.5-el7` を付けると、RHEL / CentOS 7 の `sar` の文法と出力になる。**
-`-h` はヘルプ、`-R` がある、`-I` は `SUM` / `ALL` (先頭 16 本) / `XALL` / 割り込み番号。
-10.1.5 に無いオプション (`--dec=` / `-x` / `-z` / `-r ALL` など) は usage エラー。
-`sadf` にはプロファイルが無く、指定するとエラーになる。
+**`--sar-profile sysstat-10.1.5-el7` selects RHEL/CentOS 7 sar syntax and output.**
+Here `-h` is help, `-R` exists, and `-I` accepts `SUM`, `ALL` (first 16 interrupts),
+`XALL`, or an interrupt number. Options absent from 10.1.5, such as `--dec=`,
+`-x`, `-z`, and `-r ALL`, produce usage errors.
+`sadf` has no profile option and rejects it.
 
 ```bash
-resarch --sar-profile sysstat-10.1.5-el7 -A -f sa07      # CentOS 7 の sar -A と同じ
+resarch --sar-profile sysstat-10.1.5-el7 -A -f sa07      # Same as CentOS 7 sar -A
 resarch --sar-profile sysstat-10.1.5-el7 -u -P ALL -f sa07
 ```
 
-**互換出力では欠落がゼロ補完される。** 本家が「その世代に無いフィールドを 0 埋めした
-構造体」を読むため。欠落を欠落として知りたいなら独自出力を使うこと。
+**Compatibility output fills absent fields with zero**, matching upstream's
+zero-initialized structures. Use native output to preserve missingness.
 
-**本家 `sar` が読む環境変数も効く** (`sar` / `sa2sar` / `show --format sar`)。
-採取元と同じ出力を再現したいときに使う。どちらも未設定なら従来どおり。
+**Upstream sar formatting environment variables also apply** to `sar`,
+`sa2sar`, and `show --lang en --format sar`. Use them to reproduce source-host
+formatting. Leaving both unset preserves the default behavior.
 
-| 変数 | 値 | 効果 |
+| Variable | Value | Effect |
 |---|---|---|
-| `S_TIME_FORMAT` | `ISO` と完全一致 | バナー行の日付が `MM/DD/YY` → `YYYY-MM-DD` |
-| `S_REPEAT_HEADER` | 全桁数字で `> 0` | N 行ごとに列見出しを再表示 (標準出力が端末でないときだけ) |
+| `S_TIME_FORMAT` | Exactly `ISO` | Changes the banner date from `MM/DD/YY` to `YYYY-MM-DD` |
+| `S_REPEAT_HEADER` | Digits only, greater than 0 | Repeats column headers every N lines when stdout is not a terminal |
 
-端末へ出すときは代わりにウィンドウの高さ (`rows - 2`) が使われる。
-`sadf` にはどちらも効かない (本家がそうなっている)。
+Terminal output instead uses the window height (`rows - 2`). Neither variable
+applies to `sadf`, matching upstream.
 
-**`sar -A` / `sa2sar` は環境変数なしでも列見出しを繰り返す。** 本家は
-CPU ビットマップを使う activity で 1 サンプルを `count_bits(cpu_bitmap)` 行として
-数え、`-A` と `-P ALL` はビットマップ全体を埋めるので、実 CPU 数に関係なく
-1 サンプル = 8200 行になり、既定の 86400 行を 11 サンプルで越える。
-本家と同じ挙動なので、見出し行を数えて件数を出すような処理では注意する。
+**`sar -A` and `sa2sar` repeat headers even without these variables.** For
+activities using a CPU bitmap, upstream counts each sample as
+`count_bits(cpu_bitmap)` lines. `-A` and `-P ALL` fill the whole bitmap, so one
+sample counts as 8200 lines regardless of the actual CPU count. Eleven samples
+exceed the default 86400-line limit. Account for this when counting output
+records from header occurrences.
 
-### デバイス名について
+### Device names
 
-`sar -d` のデバイス名列は `dev8-0` の形で出る。本家は `major:minor` を**実行ホストの**
-`/dev` / `/sys` で名前に解決するが、それは他ホストで採取したログには誤った名前を与える。
-`--dev=` のマッチングも `dev<major>-<minor>` に対して行う。
+`sar -d` emits names such as `dev8-0`. Upstream resolves `major:minor` through
+the **execution host's** `/dev` and `/sys`, which can misidentify devices in
+logs collected elsewhere. `--dev=` also matches `dev<major>-<minor>`.
 
-## 旧世代のファイルを変換する
+## Convert legacy files
 
 ```bash
-resarch sadf -c sa07 > sa07-current        # 0x2171 / 0x2173 → 0x2175
-resarch sadf -c sa07 -O hz=250 > out       # 仮定する HZ を上書き
+resarch sadf -c sa07 > sa07-current        # 0x2171 / 0x2173 -> 0x2175
+resarch sadf -c sa07 -O hz=250 > out       # Override the assumed HZ
 ```
 
-変換後のバイナリは **stdout のみ**、進捗と警告は stderr。
+Converted binary data goes **only to stdout**; progress and warnings go to stderr.
 
-旧世代のヘッダは HZ を持たないため、直読・変換とも既定は USER_HZ=100。
-`CONFIG_HZ` とは別の値であり、壁時計の差から推定しない。
-生成元の tick 周波数が分かる場合だけ `-O hz=` で上書きする。採用値と出所は stderr に出る。
+Legacy headers do not store HZ, so direct reading and conversion default to
+USER_HZ=100. This differs from `CONFIG_HZ`; do not infer it from wall-clock deltas.
+Use `-O hz=` only when the source tick frequency is known. The chosen value and
+its source are reported on stderr.
 
-## 落とし穴
+## Pitfalls
 
-独自コマンドの `--from` / `--to` の `hh:mm[:ss]` は **`--timezone` の基準**で解釈する
-(既定は実行環境のローカル。時刻表示も同じ基準)。`--timezone local|utc|<IANA 名>`、
-`--utc` はその別名。10 桁の epoch 秒はタイムゾーンの影響を受けず、機械可読形式の
-`start_epoch` / `end_epoch` も epoch 秒のまま。
+Native commands interpret `--from` / `--to` values in `hh:mm[:ss]` using
+**`--timezone`**, also used for display (local by default).
+Use `--timezone local|utc|<IANA-name>` or `--utc` as shorthand for UTC.
+Ten-digit epoch seconds are independent of the timezone; structured output's
+`start_epoch` / `end_epoch` remain epoch seconds.
 
-| 症状 | 原因と対処 |
+| Symptom or task | Cause and action |
 |---|---|
-| 時刻が UTC で出ない / 以前の出力と食い違う | 独自コマンドの表示既定が実行環境のローカルタイムゾーンになった。`--utc` (= `--timezone utc`) で従来の `...Z` 表記に戻る。`info` / `identify` と互換入口 (`sar` / `sadf` / `sa2sar`) は対象外で、`--timezone` を持たない。`detect --format json` / `ndjson` の `report_timezone` が、実際に使った基準を示す |
-| `--from` / `--to` の効き方がコマンドで違う | `show` は**表示行**、`summarize` / `compare` は**集計期間そのもの**、`detect` は**報告範囲だけ** (比較基準の材料は絞らない)。`detect` だけ違うのは、狭い調査範囲の外から比較材料を取る必要があるため |
-| `summarize --from` で結果が空になる | `--from` に一致した最初のレコードは**前サンプルとして消費される**ので、範囲内のレコードが 1 本だけでは区間が作れない。stderr に理由が出る |
-| `hh:mm:ss` 指定が初日で打ち切られない | 仕様どおり。時刻指定は**毎日の時刻**として比較する (`sar -s` / `-e` と同じ) |
-| `sar -A` で期待した activity が出ない | **magic が現行版と違う activity は本家も表示しない**。`resarch info <file>` で magic を確認する。独自出力 (`show`) なら出る |
-| 割り込みの CPU 別内訳を見る | `show --activity irq --irq-cpus`。`cpu` 次元に `all` と CPU 番号を出す。旧ファイルで内訳が記録されていなければ `all` だけ |
-| SVG グラフを出す | `sadf -g sa07 -- -u -P ALL > cpu.svg`。共通計算値の独自描画。`-O autoscale,packed,customcol` は未対応として拒否。PCP (`-l`) も未対応 |
-| `sadf` で `--dev=` などが効かない | item 名フィルタは `sar` 側にしか効かない (既知の未実装) |
-| 破損したファイルで止まる | `--lenient` で診断つきに読み飛ばす。既定 (`--strict`) は疑わしいデータをエラーにする |
-| 大きなファイルで遅い | `--activity` で絞る (選択外の activity はデコードせず読み飛ばす。全件比 2.8 倍速)。`--jobs` で並列度を指定 |
+| Times are not UTC or differ from older output | Native output defaults to the local timezone. `--utc` (= `--timezone utc`) restores `...Z` timestamps. `info`, `identify`, and compatibility entry points (`sar`, `sadf`, `sa2sar`) have no `--timezone`. `report_timezone` in `detect --lang en --format json` / `ndjson` records the resolved zone. |
+| `--from` / `--to` behave differently across commands | `show` filters **displayed rows**; `summarize` / `compare` filter **the aggregation period**; `detect` filters **only the report window**, keeping the baseline input unchanged. detect needs context outside a narrow investigation window. |
+| `summarize --lang en --from` produces no results | The first matching record is consumed as the previous sample. A window with only one record has no interval to aggregate; stderr explains why. |
+| `hh:mm:ss` filtering continues after the first day | Intended behavior: time-of-day filters apply **each day**, as with `sar -s` / `-e`. |
+| `sar -A` omits an expected activity | Upstream also omits activities whose magic differs from the current version. Check with `resarch info <file>`; native `show` output can include them. |
+| Inspect per-CPU interrupts | Use `show --lang en --activity irq --irq-cpus`. The `cpu` dimension contains `all` and CPU numbers; only `all` is available if the legacy file lacks per-CPU data. |
+| Produce SVG graphs | `sadf -g sa07 -- -u -P ALL > cpu.svg` uses a native renderer with shared computed values. `-O autoscale,packed,customcol` and PCP (`-l`) are unsupported and rejected. |
+| `--dev=` and similar filters do not work in sadf | Item-name filters currently apply only to sar (known limitation). |
+| Corrupt files stop processing | `--lenient` skips recoverable corruption with diagnostics. The default `--strict` rejects suspicious data. |
+| Large files are slow | Restrict `--activity`; unselected activities are skipped without decoding (measured 2.8x faster than decoding all). Use `--jobs` to set file-processing parallelism. |
 
-## 出力先の規約
+## Output conventions
 
-- **データは stdout、診断は stderr。** 互換出力に独自の警告を混ぜない
-- 読めないファイルがあれば**非ゼロ終了**する (部分結果でも)
-- `-f` はディレクトリ指定にも対応し、`SA_DIR` (既定 `/var/log/sa`) 配下の
-  `saDD` / `saYYYYMMDD` を **mtime 比較**で選ぶ
+- **Data goes to stdout; diagnostics go to stderr.** Native warnings are not
+  mixed into compatibility output.
+- An unreadable input causes a **nonzero exit**, even when partial results exist
+  (see the format-identification exception under `identify`).
+- `-f` also accepts a directory. Daily files named `saDD` / `saYYYYMMDD` under
+  `SA_DIR` (default `/var/log/sa`) are selected by **mtime**.
 
-## 調査の流れ (例)
+## Example investigation
 
 ```bash
-# 1. どんなファイルか (読めない世代でも答える)
+# 1. Identify the file, including unsupported generations, and inspect metadata
 resarch identify /var/log/sa/sa07
 resarch info /var/log/sa/sa07
 
-# 2. 当たりを付ける。ここで時刻と指標が分かる
+# 2. Find candidate times and metrics
 resarch detect /var/log/sa/sa07 --lang en
 
-# 3. detect が指した時刻の周辺を本家書式で見る
+# 3. Inspect the detected time range in upstream-compatible format
 resarch -u -P ALL -s 16:00:00 -e 17:00:00 -f /var/log/sa/sa07
 
-# 4. 数値を自分で扱う
+# 4. Extract values for analysis
 resarch show /var/log/sa/sa07 --lang en --activity cpu,disk,memory \
   --from 16:00 --to 17:00 --format ndjson --values both
 
-# 5. 前日と比べる
+# 5. Compare with the previous day
 resarch compare --lang en --host d06=/var/log/sa/sa06 --host d07=/var/log/sa/sa07
 ```
 
-**2 を飛ばさないこと。** `detect` は「評価できなかった系列」まで報告するので、
-「見ていない範囲」を把握したうえで次を絞れる。
+**Do not skip step 2.** detect reports unevaluated series as well as detections,
+so you can account for coverage gaps before narrowing the investigation.

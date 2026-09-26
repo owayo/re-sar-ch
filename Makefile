@@ -91,12 +91,11 @@ uninstall: ## Remove the binary from INSTALL_PATH
 
 ## Checks
 
-# The same flags as the CI jobs (--all-features). The crate has no features yet, so it has no effect
 test: ## Run the tests
-	$(RUN) cargo test $(CARGO_FLAGS) --all-features
+	$(RUN) cargo test $(CARGO_FLAGS)
 
 lint: ## Run clippy with warnings as errors
-	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets --all-features -- -D warnings
+	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
 fmt: ## Format the code (rewrites files)
 	$(RUN) cargo fmt --all
@@ -104,9 +103,7 @@ fmt: ## Format the code (rewrites files)
 fmt-check: ## Check the formatting (no changes)
 	$(RUN) cargo fmt --all -- --check
 
-# lint runs with --all-features, so compile with the default features here as well
-check: fmt-check lint ## Run fmt-check and lint (no changes), plus cargo check with the default features
-	$(RUN) cargo check $(CARGO_FLAGS)
+check: fmt-check lint ## Run fmt-check and lint (no changes)
 
 ci: check test ## Run the same checks as CI (no changes)
 

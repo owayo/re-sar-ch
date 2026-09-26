@@ -77,7 +77,7 @@ skill   … AI エージェント向けスキルの埋め込みとインスト�
 make ci           # CI の Quality ジョブと同じ検査 (fmt・clippy -D warnings・check・自己整合性テストを含む test)
 ```
 
-Windows は CI の Build (x86_64-pc-windows-msvc) ジョブが `cargo test --locked --all-features` を回す
+Windows は CI の Build (x86_64-pc-windows-msvc) ジョブが `cargo test --locked` を回す
 (Windows のランナーでは make を使わない)。OS で結果が変わる書き方にも気をつける。
 たとえば `std::ffi::c_long` は Windows では 64bit 環境でも 32bit になり、`chrono::Local` は
 Windows では `TZ` を読まない (互換出力のローカル時刻は `model::localtime` を使う)。

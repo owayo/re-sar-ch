@@ -159,10 +159,10 @@ jobs:
           sudo apt-get install -y musl-tools
 
       # Windows は quality で make ci を回さないので、配る OS の裏付けとしてここでテストする
-      # (Makefile の test と同じ --all-features を付ける)
+      # (Makefile の test と同じコマンド)
       - name: Test (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --locked --all-features
+        run: cargo test --locked
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

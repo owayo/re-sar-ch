@@ -388,16 +388,15 @@ const I_CPU_IDLE: &[Text] = &[
 ];
 const NE_CPU_IDLE: &[Text] = &[
     text!(
-        ja: "CPU 能力の不足。sar(1) の %idle は「未完了ディスク I/O が無い idle 時間」、\
-     %iowait は「未完了ディスク I/O がある idle 時間」で**どちらも CPU は idle** なので、\
-     %idle が低いことからは進めない。%idle=0 かつ %iowait=99 もこの条件を満たす",
+        ja: "CPU 能力の不足。%idle と %iowait は、どちらも CPU が処理していない時間。\
+             未完了のディスク I/O がある場合は %iowait に数えられるため、%idle の低さだけでは CPU 不足と判断できない。\
+             %idle=0 かつ %iowait=99 の場合も含む",
         en: "That the CPU is short of capacity. In sar(1), %idle is idle time with no outstanding disk I/O \
      and %iowait is idle time with outstanding disk I/O — **the CPU is idle in both** — so a low \
      %idle leads nowhere on its own. %idle=0 with %iowait=99 also meets this condition",
     ),
     text!(
-        ja: "実行時間の割合 (%user + %nice + %system)。複数列の和を条件にする仕組みが無く、\
-     このカタログは合成列を持たない",
+        ja: "CPU が実際に処理していた時間の割合 (%user + %nice + %system)。この検出では合計値を評価していない",
         en: "The share of running time (%user + %nice + %system). There is no mechanism for conditions on a \
      sum of columns, and this catalog has no derived columns",
     ),
@@ -644,9 +643,8 @@ const NE_SWAP_SPACE: &[Text] = &[
      with swappiness and with the workload",
     ),
     text!(
-        ja: "スワップ未構成のホストでの扱い。総量が 0 のとき使用率は 0% として計算されるため\
-     (`series::compute` の `swpused_pct`)、この条件は成立しないが\
-     「未構成なので適用対象外」とは報告されない",
+        ja: "スワップが未構成かどうか。総量が 0 の場合は使用率を 0% と計算し、検出しない。\
+             「未構成のため対象外」という区別は出していない",
         en: "What it means on a host with no swap configured. With a total of 0 the usage is computed as 0% \
      (`swpused_pct` in `series::compute`), so the condition never holds — but the report does not \
      say 'not applicable because swap is not configured' either",
@@ -1527,7 +1525,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         scope: ItemScope::Single,
         kind: ValueKind::Counter,
         unit: Unit::CountPerSec,
-        label: text!(ja: "direct reclaim のページスキャン", en: "Pages scanned in direct reclaim"),
+        label: text!(ja: "メモリ割り当て時のページ回収スキャン (direct reclaim)", en: "Pages scanned in direct reclaim"),
         fixed: &[FixedCondition {
             id: "page-reclaim-direct",
             comparison: FixedComparison::Above,

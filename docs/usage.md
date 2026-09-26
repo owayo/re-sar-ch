@@ -151,11 +151,11 @@ What it will not do is dress up a guess as a measurement:
 - **Sampling is not disguised as duration.** Three high readings are "high across 3 samples spanning 20 minutes", never "high for 20 minutes". What happened between samples was not observed.
 - **"Not evaluated" is not "nothing found".** Every series it could not assess is listed with the reason.
 
-The default text report summarises. Episodes are grouped by the series that headlined them, because a series that fires intermittently through a day produces one episode per burst — a real day's file gave 111 episodes across 23 series, and listing them one by one buried *what* is firing under 1400 lines. Each group leads with the metric, how many episodes it accounts for and its highest priority, then the times those episodes covered.
+The default text report helps you choose what to investigate first. It shows up to five headline series in priority order, with up to three episode times per series. Times are selected by priority too, so a later important event is not hidden behind earlier minor ones. Each series includes the observed values and reasoning for a representative finding. Up to three standing findings are shown in priority order.
 
 Nothing the report owes you is dropped. Each group keeps the times, the priority of each occurrence and the sample counts; episodes where **another series fired at the same time** are marked `+N 系列`, since that overlap is the clue that something happened rather than drifted. Where the basis came from, the evaluation coverage and the caveats specific to a series all stay. What a finding does **not** establish moves to the end of the report, listed once per metric instead of once per episode.
 
-What the summary drops is repetition: the per-detection breakdown (observed values, basis figures, window sizes) and the interpretation list, which is fixed per detection pattern. `--verbose` restores every episode individually, verbatim as before. `--format json` and `--format ndjson` are unaffected and always carry every field.
+Omitted counts are explicit; omitted does not mean absent. Use `--verbose` for all episodes and their detailed evidence and interpretations. `--format json` and `--format ndjson` apply no display limits and always carry every field. Inspect the selected series around those times with `show --activity ... --from ... --to ...`.
 
 ## Output language
 

@@ -364,16 +364,16 @@ pub struct DetectArgs {
     #[arg(long, value_enum, default_value_t = DetectFormat::Text)]
     pub format: DetectFormat,
 
-    /// 検出ごとの内訳と考えられる解釈まで出す。
+    /// 全件の詳細と考えられる解釈を出す。
     ///
-    /// 既定の `text` は**エピソードの見出しと検出の要約まで**で、
-    /// 検出 1 件ごとの系列・条件・観測値・比較基準と、
-    /// 検出パターンごとに固定の「考えられる解釈」を省く。
+    /// 既定の text は優先度順に最大5系列、各系列の時刻を最大3件表示する。
+    /// 代表例の観測値と判定理由を添え、背景の所見は最大3件表示する。
+    /// --verbose を付けると、表示件数の上限を外し、検出ごとの根拠も表示する。
     ///
-    /// **比較基準の出所・評価の網羅度・確かめていないことは要約でも出る**
-    /// (確かめていないことは指標ごとに 1 度、報告の末尾にまとまる)。
+    /// 比較基準の出所、評価できた範囲、この結果だけでは分からないことは、
+    /// 要約にも表示する。省略した件数も記載する。
     ///
-    /// **省くのは text だけ**で、`json` / `ndjson` は指定によらず全フィールドを出す。
+    /// json / ndjson は、この指定によらず全件・全フィールドを出す。
     #[arg(long, verbatim_doc_comment)]
     pub verbose: bool,
 
@@ -663,9 +663,9 @@ pub enum Commands {
     #[command(disable_help_flag = true)]
     Summarize(SummarizeArgs),
     /// いつ・何に異変があったか当たりを付ける。
-    ///
-    /// 自動生成の `--help` を止めて [`DetectArgs`] 側で定義する
-    /// (ルートと同じ作法。理由は [`DetectArgs::help`] を参照)。
+    //
+    // 自動生成の `--help` を止めて [`DetectArgs`] 側で定義する
+    // (ルートと同じ作法。理由は [`DetectArgs::help`] を参照)。
     #[command(disable_help_flag = true)]
     Detect(DetectArgs),
     /// 複数ホストを比較する。

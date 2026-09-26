@@ -99,7 +99,7 @@ use crate::text;
 pub const DETECT_SCHEMA_VERSION: &str = crate::model::NATIVE_SCHEMA_VERSION;
 
 /// 検出器の版。閾値や手順を変えたら上げる。
-pub const DETECTOR_VERSION: &str = "resarch-detect/1";
+pub const DETECTOR_VERSION: &str = "resarch-detect/2";
 
 /// MAD を正規分布の標準偏差に合わせる係数。
 ///
@@ -1070,14 +1070,11 @@ impl ReportWindow {
     /// 両端 (08:00 と 12:00) が範囲外なので消え、同じ範囲をエポック秒で
     /// 指定した場合 (こちらは重なりで判定していた) と結果が食い違う。
     pub fn admits(&self, start_ust: u64, end_ust: u64) -> bool {
-        if let Some(s) = self.from.epoch()
-            && end_ust < s
-        {
-            return false;
-        }
-        if let Some(e) = self.to.epoch()
-            && start_ust > e
-        {
+        // 絶対時刻で切った残りに日内条件を当てる。別々の重なり判定では、
+        // 09:00〜13:00 が「12:00 以降かつ毎日 10:00 以前」を通ってしまう。
+        let start_ust = start_ust.max(self.from.epoch().unwrap_or(0));
+        let end_ust = end_ust.min(self.to.epoch().unwrap_or(u64::MAX));
+        if start_ust > end_ust {
             return false;
         }
         if self.from.seconds_of_day().is_none() && self.to.seconds_of_day().is_none() {
@@ -1085,40 +1082,8 @@ impl ReportWindow {
         }
         let lo = self.from.seconds_of_day().unwrap_or(0);
         let hi = self.to.seconds_of_day().unwrap_or(86_399);
-        // 24 時間以上に及ぶ区間はどの時刻も含む
-        if end_ust.saturating_sub(start_ust) >= 86_400 {
-            return true;
-        }
-        // 検出区間が占める「時刻」も日跨ぎし得る弧なので、弧同士の重なりを見る。
-        // 日内秒は表示と同じタイムゾーンで取る (`% 86_400` は UTC 固定になる)。
-        arcs_overlap(
-            self.tz.seconds_of_day(start_ust),
-            self.tz.seconds_of_day(end_ust),
-            lo,
-            hi,
-        )
+        self.tz.overlaps_daily_window(start_ust, end_ust, lo, hi)
     }
-}
-
-/// 時刻 `tod` が `[lo, hi]` に入るか (`lo > hi` は日跨ぎ)。
-fn tod_in_window(tod: u64, lo: u64, hi: u64) -> bool {
-    if lo <= hi {
-        tod >= lo && tod <= hi
-    } else {
-        tod >= lo || tod <= hi
-    }
-}
-
-/// 1 日を円と見たときの 2 つの弧が重なるか。
-///
-/// 弧 `[a1, a2]` と `[b1, b2]` は、どちらか一方の端がもう一方に入っていれば
-/// 重なり、入っていなければ重ならない (どちらかが他方を包含する場合も、
-/// 包含される側の端が相手の中に入る)。**端の一致だけを見ないための判定。**
-fn arcs_overlap(a1: u64, a2: u64, b1: u64, b2: u64) -> bool {
-    tod_in_window(a1, b1, b2)
-        || tod_in_window(a2, b1, b2)
-        || tod_in_window(b1, a1, a2)
-        || tod_in_window(b2, a1, a2)
 }
 
 /// 検出の閾値。
@@ -1293,12 +1258,11 @@ impl PreparedSeries {
 
             if discontinuous {
                 discontinuities += 1;
-                // 及ぶ範囲を判定する。時刻が繋がらない / 区間長 0 は
-                // レコード列の性質なので全系列に効く。理由が付いている場合は
-                // その分類に従う (item 入れ替えはその系列だけ)。
-                let all_series = p.elapsed_cs == 0
-                    || !adjacent
-                    || p.reason.is_some_and(|r| r.affects_all_series());
+                // 系列内の時刻の穴だけではホスト全体の採取停止とは言えない。
+                // デバイスの消失・再出現でも穴ができるため、全系列に及ぶのは
+                // レコード列の不連続が確認できる場合だけにする。
+                let all_series =
+                    p.elapsed_cs == 0 || p.reason.is_some_and(|r| r.affects_all_series());
                 marks.push(DiscontinuityMark {
                     at_ust: p.end_ust,
                     all_series,
@@ -1714,7 +1678,7 @@ fn baseline_material(
         BaselineScope::Window => series
             .observations
             .iter()
-            .filter(|o| window.admits(o.start_ust, o.end_ust))
+            .filter(|o| window.admits(o.reported_start_ust(), o.end_ust))
             .copied()
             .collect(),
     }
@@ -2401,6 +2365,95 @@ mod tests {
             .expect("評価");
         assert!(ev.baseline_samples < 40);
         assert_eq!(ev.baseline_basis, Some(BasisOrigin::ReportWindowOnly));
+    }
+
+    #[test]
+    fn window_baseline_uses_the_observation_time_for_instant_gauges() {
+        let opts = DetectOptions {
+            baseline_scope: BaselineScope::Window,
+            report_to: ReportBound::Epoch(T0 + 2 * STEP_SECS),
+            ..Default::default()
+        };
+        let window = ReportWindow {
+            to: opts.report_to,
+            ..Default::default()
+        };
+        let gauge = PreparedSeries::from_timeline(&runq(&vals(&[1.0, 2.0, 100.0])));
+        let material = baseline_material(&gauge, &opts, window);
+        assert_eq!(
+            material.iter().map(|o| o.value).collect::<Vec<_>>(),
+            [1.0, 2.0]
+        );
+
+        // 区間値は、採取終点が範囲外でも区間の重なりを材料にする。
+        let counter = PreparedSeries::from_timeline(&cpu_idle(&vals(&[1.0, 2.0, 100.0])));
+        assert_eq!(baseline_material(&counter, &opts, window).len(), 3);
+    }
+
+    #[test]
+    fn mixed_epoch_and_daily_bounds_must_overlap_at_the_same_time() {
+        let from_epoch = ReportWindow {
+            from: ReportBound::Epoch(T0 + 12 * 3600),
+            to: ReportBound::TimeOfDay {
+                hour: 10,
+                min: 0,
+                sec: 0,
+            },
+            tz: DisplayTz::Utc,
+        };
+        assert!(!from_epoch.admits(T0 + 9 * 3600, T0 + 13 * 3600));
+        assert!(!from_epoch.admits(T0 - 86_400, T0 + 13 * 3600));
+        assert!(from_epoch.admits(T0 + 9 * 3600, T0 + 86_400 + 3600));
+
+        let to_epoch = ReportWindow {
+            from: ReportBound::TimeOfDay {
+                hour: 12,
+                min: 0,
+                sec: 0,
+            },
+            to: ReportBound::Epoch(T0 + 10 * 3600),
+            tz: DisplayTz::Utc,
+        };
+        assert!(!to_epoch.admits(T0 + 9 * 3600, T0 + 13 * 3600));
+        assert!(to_epoch.admits(T0 - 3600, T0 + 13 * 3600));
+    }
+
+    #[test]
+    fn daily_report_windows_follow_clock_changes() {
+        let window = |hour, min| ReportWindow {
+            from: ReportBound::TimeOfDay { hour, min, sec: 0 },
+            to: ReportBound::TimeOfDay { hour, min, sec: 0 },
+            tz: DisplayTz::parse("America/New_York").unwrap(),
+        };
+        let epoch = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp() as u64;
+        // 秋: 01:50 EDT → 01:10 EST は日跨ぎではなく、12:00 を含まない。
+        let start = epoch("2026-11-01T01:50:00-04:00");
+        let end = epoch("2026-11-01T01:10:00-05:00");
+        assert!(!window(12, 0).admits(start, end));
+        assert!(window(1, 55).admits(start, end));
+        assert!(window(1, 5).admits(start, end));
+        // 春: その日は存在しない 02:30 を区間内に補わない。
+        let start = epoch("2026-03-08T01:50:00-05:00");
+        let end = epoch("2026-03-08T03:10:00-04:00");
+        assert!(!window(2, 30).admits(start, end));
+        assert!(window(3, 0).admits(start, end));
+    }
+
+    #[test]
+    fn a_reappearing_item_does_not_mark_other_series_discontinuous() {
+        use crate::analyze::timeline::{ExclusionReason, MetricPoint};
+        let mut t = pswpin(&vals(&[1.0]));
+        t.points.push(MetricPoint::missing(
+            T0 + 2 * STEP_SECS,
+            T0 + 3 * STEP_SECS,
+            STEP_CS,
+            ExclusionReason::ItemReplaced,
+        ));
+        let series = PreparedSeries::from_timeline(&t);
+        let mark = &series.discontinuity_marks[0];
+        assert!(!mark.all_series);
+        assert!(mark.blocks(&[SeriesKey::from_metric(&t.key)]));
+        assert!(!mark.blocks(&[SeriesKey::from_metric(&cpu_idle(&[]).key)]));
     }
 
     /// カタログにあるのに入力に無い系列は「評価できなかった」として残る。

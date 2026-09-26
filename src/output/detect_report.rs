@@ -60,7 +60,7 @@ fn json_err(e: serde_json::Error) -> io::Error {
 /// 要約で落とした根拠は機械可読形式から取れる。
 ///
 /// 要約でも落とさないものがある。**その所見に固有の留保**
-/// (比較基準が異変側へ寄っている疑い) と、**評価の網羅度**、**注意**である。
+/// (比較基準が異変側へ寄っている疑い) と、**評価できた範囲**、**注意**である。
 /// 前者は規律 3、後者 2 つは規律 7 と「観測と解釈の境界」がかかっている
 /// (`docs/design.md` §11.2)。落としてよいのは、検出パターンが決まれば
 /// 内容も決まる固定文と、機械可読形式に同じものがある内訳だけ。
@@ -87,7 +87,7 @@ pub fn write_text<W: Write>(
     detail: Detail,
 ) -> io::Result<()> {
     let lang = a.lang;
-    write_header(out, a, tz)?;
+    write_header(out, a, tz, detail)?;
 
     if a.episodes.is_empty() {
         writeln!(out)?;
@@ -118,11 +118,11 @@ pub fn write_text<W: Write>(
             out,
             "{}",
             text!(
-                ja: "エピソード 1 件ずつの根拠 (観測値・比較基準・窓) と考えられる解釈は省いた \
-                     (--verbose で出る。全フィールドは --format json / --format ndjson)",
-                en: "Per-episode evidence (observed values, comparison basis, windows) and the \
-                     interpretations are omitted (--verbose shows them; --format json / \
-                     --format ndjson carry every field)",
+                ja: "次に確認: 上の系列と時刻の前後を show --activity <対象> --from <開始> --to <終了> で見る。\
+                     全件と根拠の内訳は detect --verbose / --format json / --format ndjson",
+                en: "Next: inspect the series around those times with show --activity <activity> \
+                     --from <start> --to <end>. All findings and full evidence: detect --verbose / \
+                     --format json / --format ndjson",
             )
             .get(lang)
         )?;
@@ -148,7 +148,12 @@ pub fn write_text<W: Write>(
     Ok(())
 }
 
-fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
+fn write_header<W: Write>(
+    out: &mut W,
+    a: &Assessment,
+    tz: DisplayTz,
+    detail: Detail,
+) -> io::Result<()> {
     let lang = a.lang;
     let s = &a.source;
     let host = if s.label.is_empty() { "-" } else { &s.label };
@@ -188,6 +193,57 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Res
         }
     )?;
     let basis = a.baseline_basis.label().get(lang);
+    if !detail.is_full() {
+        let scope = &a.report_scope;
+        let (from, to, priority) = (
+            scope.from.label(lang),
+            scope.to.label(lang),
+            scope.min_priority.label().get(lang),
+        );
+        let zone = tz.label_at(p.first_ust.unwrap_or(0));
+        writeln!(
+            out,
+            "{}",
+            match lang {
+                Lang::Ja => format!(
+                    "比較基準: {basis} / 報告範囲: {from} → {to} ({zone}) / 最低優先度: {priority}"
+                ),
+                Lang::En => format!(
+                    "Comparison basis: {basis} / Report window: {from} → {to} ({zone}) / Minimum priority: {priority}"
+                ),
+            }
+        )?;
+        writeln!(
+            out,
+            "{}",
+            match lang {
+                Lang::Ja => format!(
+                    "件数: 入力全体の検出 {} 件 / 報告範囲 {} 件 / エピソード {} 件 / 背景の所見 {} 件 (優先度で除外: エピソード {} 件、背景 {} 件)",
+                    scope.detections_in_input,
+                    scope.detections_in_report_window,
+                    a.episodes.len(),
+                    a.background.len(),
+                    scope.episodes_excluded_by_priority,
+                    scope.background_excluded_by_priority
+                ),
+                Lang::En => format!(
+                    "Counts: {} detections in input / {} in report window / {} episodes / {} standing findings (dropped by priority: {} episodes, {} standing findings)",
+                    scope.detections_in_input,
+                    scope.detections_in_report_window,
+                    a.episodes.len(),
+                    a.background.len(),
+                    scope.episodes_excluded_by_priority,
+                    scope.background_excluded_by_priority
+                ),
+            }
+        )?;
+        return writeln!(
+            out,
+            "{}: {}",
+            text!(ja: "所見", en: "Assessment").get(lang),
+            crate::analyze::describe_assessment(a)
+        );
+    }
     let interval = a.interval_p90_secs.map_or_else(
         || text!(ja: "不明", en: "unknown").get(lang).to_string(),
         |i| match lang {
@@ -303,17 +359,14 @@ fn write_header<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Res
     )
 }
 
-/// 1 つの系列にまとめたエピソード群。
-struct SeriesGroup<'a> {
-    series: &'a crate::detect::SeriesKey,
-    metric_label: &'static str,
-    episodes: Vec<&'a AssessedEpisode>,
-}
+/// 既定出力は調査の入口。全件の内訳は verbose / JSON に残す。
+const MAX_SUMMARY_GROUPS: usize = 5;
+const MAX_SUMMARY_BACKGROUND: usize = 3;
 
 /// 1 系列あたりで時刻を並べるエピソード数の上限。
 ///
 /// **件数は必ず出し**、時刻の列挙だけを打ち切る。
-const MAX_LISTED_ONSETS: usize = 8;
+const MAX_LISTED_ONSETS: usize = 3;
 
 /// 1 行に並べる時刻の数 (日付を省けるとき / 省けないとき)。
 const ONSETS_PER_LINE: usize = 3;
@@ -338,25 +391,7 @@ const ONSETS_PER_LINE_WITH_DATE: usize = 2;
 ///
 /// 1 件ずつの根拠は `--verbose` で従来どおり出る。
 fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) -> io::Result<()> {
-    let mut groups: Vec<SeriesGroup<'_>> = Vec::new();
-    for e in &a.episodes {
-        match groups.iter_mut().find(|g| *g.series == e.headline_series) {
-            Some(g) => g.episodes.push(e),
-            None => groups.push(SeriesGroup {
-                series: &e.headline_series,
-                metric_label: e.headline_metric_label,
-                episodes: vec![e],
-            }),
-        }
-    }
-    // 優先度の高い順 → 件数の多い順 → 系列名順 (決定的にする)
-    groups.sort_by(|x, y| {
-        let px = x.episodes.iter().map(|e| e.priority).max();
-        let py = y.episodes.iter().map(|e| e.priority).max();
-        py.cmp(&px)
-            .then_with(|| y.episodes.len().cmp(&x.episodes.len()))
-            .then_with(|| x.series.cmp(y.series))
-    });
+    let groups = a.episode_groups();
 
     // 報告が 1 日に収まるなら時刻だけにする。**日付はヘッダの「期間」が持っている**ので、
     // 全行に繰り返すと時刻そのものが読み取りにくくなる。
@@ -371,13 +406,15 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
     };
 
     let lang = a.lang;
-    for g in &groups {
+    if !groups.is_empty() {
+        writeln!(out, "\n{}", text!(
+            ja: "まず確認する系列 (優先度順、最大 5 系列。時刻も優先度順に最大 3 件)",
+            en: "Start with these series (highest priority first; up to 5 series and 3 times each)",
+        ).get(lang))?;
+    }
+    for g in groups.iter().take(MAX_SUMMARY_GROUPS) {
         writeln!(out)?;
-        let top = g
-            .episodes
-            .iter()
-            .max_by_key(|e| e.priority)
-            .expect("グループは空でない");
+        let top = g.episodes[0];
         let (mark, metric, series, n, priority) = (
             top.priority.mark(),
             g.metric_label,
@@ -396,19 +433,35 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
                 ),
             }
         )?;
-        // 観点は系列単位の和集合。**「N 個の裏付け」とは書かない** (規律 2′)。
-        let mut viewpoints: Vec<&'static str> = Vec::new();
-        for v in g.episodes.iter().flat_map(|e| e.viewpoints.iter()) {
-            if !viewpoints.contains(v) {
-                viewpoints.push(v);
-            }
+        // 値と条件が無いと、読み手は優先度の理由を判断できない。
+        // 見出しを決めた検出の代表例を、分析層が作る説明文で示す。
+        if let Some((d, _)) = top
+            .episode
+            .detections
+            .iter()
+            .zip(&top.detections)
+            .find(|(_, f)| f.headline == top.headline && f.priority == top.priority)
+        {
+            writeln!(
+                out,
+                "     {} {}→{} ({}: {}): {}",
+                text!(ja: "代表例", en: "Example").get(lang),
+                if same_day {
+                    tz.time(d.support.start_ust)
+                } else {
+                    tz.datetime(d.support.start_ust)
+                },
+                if tz.date(d.support.start_ust) == tz.date(d.support.end_ust) {
+                    tz.time(d.support.end_ust)
+                } else {
+                    tz.datetime(d.support.end_ust)
+                },
+                text!(ja: "観点", en: "View").get(lang),
+                d.route().label().get(lang),
+                describe_detection(d, lang)
+            )?;
+            write_series_specific_caveats(out, d, lang)?;
         }
-        writeln!(
-            out,
-            "     {}: {}",
-            text!(ja: "観点", en: "Views").get(lang),
-            viewpoints.join(", ")
-        )?;
 
         for chunk in g
             .episodes
@@ -470,7 +523,7 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
         let levels: Vec<_> = g.episodes.iter().map(|e| e.sufficiency.level).collect();
         let lo = levels.iter().min().expect("空でない").label().get(lang);
         let hi = levels.iter().max().expect("空でない").label().get(lang);
-        let sufficiency = text!(ja: "根拠の充足度", en: "Evidence sufficiency").get(lang);
+        let sufficiency = text!(ja: "判断に使えるデータ", en: "Evidence sufficiency").get(lang);
         if lo == hi {
             writeln!(out, "     {sufficiency}: {hi}")?;
         } else {
@@ -491,6 +544,21 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
             writeln!(out, "       ! {}", BASIS_MAY_LEAN.get(lang))?;
         }
     }
+    let omitted = groups.len().saturating_sub(MAX_SUMMARY_GROUPS);
+    if omitted > 0 {
+        writeln!(
+            out,
+            "\n{}",
+            match lang {
+                Lang::Ja => format!(
+                    "他 {omitted} 系列は表示を省略した (検出なしではない)。全件: --verbose / --format json"
+                ),
+                Lang::En => format!(
+                    "{omitted} more series omitted from this view (not absent). All findings: --verbose / --format json"
+                ),
+            }
+        )?;
+    }
     Ok(())
 }
 
@@ -499,7 +567,7 @@ fn write_episode_groups<W: Write>(out: &mut W, a: &Assessment, tz: DisplayTz) ->
 /// **要約でも落とさない。** その系列の逸脱判定が当てにならないという話で、
 /// 注意書きの一般論では代用できない。
 const BASIS_MAY_LEAN: Text = text!(
-    ja: "比較基準が異変側へ寄っている疑いがある (入力自身が材料のため)",
+    ja: "比較基準に偏りがある可能性がある。異変を見落とすおそれがあるため、固定条件の結果も確認する。",
     en: "the comparison basis may lean toward the anomaly (the input itself is its material)",
 );
 
@@ -581,7 +649,7 @@ fn write_episode<W: Write>(
     writeln!(
         out,
         "     {}: {}",
-        text!(ja: "根拠の充足度", en: "Evidence sufficiency").get(lang),
+        text!(ja: "判断に使えるデータ", en: "Evidence sufficiency").get(lang),
         e.sufficiency_spread.label(lang)
     )?;
     let basis = s.basis.label().get(lang);
@@ -1168,17 +1236,14 @@ fn write_not_established<W: Write>(out: &mut W, a: &Assessment) -> io::Result<()
         out,
         "{}",
         text!(
-            ja: "確かめていないこと (指標ごとに 1 度。観測と解釈の境界)",
+            ja: "この結果だけでは分からないこと (指標ごとに記載)",
             en: "What these findings do not establish (once per metric — the line between \
                  observation and interpretation)",
         )
         .get(a.lang)
     )?;
     for (label, items) in rows {
-        writeln!(out, "  {label}")?;
-        for n in items {
-            writeln!(out, "    - {n}")?;
-        }
+        writeln!(out, "  {label}: {}", items.join(" / "))?;
     }
     Ok(())
 }
@@ -1219,7 +1284,7 @@ fn write_background<W: Write>(
         out,
         "{}",
         text!(
-            ja: "背景の所見 (入力のほぼ全体を占め、いつ起きたかの手がかりを持たない)",
+            ja: "背景の所見 (入力のほぼ全期間で見られる状態)",
             en: "Standing findings (they span almost the whole input and carry no clue about when)",
         )
         .get(lang)
@@ -1230,14 +1295,19 @@ fn write_background<W: Write>(
         out,
         "  {}",
         text!(
-            ja: "(重要でないという意味ではない。入力のどこを切っても成立するので、\
-                 いつ何が起きたかを絞る材料にならないという意味である)",
+            ja: "発生時刻を絞れないため、エピソードとは分けて示す。こちらの優先度も確認する。",
             en: "(This does not make them unimportant. They hold wherever you cut the input, \
                  which is why they narrow down nothing about when something happened)",
         )
         .get(lang)
     )?;
-    for b in &a.background {
+    let ranked = a.ranked_background();
+    let displayed: Vec<_> = if detail.is_full() {
+        a.background.iter().collect()
+    } else {
+        ranked.into_iter().take(MAX_SUMMARY_BACKGROUND).collect()
+    };
+    for b in &displayed {
         let f = &b.finding;
         let share = b
             .share_of_input_percent
@@ -1283,13 +1353,28 @@ fn write_background<W: Write>(
         writeln!(
             out,
             "     {}: {}",
-            text!(ja: "根拠の充足度", en: "Evidence sufficiency").get(lang),
+            text!(ja: "判断に使えるデータ", en: "Evidence sufficiency").get(lang),
             match lang {
                 Lang::Ja => format!("{level} ({basis}: {material} 採取 / 要 {required} 採取)"),
                 Lang::En => format!("{level} ({basis}: {material} samples / {required} required)"),
             }
         )?;
         write_detection(out, &b.detection, tz, detail, lang)?;
+    }
+    let omitted = a.background.len() - displayed.len();
+    if omitted > 0 {
+        writeln!(
+            out,
+            "  {}",
+            match lang {
+                Lang::Ja => format!(
+                    "他 {omitted} 件の背景の所見は表示を省略した。全件: --verbose / --format json"
+                ),
+                Lang::En => format!(
+                    "{omitted} more standing findings omitted. All findings: --verbose / --format json"
+                ),
+            }
+        )?;
     }
     if excluded > 0 {
         writeln!(
@@ -1308,7 +1393,7 @@ fn write_coverage<W: Write>(out: &mut W, c: &EvaluationCoverage, lang: Lang) -> 
     writeln!(
         out,
         "{}",
-        text!(ja: "評価の網羅度", en: "Evaluation coverage").get(lang)
+        text!(ja: "評価できた範囲", en: "Evaluation coverage").get(lang)
     )?;
     let (patterns, present, evaluated, not_evaluated) = (
         c.patterns_in_catalog,
@@ -1363,9 +1448,7 @@ fn write_basis_leaning<W: Write>(
         out,
         "  {}",
         match lang {
-            Lang::Ja => format!(
-                "比較基準が異変側へ寄っている疑いがある系列: {n} 系列 (検出の有無とは無関係)"
-            ),
+            Lang::Ja => format!("比較基準に偏りがある可能性: {n} 系列 (検出がなくても要確認)"),
             Lang::En => format!(
                 "Series whose comparison basis may lean toward the anomaly: {n} \
                  (independent of whether anything was detected)"
@@ -1388,8 +1471,8 @@ fn write_basis_leaning<W: Write>(
         out,
         "    {}",
         text!(
-            ja: "(中央値そのものが固定条件の内側にある、または材料の半分以上が条件を満たしている。\
-                 この系列の逸脱検出は当てにならない)",
+            ja: "比較基準の中央値、または比較に使った値の半分以上が、固定の検出条件を満たしている。\
+                 比較基準も影響を受けているため、異変を見落とす可能性がある。",
             en: "(Either the median itself sits inside a fixed condition, or more than half the \
                  material meets one. Deviation detection for these series cannot be trusted)",
         )
@@ -1504,7 +1587,7 @@ fn write_tally<W: Write>(
             "",
             match lang {
                 Lang::Ja => format!(
-                    "うち {n} 系列は前後窓を取れない端があり、計 {samples} 採取を見ていない"
+                    "うち {n} 系列は先頭・末尾の前後比較ができず、計 {samples} 回の採取は変化の判定対象外"
                 ),
                 Lang::En => format!(
                     "{n} of them have edges where no window fits; {samples} samples in total \
@@ -1725,7 +1808,7 @@ mod tests {
     fn the_text_report_lists_what_could_not_be_evaluated() {
         let a = assessment(&[50.0; 20]);
         let text = render(&a);
-        assert!(text.contains("評価の網羅度"), "{text}");
+        assert!(text.contains("評価できた範囲"), "{text}");
         assert!(text.contains("評価できなかった系列"), "{text}");
     }
 
@@ -1738,7 +1821,7 @@ mod tests {
         let a = assessment(&v);
         let text = render(&a);
         assert!(text.contains("優先度:"), "{text}");
-        assert!(text.contains("根拠の充足度:"), "{text}");
+        assert!(text.contains("判断に使えるデータ:"), "{text}");
         // **確率値を出さない。** 「確率は出さない」という注意書き自体は出る
         assert!(!text.contains("確信度:"), "{text}");
         assert!(!text.contains("確率:"), "{text}");
@@ -1752,7 +1835,7 @@ mod tests {
             .find(|l| l.contains("優先度:"))
             .expect("優先度の行");
         assert!(
-            !priority_line.contains("充足度"),
+            !priority_line.contains("判断に使えるデータ"),
             "優先度と充足度を同じ行に混ぜない: {priority_line}"
         );
     }
@@ -1836,7 +1919,7 @@ mod tests {
 
         let text = render(&a);
         assert!(
-            text.contains("比較基準が異変側へ寄っている疑いがある系列"),
+            text.contains("比較基準に偏りがある可能性: 1 系列"),
             "{text}"
         );
         assert!(text.contains("A_CPU/all/idle"), "{text}");
@@ -1956,14 +2039,14 @@ mod tests {
         // 規律 3: 比較基準の出所
         assert!(text.contains("この入力自身が材料"), "{text}");
         assert!(text.contains("外部の正常値ではない"), "{text}");
-        // 規律 7: 評価の網羅度
-        assert!(text.contains("評価の網羅度"), "{text}");
+        // 規律 7: 評価できた範囲
+        assert!(text.contains("評価できた範囲"), "{text}");
         // 規律 21 / 22: 観測と解釈の境界 (指標ごとに 1 度)
-        assert!(text.contains("確かめていないこと"), "{text}");
+        assert!(text.contains("この結果だけでは分からないこと"), "{text}");
         assert!(text.contains("CPU 能力の不足"), "{text}");
         // 優先度と充足度は別のフィールドのまま
         assert!(text.contains("優先度:"), "{text}");
-        assert!(text.contains("根拠の充足度:"), "{text}");
+        assert!(text.contains("判断に使えるデータ:"), "{text}");
         assert!(!text.contains("確信度:"), "{text}");
     }
 
@@ -2090,9 +2173,92 @@ mod tests {
         let a = assessment_with_period(&v, period_of(&v));
         let text = render(&a);
         assert!(
-            text.contains("比較基準が異変側へ寄っている疑いがある")
+            text.contains("比較基準に偏りがある可能性")
                 || text.contains("中央値そのものが固定条件を満たしている"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn many_series_have_a_bounded_summary_and_complete_machine_output() {
+        use crate::analyze::timeline::MetricKey;
+        use crate::model::{ActivityId, Unit, ValueKind};
+        let timelines: Vec<_> = (0..24)
+            .map(|i| {
+                let mut values = vec![0.0; 240];
+                values[5 + i * 9] = 20.0;
+                timeline(
+                    MetricKey::new(ActivityId::NET_EDEV, format!("test{i:02}"), "rxerr_per_sec"),
+                    Unit::CountPerSec,
+                    ValueKind::Counter,
+                    &vals(&values),
+                )
+            })
+            .collect();
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
+        let a = assess(
+            detect(&collect(&timelines), &opts),
+            SummarySource::default(),
+            period_of(&[0.0; 240]),
+            &opts,
+        );
+        assert_eq!(a.episode_groups().len(), 24);
+        let summary = render(&a);
+        assert_eq!(summary.matches("— 1 件 (最高:").count(), MAX_SUMMARY_GROUPS);
+        assert!(summary.contains("他 19 系列は表示を省略した"), "{summary}");
+        assert!(
+            summary.contains("最小 20.00 / 最大 20.00"),
+            "判断に使える値を残す"
+        );
+        assert!(summary.contains("評価できた範囲"));
+        assert!(summary.contains("この結果だけでは分からないこと"));
+        assert!(
+            summary.lines().count() < 90,
+            "{} lines",
+            summary.lines().count()
+        );
+        assert!(render_full(&a).contains("test23"));
+        let mut json = Vec::new();
+        write_json(&mut json, std::slice::from_ref(&a), TZ).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            parsed["assessments"][0]["episodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            24
+        );
+    }
+
+    #[test]
+    fn summary_keeps_late_high_priority_events_ahead_of_early_noise() {
+        let mut values = vec![0.0; 160];
+        for i in 0..10 {
+            values[5 + i * 10] = 1.0;
+        }
+        values[140..144].fill(10.0);
+        let opts = DetectOptions {
+            lang: Lang::Ja,
+            ..Default::default()
+        };
+        let a = assess(
+            detect(&single(pswpin(&vals(&values))), &opts),
+            SummarySource::default(),
+            period_of(&values),
+            &opts,
+        );
+        let groups = a.episode_groups();
+        assert!(groups[0].episodes.len() > MAX_LISTED_ONSETS);
+        let first = groups[0].episodes[0];
+        assert_eq!(first.priority, Priority::Investigate);
+        assert_eq!(first.episode.support.start_ust, T0 + 140 * STEP_SECS);
+        let summary = render(&a);
+        assert!(
+            summary.contains(&TZ.time(T0 + 140 * STEP_SECS)),
+            "{summary}"
         );
     }
 }

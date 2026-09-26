@@ -15,7 +15,7 @@
 //! 壁時計**として比べるので、春の移行で消える 02:30 は「該当サンプルが無い」、
 //! 秋の移行で 2 度現れる 01:30 は「どちらも該当する」となり、破綻しない。
 
-use chrono::{DateTime, FixedOffset, Local, TimeZone, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, Local, LocalResult, NaiveDateTime, TimeZone, Timelike, Utc};
 
 /// 時刻の解釈と表示に使うタイムゾーン。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +159,79 @@ impl DisplayTz {
         match self.at(ust) {
             Some(dt) => u64::from(dt.num_seconds_from_midnight()),
             None => ust % 86_400,
+        }
+    }
+
+    /// 区間が毎日の壁時計の範囲と重なるか。夏時間の欠落・重複も反映する。
+    pub(crate) fn overlaps_daily_window(&self, start: u64, end: u64, lo: u64, hi: u64) -> bool {
+        if start > end || lo >= 86_400 || hi >= 86_400 {
+            return false;
+        }
+        let contains = |tod| {
+            if lo <= hi {
+                lo <= tod && tod <= hi
+            } else {
+                lo <= tod || tod <= hi
+            }
+        };
+        if contains(self.seconds_of_day(start)) || contains(self.seconds_of_day(end)) {
+            return true;
+        }
+        let (Some(first), Some(last)) = (self.at(start), self.at(end)) else {
+            // 暦に開けない入力は seconds_of_day と同じ UTC の近似に揃える。
+            return end - start >= 86_400 || (lo + 86_400 - start % 86_400) % 86_400 <= end - start;
+        };
+        // 両端が範囲外なら、その間で日内範囲の境界を通ったかを見る。
+        // 時計の巻き戻りを「日跨ぎの弧」と解釈しない。重複する境界は両方、
+        // 存在しない境界はどちらも採らない。
+        let first_date = first.date_naive().min(last.date_naive());
+        let last_date = first.date_naive().max(last.date_naive());
+        // 日付境界付近のオフセット変更で端の外側の日付を通る場合も含める。
+        let mut date = first_date.pred_opt().unwrap_or(first_date);
+        let final_date = last_date.succ_opt().unwrap_or(last_date);
+        loop {
+            for boundary in [lo, hi] {
+                let local = date
+                    .and_hms_opt(
+                        (boundary / 3600) as u32,
+                        (boundary / 60 % 60) as u32,
+                        (boundary % 60) as u32,
+                    )
+                    .expect("日内秒は検証済み");
+                let candidates = self.local_epochs(local);
+                if candidates
+                    .into_iter()
+                    .flatten()
+                    .any(|t| start <= t && t <= end)
+                {
+                    return true;
+                }
+            }
+            if date >= final_date {
+                return false;
+            }
+            let Some(next) = date.succ_opt() else {
+                return false;
+            };
+            date = next;
+        }
+    }
+
+    fn local_epochs(&self, local: NaiveDateTime) -> [Option<u64>; 2] {
+        fn epochs<T: TimeZone>(tz: T, local: NaiveDateTime) -> [Option<u64>; 2] {
+            match tz.from_local_datetime(&local) {
+                LocalResult::None => [None, None],
+                LocalResult::Single(t) => [u64::try_from(t.timestamp()).ok(), None],
+                LocalResult::Ambiguous(a, b) => [
+                    u64::try_from(a.timestamp()).ok(),
+                    u64::try_from(b.timestamp()).ok(),
+                ],
+            }
+        }
+        match self {
+            Self::Utc => epochs(Utc, local),
+            Self::Named(tz) => epochs(*tz, local),
+            Self::System => epochs(Local, local),
         }
     }
 

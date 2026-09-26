@@ -507,7 +507,7 @@ pub fn write_svg<W: Write>(out: &mut W, chart: &Chart, tz: DisplayTz) -> io::Res
             finding.assessed.sufficiency.basis.label().get(lang),
         );
         detail_lines.push(match lang {
-            Lang::Ja => format!("調査優先度: {priority}　根拠の充足度: {level} ({basis})"),
+            Lang::Ja => format!("調査優先度: {priority}　判断に使えるデータ: {level} ({basis})"),
             // **半角空白を並べて間を空けない。** SVG は連続した空白を 1 つに詰めて
             // 描くので、日本語側の全角空白 (詰められない) の代わりにならない。
             Lang::En => format!(
@@ -1075,7 +1075,7 @@ mod tests {
         assert!(!svg.contains('\u{1}'));
         assert!(svg.matches("class=\"title\"").count() > 1);
         assert!(svg.contains("調査優先度:"));
-        assert!(svg.contains("根拠の充足度:"));
+        assert!(svg.contains("判断に使えるデータ:"));
         assert!(svg.contains("固定条件"));
         assert!(svg.contains("正常値ではない"));
         assert!(svg.contains("data-value=\"1\""));
@@ -1246,7 +1246,11 @@ mod tests {
                 "class=\"note\">線は補助線。",
                 "class=\"note\">Lines are visual aids and never join",
             ),
-            ("fixed", "　根拠の充足度: ", " / Evidence sufficiency: "),
+            (
+                "fixed",
+                "　判断に使えるデータ: ",
+                " / Evidence sufficiency: ",
+            ),
             ("fixed", "<title>固定条件: ", "<title>Fixed condition: "),
             ("fixed", "<desc>欠測: ", "<desc>Missing sample: "),
             (

@@ -394,7 +394,7 @@ impl NotEvaluated {
                 text!(ja: "水準変化を見ない指標", en: "level changes are not assessed for this metric")
             }
             NotEvaluated::DispersionNotMeasurable => {
-                text!(ja: "MAD が 0 で散らばりが測れない", en: "MAD is 0, so spread cannot be measured")
+                text!(ja: "ばらつきを基準に比較できない (MAD = 0)", en: "MAD is 0, so spread cannot be measured")
             }
             NotEvaluated::DispersionTooSparse => {
                 text!(ja: "同値が大半で散らばりが測れない", en: "one value dominates, so spread cannot be measured")
@@ -403,10 +403,10 @@ impl NotEvaluated {
                 text!(ja: "基準を作るサンプルが足りない", en: "too few samples to build a basis")
             }
             NotEvaluated::NoWindowLongEnough => {
-                text!(ja: "前後窓を取れる長さの連続区間が無い", en: "no continuous stretch long enough for windows either side")
+                text!(ja: "前後を比較するための連続したデータが足りない", en: "no continuous stretch long enough for windows either side")
             }
             NotEvaluated::WindowSpansMissingSamples => {
-                text!(ja: "前後窓が欠測を挟むので連続した窓が取れない", en: "the windows would span a gap, so no continuous window exists")
+                text!(ja: "途中に欠測があるため、前後の値を比較できない", en: "the windows would span a gap, so no continuous window exists")
             }
         }
     }
@@ -1037,46 +1037,44 @@ impl BackgroundFinding {
 /// 読み手に必ず伝える前提。
 const STANDING_NOTES: &[Text] = &[
     text!(
-        ja: "比較基準はこの入力自身から作ったものであり、外部の正常値ではない。\
-             異変が入力の大半を占めていれば基準もその状態に寄る",
+        ja: "比較基準はこの入力から計算した値で、外部の正常値ではない。\
+             異変が長く続くと基準も影響を受け、変化を見落とすことがある。",
         en: "The comparison basis is built from this input itself; it is not an external \
              notion of normal. If the anomaly dominates the input, the basis moves with it",
     ),
     text!(
-        ja: "確率や確信度は出さない。優先度は順序尺度で、根拠の充足度は別のフィールドである",
+        ja: "確率や確信度は出さない。優先度は調べる順番の目安。\
+             判断に使えるデータの量は、優先度と分けて示す。",
         en: "No probabilities or confidence values are produced. Priority is an ordinal scale, \
              and how much evidence backed it is a separate field",
     ),
     text!(
-        ja: "3 つの観点 (絶対水準 / 参照分布からの逸脱 / 時間的変化) は統計的に独立ではない。\
-             複数の観点が当たったことを独立な裏付けの数として数えていない",
+        ja: "同じデータを3つの観点で調べている。\
+             複数の観点に当てはまっても、それだけで優先度は上げない。",
         en: "The three views (absolute level / deviation from the reference distribution / \
              change over time) are not statistically independent. Several of them firing is \
              not counted as that many independent corroborations",
     ),
     text!(
-        ja: "sar のデータは離散的な採取である。採取と採取の間に何が起きていたかは観測されていない",
+        ja: "採取と採取の間の状態は分からない。採取回数と時間の幅を併せて確認する。",
         en: "sar data is a series of discrete samples. What happened between two samples was \
              not observed",
     ),
     text!(
-        ja: "エピソードは検出が**始まった時刻**でまとめている。長く続く検出は始まった時刻の\
-             エピソードに 1 度だけ現れるので、後の時刻のエピソードを読むときは\
-             それ以前から続いている所見も併せて見る必要がある",
+        ja: "エピソードは、近い時刻に始まった変化のまとまり。\
+             長く続く変化は開始時刻のエピソードに一度だけ載る。後の時刻を調べる際も確認する。",
         en: "Episodes are grouped by the time a detection **started**. A long-running detection \
              appears once, in the episode for the time it began, so when reading a later episode \
              you also need the findings still running from before it",
     ),
     text!(
-        ja: "エピソードの「根拠が及ぶ範囲」は互いに重なることがある。\
-             範囲の包含は同一事象を意味しない",
+        ja: "エピソードの時間範囲が重なっても、同じ原因で起きたとは限らない。",
         en: "The range an episode's evidence covers can overlap another's. One range containing \
              another does not make them the same event",
     ),
     text!(
-        ja: "入力のほぼ全体を占める検出は「いつ」の手がかりを持たないので、\
-             エピソードではなく背景の所見として分けている。\
-             **重要でないという意味ではない**",
+        ja: "入力のほぼ全期間で見られる状態は「背景の所見」にまとめる。\
+             発生時刻を絞れないため分けているが、こちらの優先度も確認する。",
         en: "A detection that spans almost the whole input carries no clue about *when*, so it \
              is separated out as a standing finding rather than an episode. \
              **That does not make it unimportant**",
@@ -1198,7 +1196,64 @@ pub struct Assessment {
     pub lang: Lang,
 }
 
+/// テキスト要約用の系列群。優先順位の決定は分析層に置く。
+pub(crate) struct EpisodeGroup<'a> {
+    pub series: &'a SeriesKey,
+    pub metric_label: &'static str,
+    /// 優先度の高い順。同順位は開始時刻順。
+    pub episodes: Vec<&'a AssessedEpisode>,
+}
+
 impl Assessment {
+    pub(crate) fn episode_groups(&self) -> Vec<EpisodeGroup<'_>> {
+        let mut groups: Vec<EpisodeGroup<'_>> = Vec::new();
+        for e in &self.episodes {
+            match groups.iter_mut().find(|g| *g.series == e.headline_series) {
+                Some(g) => g.episodes.push(e),
+                None => groups.push(EpisodeGroup {
+                    series: &e.headline_series,
+                    metric_label: e.headline_metric_label,
+                    episodes: vec![e],
+                }),
+            }
+        }
+        for g in &mut groups {
+            g.episodes.sort_by(|a, b| {
+                b.priority.cmp(&a.priority).then_with(|| {
+                    a.episode
+                        .support
+                        .start_ust
+                        .cmp(&b.episode.support.start_ust)
+                })
+            });
+        }
+        groups.sort_by(|a, b| {
+            b.episodes[0]
+                .priority
+                .cmp(&a.episodes[0].priority)
+                .then_with(|| b.episodes.len().cmp(&a.episodes.len()))
+                .then_with(|| a.series.cmp(b.series))
+        });
+        groups
+    }
+
+    pub(crate) fn ranked_background(&self) -> Vec<&BackgroundFinding> {
+        let mut findings: Vec<_> = self.background.iter().collect();
+        findings.sort_by(|a, b| {
+            b.finding
+                .priority
+                .cmp(&a.finding.priority)
+                .then_with(|| a.detection.series.cmp(&b.detection.series))
+                .then_with(|| {
+                    a.detection
+                        .support
+                        .start_ust
+                        .cmp(&b.detection.support.start_ust)
+                })
+        });
+        findings
+    }
+
     /// 優先度の下限で絞る。
     ///
     /// **落とした件数と適用した下限を残す。** 結果だけを見て
@@ -1338,7 +1393,7 @@ pub fn describe_detection(d: &Detection, lang: Lang) -> String {
             },
             Lang::Ja,
         ) => format!(
-            "{metric} が {threshold}{unit} {}の状態で {span} (最小 {min:.2} / 最大 {max:.2})",
+            "{metric}: {span}で、{threshold}{unit} {}の値を観測。最小 {min:.2} / 最大 {max:.2}。",
             comparison.label().get(lang)
         ),
         (
@@ -1362,8 +1417,9 @@ pub fn describe_detection(d: &Detection, lang: Lang) -> String {
             },
             Lang::Ja,
         ) => format!(
-            "{metric} が比較基準 (中央値 {median:.2}{unit}、MAD {mad:.2}) から{}側へ \
-             MAD の {peak_mad_ratio:.1} 倍離れた ({span}、最小 {min:.2} / 最大 {max:.2})",
+            "{metric}: 比較基準の中央値 {median:.2}{unit} から{}側に目立つ値を観測。\
+             {span}、最小 {min:.2} / 最大 {max:.2}。\
+             基準のばらつき (MAD {mad:.2}) に対し、最大 {peak_mad_ratio:.1} 倍の差。",
             direction.as_str(lang)
         ),
         (
@@ -1394,10 +1450,9 @@ pub fn describe_detection(d: &Detection, lang: Lang) -> String {
             },
             Lang::Ja,
         ) => format!(
-            "{metric} が比較基準 (中央値 {reference:.2}{unit}) から{}側へ \
-             {peak_absolute_deviation:.2}{unit} 離れた \
-             (散らばりが測れないため絶対差で判断した: {}、要 {min_absolute_deviation:.2}{unit} 以上。\
-             {span}、最小 {min:.2} / 最大 {max:.2})",
+            "{metric}: 比較基準の中央値 {reference:.2}{unit} から{}側へ最大 {peak_absolute_deviation:.2}{unit} の差。\
+             {span}、最小 {min:.2} / 最大 {max:.2}。\
+             ばらつきを基準にできないため、{min_absolute_deviation:.2}{unit} 以上の差で判定した ({})。",
             direction.as_str(lang),
             dispersion.label().get(lang)
         ),
@@ -1445,10 +1500,9 @@ pub fn describe_detection(d: &Detection, lang: Lang) -> String {
             let (b, a) = (before.describe_span(lang), after.describe_span(lang));
             match lang {
                 Lang::Ja => format!(
-                    "{metric} の水準が前後の窓で {before_median:.2}{unit} から \
-                     {after_median:.2}{unit} へ {shift:+.2}{unit} 違う \
-                     (うち窓内の傾向で説明できる差 {trend_explained_shift:+.2}{unit} / \
-                     残る段差 {step_shift:+.2}{unit}、{norm}。前: {b} / 後: {a})"
+                    "{metric}: 前の比較区間の中央値は {before_median:.2}{unit}、後は {after_median:.2}{unit} (差 {shift:+.2}{unit})。\
+                     緩やかな増減で説明できる差は {trend_explained_shift:+.2}{unit}、残る段差は {step_shift:+.2}{unit}。\
+                     {norm}。前: {b} / 後: {a}。"
                 ),
                 Lang::En => format!(
                     "The level of {metric} differs by {shift:+.2}{unit} between the two windows, \
@@ -2372,19 +2426,27 @@ mod tests {
         );
         assert!(a.notes.iter().any(|n| n.contains("外部の正常値ではない")));
         assert!(a.notes.iter().any(|n| n.contains("確率や確信度は出さない")));
-        assert!(a.notes.iter().any(|n| n.contains("独立ではない")));
-        assert!(a.notes.iter().any(|n| n.contains("離散的な採取")));
-        // まとめ方の前提も前提として出す (読み方が変わるため)
-        assert!(a.notes.iter().any(|n| n.contains("始まった時刻")));
         assert!(
             a.notes
                 .iter()
-                .any(|n| n.contains("範囲の包含は同一事象を意味しない"))
+                .any(|n| n.contains("それだけで優先度は上げない"))
         );
         assert!(
             a.notes
                 .iter()
-                .any(|n| n.contains("重要でないという意味ではない"))
+                .any(|n| n.contains("採取と採取の間の状態は分からない"))
+        );
+        // まとめ方の前提も前提として出す (読み方が変わるため)
+        assert!(a.notes.iter().any(|n| n.contains("近い時刻に始まった変化")));
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("同じ原因で起きたとは限らない"))
+        );
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("こちらの優先度も確認する"))
         );
     }
 

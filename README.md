@@ -142,6 +142,8 @@ resarch sa2sar sa13 --sar-profile sysstat-10.1.5-el7 -o sar13   # what a RHEL/Ce
 
 The default is equivalent to `sar -A -C -t -f sa13`, using timestamps recorded by the source host. Omit `-o` or use `-o -` for stdout. Existing destination files are never overwritten; failed conversion leaves no partial destination file.
 
+When comparing an el7 `sa2sar` report with a host's saved `sar` text byte for byte, match its date setting. Set `S_TIME_FORMAT=ISO` if the saved banner uses `YYYY-MM-DD`; this affects the banner date, not the statistics.
+
 ### Its own commands
 
 ```bash

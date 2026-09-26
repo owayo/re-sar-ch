@@ -3008,6 +3008,46 @@ fn sa2sar_with_the_el7_profile_matches_sar_a() {
     assert!(r < m && m < s, "{sar}");
 }
 
+/// el7 の保存済み sar テキストと比べるときは ISO の日付設定も揃える。
+#[test]
+fn sa2sar_el7_iso_changes_only_the_banner_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = write(dir.path(), "el7-iso", memory_fixture());
+    let args = ["sa2sar", "--sar-profile", "sysstat-10.1.5-el7"];
+
+    let default = command().args(args).arg(&file).output().unwrap();
+    let iso = command()
+        .env("S_TIME_FORMAT", "ISO")
+        .args(args)
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(default.status.success() && iso.status.success());
+    let default = String::from_utf8(default.stdout).unwrap();
+    let iso = String::from_utf8(iso.stdout).unwrap();
+    let (default_banner, default_body) = default.split_once('\n').unwrap();
+    let (iso_banner, iso_body) = iso.split_once('\n').unwrap();
+    assert_ne!(default_banner, iso_banner);
+    assert_eq!(default_body, iso_body);
+    assert_eq!(iso_banner.split('\t').nth(1).unwrap().trim().len(), 10);
+
+    let sar = command()
+        .env("S_TIME_FORMAT", "ISO")
+        .args([
+            "--sar-profile",
+            "sysstat-10.1.5-el7",
+            "-A",
+            "-C",
+            "-t",
+            "-f",
+        ])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(sar.status.success());
+    assert_eq!(iso.as_bytes(), sar.stdout);
+}
+
 #[test]
 fn el7_profile_rejects_files_it_cannot_read() {
     use fixtures::{FixtureAbi, FixtureSpec, Generation, build as build_fixture};

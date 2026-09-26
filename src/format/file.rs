@@ -1537,13 +1537,14 @@ fn skip_extra_chain(cur: &Cursor<'_>, start: usize, path: &Path) -> Result<usize
         }
 
         let body = (extra_nr as u64) * (extra_size as u64);
-        offset += EXTRA_DESC_SIZE + body as usize;
+        let body_start = offset + EXTRA_DESC_SIZE;
+        offset = body_start + body as usize;
         if offset > cur.len() {
             return Err(Error::Truncated {
                 path: path.to_path_buf(),
                 context: "extra_desc の本体".into(),
                 need: body as usize,
-                have: cur.len().saturating_sub(offset),
+                have: cur.len().saturating_sub(body_start),
             });
         }
         if extra_next == 0 {
@@ -1815,6 +1816,56 @@ use layouts as _layouts_used;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拡張データ本体が途中で切れた場合、残っている本体のバイト数を報告する。
+    #[test]
+    fn truncated_extra_body_reports_remaining_body_bytes() {
+        let mut bytes = vec![0u8; EXTRA_DESC_SIZE + 5];
+        bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&10u32.to_le_bytes());
+        let cur = Cursor::new(&bytes, Endian::Little);
+
+        let err = skip_extra_chain(&cur, 0, Path::new("x")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Truncated {
+                    context,
+                    need: 10,
+                    have: 5,
+                    ..
+                } if context == "extra_desc の本体"
+            ),
+            "{err}"
+        );
+    }
+
+    /// 連鎖の 2 段目でも、その段の本体先頭から残りバイト数を数える。
+    #[test]
+    fn truncated_second_extra_body_reports_its_own_remaining_bytes() {
+        let second = EXTRA_DESC_SIZE + 2;
+        let mut bytes = vec![0u8; second + EXTRA_DESC_SIZE + 5];
+        bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[second..second + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[second + 4..second + 8].copy_from_slice(&10u32.to_le_bytes());
+        let cur = Cursor::new(&bytes, Endian::Little);
+
+        let err = skip_extra_chain(&cur, 0, Path::new("x")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Truncated {
+                    context,
+                    need: 10,
+                    have: 5,
+                    ..
+                } if context == "extra_desc の本体"
+            ),
+            "{err}"
+        );
+    }
 
     /// マジックナンバーが違うファイルは sysstat のものではないと判定する。
     #[test]

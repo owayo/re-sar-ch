@@ -98,7 +98,7 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 │time       kbactive kbinact kbdirty kbanonpg kbslab kbkstack kbpgtbl kbvmused       │
 │ 15:23:05  794624   638144  192.00  111872   234432 2784.0   3200.0  17536.0        │
 └───────────────────────────────────────────────────────────────────────────────────┘
-←→ activity  ↑↓ 時刻  i item (3)  / 絞り込み  home/end 端  c 列  [] 送り  v グラフ  ? help  q 終了
+←→ activity  ↑↓ 時刻  i item (3)  / 絞り込み  home/end 端  c 列  [] 送り  v グラフ  ? help  esc 終了
 ```
 
 文字キーは小文字で入力します。主な操作は次のとおりです。
@@ -115,7 +115,8 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 | `[` / `]` | グラフの列を前 / 次へ (表に出ている列だけを送る) |
 | `v` | グラフの表示を切り替える |
 | `?` | キー操作の一覧 |
-| `q`、`ctrl-c` | 終了 |
+| `esc` | 通常画面では終了。選択画面・ヘルプを閉じる、絞り込み入力を取り消す |
+| `ctrl-c` | どの画面からでも終了 |
 
 `c` のポップアップでは `space` でその列を表に出し入れ、`a` で全列と既定を切り替え、`enter` で確定します。確定するとカーソルの行がグラフに描かれる列になります。`esc` は取り消しで、表もグラフも元のままです。
 

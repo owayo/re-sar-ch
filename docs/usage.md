@@ -100,7 +100,7 @@ The screen looks like this (the TUI's labels are in Japanese):
 │time       kbactive kbinact kbdirty kbanonpg kbslab kbkstack kbpgtbl kbvmused       │
 │ 15:23:05  794624   638144  192.00  111872   234432 2784.0   3200.0  17536.0        │
 └───────────────────────────────────────────────────────────────────────────────────┘
-←→ activity  ↑↓ 時刻  i item (3)  / 絞り込み  home/end 端  c 列  [] 送り  v グラフ  ? help  q 終了
+←→ activity  ↑↓ 時刻  i item (3)  / 絞り込み  home/end 端  c 列  [] 送り  v グラフ  ? help  esc 終了
 ```
 
 Letter keys use lower case. The main controls are listed below.
@@ -117,7 +117,8 @@ Letter keys use lower case. The main controls are listed below.
 | `[` / `]` | previous / next metric (only those the table shows) |
 | `v` | show or hide the graph |
 | `?` | key reference |
-| `q`, `ctrl-c` | quit |
+| `esc` | quit from the main screen; close a popup or cancel filter input |
+| `ctrl-c` | quit from any screen |
 
 Inside the `c` popup, `space` adds or removes a column from the table, `a` switches between every column and the default, and `enter` applies — the row under the cursor becomes the graphed metric. `esc` cancels, leaving both the table and the graph alone.
 

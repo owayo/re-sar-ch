@@ -144,7 +144,7 @@ enum Mode {
     /// **表に出す列とグラフに描く列を 1 つの画面で扱う。** 別々のキーへ
     /// 割り当てると「どちらが表でどちらがグラフか」を覚える羽目になる。
     PickColumn,
-    /// 絞り込み入力中。**ここでは `q` は文字であって終了ではない**。
+    /// 絞り込み入力中。Esc で取り消して通常画面に戻る。
     Filter,
     /// ヘルプ。
     Help,
@@ -1083,16 +1083,16 @@ fn draw_hint(f: &mut Frame, area: Rect, app: &App) {
                 };
                 // **幅に入る最初のものを出す。** 途中で切れて語の途中で終わると、
                 // 案内どころか何のキーか読めない。優先度の低いものから落とす
-                // (最後まで残すのは `?` と `q` — ここから先は調べられる)。
+                // (最後まで残すのは `?` と `esc` — ここから先は調べられる)。
                 let candidates = [
                     format!(
-                        "←→ activity  ↑↓ 時刻  {scroll}i item ({n})  / 絞り込み  home/end 端  c 列  {graph_keys}? help  q 終了"
+                        "←→ activity  ↑↓ 時刻  {scroll}i item ({n})  / 絞り込み  home/end 端  c 列  {graph_keys}? help  esc 終了"
                     ),
-                    format!("←→ act  ↑↓ 時刻  {scroll}i item  c 列  {graph_keys}? help  q"),
-                    format!("←→ act  ↑↓ 時刻  {scroll}i item  c 列  ? help  q"),
-                    format!("←→ act  ↑↓ 時刻  {scroll}? help  q"),
-                    format!("{scroll}? help  q"),
-                    "? help  q".to_string(),
+                    format!("←→ act  ↑↓ 時刻  {scroll}i item  c 列  {graph_keys}? help  esc"),
+                    format!("←→ act  ↑↓ 時刻  {scroll}i item  c 列  ? help  esc"),
+                    format!("←→ act  ↑↓ 時刻  {scroll}? help  esc"),
+                    format!("{scroll}? help  esc"),
+                    "? help  esc".to_string(),
                 ];
                 candidates
                     .into_iter()
@@ -1251,7 +1251,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("[  ]        グラフの列を前 / 次へ (表に出ている列だけ)"),
         Line::from("v           グラフの表示を切り替える"),
         Line::from("?           このヘルプ"),
-        Line::from("q  ctrl-c   終了"),
+        Line::from("esc ctrl-c  終了 (esc は通常画面で)"),
         Line::from(""),
         Line::from("c のポップアップ:"),
         Line::from("  space     その列を表に出す / 外す"),
@@ -1292,7 +1292,6 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Backspace => {
                 app.filter.pop();
             }
-            // 入力中の `q` は文字であって終了ではない。
             KeyCode::Char(c) => app.filter.push(c),
             _ => {}
         },
@@ -1325,7 +1324,7 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         },
         Mode::Help => app.mode = Mode::Normal,
         Mode::Normal => match code {
-            KeyCode::Char('q') => app.quit = true,
+            KeyCode::Esc => app.quit = true,
             // `shift` 付きの矢印は表の横送り。activity の切り替えと
             // 同じ方向キーに載せるのは、どちらも「横に動く」操作だから。
             KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
@@ -1597,7 +1596,7 @@ mod tests {
             let screen = render(&mut app, w, 40);
             let hint = screen.lines().last().unwrap();
             // **どの幅でも最後まで読める。** 途中で切れると何のキーか分からない。
-            assert!(shows(hint, "q"), "幅 {w} で末尾まで出る: {hint}");
+            assert!(shows(hint, "esc"), "幅 {w} で末尾まで出る: {hint}");
             assert_eq!(
                 hint.chars().last(),
                 Some(' '),

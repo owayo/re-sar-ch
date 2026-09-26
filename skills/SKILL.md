@@ -23,15 +23,25 @@ C ライブラリも要らない。`sysstat` が出荷した全フォーマッ�
 「実行ホスト」ではなく「**ファイルを書いたホストの ABI**」から解決するので、
 macOS や Windows で Linux のログを読める。
 
+## 実行時の出力言語 (必須)
+
+**エージェントが `detect` / `show` / `summarize` / `compare` / `tui` を実行するときは、
+毎回 `--lang en` を明示する。** トークン消費を抑えるため、コマンドの出力は英語で読む。
+JSON / NDJSON でも説明文が含まれるため省略しない。環境変数や実行環境の言語に依存しない。
+ユーザーへの回答はユーザーが指定した言語で書く。
+
+`info` / `identify` / `sar` / `sadf` / `sa2sar` / `skill-install` とサブコマンド省略の
+sar 互換入口は `--lang` に対応しないため付けない。
+
 ## いつ使うか
 
 | やりたいこと | コマンド |
 |---|---|
-| **障害の事後調査。いつ何が起きたか当たりを付ける** | `resarch detect <file>` |
-| 検知リソースごとに前後の推移を SVG にする | `resarch detect <file> --svg-dir charts --svg-context 30m` |
-| 構造化データを取り出してエージェント自身で分析する | `resarch show <file> --format ndjson` |
-| 期間全体の平均・p95・ボトルネック判定 | `resarch summarize <file> --format json` |
-| 複数ホストを同じ時間窓で比べる | `resarch compare --host a=<f1> --host b=<f2>` |
+| **障害の事後調査。いつ何が起きたか当たりを付ける** | `resarch detect <file> --lang en` |
+| 検知リソースごとに前後の推移を SVG にする | `resarch detect <file> --lang en --svg-dir charts --svg-context 30m` |
+| 構造化データを取り出してエージェント自身で分析する | `resarch show <file> --lang en --format ndjson` |
+| 期間全体の平均・p95・ボトルネック判定 | `resarch summarize <file> --lang en --format json` |
+| 複数ホストを同じ時間窓で比べる | `resarch compare --lang en --host a=<f1> --host b=<f2>` |
 | **どのバージョンの sysstat が書いたファイルか調べる** | `resarch identify <file>...` |
 | ファイルの世代・ABI・収録 activity を知る | `resarch info <file>` |
 | 既存のツールやスクリプトに食わせる (本家と同じテキスト) | `resarch -u -f <file>` / `resarch sadf -j <file>` |
@@ -94,12 +104,11 @@ broken.bin             -       -                             -         -       -
 「このホストで何かあった」という調査の入口はこれ。**何を見ればいいか分かっていなくてよい。**
 
 ```bash
-resarch detect /var/log/sa/sa07
-resarch detect sa07 --format json          # エージェント向け (型のフィールドをそのまま出す)
-resarch detect sa07 --verbose              # text に検出ごとの内訳と解釈まで出す
-resarch detect sa07 --lang en              # 英語で出す (既定は実行環境から決まる)
-resarch detect sa07 --min-priority investigate   # 優先度の下限で絞る
-resarch detect sa07 --from 09:00 --to 10:00      # 報告範囲だけを絞る (下記の注意)
+resarch detect /var/log/sa/sa07 --lang en
+resarch detect sa07 --lang en --format json    # エージェント向け (型のフィールドをそのまま出す)
+resarch detect sa07 --lang en --verbose        # text に検出ごとの内訳と解釈まで出す
+resarch detect sa07 --lang en --min-priority investigate   # 優先度の下限で絞る
+resarch detect sa07 --lang en --from 09:00 --to 10:00      # 報告範囲だけを絞る (下記の注意)
 ```
 
 評価できるすべての系列に 3 つの観点を当て、当たったものを時間的に近いものごとに
@@ -107,13 +116,8 @@ resarch detect sa07 --from 09:00 --to 10:00      # 報告範囲だけを絞る (
 
 ### 出力の言語
 
-`detect` は日本語と英語で出る。**エージェントが読むなら `--lang en` を明示する**か、
-`--format json` / `--format ndjson` を使う (キーと列挙値は言語によらず英語で固定)。
-
-言語は `--lang` → `RESARCH_LANG` → `LC_ALL` / `LC_MESSAGES` / `LANG` → `LANGUAGE` →
-ローカルタイムゾーン (日本なら日本語) → 英語 の順で決まる。
-**ロケール環境変数はタイムゾーンより強い。** `LC_ALL=C` は `LANGUAGE` より先に
-英語で確定するので、決定的な出力がほしいスクリプトはこれを使える。
+`detect` のキーと列挙値は言語によらず英語で固定だが、説明文は言語指定で変わる。
+冒頭の必須規則に従い、`--format json` / `--format ndjson` にも `--lang en` を併用する。
 
 ### text は既定で要約 (エージェントは JSON を使う)
 
@@ -137,7 +141,7 @@ resarch detect sa07 --from 09:00 --to 10:00      # 報告範囲だけを絞る (
 - **この結果だけでは分からないこと** — エピソード本文ではなく末尾に、**指標ごとに 1 度**まとまる
 
 `text` で全エピソードを1件ずつ追うには `--verbose` を付ける。
-要約で気になった系列・時刻の前後は `show --activity ... --from ... --to ...` で調べる。
+要約で気になった系列・時刻の前後は `show --lang en --activity ... --from ... --to ...` で調べる。
 
 | 観点 | 何を見るか |
 |---|---|
@@ -172,7 +176,7 @@ resarch detect sa07 --from 09:00 --to 10:00      # 報告範囲だけを絞る (
 
 ## 検知箇所のグラフ
 
-`detect --svg-dir <新規ディレクトリ>` は、検知したホスト・起動区間・リソース・指標ごとに
+`detect --lang en --svg-dir <新規ディレクトリ>` は、検知したホスト・起動区間・リソース・指標ごとに
 前後各30分のSVGを保存する。`--svg-context 300s/15m/1h/0` で幅を変えられる。
 重なる表示範囲は同一系列内でまとめ、離れた検知は別SVGにする。
 時刻は `--timezone` の基準 (既定はローカル) で表示し、`index.json` の `timezone` に
@@ -186,9 +190,9 @@ resarch detect sa07 --from 09:00 --to 10:00      # 報告範囲だけを絞る (
 エージェント自身で分析するなら NDJSON か JSON。
 
 ```bash
-resarch show sa07 --format ndjson --activity cpu,disk
-resarch show sa07 --format ndjson --values both     # 生カウンタと派生値を別名前空間で
-resarch show sa07 --format json --from 09:00 --to 18:00
+resarch show sa07 --lang en --format ndjson --activity cpu,disk
+resarch show sa07 --lang en --format ndjson --values both     # 生カウンタと派生値を別名前空間で
+resarch show sa07 --lang en --format json --from 09:00 --to 18:00
 ```
 
 `--values` は `raw` (累積カウンタの生値) / `derived` (レート・割合、既定) / `both`。
@@ -211,8 +215,8 @@ resarch show sa07 --format json --from 09:00 --to 18:00
 ## 期間集計とホスト比較
 
 ```bash
-resarch summarize sa07 sa08 --format json      # 複数ファイルを連結して集計
-resarch compare --host web1=web1/sa07 --host web2=web2/sa07
+resarch summarize sa07 sa08 --lang en --format json      # 複数ファイルを連結して集計
+resarch compare --lang en --host web1=web1/sa07 --host web2=web2/sa07
 ```
 
 判定には**ルール ID と観測根拠**が付く。閾値・継続時間・必要指標・欠損時の扱い・
@@ -331,17 +335,17 @@ resarch identify /var/log/sa/sa07
 resarch info /var/log/sa/sa07
 
 # 2. 当たりを付ける。ここで時刻と指標が分かる
-resarch detect /var/log/sa/sa07
+resarch detect /var/log/sa/sa07 --lang en
 
 # 3. detect が指した時刻の周辺を本家書式で見る
 resarch -u -P ALL -s 16:00:00 -e 17:00:00 -f /var/log/sa/sa07
 
 # 4. 数値を自分で扱う
-resarch show /var/log/sa/sa07 --activity cpu,disk,memory \
+resarch show /var/log/sa/sa07 --lang en --activity cpu,disk,memory \
   --from 16:00 --to 17:00 --format ndjson --values both
 
 # 5. 前日と比べる
-resarch compare --host d06=/var/log/sa/sa06 --host d07=/var/log/sa/sa07
+resarch compare --lang en --host d06=/var/log/sa/sa06 --host d07=/var/log/sa/sa07
 ```
 
 **2 を飛ばさないこと。** `detect` は「評価できなかった系列」まで報告するので、

@@ -30,8 +30,7 @@ use std::process::ExitCode;
 use anyhow::{Context, bail};
 
 use re_sar_ch::analyze::{
-    Assessment, ColumnSummary, Finding, MetricKey, NativePeriodSummary, PercentileOutcome,
-    Priority, RetainTimelines, SummaryOptions, Verdict, assess_summary, metric_catalog,
+    Assessment, Priority, RetainTimelines, SummaryOptions, assess_summary, metric_catalog,
     rule_inputs,
 };
 use re_sar_ch::cli::{
@@ -54,7 +53,7 @@ use re_sar_ch::output::sadf::{self, SadfConfig, SadfExtra, SectionConfig, TimeBa
 use re_sar_ch::output::sar_el7;
 use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
-use re_sar_ch::output::{csv, ndjson, table};
+use re_sar_ch::output::{csv, ndjson, summarize_report, table};
 use re_sar_ch::output::{detect_report, detect_svg};
 use re_sar_ch::series::Selection;
 use re_sar_ch::series::el7;
@@ -1646,24 +1645,10 @@ fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
     let mut out = stdout_writer();
     match common.format {
         OutputFormat::Json | OutputFormat::SadfJson => {
-            serde_json::to_writer_pretty(&mut out, &analysis)?;
-            writeln!(out)?;
+            summarize_report::write_json(&mut out, &analysis)?;
         }
-        OutputFormat::Ndjson => {
-            for host in &analysis.hosts {
-                for seg in &host.segments {
-                    let row = serde_json::json!({
-                        "schema_version": analysis.schema_version,
-                        "record": "boot_segment",
-                        "host": host.identity,
-                        "segment": seg,
-                    });
-                    serde_json::to_writer(&mut out, &row)?;
-                    writeln!(out)?;
-                }
-            }
-        }
-        _ => write_summarize_text(&mut out, &analysis, tz)?,
+        OutputFormat::Ndjson => summarize_report::write_ndjson(&mut out, &analysis)?,
+        _ => summarize_report::write_text(&mut out, &analysis, tz)?,
     }
     out.flush()?;
     Ok(exit_code(
@@ -1701,158 +1686,6 @@ fn multi_options(common: &CommonArgs, tz: DisplayTz) -> anyhow::Result<MultiOpti
         time_filter: custom_time_filter(common, tz)?,
         ..Default::default()
     })
-}
-
-fn write_summarize_text<W: Write>(
-    out: &mut W,
-    analysis: &multi::MultiFileAnalysis,
-    tz: DisplayTz,
-) -> anyhow::Result<()> {
-    for (hi, host) in analysis.hosts.iter().enumerate() {
-        if hi > 0 {
-            writeln!(out)?;
-        }
-        let id = &host.identity;
-        writeln!(
-            out,
-            "host: {} ({} {} / {}, {} CPU)",
-            id.nodename,
-            id.sysname,
-            id.release,
-            id.machine,
-            id.cpu_nr.map_or("?".to_string(), |n| n.to_string())
-        )?;
-        let files: Vec<&str> = host
-            .files
-            .iter()
-            .filter_map(|i| analysis.files.get(*i).map(|f| f.path.as_str()))
-            .collect();
-        writeln!(out, "files: {}", files.join(", "))?;
-
-        for seg in &host.segments {
-            writeln!(out)?;
-            write_segment_text(out, seg, tz)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_segment_text<W: Write>(
-    out: &mut W,
-    seg: &BootSegment,
-    tz: DisplayTz,
-) -> anyhow::Result<()> {
-    let p = &seg.summary.period;
-    writeln!(
-        out,
-        "起動区間 {}  {} → {}  ({} サンプル / 連続 {} 区間 / 不連続 {} 区間)",
-        seg.index,
-        p.first_ust
-            .map_or("-".to_string(), |ust| format_epoch(tz, ust)),
-        p.last_ust
-            .map_or("-".to_string(), |ust| format_epoch(tz, ust)),
-        p.samples,
-        p.continuous_intervals,
-        p.broken_intervals
-    )?;
-    for b in &seg.boundaries {
-        // 引き継いだかどうかを必ず残す (`multi.rs` の方針)
-        let verdict = if b.decision.continuous {
-            "差分を引き継いだ".to_string()
-        } else {
-            format!(
-                "不連続 ({}、空白 {} 秒)",
-                b.decision
-                    .reason
-                    .map_or("理由不明".to_string(), |r| format!("{r:?}")),
-                b.decision.gap_secs
-            )
-        };
-        writeln!(
-            out,
-            "  ファイル境界 {} → {}: {verdict}",
-            b.prev_file, b.next_file
-        )?;
-    }
-
-    writeln!(out, "  指標 (ルール判定に使う列)")?;
-    let mut printed = false;
-    for r in rule_inputs() {
-        let key = r.key();
-        if let Some(col) = column_of(&seg.summary, &key) {
-            writeln!(out, "    {:<28} {}", key.display(), format_column(col))?;
-            printed = true;
-        }
-    }
-    if !printed {
-        writeln!(out, "    (該当する列がファイルに無い)")?;
-    }
-
-    writeln!(out, "  判定 (ルール版 {})", ruleset_version(&seg.findings))?;
-    if seg.findings.is_empty() {
-        writeln!(out, "    (判定なし)")?;
-    }
-    for f in &seg.findings {
-        write_finding_text(out, f)?;
-    }
-    Ok(())
-}
-
-fn ruleset_version(findings: &[Finding]) -> &str {
-    findings
-        .first()
-        .map(|f| f.ruleset_version)
-        .unwrap_or(re_sar_ch::analyze::RULESET_VERSION)
-}
-
-fn write_finding_text<W: Write>(out: &mut W, f: &Finding) -> anyhow::Result<()> {
-    let mark = match f.verdict {
-        Verdict::Observed => "!!",
-        Verdict::NotObserved => "ok",
-        Verdict::Undetermined => "??",
-        Verdict::NotApplicable => "--",
-    };
-    writeln!(out, "    {mark} {:<26} {}", f.rule_id, f.title)?;
-    if let Some(obs) = &f.observation {
-        writeln!(out, "       観測: {obs}")?;
-    }
-    if let Some(reason) = f.reason {
-        writeln!(out, "       理由: {reason:?}")?;
-    }
-    if !f.missing_metrics.is_empty() {
-        writeln!(
-            out,
-            "       欠けている指標: {}",
-            f.missing_metrics.join(", ")
-        )?;
-    }
-    Ok(())
-}
-
-fn column_of<'a>(summary: &'a NativePeriodSummary, key: &MetricKey) -> Option<&'a ColumnSummary> {
-    summary.column(key.activity, &key.item, &key.column)
-}
-
-fn format_column(col: &ColumnSummary) -> String {
-    let num = |v: Option<f64>| match v {
-        Some(v) => format!("{v:>10.2}"),
-        None => format!("{:>10}", "-"),
-    };
-    let p95 = match col.p95 {
-        PercentileOutcome::Computed(r) => format!("{:>10.2}", r.value),
-        PercentileOutcome::Unavailable { .. } => format!("{:>10}", "-"),
-    };
-    format!(
-        "max={} mean={} p95={} 区間={}",
-        num(col.max.map(|e| e.value)),
-        num(col.mean),
-        p95,
-        col.intervals
-    )
-}
-
-fn format_epoch(tz: DisplayTz, ust: u64) -> String {
-    tz.datetime(ust)
 }
 
 // ===========================================================================
@@ -1984,8 +1817,8 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             writeln!(
                 out,
                 "共通期間 {} → {} ({} 秒区間 × {})",
-                format_epoch(tz, window.start_ust),
-                format_epoch(tz, window.end_ust),
+                tz.datetime(window.start_ust),
+                tz.datetime(window.end_ust),
                 window.step_secs,
                 window.bucket_count()
             )?;

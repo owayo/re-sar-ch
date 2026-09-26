@@ -236,6 +236,126 @@ fn compare_retains_the_reason_for_skipping_metrics() {
     );
 }
 
+fn comparison_fixture(host: &str, cpu_nr: u32, start: u64, samples: u64) -> FixtureSpec {
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.nodename = host.to_string();
+    spec.cpu_nr = cpu_nr;
+    spec.ust_time = start;
+    spec.activities = vec![ActivitySpec::a_cpu(cpu_nr as i32)];
+    spec.records = (0..samples)
+        .map(|i| {
+            let t = start + i * 60;
+            let mut record = RecordSpec::stats(
+                vec![cpu_nr as i32],
+                t,
+                ((t / 3600) % 24) as u8,
+                ((t / 60) % 60) as u8,
+                (t % 60) as u8,
+            );
+            record.uptime = 100_000 + i * 6000;
+            record
+        })
+        .collect();
+    spec
+}
+
+#[test]
+fn compare_rejects_multiple_host_groups_in_one_directory() {
+    for difference in ["nodename", "machine", "sysname"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mixed = dir.path().join("mixed");
+        std::fs::create_dir(&mixed).unwrap();
+        let a = comparison_fixture("fixture-a", 3, 1_600_000_000, 4);
+        let mut b = a.clone();
+        match difference {
+            "nodename" => b.nodename = "fixture-b".into(),
+            "machine" => b.machine = "aarch64".into(),
+            "sysname" => b.sysname = "OtherOS".into(),
+            _ => unreachable!(),
+        }
+        save(&mixed, "sa01", &build(a.clone()).bytes);
+        save(&mixed, "sa02", &build(b).bytes);
+        let peer = save(dir.path(), "peer.sa", &build(a).bytes);
+        for format in ["table", "json", "ndjson"] {
+            for lenient in [false, true] {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_resarch"));
+                cmd.args(["compare", "--utc", "--format", format, "--host"])
+                    .arg(format!("mixed={}", mixed.display()))
+                    .arg("--host")
+                    .arg(format!("peer={}", peer.display()));
+                if lenient {
+                    cmd.arg("--lenient");
+                }
+                let out = cmd.output().unwrap();
+                assert!(!out.status.success(), "{difference}/{format}/{lenient}");
+                assert!(out.stdout.is_empty());
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    err.contains("--host mixed") && err.contains("複数のホスト"),
+                    "{err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compare_identity_matches_the_selected_boot_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let upgraded = dir.path().join("upgraded");
+    std::fs::create_dir(&upgraded).unwrap();
+    let mut old = comparison_fixture("fixture-a", 3, 1_600_000_000, 2);
+    old.release = "old-kernel".into();
+    let mut new = comparison_fixture("fixture-a", 5, 1_600_000_600, 4);
+    new.release = "new-kernel".into();
+    save(&upgraded, "sa01", &build(old).bytes);
+    save(&upgraded, "sa02", &build(new.clone()).bytes);
+    new.nodename = "fixture-b".into();
+    let peer = save(dir.path(), "peer.sa", &build(new).bytes);
+
+    for from in [None, Some("1600000600")] {
+        for format in ["json", "sadf-json", "ndjson"] {
+            let out = Command::new(env!("CARGO_BIN_EXE_resarch"))
+                .args(["compare", "--utc", "--format", format, "--host"])
+                .arg(format!("upgraded={}", upgraded.display()))
+                .arg("--host")
+                .arg(format!("peer={}", peer.display()))
+                .args(from.into_iter().flat_map(|start| ["--from", start]))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let comparisons: Vec<serde_json::Value> = if format == "ndjson" {
+                String::from_utf8(out.stdout)
+                    .unwrap()
+                    .lines()
+                    .skip(1)
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            } else {
+                let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                report["comparisons"].as_array().unwrap().clone()
+            };
+            assert!(!comparisons.is_empty());
+            for comparison in comparisons {
+                let host = comparison["hosts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|host| host["label"] == "upgraded")
+                    .unwrap();
+                assert_eq!(comparison["window"]["start_ust"], 1_600_000_600u64);
+                assert_eq!(host["identity"]["nodename"], "fixture-a");
+                assert_eq!(host["identity"]["release"], "new-kernel", "{format}");
+                assert_eq!(host["identity"]["cpu_nr"], 4, "{format}");
+            }
+        }
+    }
+}
+
 #[test]
 fn native_help_explains_the_time_basis() {
     for command in ["show", "summarize", "compare", "detect"] {

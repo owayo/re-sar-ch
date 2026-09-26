@@ -1715,6 +1715,13 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             eprintln!("resarch: {}: 読めないので飛ばした ({})", s.path, s.reason);
             partial = true;
         }
+        if analysis.hosts.len() > 1 {
+            bail!(
+                "--host {}={}: 複数のホストのデータが含まれています。ホストごとにファイルまたはディレクトリを分けて指定してください",
+                spec.name,
+                spec.path.display()
+            );
+        }
         let Some(host) = analysis.hosts.into_iter().next() else {
             eprintln!("resarch: --host {}: 統計が取れなかった", spec.name);
             partial = true;
@@ -1736,9 +1743,18 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             partial = true;
             continue;
         };
+        // グループ代表は入力順の先頭ファイル。比較に採った区間の構成とは
+        // 限らないので、その区間に寄与したファイルから識別情報を取る。
+        let identity = segment
+            .files
+            .first()
+            .and_then(|index| analysis.files.iter().find(|file| file.index == *index))
+            .context("比較対象の起動区間に対応するファイルがありません")?
+            .identity
+            .clone();
         entries.push(HostEntry {
             label: spec.name.clone(),
-            identity: host.identity,
+            identity,
             segment,
         });
     }

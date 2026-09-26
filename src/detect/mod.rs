@@ -683,8 +683,8 @@ pub const BASELINE_CAVEAT_SELF_SOURCED: Text = text!(
 /// 「散らばりが測れないため絶対差で判断した」と書いたうえで同じ留保を並べても、
 /// 読み手が得る情報は増えない。
 pub const BASELINE_CAVEAT_MAD_ZERO: Text = text!(
-    ja: "MAD が 0 なので正規化した逸脱評価はできない。\
-         宣言された最小有意変化量を超える差は絶対差として別に報告する",
+    ja: "MAD が 0 のため、ばらつきの何倍かでは比較できない。\
+         指標ごとに定めた最小の変化量以上の差は、絶対差として別に報告する",
     en: "MAD is 0, so no normalised deviation can be assessed. A difference beyond the declared \
          minimum significant change is reported separately, as an absolute difference",
 );

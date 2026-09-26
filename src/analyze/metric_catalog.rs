@@ -782,8 +782,8 @@ const I_DISK_AWAIT: &[Text] = &[
 ];
 const NE_DISK_AWAIT: &[Text] = &[
     text!(
-        ja: "滞留かサービス時間か。await はキュー待ち時間とサービス時間の合計なので、\
-     値の大きさだけでは切り分けられない (aqu-sz / areq-sz と併せる)",
+        ja: "キュー待ちと処理時間のどちらが長いか。await は両者の合計なので、\
+     この値だけでは切り分けられない。aqu-sz / areq-sz も併せて確認する。",
         en: "Whether this is queueing or service time. await is the sum of both, so its size alone does not \
      separate them (read it with aqu-sz / areq-sz)",
     ),
@@ -1848,9 +1848,9 @@ pub static CATALOG: &[CatalogEntry] = &[
             priority: Priority::Informational,
             rationale: text!(
                 ja: "受信したが処理されなかったパケットの計上が 0 超で観測された。\
-                            カーネル文書 (networking/statistics.rst) の rx_dropped は\
-                            「資源不足や**未対応プロトコル**等で処理されなかったパケットの数」で、\
-                            L2 アドレスフィルタによる破棄を含み得る。さらに procfs はホストの\
+                            rx_dropped は資源不足や未対応プロトコルなどで処理されなかったパケット数を表す。\
+                            L2 アドレスフィルタによる破棄も含み得る (カーネル文書 networking/statistics.rst)。\
+                            さらに procfs はホストの\
                             取りこぼし (rx_missed_errors) をこの列に畳み込む。\
                             **原因は特定できない**",
                 en: "Packets received but not processed were counted above 0. In the kernel documentation \

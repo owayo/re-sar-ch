@@ -22,11 +22,111 @@
 //! epoch 秒 (10 桁) をそのまま `f64` の座標にすると、有効桁の大半を
 //! 「1970 年からの経過」が占めてしまう。表示範囲の先頭を 0 とした相対秒で持ち、
 //! 軸ラベルを作るときだけ [`DisplayTz`] で実時刻へ戻す。
+//!
+//! # 比較グラフも列を重ねるだけ
+//!
+//! [`GraphPreset`] は、決まった列の組を同じ軸に重ねて描くための定義である。
+//! 重ねるのは `series` 層が確定させた列そのもので、差や和の線をここで作らない
+//! (積み上げ面を採らなかったのもそのため。帯の境界は列どうしの和になる)。
+
+use ratatui::style::Color;
 
 use crate::model::DisplayTz;
 use crate::output::json::{FieldOut, SampleOut};
 
 use super::{display_item, visible_fields};
+
+// ===========================================================================
+// 比較グラフ
+// ===========================================================================
+
+/// 同じ軸に重ねて描く列の組 (比較グラフ)。
+///
+/// この表が決めるのは「どの列を・どの色で・どの名前で重ねるか」という
+/// **見せ方だけ**である。値はすべて `series` 層の列から来る。
+pub struct GraphPreset {
+    /// 対象の activity (`A_MEMORY`)。
+    pub activity: &'static str,
+    /// グラフの題名。
+    pub title: &'static str,
+    /// 重ねる系列。**凡例はこの順** (読み取ってほしい順) に並べ、
+    /// 描くときは逆順に重ねて先頭の系列を最前面に置く。
+    pub series: &'static [PresetSeries],
+}
+
+impl PartialEq for GraphPreset {
+    fn eq(&self, other: &Self) -> bool {
+        self.activity == other.activity && self.title == other.title
+    }
+}
+
+impl std::fmt::Debug for GraphPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GraphPreset({} / {})", self.activity, self.title)
+    }
+}
+
+/// 比較グラフの 1 系列。
+pub struct PresetSeries {
+    /// 列の公開名 (`FieldOut::name`)。
+    pub column: &'static str,
+    /// 凡例の名前。
+    pub label: &'static str,
+    /// 幅が足りないときの凡例の名前。
+    pub short: &'static str,
+    /// 線と、表の見出しの色。
+    pub color: Color,
+}
+
+/// メモリ使用率の比較。
+///
+/// 同じ「使用率」でも、何を使用中と数えるかで値が 3 通りになる。
+///
+/// | 系列 | 式 | 由来 |
+/// |---|---|---|
+/// | buffers/cache を除く | `(total − free − buffers − cached) / total` | 旧来の近似。全世代で出る |
+/// | MemAvailable 基準 | `(total − kbavail) / total` | カーネルの推定 (3.14〜)。記録のある世代だけ |
+/// | buffers/cache を含む | `(total − free) / total` | sysstat 11.7.4 より前の `%memused` |
+///
+/// 「含む」と「除く」の間が buffers/cache の分。「除く」と「MemAvailable 基準」の差は、
+/// cached に含まれる共有メモリ・tmpfs (回収できない) や、回収できる slab の影響である。
+///
+/// **既定をこのグラフにする理由**: MEMORY の先頭列は `kbmemfree` で、page cache に
+/// 使われて小さく見えるのが普通の値である。それを 1 本だけ見せると、
+/// メモリ不足と読み違える。
+pub static MEMORY_USAGE: GraphPreset = GraphPreset {
+    activity: "A_MEMORY",
+    title: "メモリ使用率の比較",
+    series: &[
+        PresetSeries {
+            column: "memused_nocache_pct",
+            label: "buffers/cache を除く",
+            short: "除く",
+            // 1 列だけのグラフの線と同じ色。主に読んでほしい線であることを揃える。
+            color: Color::Cyan,
+        },
+        PresetSeries {
+            column: "memused_pct",
+            label: "MemAvailable 基準",
+            short: "MemAvailable",
+            color: Color::Green,
+        },
+        PresetSeries {
+            column: "memused_withcache_pct",
+            label: "buffers/cache を含む",
+            short: "含む",
+            color: Color::Magenta,
+        },
+    ],
+};
+
+/// activity ごとの比較グラフ。
+static PRESETS: &[&GraphPreset] = &[&MEMORY_USAGE];
+
+/// その activity の比較グラフ。
+pub fn preset_for(activity: &str) -> Option<&'static GraphPreset> {
+    PRESETS.iter().copied().find(|p| p.activity == activity)
+}
 
 /// 1 本の折れ線として描ける表示モデル。
 pub struct GraphView {
@@ -102,7 +202,7 @@ impl GraphView {
         absent.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
         let x_bounds = [0.0, ((last.saturating_sub(origin)) as f64).max(1.0)];
-        let y_bounds = y_bounds_for(&segments, unit);
+        let y_bounds = y_bounds_for(segments.iter().flatten().map(|(_, y)| *y), unit);
 
         Self {
             segments,
@@ -160,11 +260,33 @@ impl GraphView {
 
     /// Y 軸のラベル (下端・上端)。
     pub fn y_labels(&self) -> Vec<String> {
-        vec![
-            super::format_number(self.y_bounds[0]),
-            super::format_number(self.y_bounds[1]),
-        ]
+        axis_labels(self.y_bounds)
     }
+}
+
+/// Y 軸のラベル (下端・上端)。
+pub fn axis_labels(bounds: [f64; 2]) -> Vec<String> {
+    vec![
+        super::format_number(bounds[0]),
+        super::format_number(bounds[1]),
+    ]
+}
+
+/// 重ねて描く系列の Y 軸の範囲。
+///
+/// 系列ごとの範囲を別々に持つと、同じ高さの線が別の値を指してしまう。
+/// **軸は 1 本**なので、全系列の点をまとめて 1 つの窓を選ぶ
+/// (選び方は 1 系列のときと同じ)。単位が揃わなければ割合の固定はしない。
+pub fn merged_y_bounds(views: &[&GraphView]) -> [f64; 2] {
+    let mut units = views.iter().filter(|v| !v.is_empty()).map(|v| v.unit);
+    let first = units.next().unwrap_or("");
+    let unit = if units.all(|u| u == first) { first } else { "" };
+    y_bounds_for(
+        views
+            .iter()
+            .flat_map(|v| v.segments.iter().flatten().map(|(_, y)| *y)),
+        unit,
+    )
 }
 
 /// 軸に並べるラベルの本数。
@@ -187,14 +309,12 @@ fn x_label_count(plot_width: u16, minutes_only: bool) -> usize {
 /// - 収まらない割合 (CPU 数で 100% を超える集計値など) は固定しない
 /// - 非負の系列は 0 起点にする (0 との距離が意味を持つ量なので)
 /// - 負の値を含むなら min-max
-fn y_bounds_for(segments: &[Vec<(f64, f64)>], unit: &str) -> [f64; 2] {
+fn y_bounds_for(ys: impl Iterator<Item = f64>, unit: &str) -> [f64; 2] {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
-    for seg in segments {
-        for (_, y) in seg {
-            min = min.min(*y);
-            max = max.max(*y);
-        }
+    for y in ys {
+        min = min.min(y);
+        max = max.max(y);
     }
     if !min.is_finite() || !max.is_finite() {
         return [0.0, 1.0];
@@ -439,5 +559,78 @@ mod tests {
         let v = GraphView::build(&samples, "A_CPU", "all", "user");
         let labels = v.x_labels(DisplayTz::Utc, 60);
         assert!(labels.iter().all(|l| l.len() == 8), "秒まで: {labels:?}");
+    }
+
+    /// 重ねた系列は 1 本の軸を共有する。割合が 0-100 に収まれば固定する。
+    #[test]
+    fn overlaid_series_share_one_axis() {
+        let low = GraphView::build(
+            &[
+                sample(T0, true, Some(2.0), Quality::Ok),
+                sample(T0 + 600, true, Some(3.0), Quality::Ok),
+            ],
+            "A_CPU",
+            "all",
+            "user",
+        );
+        let high = GraphView::build(
+            &[
+                sample(T0, true, Some(90.0), Quality::Ok),
+                sample(T0 + 600, true, Some(95.0), Quality::Ok),
+            ],
+            "A_CPU",
+            "all",
+            "user",
+        );
+        assert_eq!(merged_y_bounds(&[&low, &high]), [0.0, 100.0]);
+
+        // 片方が 100 を超えれば、全系列が入る窓にする (系列ごとに軸を持たない)
+        let over = GraphView::build(
+            &[sample(T0, true, Some(250.0), Quality::Ok)],
+            "A_CPU",
+            "all",
+            "user",
+        );
+        let b = merged_y_bounds(&[&low, &over]);
+        assert_eq!(b[0], 0.0);
+        assert!(b[1] > 250.0, "{b:?}");
+    }
+
+    /// 1 点も無い系列は軸の範囲を動かさない (欠測を 0 と見なさない)。
+    #[test]
+    fn an_empty_series_does_not_move_the_shared_axis() {
+        let some = GraphView::build(
+            &[sample(T0, true, Some(40.0), Quality::Ok)],
+            "A_CPU",
+            "all",
+            "user",
+        );
+        let none = GraphView::build(
+            &[sample(T0, true, None, Quality::UnsupportedBySource)],
+            "A_CPU",
+            "all",
+            "user",
+        );
+        assert_eq!(merged_y_bounds(&[&some, &none]), [0.0, 100.0]);
+    }
+
+    /// 比較グラフは series 層の列名を指す。凡例の名前は重複させない。
+    #[test]
+    fn the_memory_preset_names_series_columns() {
+        let p = preset_for("A_MEMORY").expect("MEMORY には比較グラフがある");
+        let cols: Vec<_> = p.series.iter().map(|s| s.column).collect();
+        assert_eq!(
+            cols,
+            vec![
+                "memused_nocache_pct",
+                "memused_pct",
+                "memused_withcache_pct"
+            ]
+        );
+        let colors: Vec<_> = p.series.iter().map(|s| s.color).collect();
+        for (i, c) in colors.iter().enumerate() {
+            assert!(!colors[i + 1..].contains(c), "色が重複しない: {colors:?}");
+        }
+        assert!(preset_for("A_CPU").is_none());
     }
 }

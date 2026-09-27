@@ -78,7 +78,7 @@ resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
 
 Recorded activities become tabs; pick an item and read its time series as a table with a graph above it.
 
-The screen looks like this (the TUI's labels are in Japanese):
+The screen looks roughly like this (the TUI's labels are in Japanese; column positions and values are illustrative):
 
 ```text
 <host>  Linux 2.6.32-696.1.1.el6.x86_64 / x86_64  (2 CPU)
@@ -114,13 +114,13 @@ Letter keys use lower case. The main controls are listed below.
 | `i` | pick an item (device, interface, CPU) |
 | `/` | filter items by name |
 | `c` | choose columns (both the table's and the graph's) |
-| `[` / `]` | previous / next metric (only those the table shows) |
+| `[` / `]` | previous / next metric (only those the table shows; on the MEMORY tab the comparison graph comes first) |
 | `v` | show or hide the graph |
 | `?` | key reference |
 | `esc` | quit from the main screen; close a popup or cancel filter input |
 | `ctrl-c` | quit from any screen |
 
-Inside the `c` popup, `space` adds or removes a column from the table, `a` switches between every column and the default, and `enter` applies — the row under the cursor becomes the graphed metric. `esc` cancels, leaving both the table and the graph alone.
+Inside the `c` popup, `space` adds or removes a column from the table, `a` switches between every column and the default, and `enter` applies — the row under the cursor becomes the graphed metric, so applying without moving the cursor leaves the graph as it was. `esc` cancels, leaving both the table and the graph alone.
 
 For activities with many columns, such as memory, the table limits the visible columns to keep values readable.
 

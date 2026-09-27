@@ -76,7 +76,7 @@ resarch tui sa01
 resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 ```
 
-収録されている activity がタブになり、選んだ item の時系列を表とグラフで読めます。
+収録されている activity がタブになり、選んだ item の時系列を表とグラフで読めます。画面は次のようになります (列の位置や値は説明用の例です)。
 
 ```text
 <host>  Linux 2.6.32-696.1.1.el6.x86_64 / x86_64  (2 CPU)
@@ -112,13 +112,13 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 | `i` | item (デバイス・インターフェース・CPU) を選ぶ |
 | `/` | item を名前で絞り込む |
 | `c` | 列を選ぶ (表に出す列とグラフの列) |
-| `[` / `]` | グラフの列を前 / 次へ (表に出ている列だけを送る) |
+| `[` / `]` | グラフの列を前 / 次へ (表に出ている列だけを送る。MEMORY タブでは先頭が比較グラフ) |
 | `v` | グラフの表示を切り替える |
 | `?` | キー操作の一覧 |
 | `esc` | 通常画面では終了。選択画面・ヘルプを閉じる、絞り込み入力を取り消す |
 | `ctrl-c` | どの画面からでも終了 |
 
-`c` のポップアップでは `space` でその列を表に出し入れ、`a` で全列と既定を切り替え、`enter` で確定します。確定するとカーソルの行がグラフに描かれる列になります。`esc` は取り消しで、表もグラフも元のままです。
+`c` のポップアップでは `space` でその列を表に出し入れ、`a` で全列と既定を切り替え、`enter` で確定します。確定するとカーソルの行がグラフに描かれる列になります (カーソルを動かさずに確定すれば、グラフは変わりません)。`esc` は取り消しで、表もグラフも元のままです。
 
 メモリなど列が多い activity でも値を読めるように、表示する列を次のように絞ります。
 
@@ -127,7 +127,7 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 
 `c` を押すと列の一覧が出ます。値が出なかった列も一覧には並び、灰色で「(全時刻で値なし)」と注記が付きます。列幅は全サンプルの値を見て決めるので、行をスクロールしても幅が揺れません。
 
-グラフは表の上に出て、選んでいる activity / item / 列の 1 系列を描きます。**グラフに出している列は、下の表の見出しも線と同じ色**になるので、どの列が描かれているかが一目で分かります。表で選んでいる時刻には縦線が立つので、表とグラフが同じ時点を指していることも分かります。端末が低いとき (24 行以下) は既定で出しません。表が数行しか見えないと時刻を追えなくなるためです。`v` を押せば高さ 18 行以上の端末で表示できます。18 行未満では表示できません。
+グラフは表の上に出て、選んでいる activity / item / 列の 1 系列を描きます (MEMORY タブの既定は 3 系列の比較です。[後述](#memory-タブの比較グラフ))。**グラフに出している列は、下の表の見出しも線と同じ色**になるので、どの列が描かれているかが一目で分かります。表で選んでいる時刻には縦線が立つので、表とグラフが同じ時点を指していることも分かります。端末が低いとき (24 行以下) は既定で出しません。表が数行しか見えないと時刻を追えなくなるためです。`v` を押せば高さ 18 行以上の端末で表示できます。18 行未満では表示できません。
 
 値と時刻は、他の独自出力と同じ規則で表示します。
 
@@ -137,6 +137,54 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 - 時刻は `--timezone` の基準 (既定は実行環境のローカル) で、画面にもそう明記します。
 
 TUI は対話端末でのみ動きます。パイプやファイルへ出す場合は `resarch show` / `resarch sar` を使ってください (その旨のエラーを返します)。
+
+### MEMORY タブの比較グラフ
+
+MEMORY タブを開くと、既定では「メモリ使用率の比較」グラフ (`A_MEMORY / - / メモリ使用率の比較 (percent)`) が出ます。使用率の 3 つの見積もりを 0〜100% の同じ軸に重ねたもので、3 本の違いは何を空きとして数えるかだけです。
+
+| 線の色 | 凡例 | 列 | 空きとして数えるもの |
+|---|---|---|---|
+| シアン | buffers/cache を除く | `memused_nocache_pct` | `kbmemfree` + `kbbuffers` + `kbcached` |
+| 緑 | MemAvailable 基準 | `memused_pct` | `kbavail` (カーネルの `MemAvailable`) |
+| マゼンタ | buffers/cache を含む | `memused_withcache_pct` | `kbmemfree` だけ |
+
+- 「含む」と「除く」の差が buffers と cache の分です。「除く」と「MemAvailable 基準」の差は、共有メモリ・tmpfs・回収できる slab などの影響です (読み方は[次の節](#メモリの使用量をどう読むか))。
+- 凡例は色付きの印と名前でグラフ枠の上辺に出ます。幅が足りないときは短い名前 (除く / MemAvailable / 含む) になり、それでも入らなければ下辺の左へ移ります。
+- 値の無い系列は線を引かず、凡例に灰色で理由を添えます。全時刻で「その世代に無い」場合は「(記録なし)」、欠測など別の理由が混じる場合は「(値なし)」です。`kbavail` を記録しない世代 (RHEL / CentOS 7 の sysstat 10.1.5 など) では「MemAvailable 基準」が「(記録なし)」になります。0 の線を引いたり、別の値で代用したりはしません。
+- 表の見出しは、グラフに描いている 3 列がそれぞれ線と同じ色になります。新しい 4 列 (`kbmemused_nocache` / `memused_nocache_pct` / `kbmemfree_withcache` / `memused_withcache_pct`) は `memused_pct` の直後に並ぶので、横に送らなくても時刻ごとの数値を読めます。
+- `[` / `]` で送ると、比較グラフが巡回の先頭に入ります。`]` で単一列のグラフへ進み、`[` で比較グラフへ戻れます。`c` の一覧でカーソルを動かして確定するとその列だけのグラフになり、動かさずに確定すれば比較グラフのままです。
+- `?` のヘルプにも 3 本の読み方を載せています。
+
+## メモリの使用量をどう読むか
+
+`kbmemused` と `%memused` の式は、sysstat の版によって 3 回変わっています。同じホストの同じ時刻でも、どの版の `sar` で見たかによって値が大きく違います。
+
+| sysstat の版 | `kbmemused` の式 | 補足 |
+|---|---|---|
+| 11.7.4 より前 (安定版では 11.6.4 / 11.4.10 より前)。RHEL / CentOS 7 の 10.1.5 もここに入る | `MemTotal − MemFree` | buffers と page cache も使用量に入るので、`%memused` は 90% 台になりやすい |
+| 11.7.4 〜 12.7.7 | `MemTotal − MemFree − Buffers − Cached − Slab` | free(1) と top(1) の表示にそろえた式 |
+| 12.7.8 以降 | `MemTotal − MemAvailable` (`kbavail`) | reSARch の `kbmemused` / `memused_pct` もこの式 (互換出力の扱いは後述) |
+
+**`kbmemfree` が小さいこと自体は異常ではありません。** Linux は空いているメモリを page cache に回し、必要になれば回収します。`kbmemfree` が総量の数 % しかなくても、それだけではメモリ不足とは言えません。古い `sar` の `%memused` が 90% 台に張り付くのも同じ理由です。
+
+**空きの正確な見積もりは `kbavail` (`MemAvailable`) です。** カーネル 3.14 で加わった値で、カーネル文書 (`filesystems/proc.rst`) は「swap を起こさずに新しいアプリケーションを起動するのに使える量の見積もり」と定義し、`MemFree`・`SReclaimable`・file LRU の大きさ・各ゾーンの low watermark から計算します。sa ファイルには sysstat 11.5.3 から記録されます。RHEL 7 のカーネル (3.10.0) にもこの値はありますが、RHEL 7 の sysstat 10.1.5 は記録しません。procps-ng の `free` も 3.3.10 で `MemAvailable` を使う available 列を加え、4.0.1 からは used を total − available で出しています (現行の `free` の cache は `Cached` + `SReclaimable` なので、`kbcached` とは一致しません)。
+
+**buffers と cache を除いた値は近似です。** `MemAvailable` が無かった頃は、free と cached の和で空きを見積もるのが一般的でした。カーネルに `MemAvailable` を加えた commit (34e431b0) は、この見積もりを「10 年前なら問題なかったが、今ではほぼ確実に誤り」としています。`Cached` には共有メモリ・tmpfs・ramfs のように page cache としては解放できないものが含まれ、逆に回収できる slab は含まれないためです。共有メモリや tmpfs を多く使うホストでは、buffers/cache を除いた使用率は実際より低く出ます (空きを多く見積もります)。回収できる slab が大きいと、逆に高く出ます。
+
+独自出力は、この違いを別々の列で出します。
+
+| 列 | 式 | 使いどころ |
+|---|---|---|
+| `kbavail` (kB) | カーネルの `MemAvailable` | 余裕があるかの判断はまずこれ |
+| `memused_pct` (%) | `(kbmemtotal − kbavail) / kbmemtotal × 100` | 同上 |
+| `kbmemused_nocache` (kB) | `kbmemtotal − kbmemfree − kbbuffers − kbcached`。負になるときは 0 | `kbavail` の無い世代で推移を読む (近似) |
+| `memused_nocache_pct` (%) | `kbmemused_nocache / kbmemtotal × 100` | 同上 |
+| `kbmemfree_withcache` (kB) | `kbmemfree + kbbuffers + kbcached`。総量で頭打ちにしない | 同上 |
+| `memused_withcache_pct` (%) | `(kbmemtotal − kbmemfree) / kbmemtotal × 100` | 11.7.4 より前の `sar` の `%memused` と突き合わせる |
+
+- 新しい 4 列の入力は、旧世代のファイルにもある 4 項目だけです。そのため `kbavail` を記録しない世代でも値が出て、式も世代で変わりません。sysstat 11.7.4〜12.7.7 と違って `Slab` を引かないのもこのためです (`kbslab` は 11.1.3 より前の世代にありません)。
+- `kbavail` を記録しない世代では、独自出力の `kbavail` / `kbmemused` / `memused_pct` は値なし (`—`) のままです。意味の違う値なので、新しい列の値で埋めることはしません。`detect` と `summarize` の判定も新しい列を使わず、`kbavail` の無い世代では評価できないと報告します。
+- 互換出力 (`sar -r` / `sadf`) は本家の式のままで、新しい 4 列は出ません。`kbavail` を記録しない世代では、本家の `sadf -c` と同じく `kbavail` の代わりに `kbmemfree` を使うので、`%memused` は 11.7.4 より前の式 (buffers/cache を含む) と同じ値になります。`--sar-profile sysstat-10.1.5-el7` の出力は、もともとこの式です。
 
 ## 異変の当たりを付ける
 

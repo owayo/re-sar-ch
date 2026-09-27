@@ -23,6 +23,9 @@
 //! - **時刻の基準を画面に明記する** (`--timezone`、既定はローカル)。独自出力の既定と揃える。
 //! - **グラフも同じ規律で描く。** 折れ線は不連続と欠測のところで切り、
 //!   飛び越えて結ばない。欠測を 0 に写さない (`graph` モジュールを参照)。
+//! - **比較グラフも列を重ねるだけ。** MEMORY の既定は使用率 3 通りの比較
+//!   ([`graph::MEMORY_USAGE`]) だが、線はどれも `series` 層の列そのもので、
+//!   差や和の線をここで作らない。値の無い系列は凡例から消さずに理由を書く。
 
 pub mod graph;
 
@@ -166,6 +169,24 @@ enum GraphVisibility {
     Hidden,
 }
 
+/// グラフに描く対象。
+///
+/// **添字ではなく名前で持つ。** item を切り替えると列の顔ぶれが変わるので、
+/// 添字では「別の列に化ける」。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GraphTarget {
+    /// 1 列を 1 本の線で描く。
+    Column(&'static str),
+    /// 決まった列の組を同じ軸に重ねる (比較グラフ)。
+    Preset(&'static graph::GraphPreset),
+}
+
+/// 比較グラフの凡例で、系列の色を示す印。
+///
+/// 線と同じ Braille の全点を使う。`■` や `█` は East Asian Width が曖昧で、
+/// 日本語環境の端末では 2 桁に描かれて凡例の位置がずれる。
+const LEGEND_MARK: &str = "⣿";
+
 /// グラフに割く行数。0 なら出さない。
 ///
 /// **表よりグラフを優先しない。** グラフを出したせいで表が 2〜3 行しか
@@ -203,12 +224,10 @@ struct App {
     tab: usize,
     /// タブごとの選択 item。タブを切り替えても選択を保つ。
     item: Vec<usize>,
-    /// タブごとのグラフ対象列。タブを切り替えても選択を保つ。
+    /// タブごとのグラフ対象。タブを切り替えても選択を保つ。
     ///
-    /// **添字ではなく名前で持つ。** item を切り替えると列の顔ぶれが変わるので、
-    /// 添字では「別の列に化ける」。`None` は「まだ選んでいない」で、
-    /// そのときは描ける列の先頭を使う。
-    graph_col: Vec<Option<&'static str>>,
+    /// `None` は「まだ選んでいない」で、そのときは [`App::default_target`] に従う。
+    graph_target: Vec<Option<GraphTarget>>,
     /// タブごとの「表に出す列」。
     ///
     /// `None` は既定 = **全時刻で 1 度も値が出なかった列を隠す**。
@@ -234,6 +253,10 @@ struct App {
     picker: ListState,
     /// 列ピッカーの選択位置 (`columns()` の添字)。
     col_picker: ListState,
+    /// 列ピッカーを開いたときのカーソル位置。
+    ///
+    /// カーソルを動かさずに確定したら、グラフの対象を変えないために使う。
+    col_picker_origin: Option<usize>,
     mode: Mode,
     filter: String,
     /// 終了要求。
@@ -256,7 +279,7 @@ impl App {
             }
         }
         let item = vec![0; tabs.len()];
-        let graph_col = vec![None; tabs.len()];
+        let graph_target = vec![None; tabs.len()];
         let col_offset = vec![0; tabs.len()];
         let shown_cols = vec![None; tabs.len()];
         let mut table = TableState::default();
@@ -266,7 +289,7 @@ impl App {
             samples: c.samples,
             marks: c.marks,
             tz: c.tz,
-            graph_col,
+            graph_target,
             shown_cols,
             col_draft: Vec::new(),
             col_offset,
@@ -274,6 +297,7 @@ impl App {
             last_height: 0,
             visible_cols: 1,
             col_picker: ListState::default(),
+            col_picker_origin: None,
             tabs,
             tab: 0,
             item,
@@ -400,8 +424,9 @@ impl App {
     /// 全サンプルを通して 1 度でも値が出た列。
     ///
     /// **「その世代に無い」「未実装」の列は全行が `—` になる。**
-    /// MEMORY の 19 列のうち何列かがそれだと、読みたい列が画面の外へ出てしまう。
-    /// 隠した列は消したのではなく、`C` で出せることをタイトルに書く。
+    /// MEMORY のように列の多い activity でそれが何列もあると、読みたい列が
+    /// 画面の外へ出てしまう。隠した列は消したのではなく、`c` で出せることを
+    /// タイトルに書く。
     fn measured_columns(&self) -> Vec<&'static str> {
         let all = self.columns();
         let (Some(act), Some(want)) = (self.current_activity(), self.selected_item_name()) else {
@@ -458,15 +483,19 @@ impl App {
     /// 列ピッカーを開く (いまの表示列を下書きに写す)。
     fn open_column_picker(&mut self) {
         self.col_draft = self.table_columns();
-        // カーソルは**いまグラフに出ている列**に合わせる。確定時にカーソル位置の
-        // 列をグラフ対象にするので、動かさなければグラフは変わらない
-        // (「表の列だけ直したらグラフまで変わった」を防ぐ)。
+        // カーソルは**いまグラフに出ている列**に合わせる。比較グラフなら
+        // その先頭の (値のある) 系列に合わせる。
         let all = self.columns();
-        let pos = self
-            .selected_column()
+        let focus = match self.selected_target() {
+            Some(GraphTarget::Column(c)) => Some(c),
+            Some(GraphTarget::Preset(p)) => self.preset_measured(p).first().copied(),
+            None => None,
+        };
+        let pos = focus
             .and_then(|c| all.iter().position(|n| *n == c))
             .unwrap_or(0);
         self.col_picker.select(Some(pos));
+        self.col_picker_origin = Some(pos);
         self.mode = Mode::PickColumn;
     }
 
@@ -508,19 +537,27 @@ impl App {
         if let Some(off) = self.col_offset.get_mut(self.tab) {
             *off = 0;
         }
+        // **カーソルを動かさなければグラフは変えない** (「表の列だけ直したら
+        // グラフまで変わった」を防ぐ)。比較グラフを出したまま表の列を直したときに、
+        // カーソルが置かれていた系列の 1 列だけのグラフへ切り替わらないようにする。
+        let cursor = self.col_picker.selected();
+        let origin = self.col_picker_origin.take();
+        if cursor.is_some() && origin == cursor {
+            return;
+        }
         // カーソル位置の列をグラフ対象にする。ただし
         // **描けない列 (識別子など) と、いま表から外した列は対象にしない。**
         // 外した列をグラフへ回すと、`[` / `]` の巡回からも外れているのに
         // グラフにだけ出ている、という辻褄の合わない状態になる。
         let all = self.columns();
-        let Some(name) = self.col_picker.selected().and_then(|i| all.get(i)).copied() else {
+        let Some(name) = cursor.and_then(|i| all.get(i)).copied() else {
             return;
         };
         if self.plottable_columns().contains(&name)
             && self.table_columns().contains(&name)
-            && let Some(slot) = self.graph_col.get_mut(self.tab)
+            && let Some(slot) = self.graph_target.get_mut(self.tab)
         {
-            *slot = Some(name);
+            *slot = Some(GraphTarget::Column(name));
         }
     }
 
@@ -557,13 +594,78 @@ impl App {
         Vec::new()
     }
 
-    /// グラフに描く列。描ける列が無ければ `None`。
-    fn selected_column(&self) -> Option<&'static str> {
-        let plottable = self.plottable_columns();
-        match self.graph_col.get(self.tab).copied().flatten() {
+    /// グラフに描く対象。描けるものが無ければ `None`。
+    fn selected_target(&self) -> Option<GraphTarget> {
+        match self.graph_target.get(self.tab).copied().flatten() {
             // 選んだ列が今の item に無ければ (デバイスを替えた等)、既定へ戻す。
-            Some(name) if plottable.contains(&name) => Some(name),
-            _ => self.default_graph_column(),
+            Some(GraphTarget::Column(name)) if self.plottable_columns().contains(&name) => {
+                Some(GraphTarget::Column(name))
+            }
+            Some(GraphTarget::Preset(p)) if self.preset() == Some(p) => {
+                Some(GraphTarget::Preset(p))
+            }
+            _ => self.default_target(),
+        }
+    }
+
+    /// 1 列だけのグラフに描いている列。比較グラフのときは `None`。
+    #[cfg(test)]
+    fn selected_column(&self) -> Option<&'static str> {
+        match self.selected_target()? {
+            GraphTarget::Column(c) => Some(c),
+            GraphTarget::Preset(_) => None,
+        }
+    }
+
+    /// まだ選んでいないときのグラフ。
+    ///
+    /// 比較グラフがあればそれを先に使う ([`graph::MEMORY_USAGE`] の理由を参照)。
+    /// 無ければ値の出る最初の列 ([`App::default_graph_column`])。
+    fn default_target(&self) -> Option<GraphTarget> {
+        self.preset()
+            .map(GraphTarget::Preset)
+            .or_else(|| self.default_graph_column().map(GraphTarget::Column))
+    }
+
+    /// この item で出せる比較グラフ。
+    ///
+    /// **系列の 1 本にも値が出ないなら出さない。** 空のグラフを既定にすると、
+    /// タブを開いた瞬間に「描画できる観測がありません」を見せることになる。
+    fn preset(&self) -> Option<&'static graph::GraphPreset> {
+        let p = graph::preset_for(self.current_activity()?)?;
+        (!self.preset_measured(p).is_empty()).then_some(p)
+    }
+
+    /// 比較グラフの系列のうち、1 度でも値が出た列 (凡例の順)。
+    fn preset_measured(&self, p: &graph::GraphPreset) -> Vec<&'static str> {
+        let measured = self.measured_columns();
+        let plottable = self.plottable_columns();
+        p.series
+            .iter()
+            .map(|s| s.column)
+            .filter(|c| measured.contains(c) && plottable.contains(c))
+            .collect()
+    }
+
+    /// 表の見出しに付けるグラフの線の色。グラフが出ていなければ空。
+    ///
+    /// **線の無い系列には色を付けない。** 付けると、線が無いのに
+    /// 「グラフに描いている列」のように見える。
+    fn graph_header_colors(&self) -> Vec<(&'static str, Color)> {
+        if !self.graph_visible() {
+            return Vec::new();
+        }
+        match self.selected_target() {
+            Some(GraphTarget::Column(c)) => vec![(c, GRAPH_LINE_COLOR)],
+            Some(GraphTarget::Preset(p)) => {
+                let measured = self.preset_measured(p);
+                p.series
+                    .iter()
+                    .filter(|s| measured.contains(&s.column))
+                    .map(|s| (s.column, s.color))
+                    .collect()
+            }
+            None => Vec::new(),
         }
     }
 
@@ -594,23 +696,38 @@ impl App {
             .collect()
     }
 
+    /// `[` / `]` の巡回。比較グラフがあれば先頭に置き、続けて 1 列ずつ。
+    ///
+    /// 比較グラフを別のキーに割り当てないのは、「グラフに何を描くかを送る」
+    /// という同じ操作だから。キーを増やすと、どちらで何が変わるかを覚える羽目になる。
+    fn graph_cycle(&self) -> Vec<GraphTarget> {
+        let mut cycle: Vec<GraphTarget> =
+            self.preset().map(GraphTarget::Preset).into_iter().collect();
+        cycle.extend(
+            self.steppable_columns()
+                .into_iter()
+                .map(GraphTarget::Column),
+        );
+        cycle
+    }
+
     fn move_col(&mut self, delta: isize) {
-        let steppable = self.steppable_columns();
-        let n = steppable.len();
+        let cycle = self.graph_cycle();
+        let n = cycle.len();
         if n == 0 {
             return;
         }
         let cur = self
-            .selected_column()
-            .and_then(|c| steppable.iter().position(|n| *n == c));
+            .selected_target()
+            .and_then(|t| cycle.iter().position(|c| *c == t));
         let next = match cur {
             Some(i) => (((i as isize + delta) % n as isize + n as isize) % n as isize) as usize,
             // いま見ている列が巡回の対象外 (表から外した列) なら端から入る。
             None if delta >= 0 => 0,
             None => n - 1,
         };
-        if let Some(slot) = self.graph_col.get_mut(self.tab) {
-            *slot = Some(steppable[next]);
+        if let Some(slot) = self.graph_target.get_mut(self.tab) {
+            *slot = Some(cycle[next]);
         }
     }
 
@@ -758,15 +875,26 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// 選択中の 1 系列を折れ線で描く。
+/// グラフに重ねる 1 系列。
+struct Plot {
+    view: graph::GraphView,
+    color: Color,
+    /// 凡例の名前 (1 列だけのグラフでは凡例を出さない)。
+    label: &'static str,
+    /// 幅が足りないときの凡例の名前。
+    short: &'static str,
+}
+
+/// 選択中の系列を折れ線で描く (1 列、または比較グラフの複数列)。
 ///
 /// **不連続と欠測ごとに `Dataset` を分ける。** 1 本の点列に混ぜて
 /// 飛び越えた線を引くと、観測していない区間をあたかも観測したかのように見せる。
+/// 比較グラフでも系列ごとに同じ規律で切る。
 fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
     let (Some(act), Some(item)) = (app.current_activity(), app.selected_item_name()) else {
         return;
     };
-    let Some(col) = app.selected_column() else {
+    let Some(target) = app.selected_target() else {
         f.render_widget(
             Paragraph::new("グラフに描ける数値の列がありません")
                 .style(Style::default().fg(Color::DarkGray))
@@ -775,21 +903,50 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
-    let view = graph::GraphView::build(&app.samples, act, &item, col);
-
-    let unit = if view.unit.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", view.unit)
+    let (name, plots): (&str, Vec<Plot>) = match target {
+        GraphTarget::Column(col) => (
+            col,
+            vec![Plot {
+                view: graph::GraphView::build(&app.samples, act, &item, col),
+                color: GRAPH_LINE_COLOR,
+                label: col,
+                short: col,
+            }],
+        ),
+        GraphTarget::Preset(p) => (
+            p.title,
+            p.series
+                .iter()
+                .map(|s| Plot {
+                    view: graph::GraphView::build(&app.samples, act, &item, s.column),
+                    color: s.color,
+                    label: s.label,
+                    short: s.short,
+                })
+                .collect(),
+        ),
     };
-    let title = format!(" {act} / {item} / {col}{unit} ");
 
-    if view.is_empty() {
+    let unit = plots
+        .iter()
+        .map(|p| p.view.unit)
+        .find(|u| !u.is_empty())
+        .map(|u| format!(" ({u})"))
+        .unwrap_or_default();
+    let title = format!(" {act} / {item} / {name}{unit} ");
+
+    if plots.iter().all(|p| p.view.is_empty()) {
         // **空の軸を出さない。** 「描けなかった」ことと「なぜか」を書く。
+        // 比較グラフでは理由を系列ごとに出す (1 つへ丸めない)。
         let mut lines = vec![Line::from("この範囲に描画できる観測がありません")];
-        if !view.absent.is_empty() {
+        for p in plots.iter().filter(|p| !p.view.absent.is_empty()) {
+            let reason = if plots.len() == 1 {
+                p.view.absent_summary()
+            } else {
+                format!("{}: {}", p.label, p.view.absent_summary())
+            };
             lines.push(Line::from(Span::styled(
-                view.absent_summary(),
+                reason,
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -802,6 +959,12 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // 系列は同じサンプル列から作るので、X の原点と範囲は共通。
+    // Y は全系列の点をまとめて 1 本の軸にする (系列ごとに軸を持たない)。
+    let (x_origin, x_bounds) = (plots[0].view.x_origin, plots[0].view.x_bounds);
+    let views: Vec<&graph::GraphView> = plots.iter().map(|p| &p.view).collect();
+    let y_bounds = graph::merged_y_bounds(&views);
+
     // 表で選んでいる時刻に縦線を立てる。表とグラフが同じ時刻を指していることを
     // 見せるため。**値が欠測の時刻でも線は立つ** (1 点の散布では消えてしまう)。
     let cursor: Option<[(f64, f64); 2]> = app
@@ -809,11 +972,12 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         .selected()
         .and_then(|i| app.samples.get(i))
         .map(|s| {
-            let x = (s.end_epoch as f64) - (view.x_origin as f64);
-            [(x, view.y_bounds[0]), (x, view.y_bounds[1])]
+            let x = (s.end_epoch as f64) - (x_origin as f64);
+            [(x, y_bounds[0]), (x, y_bounds[1])]
         });
 
-    let mut datasets: Vec<Dataset> = Vec::with_capacity(view.segments.len() + 1);
+    let segments: usize = plots.iter().map(|p| p.view.segments.len()).sum();
+    let mut datasets: Vec<Dataset> = Vec::with_capacity(segments + 1);
     if let Some(c) = cursor.as_ref() {
         datasets.push(
             Dataset::default()
@@ -825,17 +989,24 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
                 .data(c),
         );
     }
-    for seg in &view.segments {
-        datasets.push(
-            Dataset::default()
-                .graph_type(GraphType::Line)
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(GRAPH_LINE_COLOR))
-                .data(seg),
-        );
+    // 後に描いたものが上に乗るので、凡例の先頭 (読み取ってほしい系列) を最後に描く。
+    for p in plots.iter().rev() {
+        for seg in &p.view.segments {
+            datasets.push(
+                Dataset::default()
+                    .graph_type(GraphType::Line)
+                    .marker(symbols::Marker::Braille)
+                    .style(Style::default().fg(p.color))
+                    .data(seg),
+            );
+        }
     }
 
-    let gap = view.segments.len().saturating_sub(1);
+    let gap = plots
+        .iter()
+        .map(|p| p.view.segments.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
     // 線の切れ目は表の `!` / `R` と同じ意味。**色だけに頼らず語で書く。**
     // 軸の title には出さない (Y 軸ラベルと重なって読めなくなる)。
     let note = if gap > 0 {
@@ -843,35 +1014,103 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    let y_label_w = view
-        .y_labels()
+    let y_labels = graph::axis_labels(y_bounds);
+    let y_label_w = y_labels
         .iter()
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0) as u16;
     let plot_width = area.width.saturating_sub(y_label_w + 3);
 
+    let mut block = Block::bordered().title(title.clone());
+    let mut bottom_note = Some(Line::from(note.clone()).right_aligned());
+    if plots.len() > 1 {
+        // **2 系列以上なら凡例を必ず出す。** 上辺の題名の右に入らなければ、
+        // 下辺の左 (切れ目の注記と並べて) に置く。
+        let inner = area.width.saturating_sub(2) as usize;
+        let top_room = inner.saturating_sub(Line::from(title.as_str()).width() + 1);
+        let bottom_room = inner.saturating_sub(Line::from(note.as_str()).width() + 1);
+        if let Some(legend) = legend_line(&plots, top_room) {
+            block = block.title_top(legend.right_aligned());
+        } else if let Some(legend) = legend_line(&plots, bottom_room) {
+            block = block.title_bottom(legend.left_aligned());
+        } else if let Some(legend) = legend_line(&plots, inner) {
+            // 注記より凡例を優先する (どの線が何かが分からないと図を読めない)
+            block = block.title_bottom(legend.left_aligned());
+            bottom_note = None;
+        }
+    }
+    if let Some(n) = bottom_note {
+        block = block.title_bottom(n);
+    }
+
     let chart = Chart::new(datasets)
-        .block(
-            Block::bordered()
-                .title(title)
-                .title_bottom(Line::from(note).right_aligned()),
-        )
+        .block(block)
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
-                .bounds(view.x_bounds)
+                .bounds(x_bounds)
                 // 軸に使える幅は、枠 (2) と Y 軸ラベルの分を引いた残り。
                 // ここを渡さないと刻みが幅に追従せず、広い画面でも両端だけになる。
-                .labels(view.x_labels(app.tz, plot_width)),
+                .labels(plots[0].view.x_labels(app.tz, plot_width)),
         )
         .y_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
-                .bounds(view.y_bounds)
-                .labels(view.y_labels()),
+                .bounds(y_bounds)
+                .labels(y_labels),
         );
     f.render_widget(chart, area);
+}
+
+/// 比較グラフの凡例。幅 `room` に入らなければ短い名前で試し、それでも入らなければ `None`。
+///
+/// - **色だけに頼らない。** 色の印の後に名前を書く。名前は本文の色のまま
+///   (系列の色で文字を塗ると、線との対応ではなく強調に見える)。
+/// - **値の無い系列も消さない。** 灰色で「(記録なし)」と書く。線が無いこと自体が
+///   「その世代のファイルに無い」という観測だからである。
+fn legend_line(plots: &[Plot], room: usize) -> Option<Line<'static>> {
+    for short in [false, true] {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        for (i, p) in plots.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            let name = if short { p.short } else { p.label };
+            if p.view.is_empty() {
+                spans.push(Span::styled(
+                    format!("- {name} ({})", absent_word(&p.view)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                spans.push(Span::styled(LEGEND_MARK, Style::default().fg(p.color)));
+                spans.push(Span::raw(format!(" {name}")));
+            }
+        }
+        spans.push(Span::raw(" "));
+        let line = Line::from(spans);
+        if line.width() <= room {
+            return Some(line);
+        }
+    }
+    None
+}
+
+/// 1 点も描けなかった系列の言い方。
+///
+/// **「無い」の理由を混ぜない。** 全時刻で「その世代のファイルに無い」なら
+/// 記録そのものが無い。欠測など別の理由が混じるなら、値が無いとだけ言う。
+fn absent_word(view: &graph::GraphView) -> &'static str {
+    if !view.absent.is_empty()
+        && view
+            .absent
+            .iter()
+            .all(|(reason, _)| *reason == Quality::UnsupportedBySource.label())
+    {
+        "記録なし"
+    } else {
+        "値なし"
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -976,19 +1215,17 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
 
     // グラフに描いている列は、表の見出しも同じ色にする。
     // **グラフの線と同じ色を使う** — 「どの列が上の線なのか」を色で結びつける。
+    // 比較グラフなら系列ごとにその線の色になる。
     // グラフが出ていないときは色を付けない (対応する線が無い)。
-    let graphed = app.graph_visible().then(|| app.selected_column()).flatten();
+    let graphed = app.graph_header_colors();
     let mut header: Vec<Cell> = vec![Cell::from("time")];
     header.extend(cols.iter().map(|c| {
         let cell = Cell::from(*c);
-        if Some(*c) == graphed {
-            cell.style(
-                Style::default()
-                    .fg(GRAPH_LINE_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            cell
+        match graphed.iter().find(|(name, _)| name == c) {
+            Some((_, color)) => {
+                cell.style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
+            }
+            None => cell,
         }
     }));
 
@@ -1249,6 +1486,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("/           item を名前で絞り込む"),
         Line::from("c           列を選ぶ (表に出す列とグラフの列)"),
         Line::from("[  ]        グラフの列を前 / 次へ (表に出ている列だけ)"),
+        Line::from("            MEMORY は先頭が使用率 3 通りの比較グラフ"),
         Line::from("v           グラフの表示を切り替える"),
         Line::from("?           このヘルプ"),
         Line::from("esc ctrl-c  終了 (esc は通常画面で)"),
@@ -1264,6 +1502,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("表は既定で「全時刻で値が出なかった列」を外す。c で出せる。"),
         Line::from("グラフの線は、不連続と欠測のところで切れる。"),
         Line::from("切れ目を飛び越えて結ばないのは、その間を観測していないため。"),
+        Line::from(""),
+        Line::from("メモリ使用率の比較 (MEMORY):"),
+        Line::from("  MemAvailable 基準     カーネルの推定。記録があればこれ"),
+        Line::from("  buffers/cache を除く  旧来の近似。全世代で出る"),
+        Line::from("  buffers/cache を含む  11.7.4 より前の sar の %memused"),
+        Line::from("kbmemfree が小さいだけではメモリ不足と言えない。"),
     ];
     let r = centered(area, 62, lines.len() as u16 + 2);
     f.render_widget(Clear, r);
@@ -1310,6 +1554,7 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             // Esc は下書きを捨てる (表もグラフも元のまま)。
             KeyCode::Esc => {
                 app.col_draft.clear();
+                app.col_picker_origin = None;
                 app.mode = Mode::Normal;
             }
             KeyCode::Enter => {
@@ -2033,7 +2278,7 @@ mod tests {
             });
         }
         // `b` をグラフ対象にしたまま、表からは外す
-        app.graph_col[app.tab] = Some("b");
+        app.graph_target[app.tab] = Some(GraphTarget::Column("b"));
         app.open_column_picker();
         app.col_picker.select(Some(1));
         app.toggle_draft_column();
@@ -2154,6 +2399,321 @@ mod tests {
         }
         assert!(red > 0, "選択時刻のカーソルが赤で出る");
         assert!(cyan > 0, "観測値の線は別の色で出る");
+    }
+
+    // -----------------------------------------------------------------------
+    // メモリ使用率の比較グラフ
+    // -----------------------------------------------------------------------
+
+    /// MEMORY の 1 時刻分。`None` はその列の値が無いこと。
+    struct MemRow {
+        free: f64,
+        /// `memused_pct` (MemAvailable 基準)。`None` は「その世代に無い」。
+        avail_based: Option<f64>,
+        nocache: Option<f64>,
+        withcache: Option<f64>,
+    }
+
+    fn pct(name: &'static str, v: Option<f64>, absent: Quality) -> FieldOut {
+        FieldOut {
+            name,
+            unit: "percent",
+            kind: "gauge",
+            raw: None,
+            value: v,
+            text: None,
+            quality: if v.is_some() { Quality::Ok } else { absent },
+        }
+    }
+
+    fn kb(name: &'static str, v: f64) -> FieldOut {
+        FieldOut {
+            name,
+            unit: "kB",
+            kind: "gauge",
+            raw: None,
+            value: Some(v),
+            text: None,
+            quality: Quality::Ok,
+        }
+    }
+
+    /// 列の並びは layout と同じ (kbmemfree → memused_pct → 追加の 2 列 → kbcached)。
+    fn memory_app(rows: &[MemRow]) -> App {
+        let samples = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| SampleOut {
+                boot: 1,
+                start_epoch: T0 + i as u64 * 600,
+                end_epoch: T0 + (i as u64 + 1) * 600,
+                elapsed_cs: 60_000,
+                continuous: true,
+                activities: vec![ActivityOut {
+                    activity: "A_MEMORY",
+                    label: "メモリ・スワップ利用状況",
+                    items: vec![ItemOut {
+                        item: "-".into(),
+                        index: 0,
+                        cpu: None,
+                        raw: Vec::new(),
+                        rates: vec![
+                            kb("kbmemfree", r.free),
+                            pct("memused_pct", r.avail_based, Quality::UnsupportedBySource),
+                            pct("memused_nocache_pct", r.nocache, Quality::MissingInSample),
+                            pct(
+                                "memused_withcache_pct",
+                                r.withcache,
+                                Quality::MissingInSample,
+                            ),
+                            kb("kbcached", 2_600_000.0),
+                        ],
+                    }],
+                }],
+            })
+            .collect();
+        App::new(Collected {
+            host: host(),
+            samples,
+            marks: Vec::new(),
+            tz: DisplayTz::Utc,
+        })
+    }
+
+    /// el7 (sysstat 10.1.5) のように MemAvailable を記録しない世代。
+    fn el7_rows() -> Vec<MemRow> {
+        [
+            (345_324.0, 64.0, 95.8),
+            (321_536.0, 65.2, 96.1),
+            (155_016.0, 66.0, 98.1),
+        ]
+        .iter()
+        .map(|&(free, nocache, withcache)| MemRow {
+            free,
+            avail_based: None,
+            nocache: Some(nocache),
+            withcache: Some(withcache),
+        })
+        .collect()
+    }
+
+    /// Braille で描かれたセルのうち、その色のものの数。
+    fn braille_cells(app: &mut App, w: u16, h: u16, color: Color) -> usize {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut n = 0;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                let braille = cell
+                    .symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+                if braille && cell.style().fg == Some(color) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// 表の見出しに出ている列名の文字色。
+    fn header_fg(app: &mut App, w: u16, needle: &str) -> Option<Color> {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, 40)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>();
+            if line.contains("time")
+                && let Some(x) = line.find(needle)
+            {
+                return buf[(x as u16, y)].style().fg;
+            }
+        }
+        None
+    }
+
+    /// MEMORY は kbmemfree 1 本ではなく、使用率の比較から開く。
+    ///
+    /// kbmemfree は page cache に使われて小さく見えるのが普通の値で、
+    /// それだけを見せるとメモリ不足と読み違える。
+    #[test]
+    fn memory_opens_on_the_usage_comparison() {
+        let mut app = memory_app(&el7_rows());
+        assert_eq!(
+            app.selected_target(),
+            Some(GraphTarget::Preset(&graph::MEMORY_USAGE))
+        );
+        assert_eq!(app.selected_column(), None, "1 列だけのグラフではない");
+
+        let screen = render(&mut app, 140, 40);
+        assert!(
+            shows(&screen, "A_MEMORY / - / メモリ使用率の比較 (percent)"),
+            "{screen}"
+        );
+        assert!(shows(&screen, "buffers/cache を除く"), "{screen}");
+        assert!(shows(&screen, "buffers/cache を含む"), "{screen}");
+        // **記録の無い系列も凡例から消さない。** 無いこと自体を書く。
+        assert!(shows(&screen, "MemAvailable 基準 (記録なし)"), "{screen}");
+    }
+
+    /// 系列ごとに別の色で描き、値の無い系列は線を引かない。
+    #[test]
+    fn the_comparison_draws_each_series_in_its_own_colour() {
+        let mut app = memory_app(&el7_rows());
+        assert!(braille_cells(&mut app, 100, 40, Color::Cyan) > 0, "除く");
+        assert!(braille_cells(&mut app, 100, 40, Color::Magenta) > 0, "含む");
+        assert_eq!(
+            braille_cells(&mut app, 100, 40, Color::Green),
+            0,
+            "記録の無い系列は 0 の線にしない"
+        );
+
+        // MemAvailable を記録している世代なら 3 本とも出る
+        let mut rows = el7_rows();
+        for (r, v) in rows.iter_mut().zip([61.0, 62.5, 63.0]) {
+            r.avail_based = Some(v);
+        }
+        let mut app = memory_app(&rows);
+        assert!(braille_cells(&mut app, 100, 40, Color::Green) > 0);
+        let screen = render(&mut app, 140, 40);
+        assert!(shows(&screen, "MemAvailable 基準"), "{screen}");
+        assert!(!shows(&screen, "記録なし"), "{screen}");
+    }
+
+    /// 比較グラフの系列の列は、表の見出しもそれぞれの線の色になる。
+    #[test]
+    fn the_comparison_colours_each_graphed_header() {
+        let mut app = memory_app(&el7_rows());
+        assert_eq!(
+            header_fg(&mut app, 120, "memused_nocache_pct"),
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            header_fg(&mut app, 120, "memused_withcache_pct"),
+            Some(Color::Magenta)
+        );
+        // 線の無い列 (kbmemfree) には色を付けない
+        let free = header_fg(&mut app, 120, "kbmemfree");
+        assert!(
+            !matches!(free, Some(Color::Cyan | Color::Magenta | Color::Green)),
+            "{free:?}"
+        );
+    }
+
+    /// `]` で 1 列のグラフへ出て、`[` で比較グラフへ戻る。
+    #[test]
+    fn brackets_leave_and_return_to_the_comparison() {
+        let mut app = memory_app(&el7_rows());
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("kbmemfree"));
+        let screen = render(&mut app, 120, 40);
+        assert!(shows(&screen, "A_MEMORY / - / kbmemfree (kB)"), "{screen}");
+
+        on_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(
+            app.selected_target(),
+            Some(GraphTarget::Preset(&graph::MEMORY_USAGE))
+        );
+        // 巻き戻しでも比較グラフを通る
+        on_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("kbcached"), "末尾の列へ");
+        on_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(
+            app.selected_target(),
+            Some(GraphTarget::Preset(&graph::MEMORY_USAGE))
+        );
+    }
+
+    /// 列ピッカーでカーソルを動かさなければ、比較グラフのまま。
+    ///
+    /// 表の列を直しただけで、カーソルの置かれた 1 列のグラフへ切り替わると
+    /// 「表をいじったらグラフまで変わった」になる。
+    #[test]
+    fn the_picker_keeps_the_comparison_when_the_cursor_stays() {
+        let mut app = memory_app(&el7_rows());
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.selected_target(),
+            Some(GraphTarget::Preset(&graph::MEMORY_USAGE))
+        );
+
+        // カーソルを動かして確定すれば、その列のグラフになる
+        // (カーソルは先頭の系列 memused_nocache_pct にあり、下は memused_withcache_pct)
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.selected_column(), Some("memused_withcache_pct"));
+
+        // 値の無い列 (表から外れている) へ動かしても、グラフは空にならない
+        app.graph_target[app.tab] = None;
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Up, KeyModifiers::NONE); // memused_pct (記録なし)
+        on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.selected_target(),
+            Some(GraphTarget::Preset(&graph::MEMORY_USAGE))
+        );
+    }
+
+    /// 系列に 1 点も値が無ければ、比較グラフを既定にしない。
+    #[test]
+    fn a_comparison_without_values_is_not_the_default() {
+        let rows: Vec<MemRow> = (0..3)
+            .map(|i| MemRow {
+                free: 300_000.0 + i as f64,
+                avail_based: None,
+                nocache: None,
+                withcache: None,
+            })
+            .collect();
+        let mut app = memory_app(&rows);
+        assert_eq!(app.selected_column(), Some("kbmemfree"));
+        assert!(
+            !app.graph_cycle()
+                .iter()
+                .any(|t| matches!(t, GraphTarget::Preset(_)))
+        );
+        let screen = render(&mut app, 120, 40);
+        assert!(!shows(&screen, "描画できる観測がありません"), "{screen}");
+    }
+
+    /// 凡例は幅に合わせて短くし、入らなければ下辺へ移す。題名とは重ならない。
+    #[test]
+    fn the_legend_adapts_to_the_terminal_width() {
+        for w in [60u16, 80, 100, 140] {
+            let mut app = memory_app(&el7_rows());
+            let screen = render(&mut app, w, 40);
+            assert!(
+                shows(&screen, "メモリ使用率の比較"),
+                "幅 {w} で題名が残る: {screen}"
+            );
+            assert!(shows(&screen, "除く"), "幅 {w} で凡例が出る: {screen}");
+            assert!(shows(&screen, "含む"), "幅 {w} で凡例が出る: {screen}");
+            assert!(shows(&screen, "MemAvailable"), "幅 {w}: {screen}");
+        }
+        // 広い端末では省略しない名前で出す
+        let mut app = memory_app(&el7_rows());
+        let wide = render(&mut app, 140, 40);
+        assert!(shows(&wide, "⣿ buffers/cache を除く"), "{wide}");
+    }
+
+    /// 欠測は「記録なし」と言わない (その世代に無いのとは別の理由)。
+    #[test]
+    fn a_missing_series_is_not_called_unrecorded() {
+        let mut rows = el7_rows();
+        for r in &mut rows {
+            r.withcache = None; // MissingInSample
+        }
+        let mut app = memory_app(&rows);
+        let screen = render(&mut app, 140, 40);
+        assert!(shows(&screen, "buffers/cache を含む (値なし)"), "{screen}");
+        assert!(shows(&screen, "MemAvailable 基準 (記録なし)"), "{screen}");
     }
 
     /// 実ファイルの描画を目で見るための一時確認。

@@ -66,6 +66,27 @@
 
 ### 追加
 
+- **独自出力の `A_MEMORY` に、`MemAvailable` を使わない旧来の見積もりを 4 列足した。**
+  `memused_pct` の直後に並び、独自出力 (`show` / `summarize` / `compare` / TUI) に出る。
+  互換出力 (`sar` / `sadf` / `sa2sar`) には出ない
+  - `kbmemused_nocache` (kB) … `kbmemtotal − kbmemfree − kbbuffers − kbcached`。
+    空き・buffers・cache の合計が総量を超えて負になるときは 0
+  - `memused_nocache_pct` (%) … `kbmemused_nocache / kbmemtotal × 100`
+  - `kbmemfree_withcache` (kB) … `kbmemfree + kbbuffers + kbcached`。総量で頭打ちにしない
+  - `memused_withcache_pct` (%) … `(kbmemtotal − kbmemfree) / kbmemtotal × 100`。
+    sysstat 11.7.4 より前の `%memused` と同じ式
+  - 入力の 4 項目は旧世代のファイルにもあるので、`kbavail` を記録しない世代
+    (RHEL / CentOS 7 の sysstat 10.1.5 など) でも値が出る。式は世代で変えない
+  - **`kbavail` の代わりではない。** 空きの正確な見積もりは `kbavail` (カーネルの
+    `MemAvailable`) で、`kbmemused` / `memused_pct` はこれまでどおり `kbavail` から求める。
+    `kbavail` の無い世代では独自出力で値なしのままで、新しい列の値では埋めない。
+    buffers と cache を除く見積もりは `MemAvailable` が無かった時代の近似で、`Cached` に
+    含まれる共有メモリ・tmpfs まで空きとして数え、回収できる slab を数えない
+  - `detect` と `summarize` の判定には使わない。`kbavail` の無い世代では、
+    `summarize` の `memory-available-low` も `detect` の `%memused` の固定条件も、
+    従来どおり評価できないと報告する
+  - 読み方は `docs/usage.ja.md` の「メモリの使用量をどう読むか」
+
 - `skill-install` で配布する AI 向けスキルで、言語指定に対応するコマンドの
   `--lang en` を必須にした。JSON / NDJSON も対象とし、実行例にも明記した。
   スキル自体の説明・本文・実行例のコメントも英語に統一した。
@@ -148,6 +169,27 @@
 
 ### 変更
 
+- **TUI の MEMORY タブの既定グラフを「メモリ使用率の比較」にした。** 使用率の 3 つの
+  見積もりを 0〜100% の同じ軸に重ねる (題名は `A_MEMORY / - / メモリ使用率の比較 (percent)`)
+  - 「buffers/cache を除く」(`memused_nocache_pct`、シアン)、「MemAvailable 基準」
+    (`memused_pct`、緑)、「buffers/cache を含む」(`memused_withcache_pct`、マゼンタ)。
+    「含む」と「除く」の差が buffers と cache の分、「除く」と「MemAvailable 基準」の差が
+    共有メモリ・tmpfs・回収できる slab などの影響になる
+  - 凡例は色付きの印と名前でグラフ枠の上辺に出す。幅が足りなければ短い名前
+    (除く / MemAvailable / 含む) にし、それでも入らなければ下辺の左へ移す
+  - 値の無い系列は線を引かず、凡例に灰色で理由を添える。全時刻で「その世代に無い」なら
+    「(記録なし)」(`kbavail` を記録しない世代の「MemAvailable 基準」がこれ)、
+    欠測など別の理由が混じるなら「(値なし)」。0 の線も代わりの値も描かない
+  - 表の見出しは、グラフに描いている 3 列がそれぞれ線と同じ色になる
+  - `[` / `]` の巡回の先頭に比較グラフが入る。`]` で単一列のグラフへ進み、`[` で戻る。
+    `c` の一覧でカーソルを動かして確定するとその列だけのグラフになり、
+    動かさずに確定すれば比較グラフのまま
+  - `?` のヘルプにも 3 系列の読み方と、`kbmemfree` が小さいだけではメモリ不足と
+    言えないことを足した
+- **`show --format table` と TUI の表で、メモリの列が 4 つ増えて並びが変わる。**
+  上記の派生列が `memused_pct` の直後に入り、`kbbuffers` 以降が右へずれる。
+  JSON / NDJSON はキーが増えるだけ、CSV は縦持ちなので行が増えるだけでヘッダは変わらない。
+  互換出力は変わらない
 - **TUI のキーから大文字を廃止した。** `g` / `G` → `home` / `end`、
   表の列選択 `C` はグラフの列選択 `c` に統合。`shift` の有無で別の操作になると、
   打ち間違いが「別の機能が動く」形で出るため

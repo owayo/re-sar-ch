@@ -26,8 +26,11 @@
 //! - **比較グラフも列を重ねるだけ。** MEMORY の既定は使用率 3 通りの比較
 //!   ([`graph::MEMORY_USAGE`]) だが、線はどれも `series` 層の列そのもので、
 //!   差や和の線をここで作らない。値の無い系列は凡例から消さずに理由を書く。
+//! - **表の下の列の説明は式と意味だけを書く** ([`notes`])。数値は表から読み、
+//!   説明のために値を組み立て直さない。説明のために表を潰さない (`note_layout`)。
 
 pub mod graph;
+pub mod notes;
 
 use std::path::Path;
 
@@ -202,6 +205,55 @@ fn graph_height(vis: GraphVisibility, total: u16) -> u16 {
         GraphVisibility::Auto if total < 25 => 0,
         _ if total < 32 => 7,
         _ => (total / 3).clamp(9, 14),
+    }
+}
+
+/// 表の下の列の説明を、どの形で出すか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteLayout {
+    /// 出さない (説明する列が表に無い、または表が潰れる)。
+    None,
+    /// 1 行の要約。列ごとの式は `?` のヘルプで読む。
+    Summary,
+    /// 列ごとに 1 行 + 注意 1 行。
+    Full,
+}
+
+/// 説明欄を置いても表に残す行数 (枠 2 + 見出し 1 + 5 行)。
+///
+/// **説明より表を優先する。** 説明のために表が 2〜3 行になると、
+/// 時刻を追って値を読むという本来の用ができなくなる。
+const TABLE_KEEP: u16 = 8;
+
+/// 説明欄の形を決める。
+///
+/// - `notes`: 説明する列のうち表に出ている数
+/// - `left`: 表と説明欄に使える行数 (ヘッダ・タブ・グラフ・ヒントを引いた残り)
+/// - `fits_width`: 列ごとの説明が (短い版で) 1 行に収まる幅か
+///
+/// **列名と説明の途中で切らない。** 1 行に収まらない幅では、切れた説明を並べる
+/// 代わりに 1 行の要約で `?` のヘルプへ案内する (列名と説明の対応が崩れると
+/// 読み違えるため)。
+fn note_layout(notes: usize, left: u16, fits_width: bool) -> NoteLayout {
+    if notes == 0 {
+        return NoteLayout::None;
+    }
+    let full = notes as u16 + 1;
+    if fits_width && left >= TABLE_KEEP + full {
+        NoteLayout::Full
+    } else if left > TABLE_KEEP {
+        NoteLayout::Summary
+    } else {
+        NoteLayout::None
+    }
+}
+
+/// 説明欄に使う行数。
+fn note_rows(layout: NoteLayout, notes: usize) -> u16 {
+    match layout {
+        NoteLayout::None => 0,
+        NoteLayout::Summary => 1,
+        NoteLayout::Full => notes as u16 + 1,
     }
 }
 
@@ -669,6 +721,20 @@ impl App {
         }
     }
 
+    /// 表の下に説明を出す列 (表に出ている列だけ、表の列順)。
+    ///
+    /// `c` で表から外した列の説明は出さない。表に無い列の説明が並ぶと、
+    /// どの列の話なのかを表で確かめられない。
+    fn shown_notes(&self) -> Option<(&'static notes::NoteSet, Vec<&'static notes::ColumnNote>)> {
+        let set = notes::notes_for(self.current_activity()?)?;
+        let shown: Vec<&'static notes::ColumnNote> = self
+            .table_columns()
+            .into_iter()
+            .filter_map(|c| set.notes.iter().find(|n| n.column == c))
+            .collect();
+        (!shown.is_empty()).then_some((set, shown))
+    }
+
     /// まだ選んでいないときにグラフへ出す列。
     ///
     /// **値の出る列を先に探す。** 単に先頭を採ると、その列がその世代に無いだけで
@@ -850,11 +916,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     // `v` の判定に使うので、描画のたびに実際の高さを控える。
     app.last_height = area.height;
     let gh = graph_height(app.graph, area.height);
+    // 説明欄は、グラフを決めたあとの残り (表と説明欄の分) から取る。
+    // グラフの高さは説明欄の有無で変えない (タブを替えるたびにグラフが伸び縮みしない)。
+    let shown_notes = app.shown_notes();
+    let left = area.height.saturating_sub(2 + 1 + 1 + gh);
+    let (layout, n_notes) = match &shown_notes {
+        Some((set, list)) => (
+            note_layout(list.len(), left, notes_fit_width(set, list, area.width)),
+            list.len(),
+        ),
+        None => (NoteLayout::None, 0),
+    };
+    let nh = note_rows(layout, n_notes);
     let chunks = Layout::vertical([
         Constraint::Length(2),  // ヘッダ
         Constraint::Length(1),  // タブ
         Constraint::Length(gh), // グラフ (0 なら出ない)
         Constraint::Min(3),     // 表
+        Constraint::Length(nh), // 列の説明 (0 なら出ない)
         Constraint::Length(1),  // キーヒント
     ])
     .split(area);
@@ -865,7 +944,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_graph(f, chunks[2], app);
     }
     draw_table(f, chunks[3], app);
-    draw_hint(f, chunks[4], app);
+    if let Some((set, list)) = &shown_notes
+        && nh > 0
+    {
+        draw_notes(f, chunks[4], app, set, list, layout);
+    }
+    draw_hint(f, chunks[5], app);
 
     match app.mode {
         Mode::PickItem => draw_picker(f, area, app),
@@ -1061,6 +1145,83 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
                 .labels(y_labels),
         );
     f.render_widget(chart, area);
+}
+
+/// 列ごとの説明の、列名の桁 (表の見出しと同じ表記で左に揃える)。
+fn note_name_width(list: &[&notes::ColumnNote]) -> usize {
+    list.iter().map(|n| text_width(n.column)).max().unwrap_or(0)
+}
+
+/// 列ごとの説明が、短い版なら 1 行に収まる幅か。
+///
+/// 注意の行も含めて確かめる。1 行でも収まらなければ、列ごとに並べるのをやめる。
+fn notes_fit_width(set: &notes::NoteSet, list: &[&notes::ColumnNote], width: u16) -> bool {
+    let width = width as usize;
+    let room = width.saturating_sub(1 + note_name_width(list) + 2);
+    // 注意の行は先頭に 1 桁の余白を置くので、幅より狭い必要がある。
+    list.iter().all(|n| text_width(n.short) <= room) && text_width(set.caveat_short) < width
+}
+
+/// 表の下に列の説明を出す。
+///
+/// - 列名は表の見出しと同じ表記・同じ色の規則にする (グラフに描いている列は線の色)。
+///   色は対応の手がかりで、**対応そのものは列名の文字で示す**
+/// - 説明は本文の色で書く (灰色にすると読むための欄なのに読みにくい)
+/// - 幅に入らない全文は短い版にする。短い版も入らない幅では [`NoteLayout::Summary`]
+///   になっている ([`note_layout`])
+fn draw_notes(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    set: &notes::NoteSet,
+    list: &[&notes::ColumnNote],
+    layout: NoteLayout,
+) {
+    let width = area.width as usize;
+    // 1 行だけの行 (要約・注意) は先頭に 1 桁の余白を置く。入るのは幅より狭い文。
+    let lines: Vec<Line> = match layout {
+        NoteLayout::None => return,
+        NoteLayout::Summary => {
+            let text = if text_width(set.summary) < width {
+                set.summary
+            } else {
+                set.summary_short
+            };
+            vec![Line::from(format!(" {text}"))]
+        }
+        NoteLayout::Full => {
+            let name_w = note_name_width(list);
+            let room = width.saturating_sub(1 + name_w + 2);
+            // **全文と短い版を行ごとに混ぜない。** 1 行でも全文が入らなければ全部を
+            // 短い版にそろえる (説明の粒度が行ごとに違うと、見比べにくい)。
+            let full = list.iter().all(|n| text_width(n.text) <= room);
+            let colors = app.graph_header_colors();
+            let mut out: Vec<Line> = list
+                .iter()
+                .map(|n| {
+                    let text = if full { n.text } else { n.short };
+                    let mut name_style = Style::default().add_modifier(Modifier::BOLD);
+                    if let Some((_, color)) = colors.iter().find(|(c, _)| *c == n.column) {
+                        name_style = name_style.fg(*color);
+                    }
+                    Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(format!("{:<name_w$}", n.column), name_style),
+                        Span::raw("  "),
+                        Span::raw(text),
+                    ])
+                })
+                .collect();
+            let caveat = if text_width(set.caveat) < width {
+                set.caveat
+            } else {
+                set.caveat_short
+            };
+            out.push(Line::from(format!(" {caveat}")));
+            out
+        }
+    };
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// 比較グラフの凡例。幅 `room` に入らなければ短い名前で試し、それでも入らなければ `None`。
@@ -1503,10 +1664,13 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("グラフの線は、不連続と欠測のところで切れる。"),
         Line::from("切れ目を飛び越えて結ばないのは、その間を観測していないため。"),
         Line::from(""),
-        Line::from("メモリ使用率の比較 (MEMORY):"),
-        Line::from("  MemAvailable 基準     カーネルの推定。記録があればこれ"),
-        Line::from("  buffers/cache を除く  旧来の近似。全世代で出る"),
-        Line::from("  buffers/cache を含む  11.7.4 より前の sar の %memused"),
+        Line::from("MEMORY の使用率と追加の列 (表の下にも説明が出る):"),
+        Line::from("  memused_pct            MemAvailable 基準の使用率"),
+        Line::from("  memused_nocache_pct    cache を空きに数えた使用率"),
+        Line::from("  memused_withcache_pct  cache も使用中に数えた使用率"),
+        Line::from("  kbmemused_nocache      total-free-buffers-cached (kB)"),
+        Line::from("  kbmemfree_withcache    free+buffers+cached (kB)"),
+        Line::from("正確な空きは kbavail。cached には共有メモリ・tmpfs も入る。"),
         Line::from("kbmemfree が小さいだけではメモリ不足と言えない。"),
     ];
     let r = centered(area, 62, lines.len() as u16 + 2);
@@ -2438,7 +2602,28 @@ mod tests {
         }
     }
 
-    /// 列の並びは layout と同じ (kbmemfree → memused_pct → 追加の 2 列 → kbcached)。
+    /// 値の無いこともある kB の列。`None` は欠測。
+    fn kb_or_missing(name: &'static str, v: Option<f64>) -> FieldOut {
+        FieldOut {
+            name,
+            unit: "kB",
+            kind: "gauge",
+            raw: None,
+            value: v,
+            text: None,
+            quality: if v.is_some() {
+                Quality::Ok
+            } else {
+                Quality::MissingInSample
+            },
+        }
+    }
+
+    /// テスト用の総量 (kB)。追加列の kB 値を割合から作るためだけに使う。
+    const TOTAL_KB: f64 = 8_220_672.0;
+
+    /// 列の並びは layout と同じ
+    /// (kbmemfree → memused_pct → 追加の 4 列 → kbcached)。
     fn memory_app(rows: &[MemRow]) -> App {
         let samples = rows
             .iter()
@@ -2460,7 +2645,15 @@ mod tests {
                         rates: vec![
                             kb("kbmemfree", r.free),
                             pct("memused_pct", r.avail_based, Quality::UnsupportedBySource),
+                            kb_or_missing(
+                                "kbmemused_nocache",
+                                r.nocache.map(|p| TOTAL_KB * p / 100.0),
+                            ),
                             pct("memused_nocache_pct", r.nocache, Quality::MissingInSample),
+                            kb_or_missing(
+                                "kbmemfree_withcache",
+                                r.nocache.map(|p| TOTAL_KB * (100.0 - p) / 100.0),
+                            ),
                             pct(
                                 "memused_withcache_pct",
                                 r.withcache,
@@ -2644,15 +2837,16 @@ mod tests {
         );
 
         // カーソルを動かして確定すれば、その列のグラフになる
-        // (カーソルは先頭の系列 memused_nocache_pct にあり、下は memused_withcache_pct)
+        // (カーソルは先頭の系列 memused_nocache_pct にあり、下は kbmemfree_withcache)
         on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
         on_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
         on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.selected_column(), Some("memused_withcache_pct"));
+        assert_eq!(app.selected_column(), Some("kbmemfree_withcache"));
 
         // 値の無い列 (表から外れている) へ動かしても、グラフは空にならない
         app.graph_target[app.tab] = None;
         on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        on_key(&mut app, KeyCode::Up, KeyModifiers::NONE); // kbmemused_nocache
         on_key(&mut app, KeyCode::Up, KeyModifiers::NONE); // memused_pct (記録なし)
         on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
@@ -2714,6 +2908,209 @@ mod tests {
         let screen = render(&mut app, 140, 40);
         assert!(shows(&screen, "buffers/cache を含む (値なし)"), "{screen}");
         assert!(shows(&screen, "MemAvailable 基準 (記録なし)"), "{screen}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 表の下の列の説明
+    // -----------------------------------------------------------------------
+
+    /// 画面の行 (全角の 2 桁目の空白は詰める)。
+    fn screen_lines(screen: &str) -> Vec<String> {
+        screen
+            .lines()
+            .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect())
+            .collect()
+    }
+
+    /// 追加の 4 列が何の値かを、表の下 (キーヒントの上) に列ごとに書く。
+    #[test]
+    fn memory_explains_the_added_columns_below_the_table() {
+        let mut app = memory_app(&el7_rows());
+        let screen = render(&mut app, 160, 44);
+        for n in notes::MEMORY_NOTES.notes {
+            assert!(shows(&screen, n.text), "{}: {screen}", n.column);
+        }
+        assert!(shows(&screen, notes::MEMORY_NOTES.caveat), "{screen}");
+
+        // 位置: 表の枠の下、キーヒントの上
+        let lines = screen_lines(&screen);
+        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let note_at = lines
+            .iter()
+            .position(|l| l.contains(&strip(notes::MEMORY_NOTES.notes[0].text)))
+            .expect("説明の行");
+        let table_bottom = lines.iter().rposition(|l| l.starts_with('└')).unwrap();
+        assert!(note_at > table_bottom, "表の下: {note_at} > {table_bottom}");
+        assert!(note_at < lines.len() - 1, "キーヒントの上");
+        assert!(
+            shows(lines.last().unwrap(), "esc"),
+            "最後の行はキーヒントのまま"
+        );
+    }
+
+    /// 説明は表に出ている列のものだけ。`c` で外した列の説明は消える。
+    #[test]
+    fn notes_follow_the_columns_shown_in_the_table() {
+        let mut app = memory_app(&el7_rows());
+        let all = app.columns();
+        let pos = all
+            .iter()
+            .position(|c| *c == "kbmemfree_withcache")
+            .unwrap();
+        app.open_column_picker();
+        app.col_picker.select(Some(pos));
+        app.toggle_draft_column();
+        app.commit_columns();
+        app.mode = Mode::Normal;
+        assert!(!app.table_columns().contains(&"kbmemfree_withcache"));
+
+        let screen = render(&mut app, 160, 44);
+        let hidden = notes::MEMORY_NOTES
+            .notes
+            .iter()
+            .find(|n| n.column == "kbmemfree_withcache")
+            .unwrap();
+        assert!(
+            !shows(&screen, hidden.text),
+            "外した列の説明は出さない: {screen}"
+        );
+        assert!(
+            shows(&screen, notes::MEMORY_NOTES.notes[0].text),
+            "表に残っている列の説明は出る: {screen}"
+        );
+    }
+
+    /// 全文が入らない幅では短い版にし、それも入らなければ `?` へ案内する 1 行にする。
+    ///
+    /// 列名と説明が途中で切れると対応が崩れるので、切れた説明は並べない。
+    #[test]
+    fn a_narrow_terminal_shortens_the_notes_or_points_to_help() {
+        let short = &notes::MEMORY_NOTES.notes[0].short;
+        let full = &notes::MEMORY_NOTES.notes[0].text;
+
+        let mut app = memory_app(&el7_rows());
+        let mid = render(&mut app, 90, 44);
+        assert!(shows(&mid, short), "短い版: {mid}");
+        assert!(!shows(&mid, full), "全文は入らない: {mid}");
+
+        // 全文が入る行があっても、入らない行があれば全部を短い版にそろえる
+        let wide_enough_for_some = render(&mut app, 100, 44);
+        let pct = notes::MEMORY_NOTES
+            .notes
+            .iter()
+            .find(|n| n.column == "memused_nocache_pct")
+            .unwrap();
+        assert!(
+            shows(&wide_enough_for_some, pct.short) && !shows(&wide_enough_for_some, pct.text),
+            "行ごとに全文と短い版を混ぜない: {wide_enough_for_some}"
+        );
+
+        let narrow = render(&mut app, 60, 44);
+        assert!(
+            shows(&narrow, notes::MEMORY_NOTES.summary_short),
+            "{narrow}"
+        );
+        assert!(!shows(&narrow, short), "列ごとには並べない: {narrow}");
+
+        // どの幅でもキーヒントは最後の行に残る
+        for w in [60u16, 90, 160] {
+            let screen = render(&mut app, w, 44);
+            assert!(shows(screen.lines().last().unwrap(), "esc"), "幅 {w}");
+        }
+    }
+
+    /// 低い端末では 1 行に畳む。**表を潰してまで説明を出さない。**
+    #[test]
+    fn notes_never_starve_the_table() {
+        // 表と説明欄に使える行数に応じた形 (説明する列が 4 つ = 全文は 5 行)
+        assert_eq!(note_layout(4, 30, true), NoteLayout::Full);
+        assert_eq!(note_layout(4, TABLE_KEEP + 5, true), NoteLayout::Full);
+        assert_eq!(note_layout(4, TABLE_KEEP + 4, true), NoteLayout::Summary);
+        assert_eq!(note_layout(4, TABLE_KEEP + 1, true), NoteLayout::Summary);
+        assert_eq!(note_layout(4, TABLE_KEEP, true), NoteLayout::None);
+        // 幅が足りなければ高さがあっても要約
+        assert_eq!(note_layout(4, 30, false), NoteLayout::Summary);
+        // 説明する列が表に無ければ出さない
+        assert_eq!(note_layout(0, 30, true), NoteLayout::None);
+
+        // 実際の画面: 低い端末でも表の行は残る
+        let mut app = memory_app(&el7_rows());
+        let screen = render(&mut app, 160, 16);
+        assert!(
+            shows(&screen, notes::MEMORY_NOTES.summary),
+            "1 行に畳む: {screen}"
+        );
+        assert!(shows(&screen, "00:30:00"), "表の最終行まで見える: {screen}");
+    }
+
+    /// グラフに描いている列は、説明の列名も線と同じ色 (表の見出しと同じ規則)。
+    #[test]
+    fn a_graphed_column_is_coloured_in_the_notes_too() {
+        let fg_in_notes = |app: &mut App, needle: &str| -> Option<Color> {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(160, 44)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // 下から探す (説明欄は表より下にある)
+            for y in (0..buf.area.height).rev() {
+                let line: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>();
+                if line.starts_with(' ')
+                    && let Some(x) = line.find(needle)
+                    && !line.contains("time")
+                {
+                    return buf[(x as u16, y)].style().fg;
+                }
+            }
+            None
+        };
+        let mut app = memory_app(&el7_rows());
+        assert_eq!(
+            fg_in_notes(&mut app, "memused_nocache_pct  "),
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            fg_in_notes(&mut app, "memused_withcache_pct  "),
+            Some(Color::Magenta)
+        );
+        // 線を引いていない列には色を付けない
+        let plain = fg_in_notes(&mut app, "kbmemused_nocache  ");
+        assert!(
+            !matches!(plain, Some(Color::Cyan | Color::Magenta | Color::Green)),
+            "{plain:?}"
+        );
+        // グラフを隠せば色は付かない (対応する線が無い)
+        on_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(!app.graph_visible());
+        let hidden = fg_in_notes(&mut app, "memused_nocache_pct  ");
+        assert_ne!(hidden, Some(Color::Cyan));
+    }
+
+    /// 説明を持たない activity では説明欄を出さない。
+    #[test]
+    fn other_activities_have_no_notes() {
+        let mut app = app_with(&[Some(1.0), Some(2.0)], &[]);
+        assert!(app.shown_notes().is_none());
+        let screen = render(&mut app, 120, 40);
+        assert!(!shows(&screen, "注:"), "{screen}");
+    }
+
+    /// 列ごとの式は `?` のヘルプでも読める (説明欄を畳んだときの全文への道筋)。
+    #[test]
+    fn the_help_lists_what_each_added_column_is() {
+        let mut app = memory_app(&el7_rows());
+        on_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        let help = render(&mut app, 80, 44);
+        for col in [
+            "kbmemused_nocache",
+            "memused_nocache_pct",
+            "kbmemfree_withcache",
+            "memused_withcache_pct",
+        ] {
+            assert!(shows(&help, col), "{col}: {help}");
+        }
+        assert!(shows(&help, "total-free-buffers-cached"), "{help}");
+        assert!(shows(&help, "正確な空きは kbavail"), "{help}");
     }
 
     /// 実ファイルの描画を目で見るための一時確認。

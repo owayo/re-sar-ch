@@ -174,11 +174,11 @@ resarch tui sa01
 resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
 ```
 
-Recorded activities become tabs; pick an item and read its time series as a table with a graph above it. Press `?` for the key reference and `Esc` to quit from the main screen. `—` means the value is absent, not zero, and the graph line breaks where samples are missing.
+Recorded activities become tabs; pick an item and read its time series as a table with a graph above it. Press `?` for the key reference and `Esc` to quit from the main screen. `—` means the value is absent, not zero, and the graph line breaks where samples are missing. The MEMORY tab compares three estimates of memory utilisation on one graph — excluding buffers/cache, based on MemAvailable, and including buffers/cache; [docs/usage.md](docs/usage.md#reading-memory-usage) explains how to read them.
 
 ![TUI showing memory usage as a time-series graph and table](docs/images/tui.png)
 
-The screenshot shows the earlier `q` quit hint; the current quit key is `Esc`.
+The screenshot predates two changes: the quit key is now `Esc` rather than `q`, and the MEMORY tab now opens on three utilisation lines instead of a single `kbmemfree` line.
 
 ### Commands
 

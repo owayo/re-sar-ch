@@ -633,4 +633,30 @@ mod tests {
         }
         assert!(preset_for("A_CPU").is_none());
     }
+
+    /// 比較グラフの系列は、layout に実在する割合の列を指す。
+    ///
+    /// 列名は文字列で持つので、layout 側で名前が変わると線が黙って消える
+    /// (凡例に「記録なし」と出るだけで、誤りに気づけない)。**機械的に突き合わせる。**
+    #[test]
+    fn preset_series_are_percent_columns_of_the_layout() {
+        use crate::layout::registry::lookup;
+        use crate::model::{ActivityId, Unit};
+
+        assert_eq!(ActivityId::MEMORY.symbol(), Some(MEMORY_USAGE.activity));
+        let def = lookup(ActivityId::MEMORY).expect("MEMORY の layout");
+        for s in MEMORY_USAGE.series {
+            let meta = def
+                .columns
+                .iter()
+                .find(|c| c.public_name == s.column)
+                .unwrap_or_else(|| panic!("{}: layout に無い列", s.column));
+            assert_eq!(
+                meta.unit,
+                Unit::Percent,
+                "{}: 同じ軸に載る割合の列",
+                s.column
+            );
+        }
+    }
 }

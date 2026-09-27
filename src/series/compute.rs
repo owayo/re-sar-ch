@@ -144,26 +144,34 @@ pub mod mem_col {
     pub const KBAVAIL: usize = 1;
     pub const KBMEMUSED: usize = 2;
     pub const MEMUSED_PCT: usize = 3;
-    pub const KBBUFFERS: usize = 4;
-    pub const KBCACHED: usize = 5;
-    pub const KBCOMMIT: usize = 6;
-    pub const COMMIT_PCT: usize = 7;
-    pub const KBACTIVE: usize = 8;
-    pub const KBINACT: usize = 9;
-    pub const KBDIRTY: usize = 10;
-    pub const KBSHMEM: usize = 11;
-    pub const KBANONPG: usize = 12;
-    pub const KBSLAB: usize = 13;
-    pub const KBKSTACK: usize = 14;
-    pub const KBPGTBL: usize = 15;
-    pub const KBVMUSED: usize = 16;
-    pub const KBMEMTOTAL: usize = 17;
-    pub const KBSWPFREE: usize = 18;
-    pub const KBSWPUSED: usize = 19;
-    pub const SWPUSED_PCT: usize = 20;
-    pub const KBSWPCAD: usize = 21;
-    pub const SWPCAD_PCT: usize = 22;
-    pub const KBSWPTOTAL: usize = 23;
+    /// `kbmemused_nocache` (独自出力のみ。`tlmkb − frmkb − bufkb − camkb`、負なら 0)
+    pub const KBMEMUSED_NOCACHE: usize = 4;
+    /// `memused_nocache_pct` (独自出力のみ。`kbmemused_nocache / tlmkb`)
+    pub const MEMUSED_NOCACHE_PCT: usize = 5;
+    /// `kbmemfree_withcache` (独自出力のみ。`frmkb + bufkb + camkb`)
+    pub const KBMEMFREE_WITHCACHE: usize = 6;
+    /// `memused_withcache_pct` (独自出力のみ。`(tlmkb − frmkb) / tlmkb`)
+    pub const MEMUSED_WITHCACHE_PCT: usize = 7;
+    pub const KBBUFFERS: usize = 8;
+    pub const KBCACHED: usize = 9;
+    pub const KBCOMMIT: usize = 10;
+    pub const COMMIT_PCT: usize = 11;
+    pub const KBACTIVE: usize = 12;
+    pub const KBINACT: usize = 13;
+    pub const KBDIRTY: usize = 14;
+    pub const KBSHMEM: usize = 15;
+    pub const KBANONPG: usize = 16;
+    pub const KBSLAB: usize = 17;
+    pub const KBKSTACK: usize = 18;
+    pub const KBPGTBL: usize = 19;
+    pub const KBVMUSED: usize = 20;
+    pub const KBMEMTOTAL: usize = 21;
+    pub const KBSWPFREE: usize = 22;
+    pub const KBSWPUSED: usize = 23;
+    pub const SWPUSED_PCT: usize = 24;
+    pub const KBSWPCAD: usize = 25;
+    pub const SWPCAD_PCT: usize = 26;
+    pub const KBSWPTOTAL: usize = 27;
 }
 
 /// `A_QUEUE` の列添字。
@@ -1299,6 +1307,24 @@ fn memory_available(
     }
 }
 
+/// `frmkb + bufkb + camkb` (空きにキャッシュを足した量、和は飽和加算)。
+///
+/// 3 項とも `kbmemused_nocache` では被減数から引く**主要項**なので
+/// [`primary_input`] で取る。buffers / cached の欠落を 0 と見なすと
+/// 「キャッシュを引いていない使用量」を黙って出すことになるため、
+/// [`MissingPolicy::Strict`] では欠落を返す。
+#[inline]
+fn memory_free_with_cache(
+    plan: &DecodePlan,
+    item: &ItemSnapshot,
+    policy: MissingPolicy,
+) -> Result<u64, ComputeIssue> {
+    let free = primary_input(plan, item, mem_col::KBMEMFREE, policy)?;
+    let buffers = primary_input(plan, item, mem_col::KBBUFFERS, policy)?;
+    let cached = primary_input(plan, item, mem_col::KBCACHED, policy)?;
+    Ok(free.saturating_add(buffers).saturating_add(cached))
+}
+
 /// `A_MEMORY` の派生列。すべてゲージ (差分化しない)。
 fn memory_derived(
     column: usize,
@@ -1318,6 +1344,47 @@ fn memory_derived(
             let avail = memory_available(plan, curr, policy)?;
             Ok(if total != 0 {
                 sp_value(avail, total, total)
+            } else {
+                0.0
+            })
+        }
+        // --- 世代で式が変わらない派生列 (独自出力のみ。sar / sadf には現れない) ---
+        //
+        // 入力は全世代にある tlmkb / frmkb / bufkb / camkb だけ。
+        // 本家の丸めを写す列ではないので、整数で差を取ってから f64 にする素直な形で書く。
+        //
+        // kbmemused_nocache = tlmkb - (frmkb + bufkb + camkb)。
+        // 和が tlmkb を超えたら 0 (sysstat 11.6.4 が nousedmem を tlmkb で頭打ちにする前例)
+        mem_col::KBMEMUSED_NOCACHE => {
+            let total = primary_input(plan, curr, mem_col::KBMEMTOTAL, policy)?;
+            let free = memory_free_with_cache(plan, curr, policy)?;
+            Ok(total.saturating_sub(free) as f64)
+        }
+        // %memused_nocache = kbmemused_nocache / tlmkb * 100 (頭打ち後の値から出す)
+        mem_col::MEMUSED_NOCACHE_PCT => {
+            let total = primary_input(plan, curr, mem_col::KBMEMTOTAL, policy)?;
+            if total == 0 && policy == MissingPolicy::Strict {
+                return Err(ComputeIssue::MissingInSample);
+            }
+            let used = total.saturating_sub(memory_free_with_cache(plan, curr, policy)?);
+            Ok(if total != 0 {
+                used as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            })
+        }
+        // kbmemfree_withcache = frmkb + bufkb + camkb (頭打ちしない生の和)
+        mem_col::KBMEMFREE_WITHCACHE => Ok(memory_free_with_cache(plan, curr, policy)? as f64),
+        // %memused_withcache = (tlmkb - frmkb) / tlmkb * 100。
+        // sysstat 11.7.4 / 11.6.4 / 11.4.10 より前の %memused と同じ式 (buffers / cached を含む)
+        mem_col::MEMUSED_WITHCACHE_PCT => {
+            let total = primary_input(plan, curr, mem_col::KBMEMTOTAL, policy)?;
+            if total == 0 && policy == MissingPolicy::Strict {
+                return Err(ComputeIssue::MissingInSample);
+            }
+            let free = primary_input(plan, curr, mem_col::KBMEMFREE, policy)?;
+            Ok(if total != 0 {
+                total.saturating_sub(free) as f64 / total as f64 * 100.0
             } else {
                 0.0
             })
@@ -3771,6 +3838,241 @@ mod tests {
         );
     }
 
+    /// `mem_col` の添字が `MEMORY_COLUMNS` の並びと一致すること。
+    ///
+    /// 派生列は名前ではなく添字で入力列を引く。列を途中に挿入したときに
+    /// 表を振り直し忘れると、別の列を読んで黙って誤った値を出す。
+    #[test]
+    fn mem_col_indices_match_the_layout_columns() {
+        let def = lookup(ActivityId::MEMORY).unwrap();
+        let expected = [
+            (mem_col::KBMEMFREE, "kbmemfree"),
+            (mem_col::KBAVAIL, "kbavail"),
+            (mem_col::KBMEMUSED, "kbmemused"),
+            (mem_col::MEMUSED_PCT, "memused_pct"),
+            (mem_col::KBMEMUSED_NOCACHE, "kbmemused_nocache"),
+            (mem_col::MEMUSED_NOCACHE_PCT, "memused_nocache_pct"),
+            (mem_col::KBMEMFREE_WITHCACHE, "kbmemfree_withcache"),
+            (mem_col::MEMUSED_WITHCACHE_PCT, "memused_withcache_pct"),
+            (mem_col::KBBUFFERS, "kbbuffers"),
+            (mem_col::KBCACHED, "kbcached"),
+            (mem_col::KBCOMMIT, "kbcommit"),
+            (mem_col::COMMIT_PCT, "commit_pct"),
+            (mem_col::KBACTIVE, "kbactive"),
+            (mem_col::KBINACT, "kbinact"),
+            (mem_col::KBDIRTY, "kbdirty"),
+            (mem_col::KBSHMEM, "kbshmem"),
+            (mem_col::KBANONPG, "kbanonpg"),
+            (mem_col::KBSLAB, "kbslab"),
+            (mem_col::KBKSTACK, "kbkstack"),
+            (mem_col::KBPGTBL, "kbpgtbl"),
+            (mem_col::KBVMUSED, "kbvmused"),
+            (mem_col::KBMEMTOTAL, "kbmemtotal"),
+            (mem_col::KBSWPFREE, "kbswpfree"),
+            (mem_col::KBSWPUSED, "kbswpused"),
+            (mem_col::SWPUSED_PCT, "swpused_pct"),
+            (mem_col::KBSWPCAD, "kbswpcad"),
+            (mem_col::SWPCAD_PCT, "swpcad_pct"),
+            (mem_col::KBSWPTOTAL, "kbswptotal"),
+        ];
+        assert_eq!(
+            def.columns.len(),
+            expected.len(),
+            "mem_col が全列を並べていない"
+        );
+        for (col, name) in expected {
+            assert_eq!(def.columns[col].public_name, name, "mem_col の添字 {col}");
+        }
+    }
+
+    /// `A_MEMORY` の 1 列を方針を指定して計算する (ゲージなので前サンプルは使わない)。
+    fn memory_value(
+        plan: &DecodePlan,
+        item: &ItemSnapshot,
+        column: usize,
+        policy: MissingPolicy,
+    ) -> Computed {
+        let def = lookup(ActivityId::MEMORY).unwrap();
+        column_value_with(
+            ActivityId::MEMORY,
+            column,
+            &def.columns[column],
+            plan,
+            item,
+            item,
+            &ComputeContext::new(100),
+            policy,
+        )
+    }
+
+    /// **世代で式が変わらない 4 列**は、`availablekb` の有無に関係なく
+    /// 同じ入力から同じ値を出す (厳密モードでも値が出る)。
+    ///
+    /// `kbmemused` / `%memused` は `availablekb` を持たない世代 (RHEL 7 の 10.1.5 =
+    /// `0x8a` / 88 バイト) で厳密モードだと欠落する。この 4 列はその代わりではなく、
+    /// 全世代にある `tlmkb` / `frmkb` / `bufkb` / `camkb` だけから作る別指標である。
+    #[test]
+    fn cache_derived_memory_columns_do_not_depend_on_available() {
+        let name = |col: usize| lookup(ActivityId::MEMORY).unwrap().columns[col].public_name;
+        let fill = |plan: &DecodePlan| {
+            let mut c = zeros(plan);
+            put(plan, &mut c, mem_col::KBMEMTOTAL, 8_000_000);
+            put(plan, &mut c, mem_col::KBMEMFREE, 2_000_000);
+            put(plan, &mut c, mem_col::KBBUFFERS, 1_000_000);
+            put(plan, &mut c, mem_col::KBCACHED, 3_000_000);
+            c
+        };
+        let modern = plan_for(ActivityId::MEMORY);
+        let mut mc = fill(&modern);
+        put(&modern, &mut mc, mem_col::KBAVAIL, 5_000_000);
+        let el7 = plan_for_revision(ActivityId::MEMORY, 0x8a, 88, LayoutAbi::LP64);
+        assert!(
+            !column_is_present(&el7, mem_col::KBAVAIL),
+            "10.1.5 の形式に availablekb は無い"
+        );
+        let oc = fill(&el7);
+
+        let want = [
+            // 8,000,000 - (2,000,000 + 1,000,000 + 3,000,000)
+            (mem_col::KBMEMUSED_NOCACHE, 2_000_000.0),
+            // 2,000,000 / 8,000,000
+            (mem_col::MEMUSED_NOCACHE_PCT, 25.0),
+            // 2,000,000 + 1,000,000 + 3,000,000
+            (mem_col::KBMEMFREE_WITHCACHE, 6_000_000.0),
+            // (8,000,000 - 2,000,000) / 8,000,000
+            (mem_col::MEMUSED_WITHCACHE_PCT, 75.0),
+        ];
+        for (plan, item, label) in [
+            (&modern, &mc, "availablekb あり"),
+            (&el7, &oc, "availablekb なし"),
+        ] {
+            for policy in [MissingPolicy::Strict, MissingPolicy::Compat] {
+                for (col, v) in want {
+                    assert_eq!(
+                        memory_value(plan, item, col, policy),
+                        Ok(v),
+                        "{label} / {policy:?} / {}",
+                        name(col)
+                    );
+                }
+            }
+        }
+
+        // 既存の kbmemused / %memused の規律は変えない (代替値で埋めない)
+        for col in [mem_col::KBMEMUSED, mem_col::MEMUSED_PCT] {
+            assert_eq!(
+                memory_value(&el7, &oc, col, MissingPolicy::Strict),
+                Err(ComputeIssue::UnsupportedBySource),
+                "{}: availablekb 無しの世代で使用量を代替しない",
+                name(col)
+            );
+        }
+        // availablekb から出す %memused とは別の量 ((8,000,000 - 5,000,000) / 8,000,000)
+        assert_eq!(
+            memory_value(&modern, &mc, mem_col::MEMUSED_PCT, MissingPolicy::Strict),
+            Ok(37.5)
+        );
+    }
+
+    /// `frmkb + bufkb + camkb > tlmkb` のとき、使用量は負にせず 0 で止める
+    /// (sysstat 11.6.4 が `nousedmem` を `tlmkb` で頭打ちにする前例)。
+    /// `kbmemfree_withcache` は頭打ちしない生の和を出す。
+    #[test]
+    fn cache_derived_memory_columns_clamp_when_free_exceeds_total() {
+        let plan = plan_for(ActivityId::MEMORY);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, mem_col::KBMEMTOTAL, 1_000);
+        put(&plan, &mut c, mem_col::KBMEMFREE, 500);
+        put(&plan, &mut c, mem_col::KBBUFFERS, 250);
+        put(&plan, &mut c, mem_col::KBCACHED, 350);
+        for policy in [MissingPolicy::Strict, MissingPolicy::Compat] {
+            let v = |col| memory_value(&plan, &c, col, policy);
+            assert_eq!(v(mem_col::KBMEMUSED_NOCACHE), Ok(0.0), "{policy:?}");
+            assert_eq!(v(mem_col::MEMUSED_NOCACHE_PCT), Ok(0.0), "{policy:?}");
+            assert_eq!(
+                v(mem_col::KBMEMFREE_WITHCACHE),
+                Ok(1_100.0),
+                "{policy:?}: 和は頭打ちしない"
+            );
+            assert_eq!(v(mem_col::MEMUSED_WITHCACHE_PCT), Ok(50.0), "{policy:?}");
+        }
+
+        // 和は飽和加算。折り返すと小さな和 (8) になり、使用量が総量近くまで跳ね上がる
+        put(&plan, &mut c, mem_col::KBMEMFREE, u64::MAX - 1);
+        put(&plan, &mut c, mem_col::KBBUFFERS, 5);
+        put(&plan, &mut c, mem_col::KBCACHED, 5);
+        let v = |col| memory_value(&plan, &c, col, MissingPolicy::Strict);
+        assert_eq!(v(mem_col::KBMEMFREE_WITHCACHE), Ok(u64::MAX as f64));
+        assert_eq!(v(mem_col::KBMEMUSED_NOCACHE), Ok(0.0));
+        assert_eq!(v(mem_col::MEMUSED_NOCACHE_PCT), Ok(0.0));
+        // frmkb > tlmkb でも %memused_withcache は負にならない
+        assert_eq!(v(mem_col::MEMUSED_WITHCACHE_PCT), Ok(0.0));
+    }
+
+    /// `tlmkb == 0` の割合は、厳密モードでは欠測、互換では 0.0
+    /// (`%swpused` の前例と同じ)。
+    #[test]
+    fn cache_derived_memory_pct_with_zero_total_follows_the_policy() {
+        let plan = plan_for(ActivityId::MEMORY);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, mem_col::KBMEMFREE, 100);
+        for col in [mem_col::MEMUSED_NOCACHE_PCT, mem_col::MEMUSED_WITHCACHE_PCT] {
+            assert_eq!(
+                memory_value(&plan, &c, col, MissingPolicy::Strict),
+                Err(ComputeIssue::MissingInSample)
+            );
+            assert_eq!(memory_value(&plan, &c, col, MissingPolicy::Compat), Ok(0.0));
+        }
+        // 量の列は分母を持たないので、方針によらず値が出る
+        for policy in [MissingPolicy::Strict, MissingPolicy::Compat] {
+            assert_eq!(
+                memory_value(&plan, &c, mem_col::KBMEMUSED_NOCACHE, policy),
+                Ok(0.0)
+            );
+            assert_eq!(
+                memory_value(&plan, &c, mem_col::KBMEMFREE_WITHCACHE, policy),
+                Ok(100.0)
+            );
+        }
+    }
+
+    /// buffers / cached は被減数から引く主要項なので、欠落を 0 と見なさない。
+    /// 厳密モードは「キャッシュを引いていない値」を出さずに欠落を返す。
+    #[test]
+    fn cache_derived_memory_columns_refuse_a_missing_input_in_strict() {
+        let plan = plan_for(ActivityId::MEMORY);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, mem_col::KBMEMTOTAL, 1_000);
+        put(&plan, &mut c, mem_col::KBMEMFREE, 250);
+        put(&plan, &mut c, mem_col::KBBUFFERS, 100);
+        // camkb がこのファイルでは読めない (申告サイズに収まらない) 状態
+        let camkb = plan.column_fields[mem_col::KBCACHED]
+            .as_ref()
+            .expect("camkb の wire フィールド")
+            .index();
+        c.values[camkb] = Availability::UnsupportedBySource;
+        for col in [
+            mem_col::KBMEMUSED_NOCACHE,
+            mem_col::MEMUSED_NOCACHE_PCT,
+            mem_col::KBMEMFREE_WITHCACHE,
+        ] {
+            assert_eq!(
+                memory_value(&plan, &c, col, MissingPolicy::Strict),
+                Err(ComputeIssue::UnsupportedBySource)
+            );
+        }
+        // %memused_withcache は camkb を使わない ((1,000 - 250) / 1,000)
+        assert_eq!(
+            memory_value(
+                &plan,
+                &c,
+                mem_col::MEMUSED_WITHCACHE_PCT,
+                MissingPolicy::Strict
+            ),
+            Ok(75.0)
+        );
+    }
+
     // ---- A_HUGE ----
 
     #[test]
@@ -4540,7 +4842,8 @@ mod tests {
         put(&plan, &mut last, mem_col::KBMEMTOTAL, 1_000);
         put(&plan, &mut last, mem_col::KBMEMFREE, 250);
 
-        let mut acc = ItemAccum::new(24);
+        // 列数は数値で書かない (列を足すと添字の範囲がずれる)
+        let mut acc = ItemAccum::new(lookup(ActivityId::MEMORY).unwrap().columns.len());
         // frmkb = 250, 250, 250 → 平均 250
         for _ in 0..3 {
             acc.add(mem_col::KBMEMFREE, Some(250), Some(250.0));
@@ -4633,7 +4936,7 @@ mod tests {
         let mut last = zeros(&plan);
         put(&plan, &mut last, mem_col::KBMEMTOTAL, 1_000);
 
-        let mut acc = ItemAccum::new(24);
+        let mut acc = ItemAccum::new(lookup(ActivityId::MEMORY).unwrap().columns.len());
         // availablekb = 301, 300, 300 → 合計 901、整数平均 300 (切り捨て)
         for v in [301u64, 300, 300] {
             acc.add(mem_col::KBAVAIL, Some(v), Some(v as f64));

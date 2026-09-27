@@ -916,6 +916,10 @@ const MEMORY_REVISIONS: &[WireRevision] = &[
 ///
 /// `&` は `-r` と `-r ALL` の境界、`|` は RAM ブロックと swap ブロックの境界。
 /// 総量 (`tlmkb` / `tlskb`) は sar の列には現れないが派生列の分母に必要なので持つ。
+///
+/// `sar_header` が空の派生列 (`kbmemused_nocache` など 4 列) は独自出力だけに出る。
+/// 互換出力 (`sar` / `sadf`) は列を明示した表 (`output::sar_text` の `ColSpec`、
+/// `output::sadf::spec`) から組み立てるので、ここに列を足しても現れない。
 const MEMORY_COLUMNS: &[ColumnMeta] = &[
     ColumnMeta {
         public_name: "kbmemfree",
@@ -946,6 +950,52 @@ const MEMORY_COLUMNS: &[ColumnMeta] = &[
     ColumnMeta {
         public_name: "memused_pct",
         sar_header: "%memused",
+        wire_name: "",
+        unit: Unit::Percent,
+        kind: ValueKind::Gauge,
+        aggregation: Aggregation::Mean,
+    },
+    // --- 以下 4 列は独自出力だけの派生列 (sar / sadf には現れない) ---
+    //
+    // 全世代にある tlmkb / frmkb / bufkb / camkb だけから作るので、式が世代で変わらない。
+    // kbmemused / %memused (tlmkb - availablekb) は availablekb を持たない世代
+    // (RHEL 7 の 10.1.5 など) で値が出ないが、その代わりではない。意味の違う別指標である。
+    //
+    // kbmemused_nocache = tlmkb - frmkb - bufkb - camkb
+    // (frmkb + bufkb + camkb > tlmkb なら 0。sysstat 11.6.4 の nousedmem を tlmkb で
+    // 頭打ちにする前例に倣う)
+    ColumnMeta {
+        public_name: "kbmemused_nocache",
+        sar_header: "",
+        wire_name: "",
+        unit: Unit::Kilobytes,
+        kind: ValueKind::Gauge,
+        aggregation: Aggregation::Mean,
+    },
+    // memused_nocache_pct = kbmemused_nocache / tlmkb * 100 (頭打ち後の値から出す)
+    ColumnMeta {
+        public_name: "memused_nocache_pct",
+        sar_header: "",
+        wire_name: "",
+        unit: Unit::Percent,
+        kind: ValueKind::Gauge,
+        aggregation: Aggregation::Mean,
+    },
+    // kbmemfree_withcache = frmkb + bufkb + camkb (頭打ちしない生の和)
+    ColumnMeta {
+        public_name: "kbmemfree_withcache",
+        sar_header: "",
+        wire_name: "",
+        unit: Unit::Kilobytes,
+        kind: ValueKind::Gauge,
+        aggregation: Aggregation::Mean,
+    },
+    // memused_withcache_pct = (tlmkb - frmkb) / tlmkb * 100
+    // (sysstat 11.7.4 / 11.6.4 / 11.4.10 より前 (RHEL 7 の 10.1.5 を含む) の %memused と
+    // 同じ式。buffers / cached も使用中に数える)
+    ColumnMeta {
+        public_name: "memused_withcache_pct",
+        sar_header: "",
         wire_name: "",
         unit: Unit::Percent,
         kind: ValueKind::Gauge,

@@ -440,6 +440,41 @@ pub struct Counter {
 
 累積値を早期に `f64` へ落とさない。大きなカウンタで差分精度が失われる。
 
+### 4.1 意味の違う値で埋めない — 旧来の近似は別の列にする
+
+`kbavail` (`MemAvailable`) は sysstat 11.5.3 から記録される。それより前の世代
+(RHEL / CentOS 7 の 10.1.5 を含む) では、独自出力の `kbavail` / `kbmemused` /
+`memused_pct` を `UnsupportedBySource` にする (`series::compute` の `MissingPolicy::Strict`)。
+`kbmemfree` を代入するのは互換出力だけで、本家の `sadf -c` と同じく、その世代の `sar` が
+出していた値を再現するためである。
+
+独自出力で同じ代入をしてはいけない。`memused_pct` が世代によって「`MemAvailable` 基準」と
+「buffers/cache を含む」という別の量を指すことになり、世代を跨いだ比較も、`kbavail` を
+前提に決めた閾値 (`detect` の `memused_pct >= 97`、`summarize` の
+`kbavail / kbmemtotal <= 5%`) も黙って誤る。
+
+それでも `kbavail` の無い世代でメモリの推移は読みたい。そこで**旧来の近似を、名前の違う
+列として足した。**
+
+| 列 | 式 |
+|---|---|
+| `kbmemused_nocache` / `memused_nocache_pct` | `kbmemtotal − kbmemfree − kbbuffers − kbcached` (負なら 0) と、その総量比 |
+| `kbmemfree_withcache` | `kbmemfree + kbbuffers + kbcached` (頭打ちしない) |
+| `memused_withcache_pct` | `(kbmemtotal − kbmemfree) / kbmemtotal × 100` (sysstat 11.7.4 より前の `%memused`) |
+
+- **列名が式を名乗る。** `kbavail` の代わりと読まれないようにするためで、`memused_pct` の
+  中身を世代で差し替えない
+- **式を世代で変えない。** 入力は旧世代にもある 4 項目だけにした。sysstat 11.7.4〜12.7.7 は
+  `Slab` も引くが、`kbslab` は 11.1.3 より前の世代に無い。入れると、同じ列が世代によって
+  別の式になるか、古い世代で値が出なくなる
+- **判定には使わない。** `detect` と `summarize` のルールは `kbavail` から求めた値だけを見る。
+  `kbavail` の無い世代で「評価できない」と報告するのが正しい結果であり (§11.2 の規律 7)、
+  近似で埋めると上の閾値が別の量に当たる
+- 互換出力 (`sar` / `sadf` / `sa2sar`) には出さない。本家に無い列だからである
+- TUI の MEMORY タブは 3 つの使用率を同じ軸に重ねる。`kbavail` を記録しない世代では
+  「MemAvailable 基準」の線を引かず、凡例に「(記録なし)」と出す
+  (0 の線にも代わりの値にもしない)
+
 ---
 
 ## 5. 差分・レート — series 層に集約
@@ -1189,6 +1224,8 @@ CIではさらにXMLパーサで生成SVGの妥当性を確認する。
 | `await` | キュー滞留の指標 | `sar(1)`: "includes the time spent by the requests in queue and the time spent servicing them"。切り分けられない |
 | `rxdrop/s` | 受信キューの溢れ | kernel `networking/statistics.rst`: "received but not processed, e.g. due to lack of resources or **unsupported protocol**... may include packets discarded due to **L2 address filtering**"。`rx_missed_errors` も procfs の drop 列に合算される。**`sar(1)` の "lack of space in linux buffers" はカーネルの定義と食い違うので採らない** |
 | `%memused` | ページキャッシュを含むので高くても問題ない | この実装の計算は `100 × (total − kbavail) / total` で、kernel `filesystems/proc.rst` の `MemAvailable` は**回収可能ページキャッシュを既に除く** |
+| `kbmemfree` / 旧 `sar` の `%memused` | `kbmemfree` が小さい (旧 `%memused` が 90% 台) = メモリ不足 | kernel `filesystems/proc.rst`: `MemAvailable` は "Calculated from MemFree, SReclaimable, the size of the file LRU lists, and the low watermarks in each zone"。**新しい負荷に使える量は、回収できる page cache と slab を含む。** sysstat 11.7.4 より前の `%memused` は `MemTotal − MemFree` (`pr_stats.c`) で buffers と page cache まで使用量に数えるが、`sar(1)` (10.1.5) の定義は "Amount of used memory in kilobytes. This does not take into account memory used by the kernel itself." で、この点に触れていない。本家も 11.7.4 と 12.7.8 で式を改めた (`CHANGES`) |
+| buffers / cache を除いた使用量 | buffers と cache を除けば正確な空きになる | kernel commit 34e431b0 (3.14 で `MemAvailable` を追加): free と cached の和で空きを見積もるのは "was fine ten years ago, but is pretty much guaranteed to be wrong today"。"Cached includes memory that is not freeable as page cache, for example shared memory segments, tmpfs, and ramfs, and it does not include reclaimable slab memory"。**共有メモリ・tmpfs が大きいと空きを多く見積もる。** procps-ng の `free` も 3.3.10 で `MemAvailable` を使う available 列を足し、4.0.1 で used を total − available にした |
 | swapping | メモリ不足の証拠 | kernel `vm.rst` の `swappiness` (既定 60) は「swap とファイルページングの相対 I/O コスト」の設定。不足が無くても退避される |
 | PSI full | 全タスクが待った時間 | kernel `accounting/psi.rst`: "all **non-idle** tasks are stalled on a given resource simultaneously" |
 

@@ -4897,10 +4897,20 @@ mod tests {
                 "{id} は方式 B"
             );
         }
-        // A_MEMORY は kB 列が方式 B、比率列が方式 B′
+        // A_MEMORY は kB 列が方式 B、比率列が方式 B′。
+        // `view.cells` の位置は `mem_col` の添字 (レジストリの列番号) とは別物なので、
+        // 列番号で引く (sar に出ない列が途中に挟まっていても同じ列を見る)。
         let mem = block(ActivityId::MEMORY, &opts);
-        assert_eq!(mem.view.cells[mem_col::KBMEMFREE].avg, AvgKind::Mean);
-        assert_eq!(mem.view.cells[mem_col::MEMUSED_PCT].avg, AvgKind::MeanRatio);
+        let avg_of = |col: usize| {
+            mem.view
+                .cells
+                .iter()
+                .find(|c| c.col == col)
+                .unwrap_or_else(|| panic!("列 {col} が sar の表示列に無い"))
+                .avg
+        };
+        assert_eq!(avg_of(mem_col::KBMEMFREE), AvgKind::Mean);
+        assert_eq!(avg_of(mem_col::MEMUSED_PCT), AvgKind::MeanRatio);
         // A_FS / A_PWR_USB は方式 C (最後の値の再掲)
         for id in [ActivityId::FS, ActivityId::PWR_USB] {
             let blk = block(id, &opts);

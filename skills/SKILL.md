@@ -225,6 +225,32 @@ assessments. **An empty value in native output is not zero.**
 
 Raw `u64` values are **decimal strings** to avoid JavaScript rounding above 2^53.
 
+### Reading memory metrics
+
+- **Judge memory headroom with `kbavail` / `memused_pct` first.** `kbavail` is
+  the kernel's `MemAvailable`, its estimate of memory available for new
+  workloads without swapping. `kbmemused` / `memused_pct` are derived from it
+  (`kbmemtotal - kbavail`), as in sysstat 12.7.8 and later.
+- **Do not report a memory shortage from a small `kbmemfree` alone.** Linux
+  keeps idle memory as page cache and reclaims it on demand. For the same
+  reason, `%memused` from sysstat before 11.7.4 (including RHEL/CentOS 7's
+  10.1.5) is `MemTotal - MemFree` and routinely exceeds 90%.
+- **Files without `kbavail`** (written before sysstat 11.5.3, including
+  RHEL/CentOS 7) leave `kbavail`, `kbmemused`, and `memused_pct` empty in
+  native output. `memused_nocache_pct` (total - free - buffers - cached) still
+  has values there and can serve as a legacy approximation. When you cite it,
+  state that it counts shared memory and tmpfs (part of `Cached`) as free, so it
+  overestimates free memory on hosts that use them heavily, and that it counts
+  reclaimable slab as used. Never present it as `memused_pct`.
+- `memused_withcache_pct` equals `%memused` from sysstat before 11.7.4. Use it
+  to reconcile old sar reports, not to judge memory pressure.
+- `detect` and `summarize` rules do not use these approximations. Without
+  `kbavail`, their memory checks are reported as not evaluated, which does not
+  mean memory was fine.
+- Compatibility output (`sar -r`, `sadf`) keeps upstream formulas. For files
+  without `kbavail`, it uses `kbmemfree` in its place, as upstream `sadf -c`
+  does, so its `%memused` is the pre-11.7.4 value.
+
 ## Summarize periods and compare hosts
 
 ```bash

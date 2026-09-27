@@ -129,7 +129,7 @@ For activities with many columns, such as memory, the table limits the visible c
 
 `c` opens the column list. Columns without values are listed too, greyed out and annotated as such. Widths are computed from every sample, so scrolling through rows never makes them jump.
 
-The graph plots one series — the selected activity, item and metric. **The header of the graphed column is drawn in the same colour as the line**, so it is obvious which column is on the chart. A vertical cursor marks the timestamp selected in the table, so both halves of the screen point at the same moment. On short terminals (24 rows or fewer) it stays hidden by default: a table reduced to a couple of rows can no longer be navigated. `v` forces it down to 18 rows; below that it cannot be shown at all.
+The graph plots one series — the selected activity, item and metric (the MEMORY tab opens on a three-series comparison instead; [see below](#the-memory-tabs-comparison-graph)). **The header of the graphed column is drawn in the same colour as the line**, so it is obvious which column is on the chart. A vertical cursor marks the timestamp selected in the table, so both halves of the screen point at the same moment. On short terminals (24 rows or fewer) it stays hidden by default: a table reduced to a couple of rows can no longer be navigated. `v` forces it down to 18 rows; below that it cannot be shown at all.
 
 It follows the same rules as the other native outputs:
 
@@ -139,6 +139,57 @@ It follows the same rules as the other native outputs:
 - Timestamps use the `--timezone` basis (local by default), and the screen says so.
 
 The TUI needs an interactive terminal. Piped or redirected, it tells you to use `resarch show` / `resarch sar` instead.
+
+### The MEMORY tab's comparison graph
+
+The MEMORY tab opens on a comparison of memory utilisation (`A_MEMORY / - / メモリ使用率の比較 (percent)`): three estimates drawn against the same 0–100 % axis. They differ only in what they count as free.
+
+| Line | Legend | Column | Counted as free |
+|---|---|---|---|
+| cyan | buffers/cache を除く (excluding buffers/cache) | `memused_nocache_pct` | `kbmemfree` + `kbbuffers` + `kbcached` |
+| green | MemAvailable 基準 (based on MemAvailable) | `memused_pct` | `kbavail` (the kernel's `MemAvailable`) |
+| magenta | buffers/cache を含む (including buffers/cache) | `memused_withcache_pct` | `kbmemfree` alone |
+
+- The gap between "including" and "excluding" is buffers and cache. The gap between "excluding" and the MemAvailable line is the effect of shared memory, tmpfs, reclaimable slab and the like (see [Reading memory usage](#reading-memory-usage)).
+- The legend sits on the graph's top border as a coloured marker and a name. On a narrow screen the names shorten (除く / MemAvailable / 含む); if they still do not fit, the legend moves to the left end of the bottom border.
+- A series without values gets no line, and its legend entry is greyed out with the reason: 記録なし (not recorded) when the generation never had the field at any timestamp, 値なし (no values) when missing samples or other reasons are mixed in. Files that do not record `kbavail` — sysstat 10.1.5 on RHEL / CentOS 7, for example — show the MemAvailable line as not recorded. Nothing is drawn as 0 or filled in from another value. If none of the three has a value, the tab opens on the graph of the first column that does.
+- In the table header, each column with a line on the graph takes that line's colour. The four new columns (`kbmemused_nocache`, `memused_nocache_pct`, `kbmemfree_withcache`, `memused_withcache_pct`) follow `memused_pct`, so their values can be read per timestamp without scrolling sideways.
+- The comparison graph heads the `[` / `]` cycle: `]` moves on to single-column graphs and `[` comes back. In the `c` popup, moving the cursor and applying switches to that column's own graph; applying without moving it keeps the comparison.
+- **The four new columns are explained below the table, just above the key hint.** Each column gets one line that says what it counts as free (or used) and gives the formula, followed by a caveat: all of them treat buffers/cache wholesale, and the accurate free figure is `kbavail`. The column names are written as in the table header, and a column with a line on the graph takes that line's colour. Columns hidden with `c` are not explained.
+  - When the screen is too narrow, every line switches to its short form together (full and short forms are never mixed). If even the short forms do not fit on one line each, the notes collapse into a single line pointing to the `?` reference, rather than cutting a description off from its column name.
+  - On a low terminal where the notes would leave fewer than five table rows, they collapse into a one-line summary, and disappear if even that does not fit. The table always takes priority.
+- The `?` reference explains the three lines and gives the formula of each new column.
+
+## Reading memory usage
+
+sysstat has changed how it computes `kbmemused` and `%memused` three times, so the same moment on the same host can look very different depending on which `sar` printed it.
+
+| sysstat | `kbmemused` | Notes |
+|---|---|---|
+| Before 11.7.4 (11.6.4 / 11.4.10 on the stable branches), including 10.1.5 on RHEL / CentOS 7 | `MemTotal − MemFree` | Buffers and page cache count as used, so `%memused` tends to sit in the 90s |
+| 11.7.4 to 12.7.7 | `MemTotal − MemFree − Buffers − Cached − Slab` | Changed to be consistent with free(1) and top(1) |
+| 12.7.8 and later | `MemTotal − MemAvailable` (`kbavail`) | What reSARch's `kbmemused` / `memused_pct` follow (for compatibility output, see below) |
+
+**A small `kbmemfree` is not a problem in itself.** Linux puts idle memory to work as page cache and reclaims it when something needs it, so `kbmemfree` at a few percent of the total does not, on its own, mean memory is short. It is also why an old `sar`'s `%memused` stays in the 90s.
+
+**The accurate estimate of free memory is `kbavail` (`MemAvailable`).** The kernel added it in 3.14. Its documentation (`filesystems/proc.rst`) defines it as "An estimate of how much memory is available for starting new applications, without swapping", calculated from `MemFree`, `SReclaimable`, the size of the file LRU lists and the low watermarks in each zone. sysstat records it from 11.5.3. The RHEL 7 kernel (3.10.0) provides it as well, but RHEL 7's sysstat 10.1.5 does not record it. procps-ng's `free` added an `available` column based on `MemAvailable` in 3.3.10, and since 4.0.1 reports `used` as total − available (its `cache` today is `Cached` plus `SReclaimable`, so it will not match `kbcached`).
+
+**Excluding buffers and cache is an approximation.** Before `MemAvailable`, free memory was commonly estimated by adding up free and cached. The kernel commit that introduced `MemAvailable` (34e431b0) says the practice "was fine ten years ago, but is pretty much guaranteed to be wrong today": `Cached` includes memory that cannot be freed as page cache — shared memory segments, tmpfs, ramfs — and it leaves out reclaimable slab. On a host that uses a lot of shared memory or tmpfs, the figure that excludes buffers and cache therefore understates usage (it overstates free memory); a large reclaimable slab pushes it the other way.
+
+reSARch's own output keeps these apart as separate columns:
+
+| Column | Formula | Use it for |
+|---|---|---|
+| `kbavail` (kB) | the kernel's `MemAvailable` | judging headroom — start here |
+| `memused_pct` (%) | `(kbmemtotal − kbavail) / kbmemtotal × 100` | the same |
+| `kbmemused_nocache` (kB) | `kbmemtotal − kbmemfree − kbbuffers − kbcached`, 0 if negative | following the trend where `kbavail` is not recorded (approximate) |
+| `memused_nocache_pct` (%) | `kbmemused_nocache / kbmemtotal × 100` | the same |
+| `kbmemfree_withcache` (kB) | `kbmemfree + kbbuffers + kbcached`, not capped at the total | the same |
+| `memused_withcache_pct` (%) | `(kbmemtotal − kbmemfree) / kbmemtotal × 100` | matching `%memused` from a `sar` older than 11.7.4 |
+
+- The four new columns use only inputs that old generations record as well, so they have values where `kbavail` is missing, and their formulas never change with the generation. That is also why they do not subtract `Slab` as sysstat 11.7.4–12.7.7 does: `kbslab` is absent before 11.1.3.
+- Where `kbavail` is not recorded, native output leaves `kbavail`, `kbmemused` and `memused_pct` empty (`—`). They are not filled in from the new columns, which measure something else. `detect` and `summarize` do not use the new columns either; without `kbavail`, they report those memory checks as not evaluated.
+- Compatibility output (`sar -r`, `sadf`) keeps upstream's formulas and carries none of the new columns. For a file without `kbavail`, it uses `kbmemfree` in its place, as upstream's `sadf -c` does, so `%memused` there equals the pre-11.7.4 figure (buffers and cache included). `--sar-profile sysstat-10.1.5-el7` output uses that formula to begin with.
 
 ## Finding what went wrong
 

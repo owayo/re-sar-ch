@@ -425,9 +425,7 @@ impl LegacyFile {
             let rec = RawRecord {
                 kind,
                 offset,
-                uptime_cs: up0
-                    .checked_mul(100)
-                    .and_then(|v| v.checked_div(options.assumed_hz)),
+                uptime_cs: super::uptime_centiseconds(up0, options.assumed_hz),
                 uptime_jiffies: Some((up, up0)),
                 ust_time,
                 hour,

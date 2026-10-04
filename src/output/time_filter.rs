@@ -143,6 +143,97 @@ impl TimeFilter {
         }
     }
 
+    /// 独自出力用。日内の範囲は毎日繰り返し、範囲へ入り直すたび基準を取り直す。
+    pub fn native_cursor(&self) -> NativeTimeCursor {
+        NativeTimeCursor { filter: *self }
+    }
+
+    fn native_contains(&self, ust_time: u64, hms: (u8, u8, u8)) -> bool {
+        let rec = self.rec_time(ust_time, hms);
+        if let (TimeBound::HhMmSs { .. }, TimeBound::HhMmSs { hour, min, sec }) =
+            (self.start, self.end)
+            && hour >= 24
+        {
+            let end = TimeBound::HhMmSs {
+                hour: hour - 24,
+                min,
+                sec,
+            };
+            return datecmp(rec, self.start, false) != Ordering::Less
+                || datecmp(rec, end, false) != Ordering::Greater;
+        }
+        datecmp(rec, self.start, false) != Ordering::Less
+            && datecmp(rec, self.end, false) != Ordering::Greater
+    }
+
+    /// 日内窓の属する日。夜間の窓では深夜側も前日の窓として扱う。
+    fn native_window_date(&self, snapshot: &Snapshot) -> Option<chrono::NaiveDate> {
+        use chrono::{TimeZone, Utc};
+        if !matches!(self.start, TimeBound::HhMmSs { .. })
+            && !matches!(self.end, TimeBound::HhMmSs { .. })
+        {
+            return None;
+        }
+        let epoch = i64::try_from(snapshot.ust_time).ok()?;
+        let date = match self.basis {
+            TimeBasis::Zone(tz) => tz.at(snapshot.ust_time)?.date_naive(),
+            TimeBasis::Local => crate::model::localtime::localtime(epoch)?.date_naive(),
+            TimeBasis::Utc | TimeBasis::Recorded => {
+                Utc.timestamp_opt(epoch, 0).single()?.date_naive()
+            }
+        };
+        let rec = self.rec_time(snapshot.ust_time, snapshot_hms(snapshot));
+        if let TimeBound::HhMmSs { hour, min, sec } = self.end
+            && hour >= 24
+            && datecmp(
+                rec,
+                TimeBound::HhMmSs {
+                    hour: hour - 24,
+                    min,
+                    sec,
+                },
+                false,
+            ) != Ordering::Greater
+        {
+            date.pred_opt()
+        } else {
+            Some(date)
+        }
+    }
+
+    /// 両端だけでなく途中も窓内か。夏時間で同じ日・同じ時刻へ戻っても窓外を跨がない。
+    fn native_interval_inside(&self, view: &IntervalView<'_>) -> bool {
+        let seconds = |hour: u8, min: u8, sec: u8| {
+            u64::from(hour) * 3600 + u64::from(min) * 60 + u64::from(sec)
+        };
+        let lo = match self.start {
+            TimeBound::HhMmSs { hour, min, sec } => seconds(hour, min, sec),
+            _ => 0,
+        };
+        let hi = match self.end {
+            TimeBound::HhMmSs { hour, min, sec } => seconds(hour, min, sec),
+            _ => 86_399,
+        };
+        if hi >= lo && hi - lo >= 86_399 {
+            return true;
+        }
+        let tz = match self.basis {
+            TimeBasis::Zone(tz) => tz,
+            TimeBasis::Utc => crate::model::timezone::DisplayTz::Utc,
+            TimeBasis::Local => crate::model::timezone::DisplayTz::System,
+            TimeBasis::Recorded => {
+                return self.native_window_date(view.prev) == self.native_window_date(view.curr);
+            }
+        };
+        // 秒単位で閉じた窓の補集合。端ちょうどのサンプルは除外しない。
+        !tz.overlaps_daily_window(
+            view.prev.ust_time,
+            view.curr.ust_time,
+            (hi + 1) % 86_400,
+            (lo + 86_399) % 86_400,
+        )
+    }
+
     /// 比較用の時刻へ換算する。
     fn rec_time(&self, ust_time: u64, hms: (u8, u8, u8)) -> RecTime {
         use chrono::{TimeZone, Timelike, Utc};
@@ -233,6 +324,45 @@ pub enum Admit {
     Stop,
 }
 
+/// 独自出力の窓判定。本家互換の停止・日跨ぎ規則を持つ `TimeCursor` から分ける。
+#[derive(Debug, Clone)]
+pub struct NativeTimeCursor {
+    filter: TimeFilter,
+}
+
+impl NativeTimeCursor {
+    pub fn is_unbounded(&self) -> bool {
+        self.filter.is_unbounded()
+    }
+
+    pub fn sample(&mut self, view: &IntervalView<'_>) -> Admit {
+        if self.filter.is_unbounded() {
+            return Admit::Emit;
+        }
+        // 日内の終了時刻を越えても翌日の窓がある。打ち切るのは絶対時刻だけ。
+        if let TimeBound::Epoch(end) = self.filter.end
+            && view.curr.ust_time > end
+        {
+            return Admit::Stop;
+        }
+        if !self.native_event(view.curr.ust_time, snapshot_hms(view.curr)) {
+            return Admit::Skip;
+        }
+        if view.has_prev
+            && self.native_event(view.prev.ust_time, snapshot_hms(view.prev))
+            && self.filter.native_interval_inside(view)
+        {
+            Admit::Emit
+        } else {
+            Admit::Reference
+        }
+    }
+
+    pub fn native_event(&self, ust_time: u64, hms: (u8, u8, u8)) -> bool {
+        self.filter.native_contains(ust_time, hms)
+    }
+}
+
 /// 走査 1 周分のフィルタ状態。
 ///
 /// 本家の「外側ループ (開始点探索) → 内側ループ (`-e` だけ見る)」を
@@ -303,20 +433,7 @@ impl TimeCursor {
     /// 独自出力のイベントは、日跨ぎ指定を日内の時刻の弧として判定する。
     /// 互換出力の特殊レコードに固有の `cross_day = false` 規則とは分ける。
     pub fn native_event(&self, ust_time: u64, hms: (u8, u8, u8)) -> bool {
-        if let (TimeBound::HhMmSs { .. }, TimeBound::HhMmSs { hour, min, sec }) =
-            (self.filter.start, self.filter.end)
-            && hour >= 24
-        {
-            let rec = self.filter.rec_time(ust_time, hms);
-            let end = TimeBound::HhMmSs {
-                hour: hour - 24,
-                min,
-                sec,
-            };
-            return datecmp(rec, self.filter.start, false) != Ordering::Less
-                || datecmp(rec, end, false) != Ordering::Greater;
-        }
-        self.event(ust_time, hms)
+        self.filter.native_contains(ust_time, hms)
     }
 
     /// `cross_day` の更新 (§1.9)。一度立ったら戻さない。

@@ -71,7 +71,7 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
     writeln!(out, "source: {}", host.source).map_err(super::sadf::wrap_io)?;
 
     let mut printed_header: BTreeMap<u32, bool> = BTreeMap::new();
-    let mut cursor = cfg.time_filter.cursor();
+    let mut cursor = cfg.time_filter.native_cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // 表には統計行しか並べないので、イベントは読み飛ばす。
         let WalkItem::Sample(view) = item else {
@@ -94,7 +94,7 @@ pub fn write_table<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> 
         let ts = cfg.tz.time(view.curr.ust_time);
         for id in selected_ids(view, cfg) {
             let Some(w) = widths.get(&id.0) else { continue };
-            let Some(pair) = ActivityPair::from_view(view, id) else {
+            let Some(pair) = ActivityPair::from_native_view(view, id) else {
                 continue;
             };
             let Some(_) = spec::lookup(id) else { continue };
@@ -165,7 +165,7 @@ fn write_block_header<W: Write>(
 fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
     let mut widths: BTreeMap<u32, Widths> = BTreeMap::new();
 
-    let mut cursor = cfg.time_filter.cursor();
+    let mut cursor = cfg.time_filter.native_cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // 幅の計測も統計行だけを見る (イベント行は表に並ばない)。
         let WalkItem::Sample(view) = item else {
@@ -181,7 +181,7 @@ fn measure(file: &SaFile, cfg: &CustomConfig) -> Result<BTreeMap<u32, Widths>> {
         }
         let ts_len = "00:00:00".len();
         for id in selected_ids(view, cfg) {
-            let Some(pair) = ActivityPair::from_view(view, id) else {
+            let Some(pair) = ActivityPair::from_native_view(view, id) else {
                 continue;
             };
             let Some(_) = spec::lookup(id) else { continue };

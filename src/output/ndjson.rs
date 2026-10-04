@@ -95,7 +95,7 @@ pub struct EventRow<'a> {
 pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> Result<()> {
     let host = HostOut::new(file, cfg.tz);
     let mut boot = BootCounter::default();
-    let mut cursor = cfg.time_filter.cursor();
+    let mut cursor = cfg.time_filter.native_cursor();
 
     walk_items(file, &cfg.selection.clone(), |item| {
         // 起動区間の境界と注記は**読んだ時点で**出す。行の並びがファイル上の
@@ -150,7 +150,7 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
         };
 
         for id in selected_ids(view, cfg) {
-            let Some(pair) = ActivityPair::from_view(view, id) else {
+            let Some(pair) = ActivityPair::from_native_view(view, id) else {
                 continue;
             };
             let Some(sp) = spec::lookup(id) else { continue };
@@ -162,8 +162,8 @@ pub fn write_ndjson<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) ->
                     boot: boot.get(),
                     start_epoch,
                     end_epoch: view.curr.ust_time,
-                    elapsed_cs: view.itv_cs,
-                    continuous: view.has_prev && view.continuous,
+                    elapsed_cs: view.native_itv_cs(),
+                    continuous: view.native_continuous(),
                     activity: sp.name,
                     activity_label: id.label().unwrap_or(""),
                     item: &out_item.item,

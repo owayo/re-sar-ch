@@ -24,3 +24,10 @@ pub use wire::{
     align_up,
 };
 pub use writer::WriteCursor;
+
+/// 旧形式の jiffies を 1/100 秒へ換算する。
+/// 中間積だけがあふれる場合も値を保ち、未指定の HZ と最終結果の桁あふれは区別せず欠落にする。
+pub(crate) fn uptime_centiseconds(jiffies: u64, hz: u64) -> Option<u64> {
+    let cs = (u128::from(jiffies) * 100).checked_div(u128::from(hz))?;
+    u64::try_from(cs).ok()
+}

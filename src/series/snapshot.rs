@@ -101,7 +101,7 @@ pub struct IntervalView<'a> {
     pub prev: &'a Snapshot,
     /// 現サンプル。
     pub curr: &'a Snapshot,
-    /// 経過時間 (1/100 秒)。
+    /// 本家互換の経過時間 (1/100 秒)。0 は 1 に置き換える。
     ///
     /// 先頭レコードでは `curr.uptime_cs` そのもの (起動からの経過) になる。
     pub itv_cs: u64,
@@ -122,6 +122,24 @@ pub struct IntervalView<'a> {
 }
 
 impl<'a> IntervalView<'a> {
+    /// 独自出力・集計用の経過時間。0 や逆行を正の区間長へ補完しない。
+    pub fn native_itv_cs(&self) -> u64 {
+        if self.has_prev {
+            if self.continuous {
+                self.curr.uptime_cs.saturating_sub(self.prev.uptime_cs)
+            } else {
+                0
+            }
+        } else {
+            self.curr.uptime_cs
+        }
+    }
+
+    /// 独自出力で有効な区間か。稼働時間が進んでいない対は不連続として示す。
+    pub fn native_continuous(&self) -> bool {
+        self.has_prev && self.continuous && self.native_itv_cs() > 0
+    }
+
     /// activity のデコード計画を引く。
     pub fn plan_for(&self, id: ActivityId) -> Option<&'a DecodePlan> {
         self.plans.iter().find(|p| p.id == id).map(|p| &p.plan)

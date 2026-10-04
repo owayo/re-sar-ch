@@ -89,17 +89,23 @@ struct Collected {
     tz: DisplayTz,
 }
 
+/// 端末を初期化する前に得る観測値と走査結果。
+pub struct Prepared {
+    collected: Collected,
+    pub scan_summary: crate::format::ScanSummary,
+}
+
 /// ファイルを 1 回走査して観測値を集める。
 ///
 /// 描画のたびにファイルを読まない。静的なファイルなので、
 /// 開いた時点の内容がすべてである。
-fn collect(file: &SaFile, cfg: &CustomConfig) -> Result<Collected> {
+pub fn prepare(file: &SaFile, cfg: &CustomConfig) -> Result<Prepared> {
     let host = HostOut::new(file, cfg.tz);
     let mut samples = Vec::new();
     let mut marks = Vec::new();
     let mut boot = BootCounter::default();
 
-    walk_items(file, &cfg.selection.clone(), |item| {
+    let scan_summary = walk_items(file, &cfg.selection.clone(), |item| {
         match item {
             WalkItem::Event(ev) => {
                 boot.advance(std::slice::from_ref(&ev));
@@ -126,11 +132,14 @@ fn collect(file: &SaFile, cfg: &CustomConfig) -> Result<Collected> {
         Ok(ScanControl::Continue)
     })?;
 
-    Ok(Collected {
-        host,
-        samples,
-        marks,
-        tz: cfg.tz,
+    Ok(Prepared {
+        collected: Collected {
+            host,
+            samples,
+            marks,
+            tz: cfg.tz,
+        },
+        scan_summary,
     })
 }
 
@@ -271,6 +280,8 @@ struct App {
     marks: Vec<Mark>,
     /// 時刻の表示に使うタイムゾーン。画面にも明記する。
     tz: DisplayTz,
+    /// 完全な先行レコードだけを表示しているか。
+    incomplete: bool,
     tabs: Vec<TabInfo>,
     /// 選択中のタブ。
     tab: usize,
@@ -341,6 +352,7 @@ impl App {
             samples: c.samples,
             marks: c.marks,
             tz: c.tz,
+            incomplete: false,
             graph_target,
             shown_cols,
             col_draft: Vec::new(),
@@ -1288,13 +1300,18 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     ]);
     let l2 = Line::from(Span::styled(
         format!(
-            "{}  {}  時刻は {}  ({} サンプル)",
+            "{}  {}  時刻は {}  ({} サンプル){}",
             h.file_date,
             h.source,
             // 先頭サンプルの時点で解決する (夏時間のある地域では時期で変わる)
             app.tz
                 .label_at(app.samples.first().map_or(0, |s| s.end_epoch)),
-            app.samples.len()
+            app.samples.len(),
+            if app.incomplete {
+                "  不完全な入力"
+            } else {
+                ""
+            }
         ),
         Style::default().fg(Color::DarkGray),
     ));
@@ -1780,7 +1797,13 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 /// 端末の後始末は `ratatui::init` / `restore` に任せる。パニックしても
 /// 端末が生 raw mode のまま残らないよう、`init` がフックを入れる。
 pub fn run(path: &Path, cfg: &CustomConfig, file: &SaFile) -> Result<()> {
-    let collected = collect(file, cfg)?;
+    run_prepared(path, prepare(file, cfg)?)
+}
+
+/// 準備済みの観測値を表示する。呼び出し側は走査結果を確認してから端末を開ける。
+pub fn run_prepared(path: &Path, prepared: Prepared) -> Result<()> {
+    let incomplete = prepared.scan_summary.incomplete;
+    let collected = prepared.collected;
     if collected.samples.is_empty() {
         return Err(crate::error::Error::Other(format!(
             "{}: 表示できるサンプルがありません",
@@ -1788,6 +1811,7 @@ pub fn run(path: &Path, cfg: &CustomConfig, file: &SaFile) -> Result<()> {
         )));
     }
     let mut app = App::new(collected);
+    app.incomplete = incomplete;
 
     // 端末が無い (パイプ・リダイレクト・CI) 場合にパニックさせない。
     // 「対話端末が要る」ことを、使える代替と一緒に伝える。
@@ -3124,7 +3148,7 @@ mod tests {
         }
         let file = crate::format::SaFile::open_with(path, Default::default()).unwrap();
         let cfg = crate::output::table::default_config();
-        let collected = collect(&file, &cfg).unwrap();
+        let collected = prepare(&file, &cfg).unwrap().collected;
         let mut app = App::new(collected);
         println!("{}", render(&mut app, 100, 36));
     }

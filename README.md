@@ -157,6 +157,8 @@ resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 
 The native commands display timestamps in the machine's local timezone, and read `hh:mm[:ss]` in `--from` / `--to` in the same timezone. `--timezone <TZ>` changes it (`local`, `utc`, or an IANA name such as `Asia/Tokyo`). For `summarize` and `compare`, `--from` / `--to` narrow the aggregation period itself.
 
+Daily windows apply to every day in a file. Each entry into a window establishes a new reference sample, including repeated windows during a daylight saving time change. `summarize` and `compare` accept `--format table`, `json`, or `ndjson`. For `show` compatibility formats, omit `--timezone` / `--utc`: `sar` uses local time and `sadf-*` uses UTC for display and filtering.
+
 ### Finding what went wrong
 
 ```bash
@@ -179,6 +181,8 @@ Recorded activities become tabs; pick an item and read its time series as a tabl
 ![TUI showing memory usage as a time-series graph and table](docs/images/tui.png)
 
 The screenshot predates two changes: the quit key is now `Esc` rather than `q`, and the MEMORY tab now opens on three utilisation lines instead of a single `kbmemfree` line.
+
+With `tui --lenient`, a truncated input retains complete samples, shows an incomplete-input notice, and exits nonzero. Native counter rates with no positive elapsed time remain absent with `non_positive_elapsed` quality; instantaneous gauges remain available.
 
 ### Commands
 

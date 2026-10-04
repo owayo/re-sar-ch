@@ -710,6 +710,15 @@ impl SaFile {
             .act_size
             .map(|v| v as usize)
             .unwrap_or(activity_layout.size);
+        // 既知フィールドだけでなく、申告された末尾の未知領域も存在しなければ切断。
+        let activity_bytes = (header.act_nr as usize)
+            .checked_mul(act_stride)
+            .ok_or_else(|| Error::InconsistentHeader {
+                path: path.clone(),
+                detail: "file_activity の一覧サイズが桁あふれします".into(),
+            })?;
+        cur.raw(offset, activity_bytes)
+            .map_err(|e| oob(e, "file_activity[]"))?;
         let mut activities = Vec::with_capacity(header.act_nr as usize);
         for i in 0..header.act_nr as usize {
             let base = offset + i * act_stride;
@@ -718,7 +727,7 @@ impl SaFile {
             validate_activity_entry(&entry, &path)?;
             activities.push(entry);
         }
-        offset += header.act_nr as usize * act_stride;
+        offset += activity_bytes;
 
         // CPU 数を持たない世代は `A_CPU` の item 数で補う。
         //
@@ -1053,11 +1062,7 @@ impl SaFile {
                         None => 0,
                     };
                     // 旧世代は jiffies 単位。HZ で 1/100 秒へ換算する。
-                    let cs = if hz == 0 {
-                        None
-                    } else {
-                        up0.checked_mul(100).map(|v| v / hz)
-                    };
+                    let cs = super::uptime_centiseconds(up0, hz);
                     (cs, Some((up, up0)))
                 }
             };

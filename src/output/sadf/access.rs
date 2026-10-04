@@ -153,6 +153,13 @@ pub struct MatrixRow<'a> {
 }
 
 impl<'a> ActivityPair<'a> {
+    /// 独自出力用の対。区間長は `series` 層の補完しない値を使う。
+    pub fn from_native_view(view: &'a IntervalView<'a>, id: ActivityId) -> Option<Self> {
+        let mut pair = Self::from_view(view, id)?;
+        pair.itv_cs = view.native_itv_cs();
+        Some(pair)
+    }
+
     /// `IntervalView` から 1 activity 分を取り出す。
     pub fn from_view(view: &'a IntervalView<'a>, id: ActivityId) -> Option<Self> {
         let curr = view.curr.activity(id)?;

@@ -210,6 +210,11 @@ resarch show sa07 --lang en --format json --from 09:00 --to 18:00
 `--values` accepts `raw` (raw cumulative counters), `derived` (rates and
 percentages; default), or `both`.
 
+Native time-of-day filters apply to every day in the input. The first sample
+on entry into each window establishes the reference; intervals spanning time
+outside the window are excluded, including repeated times during daylight
+saving changes.
+
 ### Missing is not zero
 
 Native output reports why a value is unavailable.
@@ -219,6 +224,7 @@ Native output reports why a value is unavailable.
 | `unsupported_by_source` | **The source generation has no such field.** This is not zero. |
 | `missing_in_sample` | The field exists, but its value is unavailable in this record. |
 | Discontinuity (`restart` / `item_replaced` / ...) | No valid delta can be computed, so no rate was calculated. |
+| Discontinuity (`non_positive_elapsed`) | Elapsed time is not positive; counter rates are unavailable while instantaneous gauges remain available. |
 
 Treating missing values as `0` silently corrupts averages, p95, and threshold
 assessments. **An empty value in native output is not zero.**
@@ -257,6 +263,9 @@ Raw `u64` values are **decimal strings** to avoid JavaScript rounding above 2^53
 resarch summarize sa07 sa08 --lang en --format json      # Aggregate multiple files
 resarch compare --lang en --host web1=web1/sa07 --host web2=web2/sa07
 ```
+
+Both commands accept only `--format table`, `json`, or `ndjson`. Use `json`
+instead of the former `sadf-json` alias; use `table` for a text report.
 
 Assessments include **rule IDs and observed evidence**. Thresholds, duration,
 required metrics, missing-data behavior, and rule versions remain in the output
@@ -305,6 +314,11 @@ resarch --sar-profile sysstat-10.1.5-el7 -u -P ALL -f sa07
 
 **Compatibility output fills absent fields with zero**, matching upstream's
 zero-initialized structures. Use native output to preserve missingness.
+
+For `show --format sar` / `sadf-*`, omit `--timezone` and `--utc`: display and
+filtering use local time for `sar` and UTC for `sadf-*`. Choose a native format
+when you need to select the timezone. The compatibility entry points keep
+their own time options.
 
 **Upstream sar formatting environment variables also apply** to `sar`,
 `sa2sar`, and `show --lang en --format sar`. Use them to reproduce source-host
@@ -358,7 +372,7 @@ Ten-digit epoch seconds are independent of the timezone; structured output's
 | Times are not UTC or differ from older output | Native output defaults to the local timezone. `--utc` (= `--timezone utc`) restores `...Z` timestamps. `info`, `identify`, and compatibility entry points (`sar`, `sadf`, `sa2sar`) have no `--timezone`. `report_timezone` in `detect --lang en --format json` / `ndjson` records the resolved zone. |
 | `--from` / `--to` behave differently across commands | `show` filters **displayed rows**; `summarize` / `compare` filter **the aggregation period**; `detect` filters **only the report window**, keeping the baseline input unchanged. detect needs context outside a narrow investigation window. |
 | `summarize --lang en --from` produces no results | The first matching record is consumed as the previous sample. A window with only one record has no interval to aggregate; stderr explains why. |
-| `hh:mm:ss` filtering continues after the first day | Intended behavior: time-of-day filters apply **each day**, as with `sar -s` / `-e`. |
+| Native `hh:mm:ss` filtering continues after the first day | Intended behavior: time-of-day filters apply **each day** and establish a new reference when entering a window. |
 | `sar -A` omits an expected activity | Upstream also omits activities whose magic differs from the current version. Check with `resarch info <file>`; native `show` output can include them. |
 | Inspect per-CPU interrupts | Use `show --lang en --activity irq --irq-cpus`. The `cpu` dimension contains `all` and CPU numbers; only `all` is available if the legacy file lacks per-CPU data. |
 | Produce SVG graphs | `sadf -g sa07 -- -u -P ALL > cpu.svg` uses a native renderer with shared computed values. `-O autoscale,packed,customcol` and PCP (`-l`) are unsupported and rejected. |
@@ -372,6 +386,8 @@ Ten-digit epoch seconds are independent of the timezone; structured output's
   mixed into compatibility output.
 - An unreadable input causes a **nonzero exit**, even when partial results exist
   (see the format-identification exception under `identify`).
+- `tui --lenient` preserves complete samples from a truncated input, marks the
+  input incomplete in its diagnostics and header, and exits nonzero.
 - `-f` also accepts a directory. Daily files named `saDD` / `saYYYYMMDD` under
   `SA_DIR` (default `/var/log/sa`) are selected by **mtime**.
 

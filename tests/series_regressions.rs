@@ -56,6 +56,41 @@ fn cfg(id: ActivityId) -> SadfConfig {
     cfg.section.cpu_all = false;
     cfg
 }
+
+#[test]
+fn zero_elapsed_keeps_the_one_centisecond_rule_in_all_compat_formats() {
+    let item = |value: u64| [value.to_le_bytes(), value.to_le_bytes()].concat();
+    let original = file(
+        ActivitySpec::a_pcsw(),
+        vec![vec![item(100)], vec![item(110)]],
+    );
+    let mut bytes = original.bytes().to_vec();
+    // G5 の record_header は24バイト、PCSW は16バイト。uptime_cs は先頭8バイト。
+    let at = original.records_offset() + 40;
+    bytes[at..at + 8].copy_from_slice(&100_000u64.to_le_bytes());
+    let file = SaFile::from_bytes("synthetic", bytes).unwrap();
+    let cfg = cfg(ActivityId::PCSW);
+    for writer in [
+        sadf::dbppc::write_db,
+        sadf::dbppc::write_ppc,
+        sadf::json::write_json,
+        sadf::xml::write_xml,
+    ] {
+        assert!(emit(&file, &cfg, writer).contains("1000.00"));
+    }
+    let mut sar = Vec::new();
+    write_report(
+        &mut sar,
+        &file,
+        &SarTextOptions::default(),
+        &[ActivityId::PCSW],
+    )
+    .unwrap();
+    assert!(String::from_utf8(sar).unwrap().contains("1000.00"));
+    // raw はレート化せず元のカウンタを示す。
+    let raw = emit(&file, &cfg, sadf::raw::write_raw);
+    assert!(raw.contains("110"));
+}
 #[test]
 fn cpu_all_tickless_offline_and_selection_are_shared_by_sadf() {
     let file = file(

@@ -393,12 +393,19 @@ impl BoundaryPoint {
         }
     }
 
-    /// 起動時刻の推定値 (エポック秒)。`uptime` が無ければ `None`。
+    /// 起動時刻の推定値 (エポック秒)。稼働時間が無い、または i64 に収まらない場合は `None`。
     pub fn boot_epoch(&self) -> Option<i64> {
         if self.uptime_cs == 0 {
             return None;
         }
-        Some(self.ust_time as i64 - (self.uptime_cs / 100) as i64)
+        let epoch = i128::from(self.ust_time) - i128::from(self.uptime_cs / 100);
+        i64::try_from(epoch).ok()
+    }
+
+    /// 診断用の空白時間。表現範囲を超える場合も、前進・逆行の符号は保つ。
+    fn gap_secs_since(&self, prev: Self) -> i64 {
+        let gap = i128::from(self.ust_time) - i128::from(prev.ust_time);
+        gap.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 }
 
@@ -411,7 +418,7 @@ pub struct BoundaryDecision {
     pub reason: Option<BreakReason>,
     /// 新しい起動区間を始めるか。
     pub new_segment: bool,
-    /// 前サンプルからの空白 (秒)。
+    /// 前サンプルからの空白 (秒)。i64 の範囲を超える診断値はその上下限に頭打ちする。
     pub gap_secs: i64,
     pub boot_epoch_prev: Option<i64>,
     pub boot_epoch_next: Option<i64>,
@@ -444,7 +451,7 @@ pub fn decide_boundary(
 ) -> BoundaryDecision {
     let bp = prev.boot_epoch();
     let bn = next.boot_epoch();
-    let gap_secs = next.ust_time as i64 - prev.ust_time as i64;
+    let gap_secs = next.gap_secs_since(prev);
 
     if identity != IdentityVerdict::Identical {
         return BoundaryDecision::broken(BreakReason::IdentityChanged, gap_secs, bp, bn);
@@ -455,8 +462,8 @@ pub fn decide_boundary(
     let (Some(b_prev), Some(b_next)) = (bp, bn) else {
         return BoundaryDecision::broken(BreakReason::BootEpochUnknown, gap_secs, bp, bn);
     };
-    let tolerance_secs = (opts.boot_tolerance_cs / 100) as i64;
-    if (b_prev - b_next).abs() > tolerance_secs {
+    let tolerance_secs = opts.boot_tolerance_cs / 100;
+    if b_prev.abs_diff(b_next) > tolerance_secs {
         return BoundaryDecision::broken(BreakReason::BootEpochChanged, gap_secs, bp, bn);
     }
     if next.uptime_cs < prev.uptime_cs || gap_secs < 0 {
@@ -810,14 +817,6 @@ struct PrevSample {
     /// そのサンプルが入っていたファイルの識別材料 (参照のみ。複製しない)。
     identity: Arc<HostIdentity>,
     signature: Arc<PlanSignature>,
-    /// 時刻フィルタの範囲内だったか ([`Admit::Reference`] / [`Admit::Emit`])。
-    ///
-    /// **区間を集計に入れてよいかの判定に使う。** 区間 (前サンプル → 当サンプル)
-    /// が範囲に収まっているかは、前サンプルが範囲内だったかで決まる。
-    /// 「捨てたサンプルがあったか」をファイル単位で覚える形では足りない
-    /// (前ファイルの末尾が範囲外・次ファイルの先頭が範囲内だと、そのファイル内で
-    /// 1 件も捨てていないため、範囲の外から始まる区間を数えてしまう)。
-    in_window: bool,
 }
 
 /// 1 ホスト分の系列を組み立てる。
@@ -932,7 +931,7 @@ impl<'o> GroupMerger<'o> {
         }
         let empty = Snapshot::default();
         // 時刻フィルタはファイルごとに引き直す ([`MultiOptions::time_filter`])。
-        let mut cursor = self.opts.time_filter.cursor();
+        let mut cursor = self.opts.time_filter.native_cursor();
 
         for sample in &fs.samples {
             if !sample.snapshot.valid {
@@ -958,7 +957,7 @@ impl<'o> GroupMerger<'o> {
                         (
                             Some(BoundaryDecision::broken(
                                 BreakReason::RestartRecord,
-                                point.ust_time as i64 - prev.snapshot.ust_time as i64,
+                                point.gap_secs_since(BoundaryPoint::of(&prev.snapshot)),
                                 BoundaryPoint::of(&prev.snapshot).boot_epoch(),
                                 point.boot_epoch(),
                             )),
@@ -1027,20 +1026,12 @@ impl<'o> GroupMerger<'o> {
             // 範囲外の区間は平均・極値・p95・差分合計のどれにも入れない
             // (集計器へ渡さないので、重みも期間の端点も自動的に範囲内だけになる)。
             let admit = cursor.sample(&view);
-            let in_window = matches!(admit, Admit::Reference | Admit::Emit);
-            // 前サンプルが範囲内だったか (区間の始点が範囲に収まっているか)。
-            let origin_in_window = self.prev.as_ref().is_some_and(|p| p.in_window);
             let counted = match admit {
                 // 範囲に入ったあとのレコード。直前のレコードも範囲内なので、
                 // 区間はまるごと範囲に収まっている。
                 Admit::Emit => true,
-                // 範囲に最初に合致したレコード。**区間が範囲の外へはみ出す
-                // ときだけ**値に数えず、次の区間の起点 (差分の基準) として使う。
-                // はみ出すのは「範囲外の前サンプルを基準に採っている」ときだけで、
-                // 基準が無ければ (系列やこのファイルの先頭・再起動直後・
-                // 引き継げないファイル境界) 区間が存在しないので、
-                // 絞らないときと同じに数える。
-                Admit::Reference => !view.has_prev || origin_in_window,
+                // 窓へ入り直した対は基準にする。前値が無いサンプルは瞬時値だけ採れる。
+                Admit::Reference => !view.has_prev,
                 Admit::Skip => false,
                 // `--to` を超えた。このレコードは入れず、このファイルは打ち切る。
                 Admit::Stop => break,
@@ -1057,7 +1048,7 @@ impl<'o> GroupMerger<'o> {
                         continuous: true,
                         reason: None,
                         new_segment: false,
-                        gap_secs: point.ust_time as i64 - prev.snapshot.ust_time as i64,
+                        gap_secs: point.gap_secs_since(BoundaryPoint::of(&prev.snapshot)),
                         boot_epoch_prev: BoundaryPoint::of(&prev.snapshot).boot_epoch(),
                         boot_epoch_next: point.boot_epoch(),
                     });
@@ -1085,7 +1076,6 @@ impl<'o> GroupMerger<'o> {
                 // Arc の参照だけを増やす (ファイル内で不変なものを複製しない)
                 identity: Arc::clone(&fs.identity),
                 signature: Arc::clone(&fs.signature),
-                in_window,
             });
         }
     }
@@ -1359,7 +1349,7 @@ pub fn align_to_window(
 
     for i in 0..window.bucket_count() {
         let b0 = window.start_ust + i as u64 * window.step_secs;
-        let b1 = (b0 + window.step_secs).min(window.end_ust);
+        let b1 = b0.saturating_add(window.step_secs).min(window.end_ust);
         let mut weighted = 0.0f64;
         let mut weight = 0u64;
 
@@ -1607,6 +1597,35 @@ mod tests {
             true,
             &ContinuityOptions::default(),
         )
+    }
+
+    /// 符号付き秒へ変換する前に差を取り、範囲外の起動時刻は欠落にする。
+    #[test]
+    fn extreme_boot_epochs_do_not_wrap() {
+        assert_eq!(point(i64::MAX as u64 + 1, 100).boot_epoch(), Some(i64::MAX));
+        assert_eq!(point(i64::MAX as u64 + 2, 100).boot_epoch(), None);
+        assert_eq!(point(u64::MAX, 100).boot_epoch(), None);
+        assert_eq!(point(1, 200).boot_epoch(), Some(-1));
+    }
+
+    /// 診断の秒数は符号を保って頭打ちにし、時刻の逆行と取り違えない。
+    #[test]
+    fn extreme_boundary_gaps_keep_their_direction() {
+        let forward = decide(point(2_000, 0), point(u64::MAX, 0));
+        assert_eq!(forward.reason, Some(BreakReason::BootEpochUnknown));
+        assert_eq!(forward.gap_secs, i64::MAX);
+        let backward = decide(point(u64::MAX, 0), point(2_000, 0));
+        assert_eq!(backward.reason, Some(BreakReason::BootEpochUnknown));
+        assert_eq!(backward.gap_secs, i64::MIN);
+    }
+
+    /// 個々の起動時刻が i64 に収まっても、その差は i64 を超え得る。
+    #[test]
+    fn extreme_boot_epoch_difference_breaks_continuity() {
+        let d = decide(point(1_000, u64::MAX), point(i64::MAX as u64, 100));
+        assert!(!d.continuous);
+        assert_eq!(d.reason, Some(BreakReason::BootEpochChanged));
+        assert!(d.new_segment);
     }
 
     /// 同じ起動区間で時刻が進んでいれば引き継ぐ。
@@ -2279,6 +2298,21 @@ mod tests {
         assert_eq!(w.bucket_count(), 2);
         // 重ならなければ窓は作れない
         assert!(common_window(&[(100, 200), (300, 400)], 100).is_none());
+    }
+
+    /// 最後の区間の終点を窓の終点に切り詰める前に加算をあふれさせない。
+    #[test]
+    fn extreme_comparison_steps_and_epochs_keep_the_last_bucket() {
+        for (start, end, step) in [(100, 200, u64::MAX), (u64::MAX - 100, u64::MAX, 600)] {
+            let t = gauge_timeline(&[(start, end, Some(10.0))]);
+            let w = ComparisonWindow::new(start, end, step);
+            let b = align_to_window(&t, w, GaugeFill::None);
+            assert_eq!(b.len(), 1);
+            assert_eq!(b[0].start_ust, start);
+            assert_eq!(b[0].end_ust, end);
+            assert_eq!(b[0].covered_secs, end - start);
+            assert_eq!(b[0].value, Some(10.0));
+        }
     }
 
     /// **観測が無い区間を 0 として比較しない。**

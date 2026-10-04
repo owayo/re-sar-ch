@@ -94,6 +94,18 @@ pub enum OutputFormat {
     SadfRaw,
 }
 
+/// 期間集計・ホスト比較が実際に提供する形式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum AggregateFormat {
+    /// 人が読む集計表。
+    #[default]
+    Table,
+    /// 独自 JSON。
+    Json,
+    /// 独自 NDJSON。
+    Ndjson,
+}
+
 /// 生値と派生値のどちらを出すか (`--values`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum ValueKind {
@@ -202,10 +214,10 @@ impl LangArgs {
 
 /// 複数のサブコマンドで共通の引数。
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct CommonArgs {
+pub struct CommonArgs<F: ValueEnum + Default + Send + Sync + 'static = OutputFormat> {
     /// 出力形式。
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    pub format: OutputFormat,
+    #[arg(long, value_enum, default_value_t = F::default())]
+    pub format: F,
 
     #[command(flatten)]
     pub timezone: TimeZoneArgs,
@@ -229,7 +241,7 @@ pub struct CommonArgs {
     ///
     /// `sar -s` と同じく、**範囲に最初に合致したサンプルは差分の基準として
     /// 消費される** (`show` では表示されず、`summarize` では値に数えない)。
-    /// 複数ファイルを渡した場合はファイルごとに引き直すので、
+    /// 日内の範囲は毎日繰り返し、範囲へ入り直す最初のサンプルを基準にする。
     /// `--from 09:00 --to 18:00` は「各日の 09:00〜18:00」を意味する。
     ///
     /// `detect` の `--from` / `--to` は意味が違う (報告範囲だけを絞り、
@@ -303,7 +315,7 @@ pub struct SummarizeArgs {
     pub files: Vec<PathBuf>,
 
     #[command(flatten)]
-    pub common: CommonArgs,
+    pub common: CommonArgs<AggregateFormat>,
 }
 
 // ----------------------------------------------------------------------------
@@ -487,7 +499,7 @@ pub struct CompareArgs {
     pub hosts: Vec<HostSpec>,
 
     #[command(flatten)]
-    pub common: CommonArgs,
+    pub common: CommonArgs<AggregateFormat>,
 }
 
 /// `resarch info` の引数。
@@ -1124,7 +1136,7 @@ mod tests {
             panic!("summarize が選ばれるべき");
         };
         assert_eq!(args.files.len(), 2);
-        assert_eq!(args.common.format, OutputFormat::Json);
+        assert_eq!(args.common.format, AggregateFormat::Json);
     }
 
     #[test]

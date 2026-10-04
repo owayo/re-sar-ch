@@ -766,7 +766,7 @@ pub fn column_value(
 ///
 /// 計算式自体は [`column_value`] と同一の実装を共有する。
 /// 形式ごとに式が分岐するとこの層を置いた意味が無くなるため、
-/// 分岐させるのは**欠落の埋め方だけ**に限定している。
+/// 厳密モードでは欠落を埋めず、経過時間が正でないカウンタ区間を除外する。
 pub fn column_value_strict(
     id: ActivityId,
     column: usize,
@@ -799,6 +799,16 @@ fn column_value_with(
     ctx: &ComputeContext,
     policy: MissingPolicy,
 ) -> Computed {
+    if policy == MissingPolicy::Strict
+        && meta.kind == ValueKind::Counter
+        && ctx.has_prev
+        && ctx.continuous
+        && ctx.itv_cs == 0
+    {
+        return Err(ComputeIssue::Discontinuous(
+            Discontinuity::NonPositiveElapsed,
+        ));
+    }
     if !meta.is_direct() {
         return derived_value(id, column, meta, plan, prev, curr, ctx, policy);
     }
@@ -3045,6 +3055,11 @@ pub fn rate_sample(
     // 集計は欠落を 0 で埋めない。「フィールドが無い」と「0 だった」は別物
     let curr_v = raw_column(plan, curr, column)?;
     let prev_v = raw_column(plan, prev, column)?;
+    if ctx.itv_cs == 0 {
+        return Err(ComputeIssue::Discontinuous(
+            Discontinuity::NonPositiveElapsed,
+        ));
+    }
 
     let denominator = match ctx.tick_total {
         // tick 合計 0 = その CPU は動いていない。0% と報告しない

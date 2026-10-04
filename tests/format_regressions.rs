@@ -268,6 +268,72 @@ fn declared_file_header_size_has_explicit_bounds() {
 }
 
 #[test]
+fn declared_activity_stride_requires_its_unknown_tail() {
+    for abi in [FixtureAbi::Le64, FixtureAbi::Be64] {
+        let mut spec = FixtureSpec::skeleton(Generation::G2175Current, abi);
+        spec.activities = vec![ActivitySpec::a_pcsw()];
+        spec.records.clear();
+        let mut fx = build(spec);
+        // G5 の act_size は file_header +52。既知の36バイトに未知の4バイトを追加する。
+        let size = match abi {
+            FixtureAbi::Le64 => 40u32.to_le_bytes(),
+            FixtureAbi::Be64 => 40u32.to_be_bytes(),
+            _ => unreachable!(),
+        };
+        let at = fx.file_header_off + 52;
+        fx.bytes[at..at + 4].copy_from_slice(&size);
+        fx.bytes.extend_from_slice(&[0; 4]);
+        assert!(
+            open(fx.bytes.clone(), Tolerance::Strict)
+                .unwrap()
+                .scan(|_| Ok(ScanControl::Continue))
+                .unwrap()
+                .is_exact()
+        );
+        for missing in 1..=4 {
+            let bytes = fx.bytes[..fx.bytes.len() - missing].to_vec();
+            for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+                assert!(matches!(
+                    open(bytes.clone(), tolerance),
+                    Err(re_sar_ch::error::Error::Truncated { need: 40, .. })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn large_jiffies_preserve_representable_centiseconds_and_reject_overflow() {
+    for generation in [Generation::G2171, Generation::G2173] {
+        for abi in [FixtureAbi::Le64, FixtureAbi::Be64] {
+            let mut spec = FixtureSpec::skeleton(generation, abi);
+            spec.activities = vec![ActivitySpec::a_pcsw()];
+            let mut rec = RecordSpec::stats(vec![1], 1_600_000_000, 12, 0, 0);
+            rec.uptime = u64::MAX / 100 + 1;
+            spec.records = vec![rec];
+            let file = open(build(spec).bytes, Tolerance::Strict).unwrap();
+            file.scan(|rec| {
+                assert_eq!(rec.uptime_cs, Some(u64::MAX / 100 + 1));
+                Ok(ScanControl::Continue)
+            })
+            .unwrap();
+            let mut converted = Vec::new();
+            re_sar_ch::convert::convert(&file, &Default::default(), &mut converted).unwrap();
+            open(converted, Tolerance::Strict)
+                .unwrap()
+                .scan(|rec| {
+                    assert_eq!(rec.uptime_cs, Some(u64::MAX / 100 + 1));
+                    Ok(ScanControl::Continue)
+                })
+                .unwrap();
+            let opts = re_sar_ch::convert::ConvertOptions { hz: Some(1) };
+            let err = re_sar_ch::convert::convert(&file, &opts, &mut Vec::new()).unwrap_err();
+            assert!(err.to_string().contains("uptime_cs"));
+        }
+    }
+}
+
+#[test]
 fn self_describing_old_magic_never_selects_an_era_a_layout() {
     for (id, magic, size, types) in [
         (ActivityId::CPU, 0x8a, 80, [10, 0, 0]),

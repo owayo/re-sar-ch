@@ -676,10 +676,13 @@ fn write_record<W: Write>(
         };
         // `uptime_cs = uptime0 * 100 / HZ`。全 CPU 合計の `uptime` は破棄される (§5.6)。
         let uptime0 = rec.uptime_jiffies.map(|(_, u0)| u0).unwrap_or(0);
-        let uptime_cs = uptime0
-            .checked_mul(100)
-            .map(|v| v / ctx.hz.max(1))
-            .unwrap_or(0);
+        // 中間積は広い型で求める。書き出せない時刻を 0 に置き換えてはいけない。
+        let uptime_cs = crate::format::uptime_centiseconds(uptime0, ctx.hz).ok_or_else(|| {
+            Error::Other(format!(
+                "uptime_cs を表現できません (offset={}, uptime0={uptime0}, HZ={})",
+                rec.offset, ctx.hz
+            ))
+        })?;
         put(&mut w, "uptime_cs", uptime_cs);
         put(&mut w, "ust_time", rec.ust_time);
         put(&mut w, "extra_next", 0);

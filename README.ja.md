@@ -157,6 +157,8 @@ resarch compare --host app1=app1/sa01 --host app2=app2/sa01
 
 独自サブコマンドは時刻を実行環境のローカルタイムゾーンで表示し、`--from` / `--to` の `hh:mm[:ss]` も同じタイムゾーンで解釈します。基準は `--timezone <TZ>` (`local` / `utc` / `Asia/Tokyo` のような IANA 名) で変えられます。`summarize` と `compare` の `--from` / `--to` は、集計期間そのものを絞ります。
 
+日内の範囲はファイル内の各日に適用し、窓へ入り直す最初のサンプルを差分の基準にします。夏時間で同じ時刻の窓が繰り返される場合も同じです。`summarize` / `compare` の形式は `--format table` / `json` / `ndjson` です。`show` の互換形式では `--timezone` / `--utc` を外してください。`sar` はローカル時刻、`sadf-*` は UTC で表示と絞り込みを行います。
+
 ### 異変の当たりを付ける
 
 ```bash
@@ -179,6 +181,8 @@ resarch tui sa01 --activity cpu,disk,memory   # activity を絞って開く
 ![メモリ使用状況を時系列グラフと表で表示した TUI](docs/images/tui.png)
 
 画像は以前の版の画面です。現在は `Esc` で終了し (画像の表示は `q`)、MEMORY タブを開くと使用率を比べる 3 本の線が出ます (画像は `kbmemfree` の 1 本)。
+
+`tui --lenient` で切断された入力を開くと、完全な先行サンプルを保持し、画面に不完全な入力と明示して非ゼロで終了します。独自出力では、経過時間が正でないカウンタのレートは値なし (`non_positive_elapsed`) になり、ゲージの瞬時値は保持されます。
 
 ### コマンド一覧
 

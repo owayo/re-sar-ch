@@ -626,8 +626,9 @@ impl NativeSummaryBuilder {
 
         // 区間長を重みに使えるのは「前サンプルがあり、かつ連続」な場合だけ。
         // 再起動を挟むと uptime 差分が意味を失うため、重み 0 として扱う。
+        let itv_cs = view.native_itv_cs();
         let weight_cs = if view.has_prev && view.continuous {
-            view.itv_cs
+            itv_cs
         } else {
             0
         };
@@ -642,7 +643,7 @@ impl NativeSummaryBuilder {
             start_ust,
             end_ust,
             weight_cs,
-            itv_cs: view.itv_cs,
+            itv_cs,
         };
 
         for snap in &view.curr.activities {
@@ -1023,6 +1024,9 @@ fn counter_delta(
     let Some(prev_item) = prev_item else {
         return Err(setup.missing_prev);
     };
+    if ctx.continuous && ctx.itv_cs == 0 {
+        return Err(ExclusionReason::NonPositiveElapsed);
+    }
     // CPU 割合の分母はその item の tick 合計。0 = その CPU は動いていないので
     // 0% と報告しない。区間長が 0 の場合と理由を分けるためここで判定する。
     if setup.normalize_by_ticks && !matches!(ctx.tick_total, Some(t) if t > 0) {

@@ -54,10 +54,13 @@ impl DisplayTz {
     /// `TZ=UTC` を `Named(Tz::UTC)` ではなく [`DisplayTz::Utc`] にするのは、
     /// 「UTC で見たい」と言われたときに `+00:00` ではなく `Z` を出すため。
     pub fn local() -> Self {
-        if let Ok(name) = std::env::var("TZ")
-            && let Some(tz) = parse_tz(&name)
-        {
-            return Self::from_tz(tz);
+        if let Ok(name) = std::env::var("TZ") {
+            if let Some(tz) = parse_tz(&name) {
+                return Self::from_tz(tz);
+            }
+            // Unix の POSIX 形式・空文字・ファイル指定は libc と同じ基準を使う。
+            #[cfg(unix)]
+            return Self::System;
         }
         if let Some(tz) = system_zone() {
             return Self::from_tz(tz);

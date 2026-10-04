@@ -188,6 +188,33 @@ fn lenient_reports_partial_results_and_fails_for_every_native_scan() {
 }
 
 #[test]
+fn tui_preparation_keeps_partial_scan_diagnostics() {
+    use re_sar_ch::format::{OpenOptions, SaFile, Tolerance};
+    let bytes = source(0, false);
+    let file = SaFile::from_bytes("synthetic", bytes.clone()).unwrap();
+    let prepared = re_sar_ch::tui::prepare(&file, &Default::default()).unwrap();
+    assert!(prepared.scan_summary.is_exact());
+    assert_eq!(prepared.scan_summary.stats, 125);
+    let mut truncated = bytes;
+    truncated.pop();
+    let strict = SaFile::from_bytes("synthetic", truncated.clone()).unwrap();
+    assert!(re_sar_ch::tui::prepare(&strict, &Default::default()).is_err());
+    let lenient = SaFile::from_bytes_with(
+        "synthetic",
+        truncated,
+        OpenOptions {
+            tolerance: Tolerance::Lenient,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let prepared = re_sar_ch::tui::prepare(&lenient, &Default::default()).unwrap();
+    assert!(prepared.scan_summary.incomplete);
+    assert!(prepared.scan_summary.trailing_bytes > 0);
+    assert_eq!(prepared.scan_summary.stats, 124);
+}
+
+#[test]
 fn native_cpu_count_and_epoch_validation_are_consistent() {
     let dir = tempfile::tempdir().unwrap();
     let file = save(dir.path(), "cpu.sa", &source(0, true));
@@ -205,6 +232,143 @@ fn native_cpu_count_and_epoch_validation_are_consistent() {
         assert!(!out.status.success(), "{command}");
         assert!(out.stdout.is_empty());
         assert!(String::from_utf8_lossy(&out.stderr).contains("--to は --from"));
+    }
+}
+
+#[test]
+fn zero_elapsed_rates_are_missing_in_native_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = vec![ActivitySpec::a_pcsw(), ActivitySpec::a_queue()];
+    spec.records = (0..2)
+        .map(|_| {
+            let mut rec = RecordSpec::stats(vec![1, 1], 1_600_000_000, 12, 0, 0);
+            rec.uptime = 100_000;
+            rec
+        })
+        .collect();
+    let file = save(dir.path(), "zero-elapsed.sa", &build(spec).bytes);
+    let out = run(&["show", "--format", "json"], &file);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sample = &json["samples"][1];
+    assert_eq!(sample["elapsed_cs"], 0);
+    assert_eq!(sample["continuous"], false);
+    let activities = sample["activities"].as_array().unwrap();
+    let pcsw = activities
+        .iter()
+        .find(|a| a["activity"] == "A_PCSW")
+        .unwrap();
+    for rate in pcsw["items"][0]["rates"].as_array().unwrap() {
+        assert_eq!(rate["quality"], "non_positive_elapsed");
+        assert!(rate.get("value").is_none());
+    }
+    // 瞬時値は経過時間を必要としないので、同じサンプルでも有効なまま。
+    let queue = activities
+        .iter()
+        .find(|a| a["activity"] == "A_QUEUE")
+        .unwrap();
+    assert!(
+        queue["items"][0]["rates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rate| rate["quality"] == "ok")
+    );
+    for format in ["csv", "ndjson"] {
+        let out = run(&["show", "--format", format], &file);
+        assert!(
+            out.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("non_positive_elapsed"),
+            "{format}"
+        );
+    }
+    let out = run(&["show", "--activity", "pcsw", "--format", "table"], &file);
+    assert!(out.status.success());
+    let table = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        table
+            .lines()
+            .any(|line| line.split_whitespace().filter(|cell| *cell == "-").count() >= 2)
+    );
+}
+
+#[test]
+fn restart_elapsed_is_zero_in_each_native_machine_readable_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = vec![ActivitySpec::a_pcsw()];
+    let mut first = RecordSpec::stats(vec![1], 1_600_000_000, 12, 0, 0);
+    first.uptime = 100_000;
+    let restart = RecordSpec::restart(2, 1_600_000_001, 12, 0, 1);
+    let mut after = RecordSpec::stats(vec![1], 1_600_000_002, 12, 0, 2);
+    after.uptime = 200_000;
+    spec.records = vec![first, restart, after];
+    let file = save(dir.path(), "restart.sa", &build(spec).bytes);
+    let out = run(&["show", "--format", "json"], &file);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["samples"][1]["elapsed_cs"], 0);
+    assert_eq!(json["samples"][1]["continuous"], false);
+    let out = run(&["show", "--format", "ndjson"], &file);
+    assert!(out.status.success());
+    let rows: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let last = rows.last().unwrap();
+    assert_eq!(last["elapsed_cs"], 0);
+    assert_eq!(last["continuous"], false);
+    let out = run(&["show", "--format", "csv"], &file);
+    assert!(out.status.success());
+    let mut reader = csv::Reader::from_reader(out.stdout.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let elapsed = headers.iter().position(|h| h == "elapsed_cs").unwrap();
+    let continuous = headers.iter().position(|h| h == "continuous").unwrap();
+    let last = reader.records().last().unwrap().unwrap();
+    assert_eq!(&last[elapsed], "0");
+    assert_eq!(&last[continuous], "false");
+}
+
+#[test]
+fn svg_extreme_epochs_do_not_panic_or_become_1970() {
+    let dir = tempfile::tempdir().unwrap();
+    for end in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+        spec.activities = vec![ActivitySpec::a_cpu(3)];
+        spec.records = (0..3)
+            .map(|i| {
+                let mut rec = RecordSpec::stats(vec![3], end - (2 - i) * 600, 12, 0, 0);
+                rec.uptime = 100_000 + i * 60_000;
+                rec
+            })
+            .collect();
+        let file = save(dir.path(), "extreme.sa", &build(spec).bytes);
+        for options in [vec!["sadf", "-g"], vec!["sadf", "-g", "-O", "oneday"]] {
+            let out = run(&options, &file);
+            assert!(
+                out.status.success(),
+                "{end}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let svg = String::from_utf8(out.stdout).unwrap();
+            assert!(svg.contains("</svg>"));
+            assert!(svg.contains(&end.to_string()));
+            assert!(!svg.contains("1970-01-01"));
+        }
     }
 }
 
@@ -314,7 +478,7 @@ fn compare_identity_matches_the_selected_boot_segment() {
     let peer = save(dir.path(), "peer.sa", &build(new).bytes);
 
     for from in [None, Some("1600000600")] {
-        for format in ["json", "sadf-json", "ndjson"] {
+        for format in ["json", "ndjson"] {
             let out = Command::new(env!("CARGO_BIN_EXE_resarch"))
                 .args(["compare", "--utc", "--format", format, "--host"])
                 .arg(format!("upgraded={}", upgraded.display()))
@@ -369,6 +533,214 @@ fn native_help_explains_the_time_basis() {
         assert!(help.contains("--timezone"), "{command}: {help}");
         assert!(help.contains("--utc"), "{command}: {help}");
         assert!(help.contains("local"), "{command}: {help}");
+    }
+}
+
+#[test]
+fn daily_time_windows_include_each_day_in_every_native_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = vec![ActivitySpec::a_pcsw()];
+    let midnight = 1_600_000_000 / 86_400 * 86_400;
+    spec.records = (0..96)
+        .map(|i| {
+            let epoch = midnight + i * 1800;
+            let mut rec = RecordSpec::stats(
+                vec![1],
+                epoch,
+                ((i / 2) % 24) as u8,
+                ((i % 2) * 30) as u8,
+                0,
+            );
+            rec.uptime = 100_000 + i * 180_000;
+            rec
+        })
+        .collect();
+    let file = save(dir.path(), "two-days.sa", &build(spec).bytes);
+    let out = run(
+        &[
+            "show", "--format", "json", "--from", "09:00", "--to", "11:00",
+        ],
+        &file,
+    );
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let samples = json["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 8);
+    assert_eq!(samples[4]["end_epoch"], midnight + 86_400 + 9 * 3600 + 1800);
+    for format in ["table", "csv", "ndjson"] {
+        let out = run(
+            &[
+                "show", "--format", format, "--from", "09:00", "--to", "11:00",
+            ],
+            &file,
+        );
+        assert!(out.status.success(), "{format}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        if format == "table" {
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.split_whitespace().next() == Some("09:30:00"))
+                    .count(),
+                2
+            );
+        } else {
+            assert!(
+                text.contains(&(midnight + 86_400 + 9 * 3600 + 1800).to_string()),
+                "{format}"
+            );
+        }
+    }
+    let out = run(
+        &[
+            "summarize",
+            "--format",
+            "json",
+            "--from",
+            "09:00",
+            "--to",
+            "11:00",
+        ],
+        &file,
+    );
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let period = &json["hosts"][0]["segments"][0]["summary"]["period"];
+    assert_eq!(period["samples"], 8);
+    assert_eq!(period["covered_cs"], 2 * 2 * 3600 * 100);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_local_timezone_honors_posix_tz() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "timezone.sa", &source(0, false));
+    let utc = first_cell_in_tz("UTC", &[], &file);
+    assert_eq!(first_cell_in_tz("UTC0", &[], &file), utc);
+    assert_eq!(first_cell_in_tz("", &[], &file), utc);
+    assert_eq!(
+        first_cell_in_tz("<+03>-3", &[], &file),
+        shifted(&utc, 3 * 3600)
+    );
+}
+
+#[test]
+fn repeated_dst_windows_do_not_join_across_unobserved_outside_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = vec![ActivitySpec::a_pcsw()];
+    spec.records = [1_793_511_600, 1_793_515_200]
+        .into_iter()
+        .enumerate()
+        .map(|(i, epoch)| {
+            let mut rec = RecordSpec::stats(vec![1], epoch, 1, 40, 0);
+            rec.uptime = 100_000 + i as u64 * 360_000;
+            rec
+        })
+        .collect();
+    let file = save(dir.path(), "repeated-window.sa", &build(spec).bytes);
+    let options = [
+        "--format",
+        "json",
+        "--timezone",
+        "America/New_York",
+        "--from",
+        "01:30",
+        "--to",
+        "01:45",
+    ];
+    let mut args = vec!["show"];
+    args.extend_from_slice(&options);
+    let out = run(&args, &file);
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json["samples"].as_array().unwrap().is_empty());
+    args[0] = "summarize";
+    let out = run(&args, &file);
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for host in json["hosts"].as_array().unwrap() {
+        for segment in host["segments"].as_array().unwrap() {
+            assert_eq!(segment["summary"]["period"]["covered_cs"], 0);
+        }
+    }
+}
+
+#[test]
+fn unsupported_summary_and_comparison_formats_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "formats.sa", &source(0, false));
+    for format in [
+        "csv",
+        "sar",
+        "sadf-json",
+        "sadf-xml",
+        "sadf-d",
+        "sadf-p",
+        "sadf-raw",
+    ] {
+        let out = run(&["summarize", "--format", format], &file);
+        assert!(!out.status.success(), "summarize {format}");
+        assert!(out.stdout.is_empty());
+        let out = Command::new(env!("CARGO_BIN_EXE_resarch"))
+            .args(["compare", "--format", format, "--host"])
+            .arg(format!("a={}", file.display()))
+            .arg("--host")
+            .arg(format!("b={}", file.display()))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "compare {format}");
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn show_compatibility_formats_filter_in_their_display_timezone() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = save(dir.path(), "compat-time.sa", &source(0, false));
+    // source の先頭は UTC 19:50。sadf の表示・絞り込みは UTC、sar はローカル時刻。
+    for format in [
+        "sar",
+        "sadf-d",
+        "sadf-json",
+        "sadf-xml",
+        "sadf-p",
+        "sadf-raw",
+    ] {
+        let (from, to, expected) = if format == "sar" {
+            ("05:00", "05:10", "05:10:00")
+        } else {
+            ("20:00", "20:10", "20:10:00")
+        };
+        let out = run_in_tz(
+            "Asia/Tokyo",
+            &[
+                "show",
+                "--activity",
+                "cpu",
+                "--format",
+                format,
+                "--from",
+                from,
+                "--to",
+                to,
+            ],
+            &file,
+        );
+        assert!(out.status.success(), "{format}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(expected),
+            "{format}"
+        );
+        for timezone in ["--utc", "--timezone"] {
+            let mut args = vec!["show", "--format", format, timezone];
+            if timezone == "--timezone" {
+                args.push("utc");
+            }
+            let out = run(&args, &file);
+            assert!(!out.status.success(), "{format} {timezone}");
+            assert!(out.stdout.is_empty());
+        }
     }
 }
 

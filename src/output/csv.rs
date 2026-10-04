@@ -80,7 +80,7 @@ pub fn write_csv_with<W: Write>(
     }
 
     let mut boot: u32 = 0;
-    let mut cursor = cfg.time_filter.cursor();
+    let mut cursor = cfg.time_filter.native_cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // 縦持ちの統計行しか持たない形式なので、イベントは起動区間の番号にだけ効かせる。
         let view = match item {
@@ -102,10 +102,10 @@ pub fn write_csv_with<W: Write>(
         } else {
             view.curr.ust_time
         };
-        let continuous = view.has_prev && view.continuous;
+        let continuous = view.native_continuous();
 
         for id in selected_ids(view, cfg) {
-            let Some(pair) = ActivityPair::from_view(view, id) else {
+            let Some(pair) = ActivityPair::from_native_view(view, id) else {
                 continue;
             };
             let Some(sp) = spec::lookup(id) else { continue };
@@ -118,7 +118,7 @@ pub fn write_csv_with<W: Write>(
                             boot,
                             start_epoch,
                             view.curr.ust_time,
-                            view.itv_cs,
+                            view.native_itv_cs(),
                             continuous,
                             sp.name,
                             &row.item,

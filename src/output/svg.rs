@@ -132,9 +132,9 @@ fn day_start(ust: u64, zone: &DayZone) -> u64 {
         DayZone::Recorded { offset, .. } => *offset,
     };
     // 現地時刻へ寄せて日境界で切り、UTC へ戻す。
-    let local = ust as i64 + shift;
+    let local = i128::from(ust) + i128::from(shift);
     let floored = local.div_euclid(86_400) * 86_400;
-    (floored - shift).max(0) as u64
+    u64::try_from((floored - i128::from(shift)).max(0)).unwrap_or(ust)
 }
 
 fn escaped(text: &str) -> String {

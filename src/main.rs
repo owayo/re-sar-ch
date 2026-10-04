@@ -1032,7 +1032,10 @@ fn display_tz(args: &TimeZoneArgs) -> anyhow::Result<DisplayTz> {
 ///
 /// `check_time_limits()` と同じ日跨ぎ補正を入れる
 /// (`hh:mm:ss` 形式で `--to` < `--from` なら翌日まで)。
-fn custom_time_filter(common: &CommonArgs, tz: DisplayTz) -> anyhow::Result<TimeFilter> {
+fn custom_time_filter<F: clap::ValueEnum + Default + Send + Sync + 'static>(
+    common: &CommonArgs<F>,
+    tz: DisplayTz,
+) -> anyhow::Result<TimeFilter> {
     let start = match &common.from {
         Some(v) => parse_time_arg("--from", v)?,
         None => TimeBound::None,
@@ -1104,6 +1107,13 @@ fn run_skill_install(args: SkillArgs) -> anyhow::Result<ExitCode> {
 
 fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
     let common = &args.common;
+    let native = matches!(
+        common.format,
+        OutputFormat::Table | OutputFormat::Json | OutputFormat::Csv | OutputFormat::Ndjson
+    );
+    if !native && (common.timezone.timezone.is_some() || common.timezone.utc) {
+        bail!("互換形式では --timezone / --utc を指定できません (sar はローカル時刻、sadf は UTC)");
+    }
     if args.irq_cpus
         && !matches!(
             common.format,
@@ -1115,7 +1125,20 @@ fn run_show(args: ShowArgs) -> anyhow::Result<ExitCode> {
     let options = open_options(common.lenient, common.no_mmap);
     let selection = selection_from(&common.activity)?;
     let tz = display_tz(&common.timezone)?;
-    let filter = custom_time_filter(common, tz)?;
+    let mut filter = custom_time_filter(common, tz)?;
+    // 互換形式の絞り込みは、それぞれの描画が使う本家の時刻基準に合わせる。
+    if !native {
+        filter.basis = if common.format == OutputFormat::Sar {
+            TimeBasis::Local
+        } else {
+            TimeBasis::Utc
+        };
+        filter.cross_day = if common.format == OutputFormat::Sar {
+            CrossDayRule::Sar
+        } else {
+            CrossDayRule::Sadf
+        };
+    }
 
     // 複数ファイルはヘッダだけ先に読み、**日付 → 作成時刻 → パス**の決定的な
     // 順序へ並べ替えてから流す (`multi.rs` の方針 §6.3)。
@@ -1617,7 +1640,10 @@ fn min_priority(arg: PriorityArg) -> Priority {
 /// `-s` / `--from` に最初に一致したレコードは**前サンプルとして消費され、
 /// 値には数えない** (`sar` と同じ)。したがって範囲内のレコードが 1 本しか
 /// 無い場合も区間が作れず空になる。これが一番踏みやすい。
-fn report_empty_window(analysis: &multi::MultiFileAnalysis, common: &CommonArgs) {
+fn report_empty_window<F: clap::ValueEnum + Default + Send + Sync + 'static>(
+    analysis: &multi::MultiFileAnalysis,
+    common: &CommonArgs<F>,
+) {
     if common.from.is_none() && common.to.is_none() {
         return;
     }
@@ -1644,11 +1670,15 @@ fn run_summarize(args: SummarizeArgs) -> anyhow::Result<ExitCode> {
 
     let mut out = stdout_writer();
     match common.format {
-        OutputFormat::Json | OutputFormat::SadfJson => {
+        re_sar_ch::cli::AggregateFormat::Json => {
             summarize_report::write_json(&mut out, &analysis)?;
         }
-        OutputFormat::Ndjson => summarize_report::write_ndjson(&mut out, &analysis)?,
-        _ => summarize_report::write_text(&mut out, &analysis, tz)?,
+        re_sar_ch::cli::AggregateFormat::Ndjson => {
+            summarize_report::write_ndjson(&mut out, &analysis)?
+        }
+        re_sar_ch::cli::AggregateFormat::Table => {
+            summarize_report::write_text(&mut out, &analysis, tz)?
+        }
     }
     out.flush()?;
     Ok(exit_code(
@@ -1665,7 +1695,10 @@ fn report_incomplete_files(analysis: &multi::MultiFileAnalysis) {
     }
 }
 
-fn multi_options(common: &CommonArgs, tz: DisplayTz) -> anyhow::Result<MultiOptions> {
+fn multi_options<F: clap::ValueEnum + Default + Send + Sync + 'static>(
+    common: &CommonArgs<F>,
+    tz: DisplayTz,
+) -> anyhow::Result<MultiOptions> {
     Ok(MultiOptions {
         open: open_options(common.lenient, common.no_mmap),
         selection: selection_from(&common.activity)?,
@@ -1803,7 +1836,7 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
 
     let mut out = stdout_writer();
     match common.format {
-        OutputFormat::Json | OutputFormat::SadfJson => {
+        re_sar_ch::cli::AggregateFormat::Json => {
             serde_json::to_writer_pretty(
                 &mut out,
                 &serde_json::json!({
@@ -1814,7 +1847,7 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<ExitCode> {
             )?;
             writeln!(out)?;
         }
-        OutputFormat::Ndjson => {
+        re_sar_ch::cli::AggregateFormat::Ndjson => {
             serde_json::to_writer(
                 &mut out,
                 &serde_json::json!({
@@ -1931,8 +1964,18 @@ fn run_tui(args: TuiArgs) -> anyhow::Result<ExitCode> {
         irq_cpus: false,
         tz: display_tz(&args.timezone)?,
     };
-    re_sar_ch::tui::run(&args.file, &cfg, &file)?;
-    Ok(ExitCode::SUCCESS)
+    report_diagnostics(&file);
+    let prepared = re_sar_ch::tui::prepare(&file, &cfg)?;
+    let partial = prepared.scan_summary.incomplete;
+    if partial {
+        eprintln!(
+            "resarch: {}: 不完全な末尾レコード (残余 {} バイト)。完全なレコードまでを表示します",
+            file.path().display(),
+            prepared.scan_summary.trailing_bytes
+        );
+    }
+    re_sar_ch::tui::run_prepared(&args.file, prepared)?;
+    Ok(exit_code(partial))
 }
 
 // ===========================================================================

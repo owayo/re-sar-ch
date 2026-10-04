@@ -347,17 +347,19 @@ impl FileInfo {
         };
         let utc = utc_of(h.ust_time);
         let file_date = match base {
-            TimeBase::TrueTime => format_date(h.year, u32::from(h.month), u32::from(h.day)),
+            TimeBase::TrueTime => Some(format_date(h.year, u32::from(h.month), u32::from(h.day))),
             // `-T` は読み手のローカル時刻。レコードの [`Stamp`] と同じ基準に揃える
-            TimeBase::LocalTime => {
-                let l = local_of(utc);
-                format_date(l.year(), l.month(), l.day())
-            }
-            _ => format_date(utc.year(), utc.month(), utc.day()),
-        };
+            TimeBase::LocalTime => utc
+                .map(local_of)
+                .map(|l| format_date(l.year(), l.month(), l.day())),
+            _ => utc.map(|d| format_date(d.year(), d.month(), d.day())),
+        }
+        .unwrap_or_default();
         // `-T` の名前を CLI 層から受け取らなかったときの代用。
         // 名前は引かず、ファイル作成時刻での UTC オフセット (`+09:00`) を出す。
-        let local_tz = local_of(utc).offset().to_string();
+        let local_tz = utc
+            .map(|d| local_of(d).offset().to_string())
+            .unwrap_or_default();
         Self {
             nodename: h.nodename.clone(),
             sysname: h.sysname.clone(),
@@ -365,7 +367,9 @@ impl FileInfo {
             machine: h.machine.clone(),
             cpu_count,
             file_date,
-            file_utc_time: format!("{:02}:{:02}:{:02}", utc.hour(), utc.minute(), utc.second()),
+            file_utc_time: utc
+                .map(|d| format_time(d.hour(), d.minute(), d.second()))
+                .unwrap_or_default(),
             ust_time: h.ust_time,
             tzname: h.tzname.clone().unwrap_or_default(),
             local_tz,
@@ -373,10 +377,8 @@ impl FileInfo {
     }
 }
 
-fn utc_of(secs: u64) -> DateTime<Utc> {
-    Utc.timestamp_opt(secs as i64, 0)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+fn utc_of(secs: u64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_opt(i64::try_from(secs).ok()?, 0).single()
 }
 
 /// `-T` の読み手のローカル時刻 (本家の `localtime()`、[`localtime`])。
@@ -413,15 +415,20 @@ impl Stamp {
     /// `-t` ではこれと UTC の差からオフセットを復元して日付を決める
     /// (日付跨ぎで 1 日ずれないようにするため)。
     pub fn new(base: TimeBase, ust_time: u64, rec_hms: (u8, u8, u8), info: &FileInfo) -> Self {
+        // 暦へ開けない時刻は元の epoch 秒を示す。1970年へ置き換えない。
+        let epoch_stamp = || Stamp {
+            date: String::new(),
+            time: ust_time.to_string(),
+            tz: String::new(),
+            true_time: false,
+        };
+        let Some(utc) = utc_of(ust_time) else {
+            return epoch_stamp();
+        };
         match base {
-            TimeBase::SecEpoch => Stamp {
-                date: String::new(),
-                time: ust_time.to_string(),
-                tz: String::new(),
-                true_time: false,
-            },
+            TimeBase::SecEpoch => epoch_stamp(),
             TimeBase::Utc => {
-                let t = utc_of(ust_time);
+                let t = utc;
                 Stamp {
                     date: format_date(t.year(), t.month(), t.day()),
                     time: format_time(t.hour(), t.minute(), t.second()),
@@ -430,7 +437,9 @@ impl Stamp {
                 }
             }
             TimeBase::TrueTime => {
-                let shifted = utc_of(shift_to_recorded(ust_time, rec_hms));
+                let Some(shifted) = utc_of(shift_to_recorded(ust_time, rec_hms)) else {
+                    return epoch_stamp();
+                };
                 Stamp {
                     date: format_date(shifted.year(), shifted.month(), shifted.day()),
                     time: format_time(shifted.hour(), shifted.minute(), shifted.second()),
@@ -439,7 +448,7 @@ impl Stamp {
                 }
             }
             TimeBase::LocalTime => {
-                let local = local_of(utc_of(ust_time));
+                let local = local_of(utc);
                 Stamp {
                     date: format_date(local.year(), local.month(), local.day()),
                     time: format_time(local.hour(), local.minute(), local.second()),
@@ -516,14 +525,16 @@ fn format_time(h: u32, m: u32, s: u32) -> String {
 /// 両者の時刻差から UTC オフセットが分かる。±12 時間へ正規化して足す。
 pub(crate) fn shift_to_recorded(ust_time: u64, (h, m, s): (u8, u8, u8)) -> u64 {
     const DAY: i64 = 86_400;
-    let utc = utc_of(ust_time);
+    let Some(utc) = utc_of(ust_time) else {
+        return ust_time;
+    };
     let utc_sod = (utc.hour() * 3600 + utc.minute() * 60 + utc.second()) as i64;
     let rec_sod = (h as i64) * 3600 + (m as i64) * 60 + s as i64;
     let mut diff = (rec_sod - utc_sod).rem_euclid(DAY);
     if diff > DAY / 2 {
         diff -= DAY;
     }
-    (ust_time as i64 + diff).max(0) as u64
+    u64::try_from((i128::from(ust_time) + i128::from(diff)).max(0)).unwrap_or(ust_time)
 }
 
 /// `interval` 欄の秒数 (§1.2)。
@@ -605,6 +616,24 @@ impl ItemLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrepresentable_epochs_keep_their_original_value() {
+        let info = dummy_info();
+        for epoch in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(shift_to_recorded(epoch, (12, 0, 0)), epoch);
+            for base in [
+                TimeBase::Utc,
+                TimeBase::TrueTime,
+                TimeBase::LocalTime,
+                TimeBase::SecEpoch,
+            ] {
+                let stamp = Stamp::new(base, epoch, (12, 0, 0), &info);
+                assert!(stamp.date.is_empty());
+                assert_eq!(stamp.time, epoch.to_string());
+            }
+        }
+    }
 
     #[test]
     fn interval_rounds_at_half_a_second() {

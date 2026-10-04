@@ -531,7 +531,7 @@ impl BootCounter {
 pub fn sample_out(view: &IntervalView<'_>, boot: u32, cfg: &CustomConfig) -> SampleOut {
     let mut activities = Vec::new();
     for id in selected_ids(view, cfg) {
-        if let Some(pair) = ActivityPair::from_view(view, id)
+        if let Some(pair) = ActivityPair::from_native_view(view, id)
             && let Some(a) = activity_out(&pair, cfg)
         {
             activities.push(a);
@@ -545,8 +545,8 @@ pub fn sample_out(view: &IntervalView<'_>, boot: u32, cfg: &CustomConfig) -> Sam
             view.curr.ust_time
         },
         end_epoch: view.curr.ust_time,
-        elapsed_cs: view.itv_cs,
-        continuous: view.has_prev && view.continuous,
+        elapsed_cs: view.native_itv_cs(),
+        continuous: view.native_continuous(),
         activities,
     }
 }
@@ -580,7 +580,7 @@ pub fn write_json<W: Write>(out: &mut W, file: &SaFile, cfg: &CustomConfig) -> R
 
     let mut boot = BootCounter::default();
     let mut first = true;
-    let mut cursor = cfg.time_filter.cursor();
+    let mut cursor = cfg.time_filter.native_cursor();
     walk_items(file, &cfg.selection.clone(), |item| {
         // `samples` しか持たない形式なので、イベントは起動区間の番号にだけ効かせる。
         let view = match item {

@@ -2537,7 +2537,7 @@ fn opaque_fixture(generation: Generation, abi: FixtureAbi) -> OldFile {
 ///
 /// 本家 `sadf -c` は未知 ID で `exit(1)` するが (§5.15)、reSARch は素通しにして変換を続ける
 /// (`src/convert/mod.rs` の「本家と意図的に違えた点」)。`file_activity` も旧申告値
-/// (magic / size / nr / nr2) のまま書き、件数は前置しない。
+/// (magic / size / nr / nr2) のまま書き、0x2173 だけは可変件数を前置する。
 #[test]
 fn unrecognised_activities_are_passed_through_byte_for_byte() {
     for (generation, abi) in old_generations() {
@@ -2572,7 +2572,7 @@ fn unrecognised_activities_are_passed_through_byte_for_byte() {
                 magic: 0x8a,
                 nr: 2,
                 nr2: 2,
-                has_nr: false,
+                has_nr: generation == Generation::G2173,
                 size: 24,
                 types_nr: [0, 0, 0],
             },
@@ -2585,7 +2585,7 @@ fn unrecognised_activities_are_passed_through_byte_for_byte() {
                 magic: 0xff,
                 nr: 1,
                 nr2: 1,
-                has_nr: false,
+                has_nr: generation == Generation::G2173,
                 size: 32,
                 types_nr: [0, 0, 0],
             },
@@ -2595,7 +2595,11 @@ fn unrecognised_activities_are_passed_through_byte_for_byte() {
         assert_current_activity(&o, 11, 2, 1, &who);
 
         for (r, (unknown_seed, pcsw_seed)) in o.stats().iter().zip([(0xa5, 0x5a), (0x3c, 0xc3)]) {
-            assert_eq!(r.slice(200).count, None, "{who}: 件数を前置しない");
+            assert_eq!(
+                r.slice(200).count,
+                (generation == Generation::G2173).then_some(2),
+                "{who}: 件数の前置は世代に従う"
+            );
             assert_eq!(
                 r.slice(200).items.concat(),
                 pattern(24 * 4, unknown_seed),
@@ -2695,6 +2699,63 @@ fn volatile(id: u32, nr: i32) -> ActivitySpec {
         has_nr: false,
         size: 0,
         types_nr: [0, 0, 0],
+    }
+}
+
+/// 未知 ID・未知 magic の件数変更でも、変換後の境界とバイト列を保つ。
+#[test]
+fn opaque_activities_keep_restart_item_counts() {
+    for abi in FixtureAbi::ALL {
+        for (id, magic) in [(200, 0x8a), (1, 0x99)] {
+            for (before, after) in [(2, 2), (2, 3), (3, 1)] {
+                let (acts, first, second, restart) = if id == 200 {
+                    (
+                        vec![old_act(1, 0x8a, 160, 2), old_act(id, magic, 24, before)],
+                        vec![vec![0; 320], pattern(before as usize * 24, 0x5a)],
+                        vec![vec![0; 320], pattern(after as usize * 24, 0xa5)],
+                        vec![volatile(1, 2), volatile(id, after)],
+                    )
+                } else {
+                    (
+                        vec![old_act(id, magic, 24, before)],
+                        vec![pattern(before as usize * 24, 0x5a)],
+                        vec![pattern(after as usize * 24, 0xa5)],
+                        vec![volatile(id, after)],
+                    )
+                };
+                let input = OldFile::new(Generation::G2173, abi, acts)
+                    .stats(first)
+                    .restart(restart)
+                    .stats(second);
+                let who = format!("opaque-restart-{id}-{before}-{after}/{}", input.label());
+                let (_, out, _) = convert_fixture(&who, input.bytes());
+                reopen_exact(&who, out.clone());
+                let output = walk_output(&out, abi);
+                assert!(output.activity(id).has_nr);
+                for (record, nr, seed) in [(0, before, 0x5a), (1, after, 0xa5)] {
+                    let stats = output.stats();
+                    let slice = stats[record].slice(id);
+                    assert_eq!(slice.count, Some(nr as u32));
+                    assert_eq!(slice.items.concat(), pattern(nr as usize * 24, seed));
+                }
+            }
+        }
+    }
+}
+
+/// CPU 数が分からない RESTART は現行形式の正当なペイロードに変換できない。
+#[test]
+fn a_restart_without_a_known_cpu_count_is_rejected() {
+    for abi in FixtureAbi::ALL {
+        let input = OldFile::new(Generation::G2173, abi, vec![old_act(200, 0x8a, 24, 2)])
+            .stats(vec![pattern(48, 1)])
+            .restart(vec![volatile(200, 3)])
+            .stats(vec![pattern(72, 2)]);
+        let file = SaFile::from_bytes("no-cpu-restart", input.bytes()).unwrap();
+        let mut out = Vec::new();
+        let err =
+            re_sar_ch::convert::convert(&file, &ConvertOptions::default(), &mut out).unwrap_err();
+        assert!(err.to_string().contains("CPU 数"));
     }
 }
 

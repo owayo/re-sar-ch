@@ -1502,6 +1502,7 @@ fn disk_derived(
                 curr,
                 [disk_col::RKB, disk_col::WKB, disk_col::DKB],
                 SumWidth::Bits64,
+                policy,
             )?;
             Ok(sect / d_ios / 2.0)
         }
@@ -1517,6 +1518,7 @@ fn disk_derived(
                     MissingPolicy::Compat => SumWidth::Bits32,
                     MissingPolicy::Strict => SumWidth::Bits64,
                 },
+                policy,
             )?;
             Ok(ticks / d_ios)
         }
@@ -1558,21 +1560,32 @@ enum SumWidth {
 /// 一方 [`MissingPolicy::Strict`] (独自出力・集計) では折り返しを再現しない。
 /// 「本家がそう出す」ことと「その値が正しい」ことは別で、
 /// 折り返した分子は待ち時間として意味を持たないため、
-/// 独自出力では 64bit で足して実際の合計を保つ。
+/// 独自出力では説明できない逆行を拒否し、u128 で実際の合計を保つ。
 fn disk_sum_delta(
     plan: &DecodePlan,
     prev: &ItemSnapshot,
     curr: &ItemSnapshot,
     cols: [usize; 3],
     width: SumWidth,
+    policy: MissingPolicy,
 ) -> Result<f64, ComputeIssue> {
     let mut acc: u64 = 0;
+    let mut strict_acc: u128 = 0;
     for c in cols {
         // 欠落は加算項なので 0 でよい (discard 統計を持たない世代の `dc_ticks`)。
         // 本家も 0 埋めした構造体で足している (03 §1.9-1)。
         let p = raw_or_zero(plan, prev, c)?;
         let n = raw_or_zero(plan, curr, c)?;
-        let d = wrapping_delta(p, n, counter_bits(plan, c));
+        let bits = counter_bits(plan, c);
+        if policy == MissingPolicy::Strict {
+            let d = match compute_delta(p, n, bits, DeltaContext::default()) {
+                Delta::Valid(d) | Delta::Wrapped(d) => d,
+                Delta::Unavailable(reason) => return Err(ComputeIssue::Discontinuous(reason)),
+            };
+            strict_acc += u128::from(d);
+            continue;
+        }
+        let d = wrapping_delta(p, n, bits);
         acc = match width {
             // `unsigned int` の加算 = mod 2^32
             SumWidth::Bits32 => u64::from((acc as u32).wrapping_add(d as u32)),
@@ -1580,7 +1593,10 @@ fn disk_sum_delta(
         };
     }
     // f64 化は加算を終えた後。先に f64 にすると折り返しが再現できない。
-    Ok(acc as f64)
+    Ok(match policy {
+        MissingPolicy::Compat => acc as f64,
+        MissingPolicy::Strict => strict_acc as f64,
+    })
 }
 
 /// `A_FS` の派生列。`f_*` はバイト単位のゲージ (03 §id=37)。
@@ -4152,6 +4168,85 @@ mod tests {
             compute(ActivityId::DISK, disk_col::AWAIT, &plan, &p, &c, &ctx).unwrap(),
             4.0,
             "40 ms / 10 I/O"
+        );
+    }
+
+    #[test]
+    fn strict_disk_derived_rejects_a_decreasing_sector_counter() {
+        let plan = plan_for(ActivityId::DISK);
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, disk_col::TPS, 100);
+        put(&plan, &mut c, disk_col::TPS, 101);
+        put(&plan, &mut p, disk_col::RKB, 100);
+        put(&plan, &mut c, disk_col::RKB, 50);
+        assert_eq!(
+            disk_derived(
+                disk_col::AREQ_SZ,
+                &plan,
+                &p,
+                &c,
+                &ComputeContext::new(100),
+                MissingPolicy::Strict
+            ),
+            Err(ComputeIssue::Discontinuous(
+                Discontinuity::AmbiguousDecrease
+            ))
+        );
+        assert!(
+            disk_derived(
+                disk_col::AREQ_SZ,
+                &plan,
+                &p,
+                &c,
+                &ComputeContext::new(100),
+                MissingPolicy::Compat
+            )
+            .unwrap()
+                > 1e18
+        );
+    }
+
+    #[test]
+    fn strict_disk_sector_sum_does_not_wrap_at_u64_max() {
+        let plan = plan_for(ActivityId::DISK);
+        let p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut c, disk_col::TPS, 1);
+        put(&plan, &mut c, disk_col::RKB, 1_u64 << 63);
+        put(&plan, &mut c, disk_col::WKB, 1_u64 << 63);
+        let ctx = ComputeContext::new(100);
+        assert_eq!(
+            disk_derived(
+                disk_col::AREQ_SZ,
+                &plan,
+                &p,
+                &c,
+                &ctx,
+                MissingPolicy::Strict
+            ),
+            Ok((1_u64 << 63) as f64)
+        );
+        assert_eq!(
+            disk_derived(
+                disk_col::AREQ_SZ,
+                &plan,
+                &p,
+                &c,
+                &ctx,
+                MissingPolicy::Compat
+            ),
+            Ok(0.0)
+        );
+        // 同じ派生経路でも、生成元の32bit幅で説明できるラップは採用する。
+        let mut p = zeros(&plan);
+        let mut c = zeros(&plan);
+        put(&plan, &mut p, disk_col::RD_TICKS, u32::MAX as u64 - 5);
+        put(&plan, &mut c, disk_col::RD_TICKS, 4);
+        put(&plan, &mut c, disk_col::TPS, 10);
+        assert_eq!(
+            disk_derived(disk_col::AWAIT, &plan, &p, &c, &ctx, MissingPolicy::Strict),
+            Ok(1.0)
         );
     }
 

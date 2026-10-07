@@ -1060,6 +1060,21 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
     let (x_origin, x_bounds) = (plots[0].view.x_origin, plots[0].view.x_bounds);
     let views: Vec<&graph::GraphView> = plots.iter().map(|p| &p.view).collect();
     let y_bounds = graph::merged_y_bounds(&views);
+    let scale = graph::plot_scale(y_bounds);
+    let plot_bounds = y_bounds.map(|y| y / scale);
+    type PlotSegments = Vec<Vec<(f64, f64)>>;
+    let scaled_segments: Option<Vec<PlotSegments>> = (scale != 1.0).then(|| {
+        plots
+            .iter()
+            .map(|p| {
+                p.view
+                    .segments
+                    .iter()
+                    .map(|seg| seg.iter().map(|(x, y)| (*x, *y / scale)).collect())
+                    .collect()
+            })
+            .collect()
+    });
 
     // 表で選んでいる時刻に縦線を立てる。表とグラフが同じ時刻を指していることを
     // 見せるため。**値が欠測の時刻でも線は立つ** (1 点の散布では消えてしまう)。
@@ -1068,8 +1083,8 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         .selected()
         .and_then(|i| app.samples.get(i))
         .map(|s| {
-            let x = (s.end_epoch as f64) - (x_origin as f64);
-            [(x, y_bounds[0]), (x, y_bounds[1])]
+            let x = s.end_epoch.saturating_sub(x_origin) as f64;
+            [(x, plot_bounds[0]), (x, plot_bounds[1])]
         });
 
     let segments: usize = plots.iter().map(|p| p.view.segments.len()).sum();
@@ -1086,8 +1101,9 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     // 後に描いたものが上に乗るので、凡例の先頭 (読み取ってほしい系列) を最後に描く。
-    for p in plots.iter().rev() {
-        for seg in &p.view.segments {
+    for (i, p) in plots.iter().enumerate().rev() {
+        let segs = scaled_segments.as_ref().map_or(&p.view.segments, |s| &s[i]);
+        for seg in segs {
             datasets.push(
                 Dataset::default()
                     .graph_type(GraphType::Line)
@@ -1153,7 +1169,7 @@ fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
         .y_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
-                .bounds(y_bounds)
+                .bounds(plot_bounds)
                 .labels(y_labels),
         );
     f.render_widget(chart, area);
@@ -1550,7 +1566,9 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|s| s.chars().count() as u16)
         .max()
         .unwrap_or(10)
-        .clamp(20, area.width.saturating_sub(4));
+        // 狭い端末では希望の最小幅よりも、実際に使える幅を優先する。
+        .max(20)
+        .min(area.width.saturating_sub(4));
     let r = centered(area, w + 4, h);
     f.render_widget(Clear, r);
     let list = List::new(
@@ -1636,7 +1654,8 @@ fn draw_column_picker(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|s| s.chars().count() as u16 + 22)
         .max()
         .unwrap_or(24)
-        .clamp(30, area.width.saturating_sub(4));
+        .max(30)
+        .min(area.width.saturating_sub(4));
     let r = centered(area, w, h);
     f.render_widget(Clear, r);
     let list = List::new(rows)
@@ -1936,6 +1955,32 @@ mod tests {
     fn shows(screen: &str, needle: &str) -> bool {
         let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
         strip(screen).contains(&strip(needle))
+    }
+
+    /// item 選択を開いたまま、最小幅より狭い端末へ縮めても描画を続ける。
+    #[test]
+    fn item_picker_survives_terminal_shrinking() {
+        let mut app = app_with(&[Some(1.0)], &[]);
+        on_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        for (width, height) in [(23, 20), (0, 0), (1, 1), (24, 20), (80, 20)] {
+            render(&mut app, width, height);
+        }
+        assert!(shows(&render(&mut app, 80, 20), "item"));
+        on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// 列選択も、幅 34 未満・枠すら入らない画面から再び広げられる。
+    #[test]
+    fn column_picker_survives_terminal_shrinking() {
+        let mut app = app_with(&[Some(1.0)], &[]);
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        for (width, height) in [(33, 20), (0, 0), (1, 1), (34, 20), (80, 20)] {
+            render(&mut app, width, height);
+        }
+        assert!(shows(&render(&mut app, 80, 20), "user"));
+        on_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     /// 広い端末では既定でグラフが出て、選択中の系列を名指しする。

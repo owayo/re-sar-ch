@@ -78,6 +78,8 @@ resarch tui sa01 --activity cpu,disk,memory   # open with a narrowed set
 
 Recorded activities become tabs; pick an item and read its time series as a table with a graph above it.
 
+Item (`i`) and column (`c`) pickers stay within the terminal when it shrinks; widen it to read clipped labels. Large finite graph values use scaled coordinates and scientific axis labels in the original units.
+
 The screen looks roughly like this (the TUI's labels are in Japanese; column positions and values are illustrative):
 
 ```text
@@ -249,3 +251,5 @@ resarch sadf -c sa01 -O hz=250 > out       # override the assumed HZ
 ```
 
 Old headers do not record the tick frequency. reSARch uses **USER_HZ=100** by default, matching Linux on common architectures and the direct-reading path. This is the unit of `/proc/stat`, independent of the kernel's `CONFIG_HZ`. Only `-O hz=` overrides it for an input with a known different tick frequency; wall-clock gaps and suspend never change it. The chosen value and its source are reported on stderr.
+
+An explicit HZ must fit `1..=4294967295`; larger values are rejected instead of truncated, and `hz=0` keeps the default. Unknown activities keep their original item bytes. In 0x2173 files, per-record counts preserve changes across restarts. A restart without a known positive CPU count cannot be represented in the current format and is rejected.

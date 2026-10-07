@@ -1144,6 +1144,12 @@ flowchart TD
 
 **リストの並び替えは行われない。** 旧リストの順序のまま 1:1 で出力する。
 
+reSARch が素通しする未知 ID・未知 magic では、magic・size・nr・nr2 と item の
+バイト列を保持する。ただし 0x2173 は RESTART で件数が変わるため、`has_nr=1` として
+各統計レコードに件数を前置する。0x2171 は固定件数なので `has_nr=0` のまま。
+件数を前置しない計画で申告件数とレコード件数が異なる場合は、壊れた出力を作らず拒否する。
+CPU activity が無い入力でも統計は変換できるが、正の CPU 数が不明な RESTART は拒否する。
+
 制約:
 - **旧ファイル内に現行実装が知らない activity id があると `sadf -c` は異常終了する**。
   ヘッダ解析 (`upgrade_header_section`) は `RESUME_IF_NOT_FOUND` で未知 id を黙って無視するのに、

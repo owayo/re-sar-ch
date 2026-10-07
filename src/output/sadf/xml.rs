@@ -458,6 +458,12 @@ fn esc(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            c if !matches!(c, '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}') => {
+                out.push('\u{fffd}')
+            }
             c => out.push(c),
         }
     }
@@ -478,6 +484,12 @@ mod tests {
     #[test]
     fn escaping_protects_the_document() {
         assert_eq!(esc("a<b&c\""), "a&lt;b&amp;c&quot;");
+    }
+
+    #[test]
+    fn escaping_replaces_xml_forbidden_characters() {
+        assert_eq!(esc("test\u{1}\u{fffe}\u{ffff}host"), "test���host");
+        assert_eq!(esc("\t\n\r日本語😀"), "&#9;&#10;&#13;日本語😀");
     }
 
     /// `<memory>` / `<hugepages>` は `unit="kB"` を持つ (§10.5)。

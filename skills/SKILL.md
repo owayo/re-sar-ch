@@ -223,6 +223,7 @@ Native output reports why a value is unavailable.
 |---|---|
 | `unsupported_by_source` | **The source generation has no such field.** This is not zero. |
 | `missing_in_sample` | The field exists, but its value is unavailable in this record. |
+| `not_finite` | A sensor or computed value is NaN or infinity. Computed values are absent; raw strings remain available. |
 | Discontinuity (`restart` / `item_replaced` / ...) | No valid delta can be computed, so no rate was calculated. |
 | Discontinuity (`non_positive_elapsed`) | Elapsed time is not positive; counter rates are unavailable while instantaneous gauges remain available. |
 
@@ -273,6 +274,10 @@ so the reasoning can be reconstructed later.
 
 `compare` uses the **intersection** of the hosts' observation windows.
 Never treat a window without observations from one host as zero.
+
+An instantaneous gauge with zero elapsed time can contribute to sample-weighted
+statistics, but contributes no duration or time weight. It breaks sustained
+runs and is not an observed interval in host-comparison buckets.
 
 ## sar / sadf compatibility output
 

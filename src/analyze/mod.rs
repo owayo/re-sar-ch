@@ -26,6 +26,7 @@
 //! ```
 
 pub mod assessment;
+pub(crate) mod mean;
 pub mod metric_catalog;
 pub mod percentile;
 pub mod rules;

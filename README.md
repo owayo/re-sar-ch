@@ -184,6 +184,8 @@ The screenshot predates two changes: the quit key is now `Esc` rather than `q`, 
 
 With `tui --lenient`, a truncated input retains complete samples, shows an incomplete-input notice, and exits nonzero. Native counter rates with no positive elapsed time remain absent with `non_positive_elapsed` quality; instantaneous gauges remain available.
 
+Item and column pickers fit the current terminal size, including while resizing. Extreme finite values use scaled plotting coordinates and axis labels in the original units. Native output marks NaN and infinity as `not_finite`; computed values are absent, while raw strings remain available.
+
 ### Commands
 
 | Task | Command |

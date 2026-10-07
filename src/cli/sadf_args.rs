@@ -413,7 +413,13 @@ fn parse_sadf_o_opt(value: &str, out: &mut SadfOutputOptions) -> Result<(), Sadf
                             value: token.to_string(),
                         });
                     }
-                    out.user_hz = Some(sar_args::atol(v) as u32);
+                    out.user_hz =
+                        Some(
+                            v.parse::<u32>()
+                                .map_err(|_| SadfArgError::InvalidOutputOption {
+                                    value: token.to_string(),
+                                })?,
+                        );
                 } else if let Some(v) = token.strip_prefix("pcparchive=") {
                     // 数字チェックなし。空文字も許される。
                     out.pcp_archive = Some(v.to_string());
@@ -942,6 +948,20 @@ mod tests {
             Some(""),
             "pcparchive= は空文字も許される (数字チェックなし)"
         );
+    }
+
+    #[test]
+    fn output_option_hz_never_truncates_high_bits() {
+        assert_eq!(
+            parse(&["-c", "-O", "hz=4294967295", "sa01"]).output.user_hz,
+            Some(u32::MAX)
+        );
+        for value in ["hz=4294967296", "hz=4294967396", "hz=99999999999999999999"] {
+            assert!(matches!(
+                parse_err(&["-c", "-O", value, "sa01"]),
+                SadfArgError::InvalidOutputOption { .. }
+            ));
+        }
     }
 
     #[test]

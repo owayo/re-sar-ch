@@ -1350,18 +1350,24 @@ pub fn align_to_window(
     for i in 0..window.bucket_count() {
         let b0 = window.start_ust + i as u64 * window.step_secs;
         let b1 = b0.saturating_add(window.step_secs).min(window.end_ust);
-        let mut weighted = 0.0f64;
+        let mut weighted = crate::analyze::mean::WeightedMean::default();
         let mut weight = 0u64;
 
         for p in &timeline.points {
+            if p.elapsed_cs == 0 || p.reason.is_some() {
+                continue;
+            }
             let Some(v) = p.value else { continue };
+            if !v.is_finite() {
+                continue;
+            }
             let lo = p.start_ust.max(b0);
             let hi = p.end_ust.min(b1);
             if hi <= lo {
                 continue;
             }
             let w = hi - lo;
-            weighted += v * w as f64;
+            weighted.push(v, w);
             weight += w;
         }
 
@@ -1369,7 +1375,7 @@ pub fn align_to_window(
             Bucket {
                 start_ust: b0,
                 end_ust: b1,
-                value: Some(weighted / weight as f64),
+                value: weighted.value(),
                 source: BucketSource::Observed,
                 covered_secs: weight,
             }
@@ -1440,7 +1446,10 @@ fn fill_bucket(
             // 区間の中点で線形補間する
             let mid = b0 + (b1 - b0) / 2;
             let t = (mid.saturating_sub(a.end_ust)) as f64 / gap as f64;
-            Some((va + (vb - va) * t, BucketSource::Interpolated))
+            Some((
+                crate::analyze::mean::blend(va, vb, t),
+                BucketSource::Interpolated,
+            ))
         }
     }
 }
@@ -2403,6 +2412,23 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].value, Some(50.0));
         assert_eq!(b[0].covered_secs, 100);
+    }
+
+    #[test]
+    fn zero_elapsed_gauge_is_not_a_time_weighted_observation() {
+        let mut t = gauge_timeline(&[(60, 61, Some(100.0))]);
+        t.points[0].elapsed_cs = 0;
+        let b = align_to_window(&t, ComparisonWindow::new(60, 61, 1), GaugeFill::None);
+        assert_eq!(b[0].source, BucketSource::NoObservation);
+        assert_eq!(b[0].covered_secs, 0);
+        assert_eq!(b[0].value, None);
+    }
+
+    #[test]
+    fn extreme_finite_bucket_values_keep_a_finite_mean() {
+        let t = gauge_timeline(&[(0, 50, Some(f64::MAX)), (50, 100, Some(f64::MAX))]);
+        let b = align_to_window(&t, ComparisonWindow::new(0, 100, 100), GaugeFill::None);
+        assert_eq!(b[0].value, Some(f64::MAX));
     }
 
     /// 比較できる区間数は「全ホストに値がある区間」だけを数える。

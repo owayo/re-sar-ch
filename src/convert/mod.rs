@@ -261,7 +261,7 @@ pub fn convert(
     // --- activity ごとの変換計画 ---
     let mut plans: Vec<ActivityPlan> = Vec::with_capacity(file.activities().len());
     for a in file.activities() {
-        let plan = ActivityPlan::build(
+        let mut plan = ActivityPlan::build(
             a.id,
             (a.magic != 0).then_some(a.magic),
             a.size as usize,
@@ -270,6 +270,11 @@ pub fn convert(
             &enc,
         )?;
         if !plan.known {
+            // RESTART 後に件数が変わる世代では、未知の構造でも件数を前置する。
+            plan.has_nr = matches!(
+                file.spec().restart_payload,
+                crate::format::registry::RestartPayload::VolatileActivityList
+            );
             report.opaque_activities.push(a.id);
         }
         plans.push(plan);
@@ -319,6 +324,11 @@ pub fn convert(
         src: &src,
         dst: &dst,
         plans: &plans,
+        declared_nr: file
+            .activities()
+            .iter()
+            .map(|a| a.nr.max(0) as u32)
+            .collect(),
         hz,
         // `0x2173` の RESTART が A_CPU を含まない場合に備えて現在値を持ち回る
         // (本家も file_hdr.sa_cpu_nr を更新しながら使う)。
@@ -621,7 +631,7 @@ fn write_file_activities<W: Write>(
             // 素通し: 旧申告値をそのまま保つ。
             put(&mut w, "magic", a.magic as i64)?;
             put(&mut w, "size", a.size as i64)?;
-            put(&mut w, "has_nr", 0)?;
+            put(&mut w, "has_nr", i64::from(plan.has_nr))?;
         }
         // `A_IRQ` は 1 次元 → 2 次元行列になったため nr / nr2 を入れ替える (§5.5)。
         let (nr, nr2) = if plan.swapped_dimensions {
@@ -647,6 +657,8 @@ struct RecordCtx<'a> {
     src: &'a SourceLayouts,
     dst: &'a TargetLayouts,
     plans: &'a [ActivityPlan],
+    /// 件数を前置しない activity の、ヘッダで申告した固定件数。
+    declared_nr: Vec<u32>,
     hz: u64,
     /// RESTART で更新される CPU 数。
     cpu_state: u32,
@@ -717,6 +729,11 @@ fn write_record<W: Write>(
             if let Some(n) = rec.cpu_count {
                 ctx.cpu_state = n;
             }
+            if ctx.cpu_state == 0 {
+                return Err(Error::Other(
+                    "RESTART の正の CPU 数が不明なため現行形式へ変換できない".to_string(),
+                ));
+            }
             let mut buf = [0u8; NR_T_SIZE];
             let mut w = WriteCursor::new(&mut buf, endian);
             let _ = w.put_u32(0, ctx.cpu_state);
@@ -751,6 +768,13 @@ fn write_stats_payload<W: Write>(
         // (1) 書き出す件数を決める (§5.9)
         let count = plan.count(cur, slice.offset, slice.nr);
         let out_count = if plan.swapped_dimensions { 1 } else { count };
+        if !plan.has_nr && out_count != ctx.declared_nr[slice.index] {
+            return Err(Error::Other(format!(
+                "{}: 固定件数 {} とレコードの件数 {out_count} が一致しない",
+                plan.id.display_name(),
+                ctx.declared_nr[slice.index]
+            )));
+        }
 
         // (2) `has_nr` が真なら `__nr_t` を前置する
         if plan.has_nr {

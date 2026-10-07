@@ -47,6 +47,7 @@ use crate::series::snapshot::{
     ActivitySnapshot, IntervalView, ItemSnapshot, Selection, WalkItem, walk_items,
 };
 
+use super::mean::WeightedMean;
 use super::percentile::{PercentileResult, PercentileSpec, PercentileUnavailable, WeightedSamples};
 use super::timeline::{ExclusionReason, MetricKey, MetricPoint, SINGLE_ITEM, Timelines};
 
@@ -350,12 +351,9 @@ struct ColumnAccum {
     min: Option<Extremum>,
     delta_total: u128,
     denom_total: u128,
-    /// 区間値の単純合計 (標本平均用)。
-    value_sum: f64,
-    /// 区間値 × 区間長 の合計 (時間加重平均用)。
-    weighted_sum: f64,
-    /// 区間長の合計 (時間加重平均の分母)。
-    weight_sum: f64,
+    /// 標本平均と時間加重平均を別々に蓄積する。
+    sample_mean: WeightedMean,
+    time_mean: WeightedMean,
     intervals: u64,
     wrapped: u64,
     last: Option<f64>,
@@ -398,9 +396,8 @@ impl ColumnAccum {
             min: None,
             delta_total: 0,
             denom_total: 0,
-            value_sum: 0.0,
-            weighted_sum: 0.0,
-            weight_sum: 0.0,
+            sample_mean: WeightedMean::default(),
+            time_mean: WeightedMean::default(),
             intervals: 0,
             wrapped: 0,
             last: None,
@@ -439,9 +436,8 @@ impl ColumnAccum {
         if self.min.is_none_or(|m| value < m.value) {
             self.min = Some(ex);
         }
-        self.value_sum += value;
-        self.weighted_sum += value * weight_cs as f64;
-        self.weight_sum += weight_cs as f64;
+        self.sample_mean.push(value, 1);
+        self.time_mean.push(value, weight_cs);
         self.last = Some(value);
         self.pct.push(value, weight_cs);
     }
@@ -470,19 +466,13 @@ impl ColumnAccum {
                 Some(self.delta_total as f64)
             }
             AggregationMethod::LastValid => self.last,
-            AggregationMethod::TimeWeightedMean => {
-                if self.weight_sum > 0.0 {
-                    Some(self.weighted_sum / self.weight_sum)
-                } else {
-                    None
-                }
-            }
+            AggregationMethod::TimeWeightedMean => self.time_mean.value(),
             AggregationMethod::SampleMean | AggregationMethod::DerivedIntervalSampleMean => {
                 if self.intervals == 0 {
                     return None;
                 }
                 // 標本平均は 1 区間 = 重み 1。時間加重とは別の合計を使う。
-                Some(self.value_sum / self.intervals as f64)
+                self.sample_mean.value()
             }
             AggregationMethod::NotAggregated => None,
         }
@@ -1689,6 +1679,36 @@ mod tests {
         let c = s.column(id, SINGLE_ITEM, "kbmemfree").expect("列");
         assert_eq!(c.method, AggregationMethod::SampleMean);
         assert_eq!(c.mean, Some(100.0), "(100 + 200 + 0) / 3");
+    }
+
+    #[test]
+    fn finite_sensor_extremes_do_not_overflow_the_mean() {
+        let id = ActivityId::PWR_TEMP;
+        let plan = plan_for(id);
+        for mode in [GaugeMeanMode::Sample, GaugeMeanMode::TimeWeighted] {
+            let mut opts = opts_all();
+            opts.gauge_mean = mode;
+            let mut f = Feed::new(id, opts);
+            for (epoch, uptime) in [(0, 100), (10, 1100), (20, 2100)] {
+                f.push(
+                    snapshot(
+                        id,
+                        epoch,
+                        uptime,
+                        vec![item_of(&plan, &[("temp", f64::MAX.to_bits())])],
+                    ),
+                    true,
+                );
+            }
+            let s = f.finish();
+            let c = s.activities[0].items[0]
+                .columns
+                .iter()
+                .find(|c| c.column == "temp_celsius")
+                .unwrap();
+            assert_eq!(c.mean, Some(f64::MAX), "{mode:?}");
+            assert_eq!(c.intervals, 3);
+        }
     }
 
     /// 時間加重を選ぶと区間長で重み付けされる。

@@ -156,6 +156,8 @@ pub enum Quality {
     NeedsItemGroup,
     /// 計算式が未実装 (**0 とは違う**)。
     NotImplemented,
+    /// センサ値や計算結果が NaN または無限大。
+    NotFinite,
 }
 
 impl Quality {
@@ -189,6 +191,7 @@ impl Quality {
             Quality::NotNumeric => "not_numeric",
             Quality::NeedsItemGroup => "needs_item_group",
             Quality::NotImplemented => "not_implemented",
+            Quality::NotFinite => "not_finite",
         }
     }
 }
@@ -376,7 +379,15 @@ fn raw_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
     }
     let (raw, quality) = match item.raw_curr(index) {
         Availability::Present(v) if is_double_field(col) => {
-            (Some(format!("{:.6}", f64::from_bits(v))), Quality::Ok)
+            let value = f64::from_bits(v);
+            (
+                Some(format!("{value:.6}")),
+                if value.is_finite() {
+                    Quality::Ok
+                } else {
+                    Quality::NotFinite
+                },
+            )
         }
         Availability::Present(v) => (Some(v.to_string()), Quality::Ok),
         Availability::UnsupportedBySource => (None, Quality::UnsupportedBySource),
@@ -405,7 +416,8 @@ fn rate_field(col: &ColumnMeta, item: &ItemPair<'_>, index: usize) -> FieldOut {
     }
     // 独自出力は欠落を代替で埋めない (互換出力だけが本家の代替規則に従う)
     let (value, quality) = match item.computed_strict(index) {
-        Ok(v) => (Some(v), Quality::Ok),
+        Ok(v) if v.is_finite() => (Some(v), Quality::Ok),
+        Ok(_) => (None, Quality::NotFinite),
         Err(e) => (None, Quality::from_issue(e)),
     };
     FieldOut {
@@ -719,6 +731,68 @@ mod tests {
             .find(|c| c.public_name == "user")
             .unwrap();
         assert!(!is_double_field(user), "CPU tick は整数");
+    }
+
+    #[test]
+    fn non_finite_sensor_values_are_not_marked_ok() {
+        use crate::format::abi::{Endian, LayoutAbi, SourceEncoding};
+        use crate::layout::plan::DecodePlan;
+        use crate::series::snapshot::{ActivitySnapshot, ItemSnapshot};
+        let def = crate::layout::registry::lookup(ActivityId::PWR_TEMP).unwrap();
+        let rev = def.latest().unwrap();
+        let enc = SourceEncoding::new(Endian::Little, LayoutAbi::LP64);
+        let plan = DecodePlan::build(def, rev, rev.size_lp64, 1, 1, &enc).unwrap();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 25.0] {
+            let current = ActivitySnapshot {
+                id: def.id,
+                index: 0,
+                nr: 1,
+                nr2: 1,
+                items: vec![ItemSnapshot {
+                    key: None,
+                    texts: Vec::new(),
+                    values: plan
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            Availability::Present(if f.name == "temp" {
+                                value.to_bits()
+                            } else {
+                                0
+                            })
+                        })
+                        .collect(),
+                }],
+            };
+            let pair = ActivityPair {
+                id: def.id,
+                def,
+                plan: &plan,
+                curr: &current,
+                prev: None,
+                itv_cs: 0,
+                has_prev: false,
+                continuous: true,
+            };
+            let item = &pair.output_items()[0];
+            let col = &def.columns[1];
+            let raw = raw_field(col, item, 1);
+            let rate = rate_field(col, item, 1);
+            let quality = if value.is_finite() {
+                Quality::Ok
+            } else {
+                Quality::NotFinite
+            };
+            assert_eq!(raw.quality, quality);
+            assert!(raw.raw.is_some());
+            assert_eq!(rate.quality, quality);
+            assert_eq!(rate.value, value.is_finite().then_some(value));
+            let encoded = serde_json::to_value(&rate).unwrap();
+            assert_eq!(encoded["quality"], quality.label());
+            if !value.is_finite() {
+                assert!(encoded["value"].is_null());
+            }
+        }
     }
 
     /// 起動区間は RESTART ごとに 1 増える。

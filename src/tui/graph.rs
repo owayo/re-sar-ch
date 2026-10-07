@@ -175,7 +175,7 @@ impl GraphView {
             }
             match field.and_then(|f| f.value.filter(|v| v.is_finite()).map(|v| (f, v))) {
                 Some((_, v)) => {
-                    let x = (s.end_epoch as f64) - (origin as f64);
+                    let x = s.end_epoch.saturating_sub(origin) as f64;
                     current.push((x, v));
                     plotted += 1;
                 }
@@ -246,7 +246,7 @@ impl GraphView {
         (0..n)
             .map(|i| {
                 let offset = span * (i as f64) / ((n - 1) as f64);
-                let at = self.x_origin + offset as u64;
+                let at = self.x_origin.saturating_add(offset as u64);
                 let t = tz.time(at);
                 if minutes_only {
                     // `HH:MM:SS` は ASCII なので、境界で切っても壊れない。
@@ -266,10 +266,16 @@ impl GraphView {
 
 /// Y 軸のラベル (下端・上端)。
 pub fn axis_labels(bounds: [f64; 2]) -> Vec<String> {
-    vec![
-        super::format_number(bounds[0]),
-        super::format_number(bounds[1]),
-    ]
+    bounds
+        .into_iter()
+        .map(|v| {
+            if v.abs() >= 1e12 {
+                format!("{v:.2e}")
+            } else {
+                super::format_number(v)
+            }
+        })
+        .collect()
 }
 
 /// 重ねて描く系列の Y 軸の範囲。
@@ -325,13 +331,25 @@ fn y_bounds_for(ys: impl Iterator<Item = f64>, unit: &str) -> [f64; 2] {
     let low = if min >= 0.0 { 0.0 } else { min };
     // 上端に余白を足す。最大値が天井に貼り付くと、そこが上限なのか
     // 切れているのか読めない。全部同じ値のときも幅を 0 にしない。
-    let span = (max - low).abs();
-    let pad = if span > 0.0 {
+    let span = max - low;
+    let pad = if !span.is_finite() {
+        max * 0.05 - low * 0.05
+    } else if span > 0.0 {
         span * 0.05
     } else {
         max.abs().max(1.0) * 0.05
     };
-    [low, max + pad]
+    [low, (max + pad).min(f64::MAX)]
+}
+
+/// 描画座標だけを縮尺変換する。目盛と観測値は元の単位のまま保持する。
+pub(super) fn plot_scale(bounds: [f64; 2]) -> f64 {
+    if (bounds[1] - bounds[0]).is_finite() && bounds.iter().all(|v| v.abs() <= f64::MAX / 65536.0) {
+        1.0
+    } else {
+        // 2 の冪による除算なので、極端な値の縮尺変換でも桁を余計に丸めない。
+        f64::from_bits((2045_u64) << 52)
+    }
 }
 
 /// 選択中の activity / item / 列に対応するフィールドを引く。
@@ -395,6 +413,37 @@ mod tests {
     }
 
     const T0: u64 = 1_767_225_600;
+
+    #[test]
+    fn extreme_epochs_keep_relative_seconds_and_do_not_wrap_labels() {
+        let samples = [
+            sample(u64::MAX - 1, true, Some(1.0), Quality::Ok),
+            sample(u64::MAX, true, Some(2.0), Quality::Ok),
+        ];
+        let view = GraphView::build(&samples, "A_CPU", "all", "user");
+        assert_eq!(view.segments[0], vec![(0.0, 1.0), (1.0, 2.0)]);
+        let one = GraphView::build(&samples[1..], "A_CPU", "all", "user");
+        let labels = one.x_labels(DisplayTz::Utc, 80);
+        assert!(labels.iter().all(|s| s == &DisplayTz::Utc.time(u64::MAX)));
+    }
+
+    #[test]
+    fn finite_extreme_values_keep_finite_axis_bounds() {
+        for values in [vec![f64::MAX], vec![-f64::MAX], vec![-f64::MAX, f64::MAX]] {
+            let bounds = y_bounds_for(values.iter().copied(), "degC");
+            assert!(bounds.iter().all(|v| v.is_finite()), "{bounds:?}");
+            assert!(values.iter().all(|v| bounds[0] <= *v && *v <= bounds[1]));
+            assert!(bounds[0] < bounds[1]);
+            let scale = plot_scale(bounds);
+            let scaled = bounds.map(|v| v / scale);
+            assert!((scaled[1] - scaled[0]).is_finite());
+            for v in &values {
+                let at = (*v / scale - scaled[0]) / (scaled[1] - scaled[0]);
+                assert!(at.is_finite() && (0.0..=1.0).contains(&at));
+            }
+            assert!(axis_labels(bounds).iter().all(|l| l.len() < 20));
+        }
+    }
 
     #[test]
     fn a_missing_sample_breaks_the_line_instead_of_plotting_zero() {

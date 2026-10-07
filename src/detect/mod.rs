@@ -906,24 +906,21 @@ impl DecisionEvidence {
     pub fn new(basis: DecisionBasis, observations: &[Observation]) -> Self {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
-        let mut weighted = 0.0;
-        let mut weight = 0.0;
-        let mut plain = 0.0;
+        let mut weighted = crate::analyze::mean::WeightedMean::default();
+        let mut plain = crate::analyze::mean::WeightedMean::default();
         for o in observations {
             min = min.min(o.value);
             max = max.max(o.value);
-            weighted += o.value * o.elapsed_cs as f64;
-            weight += o.elapsed_cs as f64;
-            plain += o.value;
+            weighted.push(o.value, o.elapsed_cs);
+            plain.push(o.value, 1);
         }
         let mean_basis = observations
             .first()
             .map_or(MeanBasis::PerSample, |o| o.origin.mean_basis());
         let mean = match mean_basis {
             // 区間長が取れない (全て 0) 場合は標本平均へ落とす
-            MeanBasis::TimeWeighted if weight > 0.0 => weighted / weight,
-            _ if observations.is_empty() => 0.0,
-            _ => plain / observations.len() as f64,
+            MeanBasis::TimeWeighted => weighted.value().or_else(|| plain.value()).unwrap_or(0.0),
+            _ => plain.value().unwrap_or(0.0),
         };
         Self {
             route: basis.route(),
@@ -1418,7 +1415,8 @@ pub fn median(values: &[f64]) -> Option<f64> {
     if n % 2 == 1 {
         Some(v[n / 2])
     } else {
-        Some((v[n / 2 - 1] + v[n / 2]) / 2.0)
+        // 先に足すと有限値でも桁あふれする。midpoint は極小値も失わない。
+        Some(v[n / 2 - 1].midpoint(v[n / 2]))
     }
 }
 
@@ -1909,6 +1907,22 @@ mod tests {
         assert_eq!(mad(&v, 3.0), Some(2.0));
         assert_eq!(median(&[] as &[f64]), None);
         assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
+    }
+
+    /// 有限な観測値の中点を、途中の加算で無限大にしてはいけない。
+    #[test]
+    fn median_keeps_extreme_finite_values_finite() {
+        assert_eq!(median(&[f64::MAX, f64::MAX]), Some(f64::MAX));
+        assert_eq!(median(&[-f64::MAX, -f64::MAX]), Some(-f64::MAX));
+        assert_eq!(median(&[-f64::MAX, f64::MAX]), Some(0.0));
+    }
+
+    /// 桁あふれ対策で各値を先に半分にすると、最小の非正規化数が消える。
+    #[test]
+    fn median_preserves_subnormal_values() {
+        let smallest = f64::from_bits(1);
+        assert_eq!(median(&[smallest, smallest]), Some(smallest));
+        assert_eq!(median(&[-smallest, -smallest]), Some(-smallest));
     }
 
     #[test]

@@ -193,8 +193,8 @@ impl WeightedSamples {
                 .then(a.1.cmp(&b.1))
         });
 
-        // 目標累積重み。q=0 のときも最小値が返るよう、比較は「以上」で行う。
-        let target = self.spec.quantile.clamp(0.0, 1.0) * self.total_weight as f64;
+        // 重みを f64 へ丸めず、宣言した分位の十進表記から整数順位を求める。
+        let target = quantile_rank(self.spec.quantile, self.total_weight);
         let mut acc: u128 = 0;
         let mut picked = sorted[0].0;
         for (v, w) in &sorted {
@@ -204,7 +204,7 @@ impl WeightedSamples {
             }
             acc += u128::from(*w);
             picked = *v;
-            if acc as f64 >= target {
+            if acc >= target {
                 break;
             }
         }
@@ -216,6 +216,41 @@ impl WeightedSamples {
             total_weight: u64::try_from(self.total_weight).unwrap_or(u64::MAX),
         })
     }
+}
+
+/// `ceil(q × total)`。q の最短十進表記を使い、p90 を 10 標本中の 9 番目にする。
+///
+/// u128 の重みと最大 17 桁の仮数の積は 192bit に収まる。3 桁の整数として
+/// 十進の小数点位置まで割り、捨てた剰余があれば順位を切り上げる。
+fn quantile_rank(q: f64, total: u128) -> u128 {
+    if q <= 0.0 {
+        return 1;
+    }
+    if q >= 1.0 || q.is_nan() {
+        return total;
+    }
+    let text = q.to_string();
+    let (mantissa, exponent) = text.split_once('e').map_or((text.as_str(), 0), |(m, e)| {
+        (m, e.parse::<i32>().expect("有限な分位の指数"))
+    });
+    let places = mantissa.split_once('.').map_or(0, |(_, f)| f.len() as i32) - exponent;
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mantissa = digits.parse::<u64>().expect("最短表記の仮数は 17 桁以内");
+    let low = u128::from(total as u64) * u128::from(mantissa);
+    let high = (total >> 64) * u128::from(mantissa) + (low >> 64);
+    let mut product = [low as u64, high as u64, (high >> 64) as u64];
+    let mut discarded = false;
+    for _ in 0..places {
+        let mut remainder = 0u128;
+        for limb in product.iter_mut().rev() {
+            let dividend = (remainder << 64) | u128::from(*limb);
+            *limb = (dividend / 10) as u64;
+            remainder = dividend % 10;
+        }
+        discarded |= remainder != 0;
+    }
+    let rank = (u128::from(product[1]) << 64) | u128::from(product[0]);
+    (rank + u128::from(discarded)).max(1)
 }
 
 #[cfg(test)]
@@ -340,6 +375,69 @@ mod tests {
         s.push(1.0, 0);
         s.push(2.0, 0);
         assert_eq!(s.quantile(), Err(PercentileUnavailable::ZeroWeight));
+    }
+
+    /// 浮動小数点に重みを丸めると、最後の重み 1 を取りこぼす。
+    #[test]
+    fn large_weights_do_not_move_the_quantile_rank() {
+        for (q, weights, expected) in [
+            (1.0, [1_u64 << 53, 1], 20.0),
+            (0.5, [1_u64 << 53, (1_u64 << 53) + 1], 20.0),
+            (0.5, [u64::MAX - 1, u64::MAX], 20.0),
+        ] {
+            let mut spec = time_weighted();
+            spec.quantile = q;
+            let mut s = WeightedSamples::new(spec);
+            s.push(10.0, weights[0]);
+            s.push(20.0, weights[1]);
+            assert_eq!(s.quantile().unwrap().value, expected);
+        }
+    }
+
+    #[test]
+    fn decimal_quantiles_keep_the_declared_rank() {
+        for (q, rank) in [(0.1, 1), (0.6, 6), (0.9, 9), (0.95, 10)] {
+            assert_eq!(quantile_rank(q, 10), rank);
+        }
+        assert_eq!(quantile_rank(0.5, u128::MAX), 1_u128 << 127);
+        assert_eq!(quantile_rank(f64::from_bits(1), u128::MAX), 1);
+    }
+
+    /// 分布の両端でも、重み 0 の値を最小値・最大値として採らない。
+    #[test]
+    fn endpoint_quantiles_ignore_zero_weight_observations() {
+        for (quantile, expected) in [(0.0, 10.0), (1.0, 20.0)] {
+            let mut spec = time_weighted();
+            spec.quantile = quantile;
+            let mut s = WeightedSamples::new(spec);
+            for (value, weight) in [(0.0, 0), (10.0, 100), (20.0, 100), (30.0, 0)] {
+                s.push(value, weight);
+            }
+            let result = s.quantile().unwrap();
+            assert_eq!(result.value, expected);
+            assert_eq!(result.total_weight, 200);
+        }
+    }
+
+    /// 上限ちょうどの有効標本は使え、非有限値は保持枠を消費しない。
+    #[test]
+    fn retention_limit_counts_only_accepted_observations() {
+        let mut spec = sample_weighted();
+        spec.algorithm = PercentileAlgorithm::ExactWeightedNearestRank { retention_cap: 2 };
+        let mut s = WeightedSamples::new(spec);
+        s.push(f64::NAN, 100);
+        s.push(10.0, 100);
+        s.push(f64::NEG_INFINITY, 100);
+        s.push(20.0, 100);
+        s.push(f64::INFINITY, 100);
+        assert_eq!(s.quantile().unwrap().value, 20.0);
+        assert_eq!(s.len(), 2);
+
+        s.push(30.0, 100);
+        assert_eq!(
+            s.quantile(),
+            Err(PercentileUnavailable::RetentionCapExceeded)
+        );
     }
 
     /// 宣言はそのまま結果に含まれる (再現可能性のため)。

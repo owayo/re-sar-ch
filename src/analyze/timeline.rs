@@ -288,8 +288,7 @@ struct RunBuilder {
     max: f64,
     min_at: u64,
     max_at: u64,
-    weighted_sum: f64,
-    weight: f64,
+    mean: super::mean::WeightedMean,
     open: bool,
 }
 
@@ -304,8 +303,7 @@ impl RunBuilder {
             self.max = v;
             self.min_at = p.end_ust;
             self.max_at = p.end_ust;
-            self.weighted_sum = 0.0;
-            self.weight = 0.0;
+            self.mean = super::mean::WeightedMean::default();
         }
         self.end_ust = p.end_ust;
         self.duration_cs = self.duration_cs.saturating_add(p.elapsed_cs);
@@ -319,22 +317,14 @@ impl RunBuilder {
             self.max_at = p.end_ust;
         }
         // 区間長 0 の区間は平均の重みに寄与しない
-        let w = p.elapsed_cs as f64;
-        self.weighted_sum += v * w;
-        self.weight += w;
+        self.mean.push(v, p.elapsed_cs);
     }
 
     fn finish(&self) -> Option<Run> {
         if !self.open {
             return None;
         }
-        let mean = if self.weight > 0.0 {
-            self.weighted_sum / self.weight
-        } else {
-            // 区間長が取れない場合は最大値と最小値の中点ではなく、
-            // 観測値そのもの (min == max のはず) を返す
-            self.max
-        };
+        let mean = self.mean.value().unwrap_or(self.max);
         Some(Run {
             start_ust: self.start_ust,
             end_ust: self.end_ust,
@@ -407,10 +397,9 @@ impl MetricTimeline {
             let adjacent = prev_end.is_none_or(|e| e == p.start_ust);
             prev_end = Some(p.end_ust);
 
-            let keep = match p.value {
-                Some(v) => pred(v),
-                None => false,
-            };
+            let keep = p.elapsed_cs > 0
+                && p.reason.is_none()
+                && p.value.is_some_and(|v| v.is_finite() && pred(v));
 
             if !keep || !adjacent {
                 // 条件を満たさない / 時刻が繋がらない → いま伸ばしている区間を確定
@@ -544,6 +533,19 @@ mod tests {
         assert_eq!(r.max, 97.0);
         assert_eq!(r.min, 95.0);
         assert_eq!(r.mean, 96.0);
+    }
+
+    /// 瞬時値を保持しても、区間長がない観測で前後の継続を接続しない。
+    #[test]
+    fn zero_elapsed_gauge_breaks_the_run() {
+        let mut t = MetricTimeline::new(key(), Unit::Percent, ValueKind::Gauge);
+        for (start, end, elapsed) in [(0, 180, 18_000), (180, 181, 0), (181, 361, 18_000)] {
+            t.push(MetricPoint::observed(start, end, elapsed, 95.0));
+        }
+        let r = t.longest_run_at_least(90.0).unwrap();
+        assert_eq!(r.duration_cs, 18_000);
+        assert_eq!(r.intervals, 1);
+        assert_eq!(t.points[1].value, Some(95.0));
     }
 
     /// 欠損は「閾値未満」ではなく「連続を切る」。

@@ -261,7 +261,7 @@ make ci      # Run the same checks as CI (no changes)
 Run `make` to list every target. Releases are published from GitHub Actions (**Actions → Release → Run workflow**).
 <!-- standard:dev:end -->
 
-Without mise, add `SYSTEM_TOOLS=1` to use the tools on your PATH; their versions may then differ from CI. The conformance tests against upstream sysstat data, the collection scripts and the release procedure are in [docs/development.md](docs/development.md).
+Without mise, add `SYSTEM_TOOLS=1` to use the tools on your PATH; their versions may then differ from CI. The conformance tests against upstream sysstat data, byte-reader boundary tests, comparisons with saved `sar` text, collection scripts and release procedure are in [docs/development.md](docs/development.md).
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes. Report bugs through [GitHub Issues](https://github.com/owayo/re-sar-ch/issues), including `resarch --version`, the command you ran, and the error message.
 

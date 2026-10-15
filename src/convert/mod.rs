@@ -281,6 +281,40 @@ pub fn convert(
     }
     report.activities = plans.len();
 
+    // 旧 IRQ の件数は現行形式ではファイル全体で固定の nr2 になる。
+    // RESTART 後の増加分を落とさないよう、書き出す前に最大列数を確定する。
+    if plans.iter().any(|plan| plan.swapped_dimensions) {
+        let check_columns = |columns: u32| -> Result<()> {
+            let limit = crate::format::registry::NR2_MAX;
+            if columns > limit {
+                return Err(Error::LimitExceeded {
+                    path: file.path().to_path_buf(),
+                    what: "変換後の A_IRQ の nr2".into(),
+                    value: u64::from(columns),
+                    limit: u64::from(limit),
+                });
+            }
+            Ok(())
+        };
+        for plan in &plans {
+            if plan.swapped_dimensions {
+                check_columns(plan.out_nr2)?;
+            }
+        }
+        if src_magic.format_magic == 0x2173 {
+            file.scan(|rec| {
+                for slice in rec.slices {
+                    let plan = &mut plans[slice.index];
+                    if plan.swapped_dimensions {
+                        check_columns(slice.nr)?;
+                        plan.out_nr2 = plan.out_nr2.max(slice.nr);
+                    }
+                }
+                Ok(ScanControl::Continue)
+            })?;
+        }
+    }
+
     if !report.opaque_activities.is_empty() {
         let names: Vec<String> = report
             .opaque_activities
@@ -802,6 +836,12 @@ fn write_stats_payload<W: Write>(
         // 添字はそのまま割り込みの列番号になる。
         let out_items = (out_count as u64).saturating_mul(plan.out_nr2 as u64);
         let src_items = (slice.nr as u64).saturating_mul(slice.nr2 as u64);
+        if plan.swapped_dimensions && src_items > out_items {
+            return Err(Error::Other(format!(
+                "{}: レコードの item 数 ({src_items}) が変換後の列数 ({out_items}) を超える",
+                plan.id.display_name()
+            )));
+        }
         if out_items == 0 {
             continue;
         }

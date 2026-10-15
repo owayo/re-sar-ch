@@ -2934,6 +2934,90 @@ fn irq_rows_shorter_than_the_declared_interrupt_count_are_zero_filled() {
     }
 }
 
+/// RESTART 後に増えた割り込みも、現行形式の固定列へ欠落なく写す。
+#[test]
+fn irq_growth_after_restart_preserves_every_interrupt() {
+    for abi in FixtureAbi::ALL {
+        let e = Enc::of(abi);
+        let file = OldFile::new(
+            Generation::G2173,
+            abi,
+            vec![old_act(1, 0x8a, 160, 3), old_act(3, 0x8a, 16, 2)],
+        )
+        .stats(vec![cpus3(e, 1), [irq_8a(e, 10), irq_8a(e, 1)].concat()])
+        .restart(vec![volatile(1, 3), volatile(3, 3)])
+        .stats(vec![
+            cpus3(e, 2),
+            [irq_8a(e, 20), irq_8a(e, 11), irq_8a(e, 99)].concat(),
+        ]);
+        let who = format!("irq-growth/{}", file.label());
+        let (_, out, _) = convert_fixture(&who, file.bytes());
+        let output = walk_output(&out, abi);
+        assert_current_activity(&output, 3, 1, 3, &who);
+        let records = output.stats();
+        let values: Vec<u32> = records[1]
+            .slice(3)
+            .items
+            .iter()
+            .map(|item| e.u32_at(item, 0))
+            .collect();
+        assert_eq!(values, [20, 11, 99], "{who}");
+        assert!(records[0].slice(3).items[2].iter().all(|&b| b == 0));
+        reopen_exact(&who, out);
+    }
+}
+
+/// 4096 列は保持し、それを超える件数はヘッダを書き出す前に拒否する。
+#[test]
+fn irq_column_limit_is_checked_before_output() {
+    for abi in FixtureAbi::ALL {
+        for grows in [false, true] {
+            for columns in [4096, 4097] {
+                let e = Enc::of(abi);
+                let count = if grows { 2 } else { columns };
+                let mut file = OldFile::new(
+                    Generation::G2173,
+                    abi,
+                    vec![old_act(1, 0x8a, 160, 3), old_act(3, 0x8a, 16, count)],
+                )
+                .stats(vec![cpus3(e, 1), irq_8a(e, 1).repeat(count as usize)]);
+                if grows {
+                    file = file
+                        .restart(vec![volatile(1, 3), volatile(3, columns)])
+                        .stats(vec![cpus3(e, 2), irq_8a(e, 2).repeat(columns as usize)]);
+                }
+                let src = SaFile::from_bytes("irq-column-limit", file.bytes()).unwrap();
+                let mut out = Vec::new();
+                let result = convert::convert(&src, &ConvertOptions::default(), &mut out);
+                if columns == 4096 {
+                    result.unwrap();
+                    assert_current_activity(
+                        &walk_output(&out, abi),
+                        3,
+                        1,
+                        4096,
+                        "irq-column-limit",
+                    );
+                    reopen_exact("irq-column-limit", out);
+                    continue;
+                }
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::LimitExceeded {
+                            value: 4097,
+                            limit: 4096,
+                            ..
+                        })
+                    ),
+                    "{abi:?}: {result:?}"
+                );
+                assert!(out.is_empty(), "{abi:?}: 出力前に上限超過を検出する");
+            }
+        }
+    }
+}
+
 // --- 6.7 record_type ---
 
 /// 2 本目の統計レコードの record_type を指定した fixture (`A_CPU` だけ)。

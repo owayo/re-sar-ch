@@ -1159,12 +1159,13 @@ impl SaFile {
                             // 各エントリの nr で以降のレコードの item 数が変わる。
                             // 単純にスキップすると以降の位置が全部ずれる。
                             let n = self.header.vol_act_nr.unwrap_or(0) as usize;
-                            let end = bounded_region_end(
-                                &self.path,
-                                offset,
-                                payload,
-                                n * self.act_stride,
-                            )?;
+                            let len = n.checked_mul(self.act_stride).ok_or_else(|| {
+                                self.limit(
+                                    "RESTART の volatile activity リスト",
+                                    (n as u64).saturating_mul(self.act_stride as u64),
+                                )
+                            })?;
+                            let end = bounded_region_end(&self.path, offset, payload, len)?;
                             for i in 0..n {
                                 let base = payload + i * self.act_stride;
                                 let e = record_read!(

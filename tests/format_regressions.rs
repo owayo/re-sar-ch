@@ -88,6 +88,24 @@ fn extra_chains_share_the_record_and_header_byte_limits() {
     }
 }
 
+/// 32bit の実行環境でも、巨大な volatile 件数を掛け算で折り返さない。
+#[test]
+fn oversized_volatile_list_is_rejected_before_visiting_restart() {
+    for abi in FixtureAbi::ALL {
+        let mut fx = build(FixtureSpec::minimal(Generation::G2173, abi));
+        // §3.3.2: file_magic は 76 バイト、sa_vol_act_nr はヘッダ内の +16。
+        fx.bytes[76 + 16..76 + 20].fill(0xff);
+        for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+            let file = open(fx.bytes.clone(), tolerance).unwrap();
+            let result = file.scan(|_| panic!("巨大な RESTART は通知しない"));
+            assert!(
+                matches!(result, Err(re_sar_ch::error::Error::LimitExceeded { .. })),
+                "{abi:?}/{tolerance:?}: {result:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn record_time_validation_covers_every_generation_and_abi() {
     for generation in Generation::ALL {

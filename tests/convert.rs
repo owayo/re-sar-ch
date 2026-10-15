@@ -3020,6 +3020,29 @@ fn irq_column_limit_is_checked_before_output() {
 
 // --- 6.7 record_type ---
 
+/// 旧構造体の拡張で、読めない大きさのレコードを成功扱いで書き出さない。
+#[test]
+fn converted_record_cannot_exceed_the_reader_byte_limit() {
+    let file = OldFile::new(
+        Generation::G2171,
+        FixtureAbi::Le64,
+        vec![
+            old_act(7, 0x8a, 64, 1),
+            old_act(900, 0xff, 1024, 65535),
+            old_act(901, 0xff, 1, 900),
+        ],
+    )
+    .stats(vec![vec![0; 64], vec![0; 65535 * 1024], vec![0; 900]]);
+    // 入力は 64 MiB - 12 バイト。メモリ構造体の拡張で出力だけが上限を超える。
+    let src = SaFile::from_bytes("converted-record-limit", file.bytes()).unwrap();
+    assert!(src.scan(|_| Ok(ScanControl::Continue)).unwrap().is_exact());
+    let result = convert::convert(&src, &ConvertOptions::default(), &mut std::io::sink());
+    assert!(
+        matches!(result, Err(Error::LimitExceeded { .. })),
+        "{result:?}"
+    );
+}
+
 /// 2 本目の統計レコードの record_type を指定した fixture (`A_CPU` だけ)。
 fn record_type_fixture(abi: FixtureAbi, second: u8) -> OldFile {
     let e = Enc::of(abi);

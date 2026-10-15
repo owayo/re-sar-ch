@@ -346,7 +346,7 @@ pub fn convert(
     report.cpu_nr = cpu_nr;
 
     // --- ヘッダ 3 節を書く ---
-    let mut sink = CountingSink::new(out);
+    let mut sink = CountingSink::new(out, file.path());
     write_file_magic(&mut sink, file, &dst)?;
     write_file_header(&mut sink, file, &src, &dst, hz, cpu_nr)?;
     write_file_activities(&mut sink, file, &dst, &plans)?;
@@ -495,16 +495,39 @@ impl TargetLayouts {
 struct CountingSink<'o, W: Write> {
     out: &'o mut W,
     written: u64,
+    record_start: u64,
+    path: std::path::PathBuf,
 }
 
 impl<'o, W: Write> CountingSink<'o, W> {
-    fn new(out: &'o mut W) -> Self {
-        Self { out, written: 0 }
+    fn new(out: &'o mut W, path: &std::path::Path) -> Self {
+        Self {
+            out,
+            written: 0,
+            record_start: 0,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn begin_record(&mut self) {
+        self.record_start = self.written;
     }
 
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        // 構造体の拡張や IRQ の列補完で、入力より出力が大きくなる場合もある。
+        let limit = crate::format::file::MAX_RECORD_BYTES as u64;
+        let end = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .filter(|end| end - self.record_start <= limit)
+            .ok_or_else(|| Error::LimitExceeded {
+                path: self.path.clone(),
+                what: "変換後のレコードまたはヘッダの総バイト数".into(),
+                value: (self.written - self.record_start).saturating_add(bytes.len() as u64),
+                limit,
+            })?;
         self.out.write_all(bytes)?;
-        self.written += bytes.len() as u64;
+        self.written = end;
         Ok(())
     }
 }
@@ -707,6 +730,7 @@ fn write_record<W: Write>(
     rec: &RawRecord<'_>,
     report: &mut ConvertReport,
 ) -> Result<()> {
+    sink.begin_record();
     let endian = ctx.cur.endian();
     let l = &ctx.dst.record_header;
 
@@ -908,6 +932,24 @@ fn raw_record_type(rec: &RawRecord<'_>, report: &mut ConvertReport) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    /// 上限はファイル全体ではなく各レコードに適用し、超過分は書き出さない。
+    #[test]
+    fn output_budget_resets_per_record_and_accepts_the_exact_limit() {
+        let mut out = std::io::sink();
+        let mut sink = super::CountingSink::new(&mut out, std::path::Path::new("synthetic"));
+        let chunk = [0; 8192];
+        for record in 1..=2 {
+            sink.begin_record();
+            for _ in 0..8192 {
+                sink.put(&chunk).unwrap();
+            }
+            let written = record * 64 * 1024 * 1024;
+            assert_eq!(sink.written, written);
+            assert!(matches!(sink.put(&[0]), Err(Error::LimitExceeded { .. })));
+            assert_eq!(sink.written, written);
+        }
+    }
+
     use super::*;
 
     #[test]

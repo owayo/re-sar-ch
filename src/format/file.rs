@@ -50,7 +50,7 @@ const MIN_FILE_MAGIC_BYTES: usize = 8;
 const TYPES_NR_LIMIT: u32 = 1024;
 
 /// 1 レコードの最大バイト数 (健全性上限)。
-const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 /// 旧世代で HZ が不明なときに仮定する値。
 pub const DEFAULT_ASSUMED_HZ: u64 = 100;

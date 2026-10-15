@@ -21,6 +21,91 @@ fn offset(fields: &[(&str, usize)], name: &str) -> usize {
     fields.iter().find(|(n, _)| *n == name).unwrap().1
 }
 
+/// 個別には上限内でも、合計で 64 MiB を超える統計レコードは受け入れない。
+#[test]
+fn record_byte_limit_applies_to_the_sum_of_activities() {
+    let mut spec = FixtureSpec::minimal(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = (900..902)
+        .map(|id| ActivitySpec {
+            id,
+            nr: 32768,
+            size: 1024,
+            types_nr: [0, 0, 0],
+            ..ActivitySpec::unknown_id()
+        })
+        .collect();
+    spec.records = vec![RecordSpec::stats(vec![], 1_600_000_000, 12, 0, 0)];
+    let fx = build(spec);
+    for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+        let file = open(fx.bytes.clone(), tolerance).unwrap();
+        let result = file.scan(|_| panic!("上限を超えたレコードは通知しない"));
+        assert!(
+            matches!(result, Err(re_sar_ch::error::Error::LimitExceeded { .. })),
+            "{tolerance:?}: {result:?}"
+        );
+    }
+}
+
+/// 拡張領域は統計・イベントと予算を共有し、ヘッダにも総量の上限を設ける。
+#[test]
+fn extra_chains_share_the_record_and_header_byte_limits() {
+    let chunk = ExtraSpec {
+        nr: 8192,
+        size: 1024,
+        types_nr: [0, 0, 0],
+    };
+    for location in ["header", "stats", "comment", "restart", "extra", "mixed"] {
+        let mut spec = FixtureSpec::minimal(Generation::G2175Current, FixtureAbi::Le64);
+        let extra = vec![chunk.clone(); if location == "mixed" { 4 } else { 8 }];
+        if location == "mixed" {
+            spec.activities = vec![ActivitySpec {
+                nr: 32768,
+                size: 1024,
+                types_nr: [0, 0, 0],
+                ..ActivitySpec::unknown_id()
+            }];
+        }
+        spec.records = vec![match location {
+            "comment" => RecordSpec::comment("example", 1_600_000_000, 12, 0, 0),
+            "restart" => RecordSpec::restart(2, 1_600_000_000, 12, 0, 0),
+            "extra" => RecordSpec::extra_record(5, 1_600_000_000, 12, 0, 0),
+            _ => RecordSpec::stats(vec![], 1_600_000_000, 12, 0, 0),
+        }];
+        if location == "header" {
+            spec.file_extra = extra;
+        } else {
+            spec.records[0].extra = extra;
+        }
+        let fx = build(spec);
+        for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+            let result = open(fx.bytes.clone(), tolerance)
+                .and_then(|file| file.scan(|_| panic!("上限を超えたレコードは通知しない")));
+            assert!(
+                matches!(result, Err(re_sar_ch::error::Error::LimitExceeded { .. })),
+                "{location}/{tolerance:?}: {result:?}"
+            );
+        }
+    }
+}
+
+/// 32bit の実行環境でも、巨大な volatile 件数を掛け算で折り返さない。
+#[test]
+fn oversized_volatile_list_is_rejected_before_visiting_restart() {
+    for abi in FixtureAbi::ALL {
+        let mut fx = build(FixtureSpec::minimal(Generation::G2173, abi));
+        // §3.3.2: file_magic は 76 バイト、sa_vol_act_nr はヘッダ内の +16。
+        fx.bytes[76 + 16..76 + 20].fill(0xff);
+        for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+            let file = open(fx.bytes.clone(), tolerance).unwrap();
+            let result = file.scan(|_| panic!("巨大な RESTART は通知しない"));
+            assert!(
+                matches!(result, Err(re_sar_ch::error::Error::LimitExceeded { .. })),
+                "{abi:?}/{tolerance:?}: {result:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn record_time_validation_covers_every_generation_and_abi() {
     for generation in Generation::ALL {

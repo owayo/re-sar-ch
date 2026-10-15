@@ -306,6 +306,53 @@ mod tests {
         );
     }
 
+    /// 巨大なオフセットを加算しても、折り返した先の有効な領域を読まない。
+    #[test]
+    fn overflowing_ranges_and_field_offsets_are_rejected() {
+        let buf = [0x12, 0x34, 0x56, 0x78];
+        let c = Cursor::new(&buf, Endian::Little);
+        for (offset, len) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, 0)] {
+            let expected = OutOfBounds {
+                offset,
+                need: len,
+                len: buf.len(),
+            };
+            assert_eq!(c.raw(offset, len), Err(expected));
+            assert_eq!(c.slice(offset, len).err(), Some(expected));
+        }
+
+        let expected = OutOfBounds {
+            offset: usize::MAX,
+            need: 4,
+            len: buf.len(),
+        };
+        let integer = placed(1, 4, FieldTy::U32);
+        assert_eq!(c.read_unsigned(usize::MAX, &integer), Err(expected));
+        let text = placed(1, 4, FieldTy::Bytes(4));
+        assert_eq!(c.read_bytes(usize::MAX, &text), Err(expected));
+    }
+
+    /// 終端ちょうどの空領域は有効だが、終端より先は長さ 0 でも範囲外。
+    #[test]
+    fn empty_ranges_preserve_the_end_of_buffer_boundary() {
+        for buf in [&[][..], &[1, 2, 3, 4][..]] {
+            let c = Cursor::new(buf, Endian::Big);
+            assert_eq!(c.raw(buf.len(), 0), Ok(&[][..]));
+            let empty = c.slice(buf.len(), 0).expect("終端の空領域は有効");
+            assert!(empty.is_empty());
+            assert_eq!(empty.endian(), Endian::Big);
+            assert!(empty.u8_at(0).is_err());
+
+            let expected = OutOfBounds {
+                offset: buf.len() + 1,
+                need: 0,
+                len: buf.len(),
+            };
+            assert_eq!(c.raw(buf.len() + 1, 0), Err(expected));
+            assert_eq!(c.slice(buf.len() + 1, 0).err(), Some(expected));
+        }
+    }
+
     /// 32bit ライタの unsigned long: スロット 8 バイトのうち先頭 4 バイトだけが値。
     #[test]
     fn reads_leading_half_of_ul_slot_little_endian() {

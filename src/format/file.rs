@@ -50,7 +50,7 @@ const MIN_FILE_MAGIC_BYTES: usize = 8;
 const TYPES_NR_LIMIT: u32 = 1024;
 
 /// 1 レコードの最大バイト数 (健全性上限)。
-const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 /// 旧世代で HZ が不明なときに仮定する値。
 pub const DEFAULT_ASSUMED_HZ: u64 = 100;
@@ -766,7 +766,7 @@ impl SaFile {
         // チェーンは「extra_desc (24 バイト固定) + extra_nr × extra_size の本体」を
         // 1 段として、extra_next が 0 の段 (終端は extra_nr = 0) まで続く。
         if header.extra_next.unwrap_or(0) != 0 {
-            let len = skip_extra_chain(&cur, offset, &path)?;
+            let len = skip_extra_chain(&cur, offset, 0, &path)?;
             diagnostics.push(Diagnostic {
                 offset: Some(offset),
                 message: format!(
@@ -1087,7 +1087,7 @@ impl SaFile {
                 });
             }
 
-            let mut payload = offset + rec_size;
+            let mut payload = bounded_region_end(&self.path, offset, offset, rec_size)?;
 
             // `extra_desc` チェーンの位置はレコード種別で変わる。
             //
@@ -1107,7 +1107,7 @@ impl SaFile {
                     | RecordKind::Extra(_)
             );
             if extra_next != 0 && extra_before_payload {
-                payload += record_read!(skip_extra_chain(&cur, payload, &self.path));
+                payload += record_read!(skip_extra_chain(&cur, payload, offset, &self.path));
             }
 
             let mut comment: Option<&[u8]> = None;
@@ -1124,6 +1124,8 @@ impl SaFile {
 
             match kind {
                 RecordKind::Comment => {
+                    let payload_end =
+                        bounded_region_end(&self.path, offset, payload, MAX_COMMENT_LEN)?;
                     let raw = record_read!(
                         cur.raw(payload, MAX_COMMENT_LEN)
                             .map_err(|e| self.truncated(e, "comment"))
@@ -1133,12 +1135,13 @@ impl SaFile {
                         .position(|&b| b == 0)
                         .unwrap_or(MAX_COMMENT_LEN - 1);
                     comment = Some(&raw[..end]);
-                    payload += MAX_COMMENT_LEN;
+                    payload = payload_end;
                 }
                 RecordKind::Restart => {
                     match self.spec.restart_payload {
                         RestartPayload::None => {}
                         RestartPayload::CpuCount => {
+                            let end = bounded_region_end(&self.path, offset, payload, 4)?;
                             let v = record_read!(
                                 cur.u32_at(payload)
                                     .map_err(|e| self.truncated(e, "restart.cpu_count"))
@@ -1150,12 +1153,19 @@ impl SaFile {
                                 });
                             }
                             cpu_count = Some(v);
-                            payload += 4;
+                            payload = end;
                         }
                         RestartPayload::VolatileActivityList => {
                             // 各エントリの nr で以降のレコードの item 数が変わる。
                             // 単純にスキップすると以降の位置が全部ずれる。
                             let n = self.header.vol_act_nr.unwrap_or(0) as usize;
+                            let len = n.checked_mul(self.act_stride).ok_or_else(|| {
+                                self.limit(
+                                    "RESTART の volatile activity リスト",
+                                    (n as u64).saturating_mul(self.act_stride as u64),
+                                )
+                            })?;
+                            let end = bounded_region_end(&self.path, offset, payload, len)?;
                             for i in 0..n {
                                 let base = payload + i * self.act_stride;
                                 let e = record_read!(
@@ -1194,7 +1204,7 @@ impl SaFile {
                                     }
                                 }
                             }
-                            payload += n * self.act_stride;
+                            payload = end;
                         }
                     }
                 }
@@ -1206,12 +1216,13 @@ impl SaFile {
                     for (i, act) in self.activities.iter().enumerate() {
                         let mut nr = nr_state[i];
                         if act.has_nr {
+                            let end = bounded_region_end(&self.path, offset, payload, 4)?;
                             // レコード内に item 数が前置される
                             let v = record_read!(
                                 cur.u32_at(payload)
                                     .map_err(|e| self.truncated(e, "record.item_count"))
                             );
-                            payload += 4;
+                            payload = end;
 
                             // **レコード内の個数も activity 別上限で検証する。**
                             // 初期の activity リストだけ検証しても、ここで上限を超える
@@ -1252,6 +1263,7 @@ impl SaFile {
                                 self.limit("nr * nr2 * size", items.saturating_mul(stride as u64))
                             })? as usize;
 
+                        let end = bounded_region_end(&self.path, offset, payload, len)?;
                         record_read!(
                             cur.raw(payload, len)
                                 .map_err(|e| self.truncated(e, &format!("{} のデータ", act.id)))
@@ -1266,14 +1278,14 @@ impl SaFile {
                             offset: payload,
                             len,
                         });
-                        payload += len;
+                        payload = end;
                     }
                 }
             }
 
             // RESTART / COMMENT では extra チェーンがペイロードの後に来る
             if extra_next != 0 && !extra_before_payload {
-                payload += record_read!(skip_extra_chain(&cur, payload, &self.path));
+                payload += record_read!(skip_extra_chain(&cur, payload, offset, &self.path));
             }
 
             match kind {
@@ -1496,9 +1508,15 @@ fn validate_activity_entry(e: &FileActivityEntry, path: &Path) -> Result<()> {
 /// 1 段は `extra_desc` (24 バイト固定) + `extra_size × extra_nr` バイトの本体で構成され、
 /// `extra_next` が 0 になるまで連鎖する。中身は未知拡張なので解釈せず、
 /// 長さの検証だけを行って飛ばす。
-fn skip_extra_chain(cur: &Cursor<'_>, start: usize, path: &Path) -> Result<usize> {
+fn skip_extra_chain(
+    cur: &Cursor<'_>,
+    start: usize,
+    region_start: usize,
+    path: &Path,
+) -> Result<usize> {
     let mut offset = start;
     loop {
+        let body_start = bounded_region_end(path, region_start, offset, EXTRA_DESC_SIZE)?;
         let oob = |e: OutOfBounds| Error::Truncated {
             path: path.to_path_buf(),
             context: "extra_desc".into(),
@@ -1542,8 +1560,8 @@ fn skip_extra_chain(cur: &Cursor<'_>, start: usize, path: &Path) -> Result<usize
         }
 
         let body = (extra_nr as u64) * (extra_size as u64);
-        let body_start = offset + EXTRA_DESC_SIZE;
-        offset = body_start + body as usize;
+        // 各段の上限だけでなく、先行する統計や拡張領域との合計も検査する。
+        offset = bounded_region_end(path, region_start, body_start, body as usize)?;
         if offset > cur.len() {
             return Err(Error::Truncated {
                 path: path.to_path_buf(),
@@ -1557,6 +1575,22 @@ fn skip_extra_chain(cur: &Cursor<'_>, start: usize, path: &Path) -> Result<usize
         }
     }
     Ok(offset - start)
+}
+
+/// レコード全体 (ヘッダに付く拡張ではヘッダ全体) の予算を共有する。
+fn bounded_region_end(path: &Path, origin: usize, start: usize, len: usize) -> Result<usize> {
+    start
+        .checked_add(len)
+        .filter(|end| {
+            end.checked_sub(origin)
+                .is_some_and(|len| len <= MAX_RECORD_BYTES)
+        })
+        .ok_or_else(|| Error::LimitExceeded {
+            path: path.to_path_buf(),
+            what: "レコードまたはヘッダの総バイト数".into(),
+            value: start.saturating_sub(origin).saturating_add(len) as u64,
+            limit: MAX_RECORD_BYTES as u64,
+        })
 }
 
 fn read_all(file: &File, path: &Path) -> Result<Vec<u8>> {
@@ -1820,6 +1854,36 @@ use layouts as _layouts_used;
 
 #[cfg(test)]
 mod tests {
+    /// 上限の境界は領域の起点から測り、加算の桁あふれも拒否する。
+    #[test]
+    fn region_budget_accepts_the_exact_limit_and_checks_overflow() {
+        for origin in [0, 2048] {
+            assert_eq!(
+                super::bounded_region_end(
+                    Path::new("synthetic"),
+                    origin,
+                    origin + 24,
+                    64 * 1024 * 1024 - 24
+                )
+                .unwrap(),
+                origin + 64 * 1024 * 1024
+            );
+            assert!(matches!(
+                super::bounded_region_end(
+                    Path::new("synthetic"),
+                    origin,
+                    origin + 24,
+                    64 * 1024 * 1024 - 23
+                ),
+                Err(Error::LimitExceeded { .. })
+            ));
+        }
+        assert!(matches!(
+            super::bounded_region_end(Path::new("synthetic"), usize::MAX - 1, usize::MAX, 1),
+            Err(Error::LimitExceeded { .. })
+        ));
+    }
+
     use super::*;
 
     /// 拡張データ本体が途中で切れた場合、残っている本体のバイト数を報告する。
@@ -1830,7 +1894,7 @@ mod tests {
         bytes[4..8].copy_from_slice(&10u32.to_le_bytes());
         let cur = Cursor::new(&bytes, Endian::Little);
 
-        let err = skip_extra_chain(&cur, 0, Path::new("x")).unwrap_err();
+        let err = skip_extra_chain(&cur, 0, 0, Path::new("x")).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -1857,7 +1921,7 @@ mod tests {
         bytes[second + 4..second + 8].copy_from_slice(&10u32.to_le_bytes());
         let cur = Cursor::new(&bytes, Endian::Little);
 
-        let err = skip_extra_chain(&cur, 0, Path::new("x")).unwrap_err();
+        let err = skip_extra_chain(&cur, 0, 0, Path::new("x")).unwrap_err();
         assert!(
             matches!(
                 &err,

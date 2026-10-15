@@ -32,6 +32,10 @@ Run `make` with no arguments to list every target. Besides the standard ones:
 
 `make conformance` downloads the upstream data with `make fixtures` and then runs the suites that `make test` skips. It needs `xmllint`, which macOS ships and Debian / Ubuntu provide in `libxml2-utils`. The test that records the version of sysstat's own `sar` skips itself when `sar` is not installed; CI installs sysstat on Ubuntu 24.04 so that the baseline it compares against stays fixed and is recorded in the job summary.
 
+The byte-reader regression tests cover out-of-bounds reads, range and field-offset additions involving `usize::MAX`, empty buffers, and zero-length reads exactly at the end of a buffer. They run as part of `make ci` and use the target's `usize` width for the boundary values.
+
+When comparing operational logs with saved `sar` text, select the rendering profile for the producer's version explicitly. The [local comparison procedure](format/05-sysstat-10.1.5-el7.md#61-実データ) (Japanese) provides an el7 example and distinguishes a full-text match from a scan reaching the end of the file.
+
 ## Collecting real sa files
 
 The `sar-*` targets collect and verify real `sa` files inside containers (see [How the output is verified](verification.md)). They need Apple container or Docker, plus `jq`, `curl`, and `shasum` on the host.

@@ -11,4 +11,4 @@
 # GitHub Actions のランナーでは cargo fmt / cargo clippy が無いと言われて落ちる。
 # 配布物のターゲット (aarch64 Linux を含む) は CI と Release のジョブが各 OS のランナーで
 # rustup target add してそのままビルドするので、クロスビルドの道具は要らない
-rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }
+rust = { version = "1.99.0", profile = "minimal", components = ["rustfmt", "clippy"] }

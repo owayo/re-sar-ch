@@ -261,7 +261,7 @@ make ci      # CI と同じ検査 (書き換えない)
 `make` でターゲットの一覧を表示します。リリースは GitHub Actions で行います (**Actions → Release → Run workflow**)。
 <!-- standard:dev:end -->
 
-mise を使わない場合は `SYSTEM_TOOLS=1` を付けると PATH 上のツールを使います。その場合、版が CI と一致するとは限りません。本家のデータを使う適合テスト、採取スクリプト、リリースの手順は [docs/development.ja.md](docs/development.ja.md) にあります。
+mise を使わない場合は `SYSTEM_TOOLS=1` を付けると PATH 上のツールを使います。その場合、版が CI と一致するとは限りません。本家のデータを使う適合テスト、読み出しの境界テスト、保存済み `sar` テキストとの照合、採取とリリースの手順は [docs/development.ja.md](docs/development.ja.md) にあります。
 
 変更履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。不具合は [GitHub Issues](https://github.com/owayo/re-sar-ch/issues) へ、`resarch --version` の結果、実行コマンド、エラー内容を添えて報告してください。
 

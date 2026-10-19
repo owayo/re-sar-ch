@@ -127,6 +127,7 @@ resarch -n DEV,EDEV -f sa01              # ネットワークインターフェ�
 resarch -u -P ALL -s 09:00:00 -e 18:00:00 -f sa01
 resarch sar -A -f sa01                   # sar 互換コマンド
 resarch sadf -j sa01                     # sadf 互換 JSON
+resarch sadf -g sa01 600 12 -- -u > cpu.svg  # 起動区間ごとに CPU を最大12点描画
 resarch --sar-profile sysstat-10.1.5-el7 -u -f sa01  # RHEL/CentOS 7 の sar と同じ出力
 ```
 
@@ -261,7 +262,7 @@ make ci      # CI と同じ検査 (書き換えない)
 `make` でターゲットの一覧を表示します。リリースは GitHub Actions で行います (**Actions → Release → Run workflow**)。
 <!-- standard:dev:end -->
 
-mise を使わない場合は `SYSTEM_TOOLS=1` を付けると PATH 上のツールを使います。その場合、版が CI と一致するとは限りません。本家のデータを使う適合テスト、読み出しの境界テスト、保存済み `sar` テキストとの照合、採取とリリースの手順は [docs/development.ja.md](docs/development.ja.md) にあります。
+mise を使わない場合は `SYSTEM_TOOLS=1` を付けると PATH 上のツールを使います。その場合、版が CI と一致するとは限りません。本家のデータを使う適合テスト、読み書きの境界テスト、保存済み `sar` テキストとの照合、採取とリリースの手順は [docs/development.ja.md](docs/development.ja.md) にあります。
 
 変更履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。不具合は [GitHub Issues](https://github.com/owayo/re-sar-ch/issues) へ、`resarch --version` の結果、実行コマンド、エラー内容を添えて報告してください。
 

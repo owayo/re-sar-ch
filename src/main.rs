@@ -907,7 +907,9 @@ fn run_sadf(opts: SadfOptions) -> anyhow::Result<ExitCode> {
             };
             convert::convert(&file, &cvt, &mut out).map(|r| report_conversion(&r))
         }
-        SadfFormat::Svg => re_sar_ch::output::svg::write_svg(&mut out, &file, &cfg, &opts.output),
+        SadfFormat::Svg => {
+            re_sar_ch::output::svg::write_svg_with(&mut out, &file, &cfg, &opts.output, &extra)
+        }
         SadfFormat::Pcp => bail!("-l (PCP アーカイブ) は未対応です"),
         // 上で処理済み
         SadfFormat::Header => Ok(()),

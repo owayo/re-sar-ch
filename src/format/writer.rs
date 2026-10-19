@@ -380,6 +380,70 @@ mod tests {
         assert!(w.put_u32(0, 1).is_ok());
     }
 
+    /// 桁あふれで折り返した位置への書き込みを拒否し、既存の値を保つ。
+    #[test]
+    fn overflowing_ranges_and_field_offsets_leave_the_buffer_unchanged() {
+        for endian in [Endian::Little, Endian::Big] {
+            let mut buf = [0xa5; 4];
+            let mut w = WriteCursor::new(&mut buf, endian);
+            for (offset, len) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, 0)] {
+                let expected = Err(OutOfBounds {
+                    offset,
+                    need: len,
+                    len: 4,
+                });
+                assert_eq!(w.zero(offset, len), expected);
+                assert_eq!(w.put_uint(offset, len, 1), expected);
+                assert_eq!(w.bytes(), &[0xa5; 4]);
+            }
+            assert!(w.put_raw(usize::MAX, &[1]).is_err());
+            let integer = PlacedField {
+                name: "value",
+                offset: 1,
+                width: 4,
+                value_width: 4,
+                ty: FieldTy::U32,
+            };
+            let expected = Err(OutOfBounds {
+                offset: usize::MAX,
+                need: 4,
+                len: 4,
+            });
+            assert_eq!(w.write_unsigned(usize::MAX, &integer, 1), expected);
+            assert_eq!(w.write_signed(usize::MAX, &integer, -1), expected);
+            let text = PlacedField {
+                ty: FieldTy::Bytes(4),
+                ..integer
+            };
+            assert_eq!(w.write_bytes(usize::MAX, &text, b"text"), expected);
+            assert_eq!(w.bytes(), &[0xa5; 4]);
+        }
+    }
+
+    /// 空バッファと終端ちょうどの空領域は書けるが、終端より先は拒否する。
+    #[test]
+    fn empty_writes_preserve_the_end_of_buffer_boundary() {
+        for endian in [Endian::Little, Endian::Big] {
+            for mut buf in [vec![], vec![0xa5; 4]] {
+                let end = buf.len();
+                let mut w = WriteCursor::new(&mut buf, endian);
+                assert_eq!(w.zero(end, 0), Ok(()));
+                assert_eq!(w.put_raw(end, &[]), Ok(()));
+                assert_eq!(w.put_uint(end, 0, u64::MAX), Ok(()));
+
+                let expected = Err(OutOfBounds {
+                    offset: end + 1,
+                    need: 0,
+                    len: end,
+                });
+                assert_eq!(w.zero(end + 1, 0), expected);
+                assert_eq!(w.put_raw(end + 1, &[]), expected);
+                assert_eq!(w.put_uint(end + 1, 0, 1), expected);
+                assert_eq!(w.bytes(), vec![0xa5; end]);
+            }
+        }
+    }
+
     #[test]
     fn fit_checks_match_the_effective_width() {
         let e = enc(Endian::Little, LayoutAbi::I386);

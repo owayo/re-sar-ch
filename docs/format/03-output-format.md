@@ -6109,6 +6109,10 @@ F_END:
 | `pcparchive=<f>` | — | `-l` 用 |
 | `hz=<N>` | `user_hz` | `-c` 用 |
 
+`oneday` の24時間は軸の最小長であり、選択した最後の観測がそれより後なら
+終点をその観測まで広げる。本家の `sadf.c` も、既存の終点が原点の24時間後より
+前の場合だけ終点を延ばす ([v12.8.0 の実装](https://github.com/sysstat/sysstat/blob/v12.8.0/sadf.c#L1054))。
+
 `-O` の解析は `-O <comma,separated,list>` で、**未知のトークンは usage エラー**。
 `sar_options` (= `--` 以降) の解析中には `-O` を使えない。
 

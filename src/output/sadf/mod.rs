@@ -48,7 +48,7 @@ pub mod access;
 pub mod dbppc;
 pub mod header;
 pub mod json;
-mod logic1;
+pub(super) mod logic1;
 mod logic2;
 pub mod raw;
 mod records;

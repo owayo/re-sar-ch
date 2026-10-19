@@ -4,9 +4,9 @@ use fixtures::{ActivitySpec, FixtureAbi, FixtureSpec, Generation, RecordSpec, bu
 use re_sar_ch::cli::{SadfOutputOptions, SvgPalette};
 use re_sar_ch::format::file::SaFile;
 use re_sar_ch::model::ActivityId;
-use re_sar_ch::output::sadf::{SadfConfig, TimeBase};
+use re_sar_ch::output::sadf::{RecordSelect, SadfConfig, SadfExtra, TimeBase};
 use re_sar_ch::output::sar_text::CpuSelection;
-use re_sar_ch::output::svg::write_svg;
+use re_sar_ch::output::svg::{write_svg, write_svg_with};
 use re_sar_ch::output::time_filter::{TimeBound, TimeFilter};
 
 fn sensor_file(counts: &[i32]) -> SaFile {
@@ -106,6 +106,120 @@ fn time_and_activity_selection_apply_to_graphs() {
     let svg = render(&file, &cfg, &SadfOutputOptions::default());
     assert!(!svg.contains("data-value=\"3100\""));
     assert!(svg.contains("data-value=\"3200\""));
+}
+
+/// positional の件数・間隔は、軸の走査とデータ点の走査の両方に適用する。
+#[test]
+fn positional_interval_and_count_select_svg_samples() {
+    let file = sensor_file(&[1, 1, 1, 1]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic.sa");
+    std::fs::write(&path, file.bytes()).unwrap();
+    let render_selected = |interval: &str, count: &str| {
+        let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("resarch"))
+            .args(["sadf", "-g"])
+            .arg(&path)
+            .args([interval, count, "--", "-m", "FAN"])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).unwrap()
+    };
+    let one = render_selected("1", "1");
+    assert!(one.contains("data-time=\"1600000020\""));
+    assert!(!one.contains("data-time=\"1600000030\""));
+    assert!(!one.contains("data-time=\"1600000040\""));
+    assert!(!one.contains("12:27:30"), "軸にも選択後の範囲を使う");
+
+    let spaced = render_selected("20", "0");
+    assert!(!spaced.contains("data-time=\"1600000020\""));
+    assert!(spaced.contains("data-time=\"1600000030\""));
+    assert!(!spaced.contains("data-time=\"1600000040\""));
+}
+
+/// 間引いたレコードを差分の基準にせず、前に表示したレコードからレートを求める。
+#[test]
+fn positional_interval_keeps_the_last_selected_counter_baseline() {
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = vec![ActivitySpec::a_pcsw()];
+    spec.records = (0..5)
+        .map(|i| {
+            let mut rec = RecordSpec::stats(vec![1], 1_600_000_010 + i * 10, 12, 0, i as u8 * 10);
+            rec.uptime = 100_000 + i * 1000;
+            rec
+        })
+        .collect();
+    let mut fixture = build(spec);
+    for ((offset, _), counter) in fixture
+        .record_offsets
+        .iter()
+        .zip([0u64, 100, 1000, 1100, 2000])
+    {
+        for field in [0, 8] {
+            let at = offset + 24 + field;
+            fixture.bytes[at..at + 8].copy_from_slice(&counter.to_le_bytes());
+        }
+    }
+    let file = SaFile::from_bytes("synthetic", fixture.bytes).unwrap();
+    let mut out = Vec::new();
+    write_svg_with(
+        &mut out,
+        &file,
+        &SadfConfig::default(),
+        &SadfOutputOptions::default(),
+        &SadfExtra {
+            select: RecordSelect {
+                interval: 20,
+                count: None,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let svg = String::from_utf8(out).unwrap();
+    assert!(svg.contains("data-time=\"1600000030\" data-value=\"50\""));
+    assert!(!svg.contains("data-value=\"90\""));
+    assert!(svg.contains("data-time=\"1600000050\" data-value=\"50\""));
+    assert!(
+        svg.contains("class=\"series\""),
+        "選択した点同士は線でつなぐ"
+    );
+}
+
+/// oneday は軸を最低24時間に広げる指定であり、以降の観測を切り捨てない。
+#[test]
+fn one_day_axis_preserves_samples_after_the_first_24_hours() {
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.activities = vec![ActivitySpec::a_pcsw()];
+    spec.records = [1_600_000_000, 1_600_000_010, 1_600_090_000]
+        .into_iter()
+        .enumerate()
+        .map(|(i, ust)| {
+            let mut rec = RecordSpec::stats(vec![1], ust, 12, 0, 0);
+            rec.uptime = 100_000 + i as u64 * 1000;
+            rec
+        })
+        .collect();
+    let file = SaFile::from_bytes("synthetic", build(spec).bytes).unwrap();
+    let svg = render(
+        &file,
+        &SadfConfig::default(),
+        &SadfOutputOptions {
+            one_day: true,
+            ..Default::default()
+        },
+    );
+    assert!(svg.contains("data-time=\"1600000010\""));
+    assert!(svg.contains("data-time=\"1600090000\""));
+    assert!(svg.contains("Day axis:"));
+    assert!(
+        !svg.contains("24:00"),
+        "延ばした軸の終点には実際の時刻を出す"
+    );
 }
 
 #[test]
@@ -228,4 +342,29 @@ fn restart_and_cpu_selection_are_respected() {
     assert!(svg.contains("%idle"));
     let svg_without_idle = render(&file, &cfg, &SadfOutputOptions::default());
     assert!(!svg_without_idle.contains("%idle"));
+
+    let mut out = Vec::new();
+    write_svg_with(
+        &mut out,
+        &file,
+        &cfg,
+        &SadfOutputOptions::default(),
+        &SadfExtra {
+            select: RecordSelect {
+                interval: 1,
+                count: Some(1),
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let selected = String::from_utf8(out).unwrap();
+    assert!(selected.contains("data-time=\"1600000020\""));
+    assert!(selected.contains("data-time=\"1600000060\""));
+    assert!(!selected.contains("data-time=\"1600000030\""));
+    assert!(!selected.contains("data-time=\"1600000070\""));
+    assert!(
+        !selected.contains("class=\"series\""),
+        "再起動をまたいで線を引かない"
+    );
 }

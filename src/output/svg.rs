@@ -1,25 +1,41 @@
 //! `sadf -g` の SVG グラフ。値は sadf の他の形式と同じ選択・計算結果を使い、
 //! 描画 (装飾・座標) は reSARch 独自のもの。
 //!
-//! ファイルを 2 回走査して、メモリを系列数に比例する量に抑える
+//! ファイルを 2 回走査して、値の履歴を系列数に比例する量に抑える
 //! (1 回目で値域を測り、2 回目で点と線分をストリーミングで書く)。
-//! サンプルの全履歴は保持しない。
+//! 選択用のレコード索引は保持するが、全サンプルの統計値は保持しない。
 use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::cli::SadfOutputOptions;
 use crate::cli::sadf_args::SvgPalette;
 use crate::error::{Error, Result};
-use crate::format::file::{SaFile, ScanControl};
+use crate::format::file::SaFile;
 use crate::model::ActivityId;
-use crate::series::snapshot::{IntervalView, RecordEvent, Selection, WalkItem, walk_items};
+use crate::series::snapshot::IntervalView;
 
 use super::sadf::access::ActivityPair;
 use super::sadf::dbppc::selected_specs;
+use super::sadf::logic1::{self, Logic1Sink};
 use super::sadf::render::{item_label_in, value_of};
 use super::sadf::spec::{ActivitySpec, Fmt};
-use super::sadf::{FileInfo, SadfConfig, Stamp, TimeBase};
-use super::time_filter::Admit;
+use super::sadf::{FileInfo, SadfConfig, SadfExtra, Stamp, TimeBase};
+
+/// 既存の sadf の選択処理から、描画用のクロージャへサンプルを渡す。
+struct SvgSink<F>(F);
+
+impl<F> Logic1Sink for SvgSink<F>
+where
+    F: FnMut(Option<&IntervalView<'_>>, bool) -> std::io::Result<()>,
+{
+    fn begin_block(&mut self) -> std::io::Result<()> {
+        (self.0)(None, true)
+    }
+
+    fn record(&mut self, view: Option<&IntervalView<'_>>) -> std::io::Result<()> {
+        (self.0)(view, false)
+    }
+}
 
 const WIDTH: f64 = 1040.0;
 const LEFT: f64 = 100.0;
@@ -264,64 +280,75 @@ pub fn write_svg<W: Write>(
     cfg: &SadfConfig,
     options: &SadfOutputOptions,
 ) -> Result<()> {
+    write_svg_with(out, file, cfg, options, &SadfExtra::default())
+}
+
+/// positional の選択も含めて SVG を書く。両走査で同じ sadf の選択規則を使う。
+pub fn write_svg_with<W: Write>(
+    out: &mut W,
+    file: &SaFile,
+    cfg: &SadfConfig,
+    options: &SadfOutputOptions,
+    extra: &SadfExtra,
+) -> Result<()> {
     validate(options)?;
     let specs = selected_specs(file, cfg);
-    let selection = Selection::Only(specs.iter().map(|s| s.id).collect());
+    let selection: Vec<_> = specs.iter().map(|s| s.id).collect();
     let info = FileInfo::from_file_with(file, cfg.time_base);
     let mut charts: BTreeMap<Key, Chart> = BTreeMap::new();
-    let mut cursor = cfg.time_filter.cursor();
     let mut bounds: Option<(u64, u64)> = None;
     let mut first_label = String::new();
     let mut last_label = String::new();
     // `-t` の日境界を切るのに要る、採取側ローカルと UTC の差 (秒)。
     // レコードが持つ時分秒から復元する。
     let mut recorded_offset: Option<i64> = None;
-    walk_items(file, &selection, |item| {
-        let WalkItem::Sample(view) = item else {
-            return Ok(ScanControl::Continue);
-        };
-        match cursor.sample(view) {
-            Admit::Reference | Admit::Skip => return Ok(ScanControl::Continue),
-            Admit::Stop => return Ok(ScanControl::Stop),
-            Admit::Emit => {}
-        }
-        if !view.has_prev || !view.continuous {
-            return Ok(ScanControl::Continue);
-        }
-        let t = view.curr.ust_time;
-        if recorded_offset.is_none() {
-            let shifted = super::sadf::shift_to_recorded(
+    logic1::run(
+        file,
+        cfg,
+        extra.select,
+        &selection,
+        &mut SvgSink(|view: Option<&IntervalView<'_>>, _| {
+            let Some(view) = view else {
+                return Ok(());
+            };
+            if !view.has_prev || !view.continuous {
+                return Ok(());
+            }
+            let t = view.curr.ust_time;
+            if recorded_offset.is_none() {
+                let shifted = super::sadf::shift_to_recorded(
+                    t,
+                    (view.curr.hour, view.curr.minute, view.curr.second),
+                );
+                recorded_offset = Some(shifted as i64 - t as i64);
+            }
+            let stamp = Stamp::new(
+                cfg.time_base,
                 t,
                 (view.curr.hour, view.curr.minute, view.curr.second),
-            );
-            recorded_offset = Some(shifted as i64 - t as i64);
-        }
-        let stamp = Stamp::new(
-            cfg.time_base,
-            t,
-            (view.curr.hour, view.curr.minute, view.curr.second),
-            &info,
-        )
-        .dbppc();
-        match &mut bounds {
-            None => {
-                bounds = Some((t, t));
-                first_label = stamp.clone();
+                &info,
+            )
+            .dbppc();
+            match &mut bounds {
+                None => {
+                    bounds = Some((t, t));
+                    first_label = stamp.clone();
+                }
+                Some((start, end)) => {
+                    *start = (*start).min(t);
+                    *end = (*end).max(t);
+                }
             }
-            Some((start, end)) => {
-                *start = (*start).min(t);
-                *end = (*end).max(t);
+            last_label = stamp;
+            for (key, value) in values(view, cfg, options, &specs) {
+                let chart = charts.entry(key).or_default();
+                if let Some(value) = value {
+                    chart.observe(value);
+                }
             }
-        }
-        last_label = stamp;
-        for (key, value) in values(view, cfg, options, &specs) {
-            let chart = charts.entry(key).or_default();
-            if let Some(value) = value {
-                chart.observe(value);
-            }
-        }
-        Ok(ScanControl::Continue)
-    })?;
+            Ok(())
+        }),
+    )?;
     if options.skip_empty {
         charts.retain(|_, c| c.nonzero);
     }
@@ -388,11 +415,17 @@ pub fn write_svg<W: Write>(
     let day_tz = one_day_zone(cfg.time_base, &info, recorded_offset);
     if options.one_day {
         start = day_start(start, &day_tz);
-        end = start.saturating_add(86_400);
+        // 本家と同じく24時間は軸の最小長とし、それより後の観測を残す。
+        end = end.max(start.saturating_add(86_400));
+        let axis_label = if end > start.saturating_add(86_400) {
+            format!("Day axis: 00:00 {} → {last_label}", day_tz.label())
+        } else {
+            format!("24-hour axis: 00:00–24:00 {}", day_tz.label())
+        };
         writeln!(
             out,
-            "<text x=\"32\" y=\"83\">24-hour axis: 00:00–24:00 {}</text>",
-            escaped(&day_tz.label())
+            "<text x=\"32\" y=\"83\">{}</text>",
+            escaped(&axis_label)
         )?;
     }
     for (key, chart) in &charts {
@@ -434,7 +467,7 @@ pub fn write_svg<W: Write>(
                 first_label.clone()
             }),
             y + 185.0,
-            escaped(&if options.one_day {
+            escaped(&if options.one_day && end == start.saturating_add(86_400) {
                 format!("24:00 {}", day_tz.label())
             } else {
                 last_label.clone()
@@ -449,74 +482,73 @@ pub fn write_svg<W: Write>(
         }
         writeln!(out, "</g>")?;
     }
-    let mut cursor = cfg.time_filter.cursor();
     let mut ordinal = 0u64;
-    walk_items(file, &selection, |item| {
-        let WalkItem::Sample(view) = item else {
-            if let WalkItem::Event(event) = item {
-                if matches!(event, RecordEvent::Restart { .. }) {
-                    for chart in charts.values_mut() {
-                        chart.previous = None;
-                    }
+    let specials = logic1::run(
+        file,
+        cfg,
+        extra.select,
+        &selection,
+        &mut SvgSink(|view: Option<&IntervalView<'_>>, begin_block| {
+            if begin_block {
+                for chart in charts.values_mut() {
+                    chart.previous = None;
                 }
-                if let RecordEvent::Comment { ref text, .. } = event
-                    && cfg.comments
-                    && cursor.event(event.ust_time(), event.time())
+                return Ok(());
+            }
+            // interval による間引きは、選択された点同士の接続を切らない。
+            let Some(view) = view else {
+                return Ok(());
+            };
+            ordinal += 1;
+            if !view.has_prev || !view.continuous {
+                for chart in charts.values_mut() {
+                    chart.previous = None;
+                }
+                return Ok(());
+            }
+            let t = view.curr.ust_time;
+            if t < start || t > end {
+                return Ok(());
+            }
+            for (key, value) in values(view, cfg, options, &specs) {
+                let Some(chart) = charts.get_mut(&key) else {
+                    continue;
+                };
+                let Some(value) = value else {
+                    chart.previous = None;
+                    continue;
+                };
+                let (x, y) = chart.coordinates(t, value, start, end, top);
+                let color = if options.palette == SvgPalette::Bw {
+                    "#111827"
+                } else {
+                    "#0369a1"
+                };
+                if let Some((previous, px, py)) = chart.previous
+                    && previous + 1 == ordinal
                 {
-                    writeln!(out, "<desc>{}</desc>", escaped(text))?;
+                    writeln!(
+                        out,
+                        "<path class=\"series\" stroke=\"{color}\" data-chart=\"{}\" d=\"M {px:.2} {py:.2} L {x:.2} {y:.2}\"/>",
+                        chart.index
+                    )?;
                 }
-            }
-            return Ok(ScanControl::Continue);
-        };
-        ordinal += 1;
-        match cursor.sample(view) {
-            Admit::Reference | Admit::Skip => return Ok(ScanControl::Continue),
-            Admit::Stop => return Ok(ScanControl::Stop),
-            Admit::Emit => {}
-        }
-        if !view.has_prev || !view.continuous {
-            for chart in charts.values_mut() {
-                chart.previous = None;
-            }
-            return Ok(ScanControl::Continue);
-        }
-        let t = view.curr.ust_time;
-        if t < start || t > end {
-            return Ok(ScanControl::Continue);
-        }
-        for (key, value) in values(view, cfg, options, &specs) {
-            let Some(chart) = charts.get_mut(&key) else {
-                continue;
-            };
-            let Some(value) = value else {
-                chart.previous = None;
-                continue;
-            };
-            let (x, y) = chart.coordinates(t, value, start, end, top);
-            let color = if options.palette == SvgPalette::Bw {
-                "#111827"
-            } else {
-                "#0369a1"
-            };
-            if let Some((previous, px, py)) = chart.previous
-                && previous + 1 == ordinal
-            {
                 writeln!(
                     out,
-                    "<path class=\"series\" stroke=\"{color}\" data-chart=\"{}\" d=\"M {px:.2} {py:.2} L {x:.2} {y:.2}\"/>",
-                    chart.index
+                    "<circle class=\"point\" fill=\"{color}\" cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"2\" data-chart=\"{}\" data-time=\"{t}\" data-value=\"{value}\"><title>{}: {value}</title></circle>",
+                    chart.index,
+                    escaped(&key.label())
                 )?;
+                chart.previous = Some((ordinal, x, y));
             }
-            writeln!(
-                out,
-                "<circle class=\"point\" fill=\"{color}\" cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"2\" data-chart=\"{}\" data-time=\"{t}\" data-value=\"{value}\"><title>{}: {value}</title></circle>",
-                chart.index,
-                escaped(&key.label())
-            )?;
-            chart.previous = Some((ordinal, x, y));
+            Ok(())
+        }),
+    )?;
+    for comment in specials.comments {
+        if let Some(text) = comment.comment {
+            writeln!(out, "<desc>{}</desc>", escaped(&text))?;
         }
-        Ok(ScanControl::Continue)
-    })?;
+    }
     writeln!(out, "</svg>")?;
     Ok(())
 }

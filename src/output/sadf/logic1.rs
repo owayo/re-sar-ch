@@ -35,6 +35,11 @@ use crate::series::{IntervalView, RecordRange, Selection, Snapshot, WalkItem, wa
 
 /// 形式ごとの書き出し。
 pub(crate) trait Logic1Sink {
+    /// 起動区間の開始。SVG はここで前区間の線を切る。
+    fn begin_block(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// 基準レコードより後の統計レコード 1 本。
     ///
     /// `None` は「読んだが表示しなかった」(`next_slice()` で省いた /
@@ -115,6 +120,7 @@ fn run_block<S: Logic1Sink>(
     cursor: &mut TimeCursor,
     sink: &mut S,
 ) -> Result<()> {
+    sink.begin_block().map_err(super::wrap_io)?;
     let mut slicer = Slicer::new(select, index.recs[r].uptime_cs);
     // `next_slice()` で表示を省いたレコードは前サンプルにならない
     let keep_prev = !select.selects_every_record();

@@ -90,6 +90,44 @@ fn summary_and_multi_report_real_cpu_count() {
     assert_eq!(result.hosts[0].segments[0].summary.source.cpu_nr, Some(2));
 }
 
+/// 再起動レコードの CPU 数を、起動区間の出典とルールの分母に引き継ぐ。
+#[test]
+fn restart_cpu_count_updates_the_segment_and_run_queue_verdict() {
+    use re_sar_ch::analyze::rules::Verdict;
+    let mut spec = FixtureSpec::skeleton(Generation::G2175Current, FixtureAbi::Le64);
+    spec.cpu_nr = 3;
+    spec.activities = vec![ActivitySpec::a_queue()];
+    spec.records = vec![
+        RecordSpec::stats(vec![1], 1_600_000_000, 12, 0, 0),
+        RecordSpec::restart(17, 1_600_000_001, 12, 0, 1),
+        RecordSpec::stats(vec![1], 1_600_000_010, 12, 0, 10),
+        RecordSpec::stats(vec![1], 1_600_000_610, 12, 10, 10),
+    ];
+    spec.records[2].uptime = 1000;
+    spec.records[3].uptime = 61_000;
+    let mut fixture = build(spec);
+    for index in [0, 2, 3] {
+        // A_QUEUE は先頭の ULL が nr_running (02 §9)。
+        let at = fixture.record_offsets[index].0 + 24;
+        fixture.bytes[at..at + 40].fill(0);
+        fixture.bytes[at..at + 8].copy_from_slice(&8u64.to_le_bytes());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sa");
+    std::fs::write(&path, fixture.bytes).unwrap();
+    let result = analyze_files(&[path], &MultiOptions::default()).unwrap();
+    let segments = &result.hosts[0].segments;
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].summary.source.cpu_nr, Some(2));
+    assert_eq!(segments[1].summary.source.cpu_nr, Some(16));
+    let finding = segments[1]
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id == "run-queue-saturation")
+        .unwrap();
+    assert_eq!(finding.verdict, Verdict::NotObserved);
+}
+
 #[test]
 fn multi_unknown_magic_uses_the_same_plans_as_single_file() {
     let mut spec = FixtureSpec::minimal(Generation::G2175Current, FixtureAbi::Le64);

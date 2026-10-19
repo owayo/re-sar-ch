@@ -702,6 +702,8 @@ struct SampleRecord {
     snapshot: Snapshot,
     /// このサンプルの直前に RESTART レコードがあったか。
     restart_before: bool,
+    /// 直前の RESTART が通知した実 CPU 数。通知しない旧形式では None。
+    restart_cpu_nr: Option<u32>,
 }
 
 /// 1 ファイル分のデコード結果。
@@ -761,16 +763,21 @@ fn decode_file(outline: &FileOutline, opts: &MultiOptions) -> Result<FileSamples
     // 直前に RESTART を読んだか。次の統計レコードへ持ち越す
     // (走査はイベントを束ねずに読んだ順で渡すため、ここで覚えておく)。
     let mut restart_pending = false;
+    let mut restart_cpu_nr = None;
     let scan = walk_items(&file, &opts.selection, |item| {
         match item {
             WalkItem::Event(ev) => {
-                if matches!(ev, RecordEvent::Restart { .. }) {
+                if let RecordEvent::Restart { cpu_count, .. } = ev {
                     restart_pending = true;
+                    if let Some(nr) = cpu_count {
+                        restart_cpu_nr = Some(nr.saturating_sub(1).max(1));
+                    }
                 }
             }
             WalkItem::Sample(view) => samples.push(SampleRecord {
                 snapshot: view.curr.clone(),
                 restart_before: std::mem::take(&mut restart_pending),
+                restart_cpu_nr: std::mem::take(&mut restart_cpu_nr),
             }),
         }
         Ok(ScanControl::Continue)
@@ -932,8 +939,12 @@ impl<'o> GroupMerger<'o> {
         let empty = Snapshot::default();
         // 時刻フィルタはファイルごとに引き直す ([`MultiOptions::time_filter`])。
         let mut cursor = self.opts.time_filter.native_cursor();
+        let mut identity = Arc::clone(&fs.identity);
 
         for sample in &fs.samples {
+            if let Some(cpu_nr) = sample.restart_cpu_nr {
+                Arc::make_mut(&mut identity).cpu_nr = Some(cpu_nr);
+            }
             if !sample.snapshot.valid {
                 continue;
             }
@@ -974,7 +985,7 @@ impl<'o> GroupMerger<'o> {
                             // 診断したファイル間でも、時刻とレイアウトが揃えば
                             // 差分を引き継いでしまい、出力される診断と
                             // 実際の集計動作が食い違う。
-                            identity_verdict(&prev.identity, &fs.identity),
+                            identity_verdict(&prev.identity, &identity),
                             cross_file,
                             &self.opts.continuity,
                         );
@@ -996,7 +1007,7 @@ impl<'o> GroupMerger<'o> {
             };
             if start_new {
                 self.close_segment();
-                self.open_segment(point.boot_epoch(), Arc::clone(&fs.identity));
+                self.open_segment(point.boot_epoch(), Arc::clone(&identity));
             }
 
             // --- 集計 ---
@@ -1073,8 +1084,8 @@ impl<'o> GroupMerger<'o> {
             self.prev = Some(PrevSample {
                 snapshot: sample.snapshot.clone(),
                 file_index: fs.index,
-                // Arc の参照だけを増やす (ファイル内で不変なものを複製しない)
-                identity: Arc::clone(&fs.identity),
+                // RESTART 後の CPU 数も含め、このサンプルで有効な識別材料を共有する。
+                identity: Arc::clone(&identity),
                 signature: Arc::clone(&fs.signature),
             });
         }
@@ -1418,12 +1429,12 @@ fn fill_bucket(
     let before = timeline
         .points
         .iter()
-        .filter(|p| p.value.is_some() && p.end_ust <= b0)
+        .filter(|p| p.reason.is_none() && p.value.is_some_and(f64::is_finite) && p.end_ust <= b0)
         .max_by_key(|p| p.end_ust);
     let after = timeline
         .points
         .iter()
-        .filter(|p| p.value.is_some() && p.start_ust >= b1)
+        .filter(|p| p.reason.is_none() && p.value.is_some_and(f64::is_finite) && p.start_ust >= b1)
         .min_by_key(|p| p.start_ust);
 
     match fill {
@@ -1443,9 +1454,9 @@ fn fill_bucket(
                 return None;
             }
             let (va, vb) = (a.value?, b.value?);
-            // 区間の中点で線形補間する
-            let mid = b0 + (b1 - b0) / 2;
-            let t = (mid.saturating_sub(a.end_ust)) as f64 / gap as f64;
+            // epoch を浮動小数点にせず、中点の 0.5 秒も相対時刻で保持する。
+            let to_mid = (b0 - a.end_ust) as f64 + (b1 - b0) as f64 / 2.0;
+            let t = to_mid / gap as f64;
             Some((
                 crate::analyze::mean::blend(va, vb, t),
                 BucketSource::Interpolated,
@@ -1825,6 +1836,7 @@ mod tests {
             .map(|(i, (ust, uptime, counter))| SampleRecord {
                 snapshot: snap(id, ust, uptime, item_of(&plan, &[("pswpin", counter)])),
                 restart_before: restart_at.contains(&i),
+                restart_cpu_nr: None,
             })
             .collect();
         FileSamples {
@@ -1880,6 +1892,7 @@ mod tests {
                 .map(|(ust, uptime, item)| SampleRecord {
                     snapshot: snap(id, ust, uptime, item),
                     restart_before: false,
+                    restart_cpu_nr: None,
                 })
                 .collect(),
         }
@@ -2378,6 +2391,88 @@ mod tests {
         let lin = align_to_window(&t, w, GaugeFill::Linear { max_gap_secs: 300 });
         assert_eq!(lin[1].source, BucketSource::Interpolated);
         assert!(lin[1].value.unwrap() > 0.0 && lin[1].value.unwrap() < 30.0);
+    }
+
+    /// 1 秒区間の中点は 0.5 秒にあり、巨大な epoch でも切り捨てない。
+    #[test]
+    fn linear_fill_keeps_the_fractional_bucket_midpoint() {
+        for start in [0, u64::MAX - 3] {
+            let t = gauge_timeline(&[
+                (start, start + 1, Some(10.0)),
+                (start + 2, start + 3, Some(30.0)),
+            ]);
+            let b = align_to_window(
+                &t,
+                ComparisonWindow::new(start + 1, start + 2, 1),
+                GaugeFill::Linear { max_gap_secs: 1 },
+            );
+            assert_eq!(b[0].value, Some(20.0));
+            assert_eq!(b[0].source, BucketSource::Interpolated);
+            assert_eq!(b[0].covered_secs, 0);
+        }
+    }
+
+    /// 通常の集計で除外した非有限値を、持ち越し・補間で復活させない。
+    #[test]
+    fn non_finite_gauges_are_not_fill_sources() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for endpoints in [
+                [(0, 100, Some(value)), (200, 300, Some(30.0))],
+                [(0, 100, Some(10.0)), (200, 300, Some(value))],
+            ] {
+                let t = gauge_timeline(&endpoints);
+                let b = align_to_window(
+                    &t,
+                    ComparisonWindow::new(100, 200, 100),
+                    GaugeFill::Linear { max_gap_secs: 100 },
+                );
+                assert_eq!(b[0].value, None);
+                assert_eq!(b[0].source, BucketSource::NoObservation);
+                assert_eq!(b[0].covered_secs, 0);
+            }
+
+            let t = gauge_timeline(&[(0, 100, Some(value))]);
+            let b = align_to_window(
+                &t,
+                ComparisonWindow::new(100, 200, 100),
+                GaugeFill::HoldLast { max_age_secs: 100 },
+            );
+            assert_eq!(b[0].value, None);
+            assert_eq!(b[0].source, BucketSource::NoObservation);
+            assert_eq!(b[0].covered_secs, 0);
+        }
+    }
+
+    /// 近い候補が無効でも、有効な観測を探し、その観測から許容時間を測る。
+    #[test]
+    fn gauge_fill_uses_eligible_neighbors_and_their_actual_age() {
+        let mut t = gauge_timeline(&[
+            (0, 100, Some(10.0)),
+            (100, 200, Some(f64::NAN)),
+            (300, 400, Some(f64::INFINITY)),
+            (400, 500, Some(50.0)),
+        ]);
+        let window = ComparisonWindow::new(200, 300, 100);
+        let held = align_to_window(&t, window, GaugeFill::HoldLast { max_age_secs: 100 });
+        assert_eq!(held[0].value, Some(10.0));
+        assert_eq!(
+            held[0].source,
+            BucketSource::HeldFromPrevious { age_secs: 100 }
+        );
+        let expired = align_to_window(&t, window, GaugeFill::HoldLast { max_age_secs: 99 });
+        assert_eq!(expired[0].source, BucketSource::NoObservation);
+        let linear = align_to_window(&t, window, GaugeFill::Linear { max_gap_secs: 300 });
+        assert_eq!(linear[0].value, Some(30.0));
+        let too_far = align_to_window(&t, window, GaugeFill::Linear { max_gap_secs: 299 });
+        assert_eq!(too_far[0].source, BucketSource::NoObservation);
+
+        // 値が残っていても、除外理由があれば通常の集計と同じく候補から外す。
+        t.points[1].value = Some(1000.0);
+        t.points[1].reason = Some(crate::analyze::timeline::ExclusionReason::NotFinite);
+        assert_eq!(
+            align_to_window(&t, window, GaugeFill::HoldLast { max_age_secs: 100 }),
+            held
+        );
     }
 
     /// レートは持ち越しも補間もしない (増分 0 と観測なしを区別できないため)。

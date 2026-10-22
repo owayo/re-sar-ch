@@ -7,6 +7,7 @@
 pub mod csv;
 pub mod detect_report;
 pub mod detect_svg;
+pub mod html_report;
 pub mod json;
 pub mod ndjson;
 pub mod sadf;

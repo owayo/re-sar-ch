@@ -42,9 +42,10 @@ pub use sar_args::{
 };
 pub use sar_el7_args::{El7Input, SarEl7ArgError, SarEl7Options, parse_sar_el7_args};
 
-/// ルートが受け付けるサブコマンド名。
+/// 従来から公開しているサブコマンド名の固定配列。
 ///
-/// 先頭引数がこのいずれでもなければ `sar` 互換として解釈する。
+/// 型を明示して利用するコードとの互換性のため、要素数と内容を維持する。
+/// 現在受け付ける全コマンドは [`subcommand_names`] で列挙する。
 pub const SUBCOMMAND_NAMES: [&str; 11] = [
     "sa2sar",
     "tui",
@@ -58,6 +59,11 @@ pub const SUBCOMMAND_NAMES: [&str; 11] = [
     "sar",
     "sadf",
 ];
+
+/// 現在ルートが受け付ける全サブコマンド名。件数を戻り値の型に含めない。
+pub fn subcommand_names() -> impl Iterator<Item = &'static str> {
+    SUBCOMMAND_NAMES.into_iter().chain(["report"])
+}
 
 // ============================================================================
 // 共通の値型
@@ -316,6 +322,48 @@ pub struct SummarizeArgs {
 
     #[command(flatten)]
     pub common: CommonArgs<AggregateFormat>,
+}
+
+/// `resarch report` の引数。画面で絞るため、入力の時系列を保持する。
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ReportArgs {
+    /// ヘルプを表示する。
+    #[arg(long, action = ArgAction::Help)]
+    help: Option<bool>,
+
+    /// 解析対象の `sa` ファイル。
+    #[arg(value_name = "FILE", required = true, num_args = 1..)]
+    pub files: Vec<PathBuf>,
+
+    /// 単体で開ける HTML の保存先。既存ファイルは上書きしない。- は標準出力。
+    #[arg(short, long, value_name = "HTML", default_value = "report.html")]
+    pub output: PathBuf,
+
+    /// 埋め込む activity をカンマ区切りで絞る (例: cpu,disk)。既定は全 activity。
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub activity: Vec<String>,
+
+    #[command(flatten)]
+    pub timezone: TimeZoneArgs,
+
+    #[command(flatten)]
+    pub language: LangArgs,
+
+    /// 疑わしいデータをエラーにする (既定)。
+    #[arg(long, conflicts_with = "lenient")]
+    pub strict: bool,
+
+    /// 回復可能な破損を診断付きで読み飛ばす。部分結果は非ゼロ終了する。
+    #[arg(long)]
+    pub lenient: bool,
+
+    /// mmap を使わず BufReader で読む。
+    #[arg(long)]
+    pub no_mmap: bool,
+
+    /// 並列処理するファイル数。
+    #[arg(long, value_name = "N")]
+    pub jobs: Option<usize>,
 }
 
 // ----------------------------------------------------------------------------
@@ -680,6 +728,9 @@ pub enum Commands {
     // (ルートと同じ作法。理由は [`DetectArgs::help`] を参照)。
     #[command(disable_help_flag = true)]
     Detect(DetectArgs),
+    /// 指標・時間範囲を選べる、オフライン HTML レポートを保存する。
+    #[command(disable_help_flag = true)]
+    Report(ReportArgs),
     /// 複数ホストを比較する。
     //
     // `--help` の扱いは [`Commands::Summarize`] と同じ。
@@ -801,7 +852,7 @@ fn is_root_only(arg: &str) -> bool {
 
 /// 先頭引数がサブコマンド名か。
 pub fn is_subcommand_name(arg: &str) -> bool {
-    SUBCOMMAND_NAMES.contains(&arg)
+    subcommand_names().any(|name| name == arg)
 }
 
 /// プログラム名を**含まない**引数列を解釈する。
@@ -1323,10 +1374,20 @@ mod tests {
     }
 
     #[test]
-    fn subcommand_names() {
-        for name in SUBCOMMAND_NAMES {
+    fn registered_subcommands_preserve_the_legacy_array_type() {
+        let legacy: [&str; 11] = SUBCOMMAND_NAMES;
+        for name in legacy {
             assert!(is_subcommand_name(name));
         }
+        let command = Cli::command();
+        assert_eq!(
+            super::subcommand_names().count(),
+            command.get_subcommands().count()
+        );
+        for subcommand in command.get_subcommands() {
+            assert!(is_subcommand_name(subcommand.get_name()));
+        }
+        assert!(is_subcommand_name("report"));
         assert!(!is_subcommand_name("-u"));
         assert!(!is_subcommand_name("sa01"));
     }

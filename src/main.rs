@@ -36,9 +36,9 @@ use re_sar_ch::analyze::{
 use re_sar_ch::cli::{
     self, Activity, BaselineScopeArg, CliError, Commands, CommonArgs, CompareArgs, DetectArgs,
     DetectFormat, El7Input, IdentifyArgs, InfoArgs, Invocation, OptFlags, OutputFormat,
-    PriorityArg, Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase, SarEl7Options,
-    SarFlags, SarImmediate, SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs, SummarizeArgs,
-    TimeSpec, TimeZoneArgs, TuiArgs, ValueKind,
+    PriorityArg, ReportArgs, Sa2SarArgs, SadfFormat, SadfImmediate, SadfOptions, SadfTimeBase,
+    SarEl7Options, SarFlags, SarImmediate, SarInput, SarOptions, SarOutput, ShowArgs, SkillArgs,
+    SummarizeArgs, TimeSpec, TimeZoneArgs, TuiArgs, ValueKind,
 };
 use re_sar_ch::convert::{self, ConvertOptions, ConvertReport};
 use re_sar_ch::detect::{BaselineScope, DetectOptions, ReportBound};
@@ -53,7 +53,7 @@ use re_sar_ch::output::sadf::{self, SadfConfig, SadfExtra, SectionConfig, TimeBa
 use re_sar_ch::output::sar_el7;
 use re_sar_ch::output::sar_text::{self, CpuSelection, SampleSelect, SarTextOptions, TimeStyle};
 use re_sar_ch::output::time_filter::{CrossDayRule, TimeBasis, TimeBound, TimeFilter};
-use re_sar_ch::output::{csv, ndjson, summarize_report, table};
+use re_sar_ch::output::{csv, html_report, ndjson, summarize_report, table};
 use re_sar_ch::output::{detect_report, detect_svg};
 use re_sar_ch::series::Selection;
 use re_sar_ch::series::el7;
@@ -102,6 +102,7 @@ fn run(invocation: Invocation) -> anyhow::Result<ExitCode> {
             Commands::Show(args) => run_show(args),
             Commands::Summarize(args) => run_summarize(args),
             Commands::Detect(args) => run_detect(args),
+            Commands::Report(args) => run_report(args),
             Commands::Compare(args) => run_compare(args),
             // `dispatch` は互換入口を直接互換パーサへ回すので通常ここには来ない。
             // ルート経由で来た場合も同じ結果になるよう解析し直す。
@@ -1350,11 +1351,74 @@ fn ordered_show_paths(
 // `resarch detect`
 // ===========================================================================
 
-/// 異変検出。
-///
-/// `multi` で起動区間ごとのサマリを作り、その時系列に 3 経路を走らせる。
-/// **起動区間をまたいだ検出はしない** (再起動の前後で水準が変わるのは当然なので、
-/// それを異変として報告しない)。
+/// 全指標の時系列と起動区間ごとの検知を HTML に保存する。
+fn run_report(args: ReportArgs) -> anyhow::Result<ExitCode> {
+    let tz = display_tz(&args.timezone)?;
+    let lang = args.language.resolve().map_err(|e| anyhow::anyhow!(e))?;
+    let selection = selection_from(&args.activity)?;
+    let opts = DetectOptions {
+        tz,
+        lang,
+        selected_activities: match &selection {
+            Selection::All => None,
+            Selection::Only(ids) => Some(ids.clone()),
+        },
+        ..Default::default()
+    };
+    let analysis = multi::analyze_files(
+        &args.files,
+        &MultiOptions {
+            open: open_options(args.lenient, args.no_mmap),
+            selection,
+            summary: SummaryOptions {
+                retain: RetainTimelines::All,
+                ..Default::default()
+            },
+            on_error: if args.lenient {
+                FileErrorPolicy::Skip
+            } else {
+                FileErrorPolicy::Fail
+            },
+            max_concurrent_files: args.jobs.unwrap_or(4).max(1),
+            ..Default::default()
+        },
+    )?;
+    report_incomplete_files(&analysis);
+    for skipped in &analysis.skipped {
+        eprintln!("resarch: {}: {}", skipped.path, skipped.reason);
+    }
+    let assessments: Vec<_> = analysis
+        .hosts
+        .iter()
+        .flat_map(|host| &host.segments)
+        .map(|segment| assess_summary(&segment.summary, &opts))
+        .collect();
+    if args.output == Path::new("-") {
+        let mut out = stdout_writer();
+        html_report::write_report(&mut out, &analysis, &assessments, tz, lang)?;
+        out.flush()?;
+    } else {
+        let parent = args
+            .output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        {
+            let mut out = BufWriter::new(temp.as_file_mut());
+            html_report::write_report(&mut out, &analysis, &assessments, tz, lang)?;
+            out.flush()?;
+        }
+        temp.persist_noclobber(&args.output)
+            .with_context(|| format!("{} を保存できません", args.output.display()))?;
+        eprintln!("resarch: HTML レポートを保存: {}", args.output.display());
+    }
+    Ok(exit_code(
+        !analysis.skipped.is_empty() || !analysis.incomplete_files.is_empty(),
+    ))
+}
+
+/// 異変検出。起動区間ごとに評価し、再起動をまたいだ検出はしない。
 fn run_detect(args: DetectArgs) -> anyhow::Result<ExitCode> {
     if let Some(dir) = &args.svg_dir {
         match std::fs::symlink_metadata(dir) {

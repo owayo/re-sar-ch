@@ -22,7 +22,7 @@ read on macOS and Windows.
 
 ## Output language (required)
 
-**Always pass `--lang en` when running `detect`, `show`, `summarize`, `compare`,
+**Always pass `--lang en` when running `report`, `detect`, `show`, `summarize`, `compare`,
 or `tui` as an agent.** Read command output in English to reduce token usage.
 Include it for JSON and NDJSON too: these formats can contain explanatory text.
 Do not rely on environment variables or the host's language settings.
@@ -37,6 +37,7 @@ or the implicit sar entry point: they do not support it.
 |---|---|
 | **Investigate an incident: find when and what looked unusual** | `resarch detect <file> --lang en` |
 | Plot context around detections as SVG | `resarch detect <file> --lang en --svg-dir charts --svg-context 30m` |
+| Create an offline HTML report with interactive metric and time selection | `resarch report <file>... --lang en -o report.html` |
 | Extract structured data for agent analysis | `resarch show <file> --lang en --format ndjson` |
 | Compute period averages, p95, and bottleneck assessments | `resarch summarize <file> --lang en --format json` |
 | Compare hosts over a shared time window | `resarch compare --lang en --host a=<f1> --host b=<f2>` |
@@ -51,6 +52,12 @@ or the implicit sar entry point: they do not support it.
 source time by default; `--utc` selects UTC. Omitting `-o`, or using `-o -`,
 writes to stdout. Existing destination files are never overwritten, and a
 failure does not leave a partial file at the destination.
+
+`report` embeds numeric time series, detections and evaluation coverage in a single HTML file.
+Use `--activity cpu,disk` to restrict the embedded metrics, and `--timezone` to choose the time basis.
+The browser can select resources, metrics and time ranges, zoom by dragging, and jump to detections.
+The report needs no server or network. Time selection only changes the view; detection and period
+statistics remain based on the whole input. Existing output files are preserved.
 
 **The default compatibility profile is upstream sysstat 12.8.0.** To compare
 against sarDD from RHEL/CentOS 7 (the sysstat 10.1.5 el7 package), pass

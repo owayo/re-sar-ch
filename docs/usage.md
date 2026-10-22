@@ -226,6 +226,24 @@ Omitted counts are explicit; omitted does not mean absent. Use `--verbose` for a
 
 JSON and NDJSON keep English keys and stable enum values whatever the language; only the human-readable sentences follow it.
 
+## Interactive HTML report
+
+```bash
+resarch report sa13 -o report.html
+resarch report sa13 sa14 --activity cpu,memory,disk,net-dev --timezone Asia/Tokyo -o report-tokyo.html
+resarch report sa13 --lang en --output - > report-en.html
+```
+
+Open the HTML file directly in a browser. JavaScript, CSS, sampled values and detection evidence are embedded; no server, network connection or additional installation is needed. The default output is `report.html`. Existing destination files are preserved.
+
+Select a host and boot segment, then check metrics in the searchable activity/resource list. Selected metrics share a time range, with separate axes and units. Change the start/end selectors or sliders, drag across any chart to zoom, and use **Full range** to reset. Click a detection to add its metric and show 30 minutes on each side; the other selected charts move to the same time range. Hovering shows sampled values across panels. The expandable data table provides the original values and exclusion reasons without requiring a pointer.
+
+Time selection changes the view only. Detections, comparison baselines and full-period summaries remain based on the whole input. Evaluation coverage, unevaluated series and full evidence remain available below the charts. Missing samples and discontinuities break connections, and boot segments remain separate. Percent axes start at 0–100 and expand for observations outside that range. A comparison baseline is not a normal value.
+
+Times use `--timezone` (local by default), including the selectors; opening the file on a computer in another time zone does not change them. Numeric UTC offsets distinguish repeated wall-clock times during daylight-saving transitions. The URL fragment preserves the selected segment, metrics and time range when reloading or sharing a view of the same report.
+
+All recorded numeric metrics are embedded by default. Use `--activity` to reduce report size for large inputs. With `--lenient`, partial input is marked in the report and the command exits nonzero. An empty input range produces an explicit no-data view. `sar` / `sadf` compatibility output and SVG export remain available.
+
 ## Charting detected anomalies as SVG
 
 ```bash

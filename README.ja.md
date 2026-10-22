@@ -197,6 +197,7 @@ item・列選択画面は、端末を縮めた場合も現在の画面サイズ�
 | 表や JSON などで閲覧 | `resarch show` |
 | 端末で対話的に閲覧 | `resarch tui` |
 | 異変を検知 | `resarch detect` |
+| 指標と検知を HTML で対話的に確認 | `resarch report sa01 -o report.html` |
 | 期間を集計 | `resarch summarize` |
 | 複数ホストを比較 | `resarch compare` |
 | ヘッダと記録項目を確認 | `resarch info` |

@@ -197,6 +197,7 @@ Item and column pickers fit the current terminal size, including while resizing.
 | View tables, JSON, and other formats | `resarch show` |
 | Browse interactively in a terminal | `resarch tui` |
 | Detect anomalies | `resarch detect` |
+| Explore metrics and detections in an offline HTML report | `resarch report sa01 -o report.html` |
 | Summarise a period | `resarch summarize` |
 | Compare hosts | `resarch compare` |
 | Inspect headers and recorded activities | `resarch info` |

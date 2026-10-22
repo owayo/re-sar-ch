@@ -37,7 +37,7 @@ Inspect `sa` files collected on Linux from your own PC, without installing `sar`
 
 ## Features
 
-- **sar / sadf compatible output**: text, JSON, CSV and XML reports in the format of upstream sysstat 12.8.0, or of RHEL / CentOS 7's `sar` with `--sar-profile`
+- **sar / sadf compatible output**: text, JSON, CSV and XML reports, including restart and comment records, in the format of upstream sysstat 12.8.0, or of RHEL / CentOS 7's `sar` with `--sar-profile`
 - **Terminal UI**: interactive tables and graphs of every recorded activity
 - **Analysis**: anomaly detection, period summaries, host comparisons, and SVG charts of what was detected
 - **28 registered formats**: readers for sysstat 2.2 through 12.8, including files written by big-endian and 32-bit hosts, with [legacy limitations](docs/formats.md)

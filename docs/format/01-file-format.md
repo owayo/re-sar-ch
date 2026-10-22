@@ -1518,6 +1518,8 @@ loop {
 - **旧形式に `extra_desc` / `R_EXTRA*` は存在しない。**
   `R_COMMENT` / `R_RESTART` 以外はすべて統計レコードとして扱う
   (`R_STATS = 1` / `R_LAST_STATS = 3` / 未知値も含む)。
+  16以上の未知値にも自己記述形式の上限を適用しない。
+  reSARch は種別0と不正な時刻を、世代によらず無効なヘッダとして拒否する。
 - 旧形式の統計構造体の中身は**ファイルのバイト順のまま**扱われる。
   ホスト順に正規化されるのは `file_magic` (`header_size` 以降) / `file_header` /
   `old_file_activity` / `old_record_header` / `__nr_t` だけ。
@@ -1712,6 +1714,9 @@ for fal in file_activity[] {          // ファイル内の順序どおり
 
 - ペイロードは **固定 64 バイト** (`MAX_COMMENT_LEN`) の `char` 配列。長さフィールドは持たない。
 - NUL 終端は保証されない → 読み側は 64 バイト目 (index 63) を強制的に `\0` にする。
+- 本文は最初の NUL の手前まで、最大63バイト。NUL 後の格納領域を印字不能文字として表示しない。
+  `0x216c`〜`0x216f` の固定部に重なるコメントにも同じ終端規則を適用する
+  ([配置と境界](09-legacy-generations.md#境界規則))。
 - 印字不能文字 (`isprint()` が偽) は `.` に置換して表示する
   (テスト `00740` / `tests/data-non-printable` がこれを検証)。
 - 読み飛ばす場合も `lseek(+64)` が必要。

@@ -329,31 +329,129 @@ fn all_monolithic_generations_detect_truncation_and_restart_boundaries() {
 
 #[test]
 fn comments_are_inside_fixed_records_and_follow_producer_long_width() {
+    let mut terminated = [b'x'; 64];
+    terminated[..13].copy_from_slice(b"comment-test\0");
+    let mut empty = [b'x'; 64];
+    empty[0] = 0;
+    let mut longest = [b'y'; 64];
+    longest[63] = 0;
+    let cases: [([u8; 64], &[u8]); 5] = [
+        ([0; 64], b""),
+        (empty, b""),
+        (terminated, b"comment-test"),
+        (longest, &[b'y'; 63]),
+        ([b'z'; 64], &[b'z'; 63]),
+    ];
     for (magic, map) in tables().into_iter().filter(|(magic, _)| *magic >= 0x216c) {
         for long in [4, 8] {
             for be in [false, true] {
-                let mut b = fixture(magic, &map, long, be, false);
-                let fixed = &map["file_stats"];
-                let mut comment = vec![0; fixed.size];
-                fixed.put(&mut comment, "record_type", 4, long, be);
-                // 独立したABI境界の期待値。32bitは164、64bitは168（統計レコード先頭から）。
-                let at = if long == 4 { 164 } else { 168 };
-                comment[at..at + 12].copy_from_slice(b"comment-test");
-                b.extend(comment);
-                let mut seen = false;
-                let s = open(b, long, Tolerance::Strict)
-                    .scan(|r| {
-                        if let Some(text) = r.comment {
-                            assert_eq!(&text[..12], b"comment-test");
-                            seen = true;
-                        }
-                        Ok(ScanControl::Continue)
-                    })
-                    .unwrap();
-                assert!(seen);
-                assert_eq!(s.comments, 1);
-                assert!(s.is_exact());
+                for (raw, expected) in cases {
+                    let b = fixture_with_comment(magic, &map, long, be, &raw);
+                    for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+                        let mut seen = 0;
+                        let s = open(b.clone(), long, tolerance)
+                            .scan(|r| {
+                                if let Some(text) = r.comment {
+                                    assert_eq!(text, expected, "{magic:x} long={long} be={be}");
+                                    seen += 1;
+                                }
+                                Ok(ScanControl::Continue)
+                            })
+                            .unwrap();
+                        assert_eq!(seen, 1);
+                        assert_eq!(s.stats, 2);
+                        assert_eq!(s.comments, 1);
+                        assert!(s.is_exact());
+                    }
+                }
             }
+        }
+    }
+}
+
+fn fixture_with_comment(
+    magic: u16,
+    map: &BTreeMap<&str, Layout>,
+    long: usize,
+    be: bool,
+    raw: &[u8; 64],
+) -> Vec<u8> {
+    let mut b = fixture(magic, map, long, be, false);
+    let fixed = &map["file_stats"];
+    let mut comment = vec![0; fixed.size];
+    fixed.put(&mut comment, "record_type", 4, long, be);
+    fixed.put(&mut comment, "ust_time", 1_700_000_002, long, be);
+    // 独立した ABI 境界の期待値。32bit は164、64bit は168バイト目から。
+    let at = if long == 4 { 164 } else { 168 };
+    comment[at..at + 64].copy_from_slice(raw);
+    b.extend(comment);
+    b
+}
+
+/// 本文が読めても、申告された固定レコード全体がなければ通知しない。
+#[test]
+fn truncated_fixed_comment_records_are_not_published() {
+    for (magic, map) in tables().into_iter().filter(|(magic, _)| *magic >= 0x216c) {
+        for long in [4, 8] {
+            for be in [false, true] {
+                let mut b = fixture_with_comment(magic, &map, long, be, &[b'x'; 64]);
+                let comment_offset = b.len() - map["file_stats"].size;
+                b.pop();
+                for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+                    let result = open(b.clone(), long, tolerance).scan(|r| {
+                        assert!(r.comment.is_none(), "切断したコメントを通知しない");
+                        Ok(ScanControl::Continue)
+                    });
+                    match tolerance {
+                        Tolerance::Strict => assert!(result.is_err()),
+                        Tolerance::Lenient => {
+                            let summary = result.unwrap();
+                            assert_eq!(summary.end_offset, comment_offset);
+                            assert_eq!(summary.comments, 0);
+                            assert!(!summary.is_exact());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// NUL 後の格納領域を、互換出力のどの書式にも本文として渡さない。
+#[test]
+fn fixed_comments_have_no_padding_in_all_six_compatibility_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = [b'x'; 64];
+    raw[..13].copy_from_slice(b"comment-test\0");
+    for (magic, map) in tables().into_iter().filter(|(magic, _)| *magic >= 0x216c) {
+        let path = dir.path().join(format!("{magic:x}.sa"));
+        std::fs::write(&path, fixture_with_comment(magic, &map, 8, false, &raw)).unwrap();
+        for args in [
+            vec!["sar", "-A", "-C", "-f"],
+            vec!["sadf", "-d", "-C"],
+            vec!["sadf", "-p", "-C"],
+            vec!["sadf", "-r", "-C"],
+            vec!["sadf", "-j", "-C"],
+            vec!["sadf", "-x", "-C"],
+        ] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_resarch"))
+                .args(&args)
+                .arg(&path)
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{magic:x} {args:?}: {output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("comment-test"), "{magic:x} {args:?}: {text}");
+            assert!(
+                !text.contains("comment-test."),
+                "{magic:x} {args:?}: {text}"
+            );
+            assert!(
+                !text.contains("comment-testx"),
+                "{magic:x} {args:?}: {text}"
+            );
         }
     }
 }

@@ -1072,7 +1072,7 @@ impl SaFile {
             let second = read_u8(&cur, offset, f_sec);
 
             if raw_type == 0
-                || raw_type > 15
+                || (self_describing && raw_type > RecordKind::R_EXTRA_MAX)
                 || hour > 23
                 || minute > 59
                 || second > 60

@@ -14,6 +14,8 @@ All 28 registered format magic values have readers. Legacy decoding limitations 
 
 `0x1170` does not exist in any upstream release. Red Hat changed the on-disk layout of `stats_io` in RHEL 6.3 without bumping the format version, which made the new `sar` silently misread older files; the fix in RHEL 6.5 renumbered the magic instead. Since no upstream build ever emits a 20-byte-vs-80-byte ambiguity, the declared item size alone identifies the variant.
 
+In activity-array legacy formats (`0x1170`, `0x2170`, `0x2171`, `0x2173`), unknown nonzero record kinds carry statistics, including values above 15. In the self-describing format (`0x2175`), kinds 5–15 carry extensions without statistics, and values above 15 are rejected. Comments stop at the first NUL and contain at most 63 bytes, including comments embedded in the fixed records of `0x216c`–`0x216f`.
+
 ## CentOS 3/4/5 and earlier formats
 
 sysstat 3.2.4 through 8.1.2 (`0x115a` … `0x216f`) use a fundamentally different layout: no `file_activity[]` array, no `record_header`, and — up to `0x216e` — no `file_magic` at the head of the file either. In those generations the magic lives *inside* `file_hdr`, and **its offset moves across generations** (4 → 36 → 32), so "read the first two bytes" does not identify them at all.

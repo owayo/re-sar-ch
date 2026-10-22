@@ -150,6 +150,57 @@ fn record_time_validation_covers_every_generation_and_abi() {
     );
 }
 
+/// 未知種別の統計は旧形式でのみ受理し、後続のレコード境界も維持する。
+#[test]
+fn unknown_record_kinds_follow_the_format_generation() {
+    for generation in Generation::ALL {
+        for abi in FixtureAbi::ALL {
+            for raw_type in [5, 15, 16, 200, 255] {
+                if Generation::SELF_DESCRIBED.contains(&generation) && raw_type <= 15 {
+                    continue;
+                }
+                let mut fx = build(FixtureSpec::minimal(generation, abi));
+                // 最初の統計レコードの種別だけを変更する。統計本体と後続は保つ。
+                let record_offset = fx.record_offsets[1].0;
+                let type_offset = offset(fx.facts().record_header_offsets, "record_type");
+                fx.bytes[record_offset + type_offset] = raw_type;
+                for tolerance in [Tolerance::Strict, Tolerance::Lenient] {
+                    let file = open(fx.bytes.clone(), tolerance).unwrap();
+                    let mut offsets = Vec::new();
+                    let result = file.scan(|r| {
+                        offsets.push(r.offset);
+                        if r.offset == record_offset {
+                            assert_eq!(
+                                r.kind,
+                                re_sar_ch::format::registry::RecordKind::UnknownStats(raw_type)
+                            );
+                            assert!(!r.slices.is_empty());
+                        }
+                        Ok(ScanControl::Continue)
+                    });
+                    if Generation::SELF_DESCRIBED.contains(&generation) {
+                        assert!(result.is_err(), "{generation:?} {abi:?} type={raw_type}");
+                        assert_eq!(offsets, vec![fx.first_record_off]);
+                    } else {
+                        let summary = result.unwrap();
+                        assert_eq!(summary.stats, 2);
+                        assert_eq!(summary.comments, 1);
+                        assert_eq!(summary.restarts, 1);
+                        assert!(summary.is_exact(), "{generation:?} {abi:?} type={raw_type}");
+                        assert_eq!(
+                            offsets,
+                            fx.record_offsets
+                                .iter()
+                                .map(|(at, _)| *at)
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn restart_cpu_count_validates_lower_upper_and_signed_bounds() {
     for abi in FixtureAbi::ALL {

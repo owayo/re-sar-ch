@@ -37,7 +37,7 @@ Linux で採取した `sa` ファイルを、手元の PC で調べるための�
 
 ## 機能
 
-- **sar / sadf 互換の出力**: 本家 sysstat 12.8.0 の書式によるテキスト・JSON・CSV・XML。`--sar-profile` で RHEL / CentOS 7 の `sar` の書式にも切り替え可能
+- **sar / sadf 互換の出力**: 本家 sysstat 12.8.0 の書式によるテキスト・JSON・CSV・XML。再起動とコメントのレコードも出力。`--sar-profile` で RHEL / CentOS 7 の `sar` の書式にも切り替え可能
 - **TUI**: 記録されたすべての activity を端末上の表とグラフで閲覧
 - **分析**: 異変の検知、期間集計、複数ホストの比較、検知した箇所の SVG グラフ
 - **登録済み 28 形式**: sysstat 2.2 から 12.8 系までの読み取り。big-endian・32 bit のホストが書いたファイルにも対応 ([旧形式の制限](docs/formats.ja.md)あり)

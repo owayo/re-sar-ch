@@ -433,9 +433,16 @@ impl LegacyFile {
                 second,
                 slices: if kind.carries_stats() { &slices } else { &[] },
                 comment: if kind == RecordKind::Comment {
-                    let field = self.layout.comment.field("comment").expect("comment field");
+                    let field = self
+                        .layout
+                        .comment
+                        .field("comment")
+                        .expect("コメントの配置は定義済み");
                     let at = field.at(&self.encoding);
-                    Some(&fixed[at..at + 64])
+                    // 固定部全体の検証は済んでいる。本文だけを NUL または63バイトで区切る。
+                    let raw = &fixed[at..at + 64];
+                    let end = raw[..63].iter().position(|&b| b == 0).unwrap_or(63);
+                    Some(&raw[..end])
                 } else {
                     None
                 },

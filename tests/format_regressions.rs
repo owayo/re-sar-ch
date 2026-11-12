@@ -21,6 +21,42 @@ fn offset(fields: &[(&str, usize)], name: &str) -> usize {
     fields.iter().find(|(n, _)| *n == name).unwrap().1
 }
 
+/// 途中停止しても、通知済みレコードの末尾と元ファイルのサイズを保持する。
+#[test]
+fn early_scan_stop_preserves_offsets_for_every_generation_and_abi() {
+    for generation in Generation::ALL {
+        for abi in FixtureAbi::ALL {
+            let fixture = build(FixtureSpec::minimal(generation, abi));
+            let file_size = fixture.bytes.len();
+            let file = SaFile::from_bytes("synthetic", fixture.bytes).unwrap();
+            for stop_after in 1..=fixture.record_offsets.len() {
+                let mut visited = 0;
+                let summary = file
+                    .scan(|_| {
+                        visited += 1;
+                        Ok(if visited == stop_after {
+                            ScanControl::Stop
+                        } else {
+                            ScanControl::Continue
+                        })
+                    })
+                    .unwrap();
+                let expected_end = fixture
+                    .record_offsets
+                    .get(stop_after)
+                    .map_or(file_size, |(start, _)| *start);
+                assert_eq!(visited, stop_after, "{generation:?}/{abi:?}");
+                assert_eq!(summary.total_records(), stop_after as u64);
+                assert_eq!(summary.end_offset, expected_end, "{generation:?}/{abi:?}");
+                assert_eq!(summary.file_size, file_size, "{generation:?}/{abi:?}");
+                assert!(summary.stopped_early);
+                assert!(!summary.incomplete);
+                assert!(!summary.is_exact());
+            }
+        }
+    }
+}
+
 /// 個別には上限内でも、合計で 64 MiB を超える統計レコードは受け入れない。
 #[test]
 fn record_byte_limit_applies_to_the_sum_of_activities() {

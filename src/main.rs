@@ -1403,7 +1403,12 @@ fn run_report(args: ReportArgs) -> anyhow::Result<ExitCode> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+            format!(
+                "出力先に一時ファイルを作成できません: {}",
+                args.output.display()
+            )
+        })?;
         {
             let mut out = BufWriter::new(temp.as_file_mut());
             html_report::write_report(&mut out, &analysis, &assessments, tz, lang)?;

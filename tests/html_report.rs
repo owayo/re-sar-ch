@@ -201,6 +201,20 @@ fn existing_output_is_preserved_and_failed_reads_leave_no_output() {
     assert!(!output.exists());
 }
 
+/// 一時ファイルを作れない場合も、利用者が指定した保存先をエラーに含める。
+#[test]
+fn missing_output_parent_identifies_the_requested_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = source(dir.path(), "synthetic-host", false);
+    let output = dir.path().join("absent").join("report.html");
+    let result = run(&path, &["--output", output.to_str().unwrap()]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains(output.to_str().unwrap()), "{stderr}");
+    assert!(!output.exists());
+    assert!(!output.parent().unwrap().exists());
+}
+
 #[test]
 fn lenient_report_exposes_partial_input_and_returns_failure() {
     let dir = tempfile::tempdir().unwrap();

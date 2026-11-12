@@ -1312,6 +1312,8 @@ impl SaFile {
                 ScanControl::Continue => {}
                 ScanControl::Stop => {
                     summary.stopped_early = true;
+                    summary.end_offset = payload;
+                    summary.file_size = bytes.len();
                     return Ok(summary);
                 }
             }

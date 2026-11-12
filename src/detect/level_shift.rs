@@ -181,9 +181,10 @@ pub fn detect(
     let mut skipped_for_gap = false;
     // 構造的に境目になれなかった端の点数 (前後の合計)。
     //
-    // 各連続区間の先頭 `w` 点と末尾 `w` 点は、前後窓の片側が足りないので
-    // 分割候補になれない。**「その範囲で変化が無かった」ではなく
-    // 「その範囲は見ていない」**ので、評価の網羅度へ出す (規律 7)。
+    // 分割候補 `at` (後窓の先頭) は `w..=len - w` なので、各連続区間の先頭 `w` 点と
+    // 末尾 `w - 1` 点は前後窓の片側が足りず、分割候補になれない。
+    // 「その範囲で変化が無かった」ではなく「その範囲は見ていない」ので、
+    // 評価の網羅度へ出す (規律 7)。
     let mut unevaluated_edge_points = 0usize;
 
     for segment in series.iter_segments() {
@@ -191,13 +192,15 @@ pub fn detect(
             continue;
         };
         let w = window_points(interval, th.shift_window_secs, th.shift_window_min_samples);
-        if segment.len() < 2 * w {
+        let Some(candidate_range) = split_candidates(segment.len(), w) else {
             // 区間の全点が「片側の窓が足りない」範囲になる
             unevaluated_edge_points += segment.len();
             continue;
-        }
-        // 先頭 w 点と末尾 w 点は分割候補になれない (最初の候補は `at = w`)
-        unevaluated_edge_points += 2 * w;
+        };
+        // 先頭 w 点と末尾 w - 1 点は分割候補になれない (候補は `at = w..=len - w`)。
+        // `len == 2w` でも `at = w` の 1 候補は評価するので、全点を見ていないことにはしない。
+        let candidate_count = *candidate_range.end() - *candidate_range.start() + 1;
+        unevaluated_edge_points += segment.len() - candidate_count;
         let plan = WindowPlan {
             points: w,
             requested_secs: th.shift_window_secs,
@@ -206,7 +209,7 @@ pub fn detect(
 
         // 分割候補を順に評価する
         let mut candidates: Vec<Split> = Vec::new();
-        for at in w..=segment.len() - w {
+        for at in candidate_range {
             // **欠測を挟む比較は評価しない。** 境目を指す意味が無くなる
             if !is_contiguous(&segment[at - w..at + w]) {
                 skipped_for_gap = true;
@@ -295,7 +298,7 @@ pub fn detect(
 
 /// 「評価した」状態に、構造的に見ていない端の点数を添える。
 ///
-/// 各連続区間の先頭 `w` 点と末尾 `w` 点は前後窓の片側が足りないため、
+/// 各連続区間の先頭 `w` 点と末尾 `w - 1` 点は前後窓の片側が足りないため、
 /// **分割候補になれない**。「そこで変化が無かった」のではなく
 /// 「そこは見ていない」ので、0 でなければ網羅度へ出す (規律 7)。
 fn evaluated_with_edges(edge_points: usize) -> RouteStatus {
@@ -305,13 +308,18 @@ fn evaluated_with_edges(edge_points: usize) -> RouteStatus {
     RouteStatus::EvaluatedWithBlindEdges { edge_points }
 }
 
+/// 前後に空でない窓を取れる分割候補。点数の乗算で桁あふれさせない。
+fn split_candidates(len: usize, window: usize) -> Option<std::ops::RangeInclusive<usize>> {
+    (window > 0 && window <= len / 2).then(|| window..=len - window)
+}
+
 /// 窓の点数。
 ///
 /// 要求幅を採取間隔で割り、**点数の下限で底を打つ**。
 /// 底を打った場合は実際の窓幅が要求より長くなるので、
 /// [`WindowPlan::effective_secs`] として根拠に載せる。
 fn window_points(interval: u64, window_secs: u64, min_samples: usize) -> usize {
-    let by_time = window_secs.div_ceil(interval.max(1)) as usize;
+    let by_time = usize::try_from(window_secs.div_ceil(interval.max(1))).unwrap_or(usize::MAX);
     by_time.max(min_samples)
 }
 
@@ -674,6 +682,64 @@ mod tests {
         super::detect(&series, entry, &baseline, &opts)
     }
 
+    /// 窓を取れない端の点数は、先頭 `w` 点と末尾 `w - 1` 点。
+    ///
+    /// 区間がちょうど `2w` 点でも `at = w` の 1 候補は評価するので、
+    /// 全点を「見ていない」と数えない (検出があるのに全点が対象外と言わない)。
+    #[test]
+    fn blind_edges_exclude_the_last_split_candidate() {
+        // 間隔 600 秒・窓 1800 秒・下限 5 点 → w = 5
+        for (len, expected) in [(10usize, 9usize), (30, 9)] {
+            let mut v = vec![90.0; len / 2];
+            v.extend(vec![20.0; len / 2]);
+            let (found, status) = run(cpu_idle(&vals(&v)));
+            assert_eq!(found.len(), 1, "len={len}: {found:#?}");
+            assert_eq!(
+                status,
+                RouteStatus::Detected {
+                    count: 1,
+                    blind_edge_points: expected,
+                },
+                "len={len}"
+            );
+        }
+
+        // 2w 点に満たない区間は候補が無いので全点が端になる
+        let (found, status) = run(cpu_idle(&vals(&[90.0; 9])));
+        assert!(found.is_empty());
+        assert!(
+            matches!(status, RouteStatus::NotEvaluated { .. }),
+            "{status:?}"
+        );
+    }
+
+    /// 公開閾値で空の窓や巨大な窓を要求しても、評価済みにしない。
+    #[test]
+    fn oversized_windows_are_not_evaluated() {
+        let mut timeline = cpu_idle(&vals(&[90.0; 10]));
+        for (i, point) in timeline.points.iter_mut().enumerate() {
+            point.start_ust = T0 + i as u64;
+            point.end_ust = point.start_ust + 1;
+            point.elapsed_cs = 100;
+        }
+        let entry = entry_for(&timeline);
+        let series = PreparedSeries::from_timeline(&timeline);
+        for (seconds, min_samples) in [(0, 0), (u64::MAX, 1), (1800, usize::MAX)] {
+            let mut opts = DetectOptions::default();
+            opts.thresholds.shift_window_secs = seconds;
+            opts.thresholds.shift_window_min_samples = min_samples;
+            let baseline = build_baseline(&series, entry, series.observations.clone(), &opts);
+            let (found, status) = super::detect(&series, entry, &baseline, &opts);
+            assert!(found.is_empty());
+            assert_eq!(
+                status,
+                RouteStatus::NotEvaluated {
+                    reason: NotEvaluated::NoWindowLongEnough,
+                }
+            );
+        }
+    }
+
     /// 一定値から一定値への明瞭な段差を拾う。
     ///
     /// 散らばりが 0 なので正規化はできない。**そこで落とさない**ことが要点。
@@ -864,6 +930,9 @@ mod tests {
 
         // 10 分採取で 30 分窓 → 3 点だが下限 5 で底を打つ
         assert_eq!(window_points(600, 1800, 5), 5);
+
+        // 32bit 環境でも u64 の要求点数を小さい usize に切り捨てない。
+        assert_eq!(window_points(1, u64::MAX, 1), usize::MAX);
     }
 
     /// 点数の下限で底を打った窓の**実際の幅**を根拠に載せる。

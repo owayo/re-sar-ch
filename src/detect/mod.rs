@@ -1373,7 +1373,9 @@ impl PreparedSeries {
             observed_cs: if self.origin.is_instant() {
                 0
             } else {
-                observations.iter().map(|o| o.elapsed_cs).sum()
+                observations
+                    .iter()
+                    .fold(0u64, |total, o| total.saturating_add(o.elapsed_cs))
             },
         }
     }
@@ -2057,6 +2059,31 @@ mod tests {
             "区間値は 3 区間で 1800 秒に達する"
         );
         assert_eq!(support.observed_cs, 3 * STEP_CS);
+    }
+
+    /// 複数の連続区間の観測時間が u64 を超えても巻き戻さない。
+    #[test]
+    fn observed_duration_saturates_without_assigning_time_to_instant_gauges() {
+        let points = [P::V(50.0), P::Restart, P::V(50.0)];
+        for mut timeline in [cpu_idle(&points), runq(&points)] {
+            for point in &mut timeline.points {
+                if point.value.is_some() {
+                    point.elapsed_cs = u64::MAX / 2 + 1;
+                }
+            }
+            let series = PreparedSeries::from_timeline(&timeline);
+            let support = series.support_of(&series.observations);
+            assert_eq!(support.samples, 2);
+            assert_eq!(support.discontinuities, 1);
+            assert_eq!(
+                support.observed_cs,
+                if series.origin.is_instant() {
+                    0
+                } else {
+                    u64::MAX
+                }
+            );
+        }
     }
 
     #[test]

@@ -2349,6 +2349,13 @@ kbmemfree;kbavail;kbmemused;%memused;kbbuffers;kbcached;kbcommit;%commit;kbactiv
 > 一方 `kbavail` / `kbcommit` 列は `(double) avg_xxxkb / avg_count` で**浮動小数除算**。
 > 同じ `Average:` 行の中で除算方式が違うため、パーセント列は列 2/7 と厳密に整合しない。
 > swap 側 (`%swpused` / `%swpcad`) と A_HUGE (`%hugused`) は浮動小数除算である。
+>
+> **引き算の型も瞬時値と平均で違う。** 瞬時値の `SP(availablekb, tlmkb, tlmkb)` は
+> 両辺が `unsigned long long` のまま引くので、`availablekb > tlmkb` なら巻き戻る。
+> 平均の `%memused` は引く側が `double` なので、平均の `availablekb` が最終サンプルの
+> `tlmkb` を超えると (区間内で MemTotal が減ったとき) 負の値になる。
+> 例: `availablekb` が 900000 ×3 と 400000、最終の `tlmkb` が 500000 なら
+> `(500000 - 775000.0) / 500000 * 100` = `-55.00`。
 
 `avg_*` は瞬時値表示のたびに `+=` で累積され、`Average:` 出力後に 0 にリセットされる
 (`static` 変数)。累積は `!dispavg` のパスのみで行われる。一方

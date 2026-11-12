@@ -3405,15 +3405,16 @@ pub fn average_ratio(
             let total = raw_column(plan, last, mem_col::KBMEMTOTAL)?;
             Ok(total as f64 - acc.float_mean(average_available_column(plan, last)))
         }
-        // %memused は **整数除算**を経由する (03 §7-A の落とし穴)
+        // %memused は **整数除算**を経由する (03 §7-A の落とし穴)。
+        // 本家は `SP_VALUE((double) (avg_availablekb / avg_count), tlmkb, tlmkb)` で、
+        // 引く側を double にしてから引く。区間内で MemTotal が減り、平均の
+        // availablekb が最終サンプルの tlmkb を超えると、符号なしで巻き戻らずに
+        // 負の値になる。瞬時値は両辺が整数のまま引くので巻き戻る ([`sp_value`])。
         (ActivityId::MEMORY, mem_col::MEMUSED_PCT) => {
             let total = raw_column(plan, last, mem_col::KBMEMTOTAL)?;
+            let available = acc.int_mean(average_available_column(plan, last)) as f64;
             Ok(if total != 0 {
-                sp_value(
-                    acc.int_mean(average_available_column(plan, last)),
-                    total,
-                    total,
-                )
+                (total as f64 - available) / total as f64 * 100.0
             } else {
                 0.0
             })
@@ -5059,6 +5060,56 @@ mod tests {
         // kbavail 列自身は浮動小数除算
         let avail = acc.mean(mem_col::KBAVAIL).unwrap();
         assert!((avail - 300.333_333).abs() < 1e-5, "{avail}");
+    }
+
+    /// 平均の availablekb が最終サンプルの tlmkb を超えても巻き戻らない。
+    ///
+    /// 本家の平均は引く側を double にしてから引くので負の値になる
+    /// (`SP_VALUE((double) (avg_availablekb / avg_count), tlmkb, tlmkb)`)。
+    /// 符号なしで引くと 3.7e15 のような値になっていた。
+    #[test]
+    fn average_memused_pct_goes_negative_when_total_shrinks() {
+        let plan = plan_for(ActivityId::MEMORY);
+        let mut last = zeros(&plan);
+        put(&plan, &mut last, mem_col::KBMEMTOTAL, 500_000);
+        put(&plan, &mut last, mem_col::KBAVAIL, 400_000);
+
+        let mut acc = ItemAccum::new(lookup(ActivityId::MEMORY).unwrap().columns.len());
+        for v in [900_000u64, 900_000, 900_000, 400_000] {
+            acc.add(mem_col::KBAVAIL, Some(v), Some(v as f64));
+            acc.count += 1;
+        }
+        let pct =
+            average_ratio(ActivityId::MEMORY, mem_col::MEMUSED_PCT, &plan, &acc, &last).unwrap();
+        // 本家と同じ順序の浮動小数演算 (表示は -55.00)
+        assert_eq!(pct, (500_000.0 - 775_000.0) / 500_000.0 * 100.0);
+        assert!((pct + 55.0).abs() < 1e-9, "{pct}");
+        assert_eq!(
+            average_ratio(ActivityId::MEMORY, mem_col::KBMEMUSED, &plan, &acc, &last).unwrap(),
+            -275_000.0,
+            "kbmemused も同じ引き算で負になる"
+        );
+
+        // 瞬時値は本家も符号なしのまま引くので巻き戻る (平均とは型が違う)
+        let mut curr = zeros(&plan);
+        put(&plan, &mut curr, mem_col::KBMEMTOTAL, 500_000);
+        put(&plan, &mut curr, mem_col::KBAVAIL, 600_000);
+        let meta = &lookup(ActivityId::MEMORY).unwrap().columns[mem_col::MEMUSED_PCT];
+        let ctx = ComputeContext::new(100);
+        let instant = column_value(
+            ActivityId::MEMORY,
+            mem_col::MEMUSED_PCT,
+            meta,
+            &plan,
+            &zeros(&plan),
+            &curr,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            instant,
+            500_000u64.wrapping_sub(600_000) as f64 / 500_000.0 * 100.0
+        );
     }
 
     #[test]

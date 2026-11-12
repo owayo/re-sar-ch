@@ -192,14 +192,15 @@ pub fn detect(
             continue;
         };
         let w = window_points(interval, th.shift_window_secs, th.shift_window_min_samples);
-        if w > segment.len() / 2 {
+        let Some(candidate_range) = split_candidates(segment.len(), w) else {
             // 区間の全点が「片側の窓が足りない」範囲になる
             unevaluated_edge_points += segment.len();
             continue;
-        }
+        };
         // 先頭 w 点と末尾 w - 1 点は分割候補になれない (候補は `at = w..=len - w`)。
         // `len == 2w` でも `at = w` の 1 候補は評価するので、全点を見ていないことにはしない。
-        unevaluated_edge_points += (2 * w).saturating_sub(1);
+        let candidate_count = *candidate_range.end() - *candidate_range.start() + 1;
+        unevaluated_edge_points += segment.len() - candidate_count;
         let plan = WindowPlan {
             points: w,
             requested_secs: th.shift_window_secs,
@@ -208,7 +209,7 @@ pub fn detect(
 
         // 分割候補を順に評価する
         let mut candidates: Vec<Split> = Vec::new();
-        for at in w..=segment.len() - w {
+        for at in candidate_range {
             // **欠測を挟む比較は評価しない。** 境目を指す意味が無くなる
             if !is_contiguous(&segment[at - w..at + w]) {
                 skipped_for_gap = true;
@@ -305,6 +306,11 @@ fn evaluated_with_edges(edge_points: usize) -> RouteStatus {
         return RouteStatus::Evaluated;
     }
     RouteStatus::EvaluatedWithBlindEdges { edge_points }
+}
+
+/// 前後に空でない窓を取れる分割候補。点数の乗算で桁あふれさせない。
+fn split_candidates(len: usize, window: usize) -> Option<std::ops::RangeInclusive<usize>> {
+    (window > 0 && window <= len / 2).then(|| window..=len - window)
 }
 
 /// 窓の点数。
@@ -707,7 +713,7 @@ mod tests {
         );
     }
 
-    /// 公開閾値で巨大な窓を要求しても、点数不足として返す。
+    /// 公開閾値で空の窓や巨大な窓を要求しても、評価済みにしない。
     #[test]
     fn oversized_windows_are_not_evaluated() {
         let mut timeline = cpu_idle(&vals(&[90.0; 10]));
@@ -718,7 +724,7 @@ mod tests {
         }
         let entry = entry_for(&timeline);
         let series = PreparedSeries::from_timeline(&timeline);
-        for (seconds, min_samples) in [(u64::MAX, 1), (1800, usize::MAX)] {
+        for (seconds, min_samples) in [(0, 0), (u64::MAX, 1), (1800, usize::MAX)] {
             let mut opts = DetectOptions::default();
             opts.thresholds.shift_window_secs = seconds;
             opts.thresholds.shift_window_min_samples = min_samples;

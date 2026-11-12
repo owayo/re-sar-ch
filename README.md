@@ -170,6 +170,14 @@ resarch detect sa13 --svg-dir charts     # chart each detection as SVG
 
 `resarch detect` tells you **when** and **what** looks off, without needing you to know what to look for. It checks fixed conditions on values whose meaning is established, deviation from the file's own median and MAD, and level changes between adjacent windows, then groups what fires into episodes. It gives no confidence percentages, says when its own yardstick is suspect, and lists every series it could not evaluate. Reports are in English or Japanese (`--lang`).
 
+### Exploring an offline HTML report
+
+```bash
+resarch report sa01 sa02 --timezone Asia/Tokyo -o report.html
+```
+
+Open the file in a browser to compare selected metrics on a shared timeline and inspect detections. The file includes its data, scripts and styles and needs no network connection. Selecting a time range changes the view; detection results and summaries still cover the whole input. Existing files are preserved. See [the HTML report guide](docs/usage.md#interactive-html-report) for controls and options.
+
 ### Browsing interactively (TUI)
 
 ```bash

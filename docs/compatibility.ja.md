@@ -19,6 +19,8 @@ reSARch の `sar` 互換性は、入力、計算・出力、CLI に分けて示�
 | `sadf -g -O autoscale,packed,customcol` | この 3 つは明示的に拒否。skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday は対応 |
 | `sadf -H` と他形式の併用 | 未対応 (`resarch sadf -H <file>` を使う) |
 
+`sadf -c` は旧形式の未知レコード種別をそのままコピーし、警告を出します。現行形式では種別5〜15が統計を伴わない拡張、16〜255が無効になるため、変換後のファイルを読めない場合があります。この種のレコードを含むファイルは、reSARch で元ファイルを直接読んでください。変換しても現行の `sar` で読めるようにはなりません。
+
 ## RHEL / CentOS 7 の `sar` を再現する
 
 ```bash

@@ -19,6 +19,8 @@ Options that are parsed but not yet acted upon are rejected at run time with a r
 | `sadf -g -O autoscale,packed,customcol` | These SVG options are explicitly rejected; skipempty/showidle/showinfo/showtoc/height/bwcol/debug/oneday are supported |
 | `sadf -H` combined with another format | Not implemented — use `resarch sadf -H <file>` |
 
+Legacy unknown record types are copied unchanged by `sadf -c`, with a warning. Their meaning changes in the current format: types 5–15 are extensions without statistics, and types 16–255 are invalid. The converted file may therefore be unreadable. Read the original file directly with reSARch when it contains these records; conversion does not make them compatible with current `sar`.
+
 ## Reproducing RHEL / CentOS 7's `sar`
 
 ```bash
